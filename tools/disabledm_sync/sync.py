@@ -12,6 +12,8 @@ from pathlib import Path
 
 IDENTITY = ["-c", "user.name=github-actions[bot]", "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com"]
 
+UPSTREAM_ORIGIN_REL = "openpilot/selfdrive/carrot/upstream_origin.json"
+
 
 class SyncError(RuntimeError):
   pass
@@ -22,6 +24,24 @@ def git(repo, *args, check=True):
   if check and result.returncode:
     raise SyncError(result.stderr.strip() or result.stdout.strip() or f"git {args[0]} failed")
   return result
+
+
+def upstream_origin_payload(repo, upstream, upstream_url, branch="carrot-wip"):
+  return {
+    "remote": str(upstream_url),
+    "branch": branch,
+    "commit": upstream,
+    "short_commit": git(repo, "rev-parse", "--short", upstream).stdout.strip(),
+    "commit_date": git(repo, "show", "--no-patch", "--format='%ct %ci'", upstream).stdout.strip(),
+    "commit_datetime": git(repo, "show", "-s", "--date=format:%Y-%m-%d %H:%M:%S", "--format=%cd", upstream).stdout.strip(),
+  }
+
+
+def write_upstream_origin(repo, upstream, upstream_url, branch="carrot-wip"):
+  path = Path(repo) / UPSTREAM_ORIGIN_REL
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_text(json.dumps(upstream_origin_payload(repo, upstream, upstream_url, branch), indent=2) + "\n", encoding="utf-8")
+  git(repo, "add", "--", UPSTREAM_ORIGIN_REL)
 
 
 def clean_checkout(repo):
@@ -58,6 +78,7 @@ def prepare(repo, upstream_url, branch="carrot-wip"):
       git(repo, "merge", "--abort")
     raise SyncError(f"Upstream merge failed; nothing published.\n{conflicts or merge.stderr.strip()}")
 
+  write_upstream_origin(repo, upstream, upstream_url, branch)
   git(repo, "commit", "-m", f"Sync upstream {branch} at {upstream[:12]} with DisableDM patch")
   candidate = git(repo, "rev-parse", "HEAD").stdout.strip()
   return Candidate(original, upstream, candidate)

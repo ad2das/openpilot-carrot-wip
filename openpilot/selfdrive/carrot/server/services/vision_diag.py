@@ -19,6 +19,11 @@ from ..config import VISION_DIAG_DEFAULT_DISCORD_KEY, VISION_DIAG_DEFAULT_DISCOR
 from .params import HAS_PARAMS, Params
 from .vision_test import LOG_PATH as VISION_TEST_LOG_PATH
 from .vision_test import get_status as get_vision_test_status
+from openpilot.selfdrive.carrot.telemetry_origin import (
+  reported_git_branch,
+  reported_git_commit_datetime,
+  reported_git_short_commit,
+)
 
 try:
   from openpilot.system.hardware import HARDWARE
@@ -135,9 +140,9 @@ def _diagnostic_metadata(params: Any | None = None) -> dict[str, str]:
     "carName": _param_text(params, "CarName", "none"),
     "dongleId": _param_text(params, "DongleId", "unknown"),
     "serial": _device_serial(params),
-    "branch": _git_text(["branch", "--show-current"]),
-    "commit": _git_text(["rev-parse", "--short", "HEAD"]),
-    "commitDate": _git_text(["show", "-s", "--date=format:%Y-%m-%d %H:%M:%S", "--format=%cd", "HEAD"]),
+    "branch": reported_git_branch(),
+    "commit": reported_git_short_commit(),
+    "commitDate": reported_git_commit_datetime(),
   }
 
 

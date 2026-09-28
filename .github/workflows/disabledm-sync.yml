@@ -66,7 +66,7 @@ jobs:
         run: python tools/disabledm_sync/sync.py prepare --state "$RUNNER_TEMP/disabledm-sync.json"
 
       - name: Install focused test dependencies
-        run: python -m pip install pytest
+        run: python -m pip install pytest aiohttp
 
       - name: Check DisableDM and sync regressions
         run: |
@@ -80,6 +80,8 @@ jobs:
             openpilot/selfdrive/carrot/server/tests/test_vision_dm_config.py \
             openpilot/selfdrive/carrot/server/tests/test_youtube_live_contract.py \
             openpilot/selfdrive/carrot/server/tests/test_settings_schema.py \
+            openpilot/selfdrive/carrot/server/tests/test_telemetry_origin.py \
+            openpilot/selfdrive/carrot/server/tests/test_upload_identity.py \
             tools/docs/wiki_settings/tests
 
       - name: Check video and hidden settings in the web client

@@ -13,6 +13,11 @@ from aiohttp import ClientSession
 
 from .params import HAS_PARAMS, Params, get_param_values, infer_type_from_setting
 from .settings import get_settings_cached
+from openpilot.selfdrive.carrot.telemetry_origin import (
+  reported_git_commit,
+  reported_git_remote,
+  reported_param_value,
+)
 
 
 DEFAULT_TIMEOUT_S = 4.0
@@ -222,11 +227,11 @@ def build_snapshot_payload() -> dict[str, Any] | None:
   defaults = {name: by_name.get(name, {}).get("default", 0) for name in param_names}
   raw_values = get_param_values(param_names, defaults)
   values = {
-    name: _coerce_value(raw_values.get(name, defaults.get(name, 0)), by_name.get(name, {}))
+    name: _coerce_value(reported_param_value(name, raw_values.get(name, defaults.get(name, 0))), by_name.get(name, {}))
     for name in param_names
   }
 
-  repo_remote = _param_text(params, "GitRemote")
+  repo_remote = reported_git_remote()
   settings_version = data.get("apilot")
   try:
     settings_version = int(settings_version)
@@ -242,7 +247,7 @@ def build_snapshot_payload() -> dict[str, Any] | None:
     "car_key": car_key,
     "settings_version": settings_version,
     "settings_hash": _settings_hash(data, param_names),
-    "app_commit": _param_text(params, "GitCommit"),
+    "app_commit": reported_git_commit(),
     "param_catalog": _param_catalog_payload(by_name, param_names),
     "values": values,
   }

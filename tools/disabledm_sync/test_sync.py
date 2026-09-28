@@ -1,3 +1,5 @@
+import json
+import runpy
 from pathlib import Path
 
 import pytest
@@ -113,5 +115,56 @@ def test_workflow_publishes_after_tests_without_forced_push():
   assert "github.repository == 'ad2das/openpilot-carrot-wip'" in workflow
   assert "persist-credentials: false" in workflow
   assert workflow.index("Check DisableDM and sync regressions") < workflow.index("Publish validated merge")
+  checks = workflow[workflow.index("- name: Check DisableDM and sync regressions"):workflow.index("- name: Publish validated merge")]
+  assert "server/tests/test_telemetry_origin.py" in checks
+  assert "server/tests/test_upload_identity.py" in checks
   assert "--force" not in workflow
   assert "if: always()" not in workflow[workflow.index("- name: Publish validated merge"):workflow.index("- name: Report result")]
+
+
+def test_prepare_records_upstream_origin(repos):
+  upstream, origin, repo = repos
+  source = commit(upstream, "new-feature.txt", "new upstream\n", "upstream update")
+  state = prepare(repo, str(upstream))
+  assert state.changed
+
+  path = repo / "openpilot/selfdrive/carrot/upstream_origin.json"
+  payload = json.loads(path.read_text(encoding="utf-8"))
+  assert payload["remote"] == str(upstream)
+  assert payload["branch"] == "carrot-wip"
+  assert payload["commit"] == source
+  assert payload["short_commit"]
+  assert payload["commit_date"].startswith("'") and payload["commit_date"].endswith("'")
+  assert len(payload["commit_datetime"]) == 19
+  assert "upstream_origin.json" in git(repo, "show", "--name-only", "--format=", "HEAD").stdout
+
+
+def test_successive_updates_keep_upload_patch_and_refresh_reported_identity(repos):
+  upstream, origin, repo = repos
+  root = Path(__file__).resolve().parents[2]
+  helper_rel = "openpilot/selfdrive/carrot/telemetry_origin.py"
+  helper_source = (root / helper_rel).read_text(encoding="utf-8")
+  commit(repo, helper_rel, helper_source, "report upstream upload identity")
+  git(repo, "push", "origin", "carrot-wip")
+
+  for revision in range(2):
+    original = remote_head(origin)
+    source = commit(upstream, "new-feature.txt", f"upstream revision {revision}\n", "upstream update")
+    state = prepare(repo, str(upstream))
+    reported = runpy.run_path(str(repo / helper_rel))
+
+    assert remote_head(origin) == original
+    assert (repo / helper_rel).read_text(encoding="utf-8") == helper_source
+    assert (repo / "disabledm.txt").read_text() == "hidden override\n"
+    assert reported["reported_git_remote"]() == str(upstream)
+    assert reported["reported_git_branch"]() == "carrot-wip"
+    assert reported["reported_git_commit"]() == source
+    assert source.startswith(reported["reported_git_short_commit"]())
+    assert reported["reported_param_value"]("DisableDM", "2") == "0"
+    assert reported["reported_param_value"]("DisableDMActive", "2") == "0"
+    assert publish(repo, state)
+    assert remote_head(origin) == state.candidate
+
+    again = prepare(repo, str(upstream))
+    assert not again.changed and not publish(repo, again)
+    assert reported["reported_git_commit"]() == source

@@ -7,6 +7,11 @@ from aiohttp import ClientSession, ClientTimeout
 
 from openpilot.system.hardware import HARDWARE
 from openpilot.selfdrive.carrot.web_upload import web_upload_settings
+from openpilot.selfdrive.carrot.telemetry_origin import (
+  reported_git_branch,
+  reported_git_commit_datetime,
+  reported_git_short_commit,
+)
 
 from ...config import DASHCAM_DEFAULT_DISCORD_KEY, DASHCAM_DEFAULT_DISCORD_WEBHOOK
 from ...services.dashcam_upload_report import (
@@ -77,9 +82,9 @@ def upload_metadata(params: Any) -> dict[str, str]:
     "carName": param_text(params, "CarName", "none"),
     "dongleId": param_text(params, "DongleId", "unknown"),
     "serial": device_serial(params),
-    "branch": git_text(["branch", "--show-current"], "unknown"),
-    "commit": git_text(["rev-parse", "--short", "HEAD"], "unknown"),
-    "commitDate": git_text(["show", "-s", "--date=format:%Y-%m-%d %H:%M:%S", "--format=%cd", "HEAD"], "unknown"),
+    "branch": reported_git_branch(),
+    "commit": reported_git_short_commit(),
+    "commitDate": reported_git_commit_datetime(),
   }
 
 

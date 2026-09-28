@@ -10,6 +10,11 @@ from typing import Any
 from aiohttp import ClientSession, ClientTimeout
 
 from .params import get_param_values
+from openpilot.selfdrive.carrot.telemetry_origin import (
+  reported_git_branch,
+  reported_git_commit_datetime,
+  reported_git_short_commit,
+)
 
 try:
   from openpilot.system.hardware import HARDWARE
@@ -99,9 +104,9 @@ def support_metadata() -> dict[str, str]:
     "carName": str(params.get("CarName") or "none").strip() or "none",
     "dongleId": str(params.get("DongleId") or "unknown").strip() or "unknown",
     "serial": _device_serial(params),
-    "branch": _git_text(["branch", "--show-current"]),
-    "commit": _git_text(["rev-parse", "--short", "HEAD"]),
-    "commitDate": _git_text(["show", "-s", "--date=format:%Y-%m-%d %H:%M:%S", "--format=%cd", "HEAD"]),
+    "branch": reported_git_branch(),
+    "commit": reported_git_short_commit(),
+    "commitDate": reported_git_commit_datetime(),
     "host": socket.gethostname(),
   }
 

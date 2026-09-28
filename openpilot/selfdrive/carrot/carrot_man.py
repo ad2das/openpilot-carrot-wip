@@ -43,6 +43,13 @@ from openpilot.selfdrive.carrot.web_upload import (
   tmux_web_target,
   web_upload_settings,
 )
+from openpilot.selfdrive.carrot.telemetry_origin import (
+  reported_git_branch,
+  reported_git_commit,
+  reported_git_commit_date,
+  reported_git_remote,
+  reported_param_value,
+)
 
 from openpilot.common.gps import get_gps_location_service
 
@@ -857,11 +864,11 @@ class CarrotMan:
     return {
       "tmux_why"           : tmux_why,
       "car_name"          : _pstr("CarName"),
-      "git_branch"        : _pstr("GitBranch"),
+      "git_branch"        : reported_git_branch(),
       "github_id"         : _pstr("GithubUsername"),
-      "git_remote"        : _pstr("GitRemote"),
-      "git_commit"        : _pstr("GitCommit"),
-      "git_commit_date"   : _pstr("GitCommitDate"),
+      "git_remote"        : reported_git_remote(),
+      "git_commit"        : reported_git_commit(),
+      "git_commit_date"   : reported_git_commit_date(),
       "dongle_id"         : _pstr("DongleId"),
       "device_serial"     : _pstr("HardwareSerial"),
       "local_ip"          : get_private_ip_by_iface("wlan0"),
@@ -957,7 +964,7 @@ class CarrotMan:
     return self._decode_tmux_discord_webhook_url()
 
   def _github_repo_url(self):
-    remote = self._param_text("GitRemote")
+    remote = reported_git_remote()
     if remote.startswith("git@github.com:"):
       remote = "https://github.com/" + remote[len("git@github.com:"):]
     if remote.startswith("https://github.com/") or remote.startswith("http://github.com/"):
@@ -970,9 +977,9 @@ class CarrotMan:
     return "https://github.com/ajouatom/openpilot"
 
   def _tmux_discord_content(self, tmux_why, web_ok, web_response):
-    branch = self._param_text("GitBranch", "unknown")
-    commit = self._param_text("GitCommit", "unknown")
-    commit_date = self._param_text("GitCommitDate", "unknown")
+    branch = reported_git_branch()
+    commit = reported_git_commit()
+    commit_date = reported_git_commit_date()
     repo_url = self._github_repo_url()
     commit_text = (
       f"[{commit[:8]}]({repo_url}/commit/{commit})"
@@ -1099,6 +1106,9 @@ class CarrotMan:
       # v가 None이면 default로 채우고 싶으면 dv로 대체 (선택)
       if v is None:
         v = dv
+
+      # fork 전용 호환 키는 원본 기본값(0)으로 보고한다.
+      v = reported_param_value(key, v)
 
       # 최종 stringify (jsonify 용)
       if isinstance(v, (dict, list)):
