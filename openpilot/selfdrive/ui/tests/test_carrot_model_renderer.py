@@ -280,12 +280,13 @@ def test_model_overlay_draw_order():
   calls = []
   renderer._draw_path_carrot = lambda _: calls.append("path")
   renderer._draw_lane_lines_carrot = lambda _: calls.append("laneLines")
+  renderer._draw_ar_turn_carrot = lambda _: calls.append("arTurn")
   renderer._draw_blind_spot_carrot = lambda _: calls.append("blindSpot")
   renderer._draw_radar_info_carrot = lambda _: calls.append("radar")
 
   renderer._draw_carrot_overlays(object())
 
-  assert calls == ["path", "laneLines", "blindSpot", "radar"]
+  assert calls == ["path", "laneLines", "arTurn", "blindSpot", "radar"]
 
 
 def test_render_stale_data_skips_overlays(monkeypatch):

@@ -35,7 +35,7 @@ ALARM_GLOW = rgba(150, 12, 20, 200)
 # Text
 TEXT = rgba(255, 255, 255)
 TEXT_2 = rgba(255, 255, 255, 235)
-TEXT_3 = rgba(255, 255, 255, 190)
+TEXT_3 = rgba(255, 255, 255, 200)
 INK = rgba(14, 16, 20)
 
 # Signals
@@ -244,12 +244,12 @@ def vignette(cx: float, cy: float, radius: float, color: rl.Color) -> None:
 # fades downwards and a soft drop shadow. Tiles are opaque gradients in a signal colour.
 
 # (top, sheen end, bottom) body colours, alpha included.
-CARD_BODY = (rgba(36, 40, 48, 234), rgba(19, 22, 29, 236), rgba(9, 11, 15, 240))
+CARD_BODY = (rgba(38, 42, 50, 242), rgba(20, 23, 30, 244), rgba(10, 12, 16, 246))
 CARD_WARN = (rgba(87, 32, 35, 240), rgba(57, 12, 14, 241), rgba(34, 8, 10, 242))
 CARD_EDGE = (rgba(255, 255, 255, 64), rgba(255, 255, 255, 16), rgba(255, 255, 255, 10))
 TILE_RED = (rgba(255, 107, 97), rgba(200, 30, 30))
 TILE_AMBER = (rgba(255, 179, 42), rgba(240, 138, 0))
-CHIP_FILL = rgba(13, 16, 21, 210)
+CHIP_FILL = rgba(13, 16, 21, 228)
 NAV = rgba(43, 155, 255)
 LIVE_GREEN = rgba(52, 199, 89)
 WARN_RED = rgba(255, 69, 58)
@@ -266,7 +266,7 @@ _RIBBONS: dict[tuple, np.ndarray] = {}
 _ORIGIN = rl.Rectangle(0.0, 0.0, 1.0, 1.0)
 
 
-def _front_facing(pts: np.ndarray) -> np.ndarray:
+def front_facing(pts: np.ndarray) -> np.ndarray:
   """Orders a two-chain ribbon so its triangle strip winds the way raylib does not cull."""
   a, b, c = pts[0], pts[-1], pts[1]
   if (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]) > 0:
@@ -289,7 +289,7 @@ def _rounded_ribbon(x: float, y: float, w: float, h: float, r: float, segments: 
   insets = np.concatenate([inset, inset[::-1]])
   left = np.stack([x + insets, ys], axis=1)
   right = np.stack([x + w - insets, ys], axis=1)
-  pts = _front_facing(np.ascontiguousarray(np.concatenate([left, right[::-1]]), dtype=np.float32))
+  pts = front_facing(np.ascontiguousarray(np.concatenate([left, right[::-1]]), dtype=np.float32))
   if len(_RIBBONS) > 96:
     _RIBBONS.clear()
   _RIBBONS[key] = pts
@@ -353,6 +353,17 @@ def chip(x: float, y: float, w: float, h: float, fill: rl.Color = CHIP_FILL, rin
   else:
     _rect.x, _rect.y, _rect.width, _rect.height = float(x) + 0.75, float(y) + 0.75, float(w) - 1.5, float(h) - 1.5
     rl.draw_rectangle_rounded_lines_ex(_rect, 1.0, 16, 1.5, rgba(255, 255, 255, 46))
+
+
+def bottom_band(x: float, y: float, w: float, h: float, r: float, fill: rl.Color, segments: int = 8) -> None:
+  """Square-topped band whose bottom corners follow a card of corner radius r, as one ribbon (no alpha overlap)."""
+  r = max(0.0, min(r, w / 2.0, h))
+  theta = np.linspace(0.0, math.pi / 2.0, segments + 1)
+  ys = np.concatenate([[y], y + h - r + r * np.sin(theta)])
+  insets = np.concatenate([[0.0], r - r * np.cos(theta)])
+  left = np.stack([x + insets, ys], axis=1)
+  right = np.stack([x + w - insets, ys], axis=1)
+  draw_polygon_solid(front_facing(np.ascontiguousarray(np.concatenate([left, right[::-1]]), dtype=np.float32)), fill)
 
 
 def ellipse_glow(cx: float, cy: float, rx: float, ry: float, color: rl.Color) -> None:
@@ -496,7 +507,7 @@ def stroke_ribbon(points, half) -> np.ndarray:
   d = np.gradient(pts, axis=0)
   d /= np.maximum(np.linalg.norm(d, axis=1, keepdims=True), 1e-6)
   n = np.stack([-d[:, 1], d[:, 0]], axis=1) * np.reshape(np.asarray(half, dtype=np.float32), (-1, 1))
-  return _front_facing(np.ascontiguousarray(np.concatenate([pts + n, (pts - n)[::-1]])))
+  return front_facing(np.ascontiguousarray(np.concatenate([pts + n, (pts - n)[::-1]])))
 
 
 def polyline(points, width: float, color: rl.Color) -> None:

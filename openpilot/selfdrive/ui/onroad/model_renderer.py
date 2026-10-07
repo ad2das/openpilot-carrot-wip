@@ -14,7 +14,7 @@ from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.selfdrive.ui.road_markings import (
   LANE_DASH_LENGTH_M as LANE_DASH_LENGTH_M, LANE_DASH_GAP_M as LANE_DASH_GAP_M,
-  lane_dash_segments, project_lane_segments, project_blindspot_barrier, blindspot_barrier_quads,
+  lane_dash_segments, project_lane_segments, project_blindspot_barrier,
 )
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
@@ -56,6 +56,12 @@ LANE_YELLOW = (255, 196, 0)
 FADE_STOPS = [0.0, 0.3, 0.5]
 LEAD_RED = rl.Color(255, 69, 58, 255)
 LEAD_AMBER = rl.Color(255, 159, 10, 255)
+# Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
+LEAD_SIZE = 58
+LEAD_SIZE_2 = 40
+LEAD_UNIT_SIZE = 36
+LEAD_STATE_SIZE = 48
+LEAD_CAPSULE_H = 86.0
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
 LEAD_TWO = rl.Color(230, 126, 34, 255)
 
@@ -846,31 +852,35 @@ class ModelRenderer(Widget):
 
 
   def _lead_runs_carrot(self) -> list[tuple]:
-    """Readout capsule contents: ('dot', colour) and ('text', text, size, colour) runs."""
+    """Readout capsule contents: ('dot', colour) and ('text'/'unit', text, size, colour) runs on one baseline."""
     if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
-      return [("text", text, 42, hs.TEXT)]
+      return [("text", text, LEAD_STATE_SIZE, hs.TEXT)]
     if self._carrot_long_active:
       if self._carrot_x_state in (3, 5):
         if self._carrot_v_ego < 1.0:
-          return [("text", "Signal Error" if self._carrot_traffic_state >= 1000 else "Signal Ready", 42, hs.TEXT)]
-        return [("text", "Signal slowing", 42, hs.TEXT)]
+          return [("text", "Signal Error" if self._carrot_traffic_state >= 1000 else "Signal Ready", LEAD_STATE_SIZE, hs.TEXT)]
+        return [("text", "Signal slowing", LEAD_STATE_SIZE, hs.TEXT)]
       if self._carrot_x_state == 4:
-        return [("text", "E2E주행중", 42, hs.TEXT)]
+        return [("text", "E2E주행중", LEAD_STATE_SIZE, hs.TEXT)]
 
     text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
     runs: list[tuple] = []
-    if self._carrot_radar_dist > 0.0:
-      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER), ("text", f"{self._carrot_radar_dist:.1f}", 46, text_color)]
+    radar = self._carrot_radar_dist > 0.0
+    if radar:
+      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER),
+               ("text", f"{self._carrot_radar_dist:.1f}", LEAD_SIZE, text_color)]
     if self._carrot_vision_dist > 0.0:
-      runs += [("dot", LEAD_BLUE), ("text", f"{self._carrot_vision_dist:.1f}", 46, text_color)]
+      # Beside a radar distance the vision estimate is a cross-check, so it steps down a size.
+      runs += [("dot", LEAD_BLUE), ("text", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2 if radar else LEAD_SIZE,
+                                     hs.TEXT_3 if radar else text_color)]
     if runs:
-      runs.append(("unit", "m", 32, hs.with_alpha(hs.TEXT, 153)))
+      runs.append(("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3))
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       if runs:
         runs.append(("bar",))
-      runs += [("text", f"{self._carrot_lead_speed:.0f}", 46, hs.LABEL_AMBER),
-               ("unit", "km/h" if ui_state.is_metric else "mph", 32, hs.with_alpha(hs.TEXT, 153))]
+      runs += [("text", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
+               ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
     return runs
 
   def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
@@ -884,12 +894,12 @@ class ModelRenderer(Widget):
     for run in runs:
       if prev is not None:
         width += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
-      width += 14.0 if run[0] == "dot" else 3.0 if run[0] == "bar" else t.width(run[1], run[2], hs.SEMI)
+      width += 16.0 if run[0] == "dot" else 3.0 if run[0] == "bar" else t.width(run[1], run[2], hs.SEMI)
       if run[0] == "bar":
         width += 22.0
       prev = run[0]
-    h = 72.0
-    w = width + 60.0
+    h = LEAD_CAPSULE_H
+    w = width + 64.0
     mid = hs.clear_of_panels(cx, car_top - 60.0 - h / 2, w, h)
     self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
     self._lead_capsule = (runs, cx, mid, w, h, car_top)
@@ -901,20 +911,22 @@ class ModelRenderer(Widget):
     if mid + h / 2 < car_top - 8.0:
       rl.draw_line_ex(rl.Vector2(cx, mid + h / 2), rl.Vector2(cx, car_top - 4.0), 3.0, hs.rgba(255, 255, 255, 128))
     hs.chip(x, mid - h / 2, w, h)
-    x += 30.0
+    x += 32.0
+    # Every run shares the large figures' baseline; smaller figures and units sit on it.
+    base = mid + max((run[2] for run in runs if run[0] == "text"), default=LEAD_SIZE) * hs.INTER_CAP / 2
     prev = None
     for run in runs:
       if prev is not None:
         x += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
       kind = run[0]
       if kind == "dot":
-        hs.dot(x + 7.0, mid + 2.0, 7.0, run[1])
-        x += 14.0
+        hs.dot(x + 8.0, mid, 8.0, run[1])
+        x += 16.0
       elif kind == "bar":
-        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 18.0, 3.0, 36.0), 1.0, 4, hs.rgba(255, 255, 255, 64))
+        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 22.0, 3.0, 44.0), 1.0, 4, hs.rgba(255, 255, 255, 70))
         x += 3.0 + 22.0
       else:
-        x += t.draw(run[1], x, mid + 46 * hs.INTER_CAP / 2, run[2], run[3], hs.SEMI)
+        x += t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
       prev = kind
 
   def _draw_path_end_overlay_carrot(self):
@@ -1069,9 +1081,35 @@ class ModelRenderer(Widget):
       self._carrot_lane_barrier_vertices[1] = self._build_blind_spot_barrier_carrot(model_position, 1.7)
 
   def _draw_blind_spot_segments_carrot(self, points: np.ndarray, color: rl.Color):
-    # Same near fade as lane markings: the fence reads beside the car, not under the speed cluster.
-    for quad in blindspot_barrier_quads(points):
-      self._fade_fill_carrot(np.asarray(quad, dtype=np.float32), (color.r, color.g, color.b), color.a, bell=True)
+    # One continuous wall, lit along its far stretch beside the car and faded toward the
+    # near end, where the drive card covers it anyway.
+    if len(points) < 6:
+      return
+    pts = hs.front_facing(np.asarray(points, dtype=np.float32))
+    top, h = self._rect.y, self._rect.height
+    y0 = float(pts[:, 1].min())
+    y1 = min(float(pts[:, 1].max()), top + h)
+    if y1 - y0 < 4.0:
+      return
+
+    def frac(y: float) -> float:
+      return min(max(1.0 - (y - top) / h, 0.0), 1.0)
+
+    rgb = (color.r, color.g, color.b)
+    stops = [frac(y1), frac(y0 + 0.3 * (y1 - y0)), frac(y0)]
+    stops[1] = max(stops[1], stops[0] + 1e-3)
+    stops[2] = max(stops[2], stops[1] + 1e-3)
+    # A translucent pane: the road stays readable through it, the top rail carries the colour.
+    colors = [rl.Color(*rgb, 0), rl.Color(*rgb, int(color.a * 0.5)), rl.Color(*rgb, int(color.a * 0.3))]
+    draw_polygon(self._rect, pts, gradient=Gradient(start=(0.0, 1.0), end=(0.0, 0.0), colors=colors, stops=stops))
+    half = len(pts) // 2
+    rail = min(pts[:half], pts[half:][::-1], key=lambda chain: float(chain[:, 1].mean()))
+    near = y0 + 0.75 * (y1 - y0)
+    for a, b in zip(rail[:-1], rail[1:], strict=True):
+      k = float(np.clip((near - max(a[1], b[1])) / max(near - y0, 1.0) * 2.0, 0.0, 1.0))
+      if k > 0.0:
+        rl.draw_line_ex(rl.Vector2(float(a[0]), float(a[1])), rl.Vector2(float(b[0]), float(b[1])), 4.0,
+                        rl.Color(*rgb, int(235 * k)))
 
 
   @staticmethod
@@ -1257,7 +1295,7 @@ class ModelRenderer(Widget):
         elif model_prob == 0.01:
           ring = hs.LIVE_GREEN
         elif v_sum > 0.0:
-          ring = hs.LABEL_AMBER
+          ring = None
         else:
           ring = hs.WARN_RED
 
@@ -1277,18 +1315,18 @@ class ModelRenderer(Widget):
       elif self._carrot_show_radar_info >= 3:
         hs.dot(x, y, 7.0, hs.rgba(255, 255, 255, 200))
 
-  def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: rl.Color, trend: int, d_rel: float):
+  def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", trend: int, d_rel: float):
     """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
 
     trend 1 = pulling away (green up), -1 = closing (red down). Returns (centre x, centre y, height) or None."""
     near = d_rel < 40.0
-    size = 42 if near else 36
-    h = 62.0 if near else 54.0
+    size = 46 if near else 40
+    h = 66.0 if near else 58.0
     glyph = 0.0 if trend == 0 else h * 0.36
     text_w = self._type.width(text, size, hs.SEMI)
     inner = text_w + (glyph + 10.0 if glyph else 0.0)
     w = max(h * 1.6, inner + h * 0.8)
-    tail = 12.0
+    tail = 10.0
     spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
     if spot is None:
       return None
@@ -1299,13 +1337,13 @@ class ModelRenderer(Widget):
     if abs(tx - x) < 1.0:
       # Directly above: a callout tail, extended by a hairline stem if the label had to rise.
       if y - bottom > tail + 2.0:
-        rl.draw_line_ex(rl.Vector2(x, bottom + tail - 1.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
-      hs.triangle((x - tail, bottom - 1.0), (x + tail, bottom - 1.0), (x, bottom + tail), fill)
+        rl.draw_line_ex(rl.Vector2(x, bottom + tail - 1.0), rl.Vector2(x, y), 2.0, hs.rgba(255, 255, 255, 110))
+      hs.triangle((x - tail * 0.7, bottom - 1.0), (x + tail * 0.7, bottom - 1.0), (x, bottom + tail * 0.7), fill)
     else:
       ex = min(max(x, left + h / 2), left + w - h / 2)
       rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
       hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
-    hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230))
+    hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230) if ring is not None else None, ring_width=3.0)
     cx = tx - inner / 2
     if glyph:
       gy, gh = mid, glyph * 0.8

@@ -357,12 +357,11 @@ def test_drive_card_uses_one_limit_snapshot_and_keeps_draw_order(hud_module, mon
   monkeypatch.setattr(renderer, "_get_gear_text", lambda: (calls.append("gear"), "D")[1])
   monkeypatch.setattr(renderer, "_get_cruise_gap", lambda: (calls.append("gap"), 3)[1])
   monkeypatch.setattr(renderer, "_get_driving_mode_text_and_color", lambda: (calls.append("mode"), ("", module.hs.TEXT))[1])
-  monkeypatch.setattr(renderer, "_draw_device_state", lambda x, y: calls.append("device"))
 
   renderer._draw_drive_card(module.rl.Rectangle(10, 20, 1000, 600))
 
   assert limit_reads == [True]
-  assert calls == ["cruise", "animation", "limit", "light", "chip", "gear", "gap", "mode", "device"]
+  assert calls == ["cruise", "animation", "limit", "light", "chip", "gear", "gap", "mode"]
   assert labels == ["SET", "--", "40", "km/h"]
 
 
@@ -647,6 +646,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   monkeypatch.setattr(renderer, "_draw_guidance_card", lambda rect, info: calls.append("guide"))
   monkeypatch.setattr(renderer, "_draw_tpms", lambda rect, top: calls.append(("tpms", top)))
   monkeypatch.setattr(renderer, "_draw_status_capsule", lambda rect: calls.append("status"))
+  monkeypatch.setattr(renderer, "_draw_device_state", lambda rect: calls.append("device"))
   monkeypatch.setattr(renderer, "_draw_trip", lambda rect, info: calls.append("trip"))
   monkeypatch.setattr(renderer, "_draw_drive_card", lambda rect: calls.append("drive"))
   monkeypatch.setattr(renderer, "_draw_clock", lambda rect: calls.append("clock"))
@@ -665,6 +665,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
     "guide",
     ("tpms", True),
     "status",
+    "device",
     "trip",
     ("tpms", False),
     "drive",

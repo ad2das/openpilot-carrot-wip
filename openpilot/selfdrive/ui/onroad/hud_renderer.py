@@ -31,49 +31,54 @@ M_TOP = 32
 M_BOTTOM = 30
 CARD_R = 38
 TOP_SHADE_H = 250
-BOTTOM_SHADE_H = 390
-DRIVE_W = 620
-DRIVE_H = 328
-SET_SIZE = 60
+BOTTOM_SHADE_H = 400
+DRIVE_W = 640
+DRIVE_H = 362
+DRIVE_FOOT_H = 86    # status strip under the speed: gear, gap, mode
+SET_SIZE = 68
+SET_LABEL_SIZE = 34
 SET_BASE = 74
-CHIP_SIZE = 36
-CHIP_H = 56
-SPEED_SIZE = 196
-SPEED_SIZE_3 = 152
-SPEED_BASE = 246
-UNIT_SIZE = 42
+CHIP_SIZE = 40
+CHIP_LABEL_SIZE = 36
+CHIP_H = 62
+SPEED_SIZE = 248
+SPEED_SIZE_3 = 192
+SPEED_BASE = 256
+UNIT_SIZE = 44
 SIGN_R = 86
 SIGN_RIGHT = 118
 SIGN_RIGHT_LIGHT = 198
-SIGN_Y = 156
+SIGN_Y = 140
 LIGHT_RIGHT = 62
-STATUS_MID = 286
-STATUS_SIZE = 40
-NAV_W_MIN = 520
-NAV_W_MAX = 900
-NAV_H = 276
-NAV_H_SHORT = 224
+STATUS_SIZE = 42
+NAV_W_MIN = 540
+NAV_W_MAX = 920
+NAV_H = 290
+NAV_H_SHORT = 232
 NAV_TILE = 176
-NAV_DISTANCE_SIZE = 132
-NAV_UNIT_SIZE = 58
-NAV_TEXT_SIZE = 54
+NAV_DISTANCE_SIZE = 142
+NAV_UNIT_SIZE = 60
+NAV_TEXT_SIZE = 56
 NAV_PROGRESS_SPAN = 2000.0
-CLOCK_SIZE = 76
-DATE_SIZE = 40
-BADGE_SIZE = 28
-BADGE_H = 52
-TPMS_W = 320
-TPMS_H = 236
-TPMS_SIZE = 50
-TRIP_STATS_H = 150     # three-column stats row
-TRIP_HEAD_H = 66       # road-name header above it
-TRIP_COL_MIN = 196
-TRIP_COL_PAD = 34
-TRIP_SIZE = 64
-TRIP_UNIT_SIZE = 38
-TRIP_LABEL_SIZE = 30
-TRIP_ROAD_SIZE = 38
-STACK_GAP = 20
+CLOCK_SIZE = 66
+DATE_SIZE = 42
+CLOCK_H = 92
+BADGE_SIZE = 34
+BADGE_H = 62
+TPMS_W = 340
+TPMS_H = 250
+TPMS_SIZE = 62
+DEVICE_LABEL_SIZE = 28
+DEVICE_SIZE = 40
+TRIP_STATS_H = 172     # three-column stats row
+TRIP_HEAD_H = 74       # road-name header above it
+TRIP_COL_MIN = 224
+TRIP_COL_PAD = 36
+TRIP_SIZE = 78
+TRIP_UNIT_SIZE = 44
+TRIP_LABEL_SIZE = 36
+TRIP_ROAD_SIZE = 44
+STACK_GAP = 16
 DIM_GREY = hs.rgba(142, 147, 155)
 NAV_BLUE = hs.NAV
 # SetSpeedOverrideState.speed_color_mode -> chip colour (eco, deceleration, vehicle navigation, external navigation).
@@ -344,6 +349,7 @@ class HudRenderer(Widget):
     self._draw_guidance_card(rect, info)
     self._draw_tpms(rect, top=True)
     self._draw_status_capsule(rect)
+    self._draw_device_state(rect)
     self._draw_trip(rect, info)
     self._draw_tpms(rect, top=False)
     if self.is_cruise_available:
@@ -391,13 +397,14 @@ class HudRenderer(Widget):
     # A capsule under the tyre card (or in its place), with a status dot. hs.Type swaps in the
     # Hangul atlas for non-Latin badge text (e.g. Jetlink states), so mixed-script labels render.
     t = self._type
-    w = t.width(text, BADGE_SIZE, hs.BOLD, 1.0) + 74
+    w = t.width(text, BADGE_SIZE, hs.BOLD, 1.0) + 84
     right = rect.x + rect.width - M_X
-    tpms = hs.zones.get("tpms")
-    y = tpms[1] + tpms[3] + 16 if tpms is not None else rect.y + M_TOP
-    hs.chip(right - w, y, w, 56)
-    hs.dot(right - w + 30, y + 28, 8, color)
-    t.draw_mid(text, right - w + 50, y + 28, BADGE_SIZE, color, hs.BOLD, spacing=1.0)
+    y = self._right_column_top(rect)
+    hs.chip(right - w, y, w, BADGE_H)
+    hs.dot(right - w + 34, y + BADGE_H / 2, 10, color)
+    t.draw_mid(text, right - w + 58, y + BADGE_H / 2, BADGE_SIZE, color, hs.BOLD, spacing=1.0)
+    hs.top_boxes.append((right - w, y, w, BADGE_H))
+    hs.zones["egpu"] = (right - w, y, w, BADGE_H)
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
@@ -735,38 +742,47 @@ class HudRenderer(Widget):
 
     # SET row: the label carries the engagement colour; an active override reads as a solid pill.
     sx = x + 32
-    sx += t.draw("SET", sx, y + SET_BASE, 30, hs.LIVE_GREEN if engaged else DIM_GREY, hs.BOLD, spacing=2) + 14
-    number_w = t.draw(cruise_text, sx, y + SET_BASE, SET_SIZE, hs.TEXT if engaged else hs.with_alpha(hs.TEXT, 128), hs.SEMI)
+    sx += t.draw("SET", sx, y + SET_BASE, SET_LABEL_SIZE, hs.LIVE_GREEN if engaged else DIM_GREY, hs.BOLD, spacing=2) + 14
+    number_w = t.draw(cruise_text, sx, y + SET_BASE, SET_SIZE, hs.TEXT if engaged else hs.with_alpha(hs.TEXT, 150), hs.SEMI)
     self._set_anchor = (sx + number_w / 2, y + SET_BASE)
     chip = self._override_chip()
     if chip is not None:
       label, value, fill, white = chip
       ink = hs.TEXT if white else hs.INK
-      # The pill sits above the sign's crown, so only the card edge bounds it; the reason drops before the speed does.
-      cx = sx + number_w + 22
-      value_w = t.width(value, CHIP_SIZE, hs.BOLD)
-      label_w = t.width(label, 32, hs.BOLD) + 14
-      if cx + label_w + value_w + 52 > right - 32:
-        label, label_w = "", 0.0
-      cw = label_w + value_w + 52
       mid = y + SET_BASE - SET_SIZE * hs.INTER_CAP / 2
-      hs.card(cx, mid - CHIP_H / 2, cw, CHIP_H, fill, CHIP_H / 2, None)
+      # The pill stops short of the sign's rim at its lower edge; the reason drops before the speed does.
+      limit_x = right - 32
+      if limit > 0:
+        dy = (y + SIGN_Y) - (mid + CHIP_H / 2)
+        if dy < SIGN_R:
+          limit_x = min(limit_x, sign_x - math.sqrt(SIGN_R * SIGN_R - dy * dy) - 10)
+      cx = sx + number_w + 20
+      # Full size, then a compact pill, and only then without the reason word.
+      for label_size, value_size, _chip_h, pad in ((CHIP_LABEL_SIZE, CHIP_SIZE, CHIP_H, 26), (30, 36, 54, 20)):
+        value_w = t.width(value, value_size, hs.BOLD)
+        label_w = t.width(label, label_size, hs.BOLD) + 12 if label else 0.0
+        if cx + label_w + value_w + 2 * pad <= limit_x:
+          break
+      else:
+        label, label_w = "", 0.0
+      cw = label_w + value_w + 2 * pad
+      hs.card(cx, mid - _chip_h / 2, cw, _chip_h, fill, _chip_h / 2, None)
       if label:
-        t.draw_mid(label, cx + 26, mid, 32, ink, hs.BOLD)
-      t.draw_mid(value, cx + 26 + label_w, mid, CHIP_SIZE, ink, hs.BOLD)
+        t.draw_mid(label, cx + pad, mid, label_size, ink, hs.BOLD)
+      t.draw_mid(value, cx + pad + label_w, mid, value_size, ink, hs.BOLD)
 
     # Speed numerals, red over the limit, shrunk rather than run into the sign.
     speed_text = "123" if self._debug_speed_panel else str(int(round(self.speed)))
     size = SPEED_SIZE if len(speed_text) < 3 else SPEED_SIZE_3
     unit = tr("km/h") if ui_state.is_metric else tr("mph")
     room = column - (x + 26)
-    need = t.width(speed_text, size, hs.SEMI, -6 * size / SPEED_SIZE) + 18 + t.width(unit, UNIT_SIZE, hs.MEDIUM)
+    need = t.width(speed_text, size, hs.SEMI, -8 * size / SPEED_SIZE) + 12 + t.width(unit, UNIT_SIZE, hs.MEDIUM)
     if need > room:
       size *= max(0.7, room / need)
     self._overspeed = limit > 0 and self.speed > limit + 2
     w = t.draw(speed_text, x + 26, y + SPEED_BASE, size, hs.WARN_RED if self._overspeed else hs.TEXT, hs.SEMI,
-               spacing=-6 * size / SPEED_SIZE)
-    t.draw(unit, x + 26 + w + 18, y + SPEED_BASE, UNIT_SIZE, hs.with_alpha(hs.TEXT, 178), hs.MEDIUM)
+               spacing=-8 * size / SPEED_SIZE)
+    t.draw(unit, x + 26 + w + 12, y + SPEED_BASE, UNIT_SIZE, hs.TEXT_3, hs.MEDIUM)
 
     if limit > 0:
       if alarm:
@@ -775,27 +791,34 @@ class HudRenderer(Widget):
       hs.regulatory_sign(sign_x, y + SIGN_Y, str(limit), t)
     if light:
       lx = right - LIGHT_RIGHT
-      hs.card(lx - 30, y + SIGN_Y - 78, 60, 156, hs.rgba(0, 0, 0, 140), 30, hs.rgba(255, 255, 255, 38), 1.5)
-      for cy, color, on in ((y + SIGN_Y - 34, hs.WARN_RED, light == "red"), (y + SIGN_Y + 34, hs.LIVE_GREEN, light == "green")):
+      hs.card(lx - 32, y + SIGN_Y - 82, 64, 164, hs.rgba(0, 0, 0, 160), 32, hs.rgba(255, 255, 255, 46), 1.5)
+      for cy, color, on in ((y + SIGN_Y - 36, hs.WARN_RED, light == "red"), (y + SIGN_Y + 36, hs.LIVE_GREEN, light == "green")):
         if on:
-          hs.glow(lx, cy, 40, hs.with_alpha(color, 120))
-        hs.dot(lx, cy, 21, color if on else hs.with_alpha(color, 46))
+          hs.glow(lx, cy, 44, hs.with_alpha(color, 130))
+        hs.dot(lx, cy, 23, color if on else hs.with_alpha(color, 46))
 
-    # Status row: gear tile and following-gap segments on the left, driving mode on the right.
-    mid = y + STATUS_MID
-    hs.card(x + 30, mid - 24, 56, 48, hs.with_alpha(hs.TEXT, 235), 12, None)
-    t.draw_mid(self._get_gear_text(), x + 58, mid, 36, hs.INK, hs.BOLD, align=0.5)
+    # Status strip: a recessed band along the card's foot, split from the speed by a hairline.
+    foot = y + DRIVE_H - DRIVE_FOOT_H
+    hs.bottom_band(x + 1.5, foot, DRIVE_W - 3, DRIVE_FOOT_H - 1.5, 38.5, hs.rgba(0, 0, 0, 78))
+    hs.card(x + 1.5, foot, DRIVE_W - 3, 1.5, hs.HAIRLINE, 0, None)
+    mid = foot + DRIVE_FOOT_H / 2
+    hs.card(x + 30, mid - 28, 64, 56, hs.with_alpha(hs.TEXT, 240), 13, None)
+    t.draw_mid(self._get_gear_text(), x + 62, mid, 40, hs.INK, hs.BOLD, align=0.5)
+    # Following gap, as on the cluster: the lead car on top, distance bars below it lit from our side up.
     gap = self._get_cruise_gap()
-    gx = x + 108
+    gcx = x + 154
+    hs.card(gcx - 15, mid - 35, 30, 13, hs.TEXT, 5, None)
+    hs.card(gcx - 11, mid - 32, 22, 7, hs.rgba(30, 33, 40, 255), 3, None)
+    hs.card(gcx - 25, mid - 24, 50, 17, hs.TEXT, 6, None)
     for i in range(4):
-      hs.card(gx + i * 30, mid - 8, 24, 16, hs.TEXT if i < gap else hs.with_alpha(hs.TEXT, 56), 5, None)
+      bw = 66 - i * 10
+      hs.card(gcx - bw / 2, mid + 27 - i * 9, bw, 5, hs.TEXT if i < gap else hs.with_alpha(hs.TEXT, 46), 2.5, None)
     mode_text, mode_color = self._get_driving_mode_text_and_color()
     if self._debug_speed_panel:
       mode_text, mode_color = "safe", hs.AMBER
     if mode_text:
-      t.draw_mid(mode_text, right - 32, mid, STATUS_SIZE, mode_color, hs.SEMI, align=1.0)
-
-    self._draw_device_state(x, y)
+      mode_w = t.draw_mid(mode_text, right - 32, mid, STATUS_SIZE, hs.TEXT, hs.SEMI, align=1.0)
+      hs.dot(right - 32 - mode_w - 20, mid, 9, mode_color)
 
   def _update_cruise_speed_animation(self, cruise_text: str) -> None:
     if self._cruise_speed_text_last != cruise_text:
@@ -823,7 +846,16 @@ class HudRenderer(Widget):
     self._type.draw(self._cruise_speed_animation_text, target_x + (start_x - target_x) * t,
                     target_y + (start_y - target_y) * t, size, hs.LIVE_GREEN, hs.SEMI, align=0.5, shadow=True)
 
-  def _draw_device_state(self, card_x: float, card_y: float) -> None:
+  def _right_column_top(self, rect: rl.Rectangle) -> float:
+    """Top of the next capsule in the right-hand column, under the tyre card and whatever already stacked there."""
+    bottom = None
+    for name in ("tpms", "status", "device", "egpu"):
+      zone = hs.zones.get(name)
+      if zone is not None:
+        bottom = max(bottom or 0.0, zone[1] + zone[3])
+    return bottom + STACK_GAP if bottom is not None else rect.y + M_TOP
+
+  def _draw_device_state(self, rect: rl.Rectangle) -> None:
     if self._show_device_state <= 0:
       return
 
@@ -834,50 +866,67 @@ class HudRenderer(Widget):
       last = ("VOLT", self._voltage_text, False)
     items = (("CPU", self._cpu_temp_text, self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85), last)
 
-    # One capsule above the drive card.
+    # A capsule in the right-hand status column, clear of the road beside the drive card.
     t = self._type
     width = 0.0
     for label, value, _hot in items:
-      width += t.width(label, 28, hs.BOLD, 1.5) + 10 + t.width(value, 38, hs.SEMI) + 30
-    h = 60
-    top = card_y - 18 - h
-    hs.chip(card_x, top, width + 30, h)
-    x = card_x + 30
+      width += t.width(label, DEVICE_LABEL_SIZE, hs.BOLD, 1.5) + 10 + t.width(value, DEVICE_SIZE, hs.SEMI) + 28
+    w, h = width + 28, BADGE_H
+    right = rect.x + rect.width - M_X
+    top = self._right_column_top(rect)
+    hs.chip(right - w, top, w, h)
+    hs.top_boxes.append((right - w, top, w, h))
+    hs.zones["device"] = (right - w, top, w, h)
+    x = right - w + 28
     mid = top + h / 2
     for label, value, hot in items:
-      x += t.draw_mid(label, x, mid, 28, hs.with_alpha(hs.TEXT, 150), hs.BOLD, spacing=1.5) + 10
-      x += t.draw_mid(value, x, mid, 38, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 30
+      x += t.draw_mid(label, x, mid, DEVICE_LABEL_SIZE, hs.TEXT_3, hs.BOLD, spacing=1.5) + 10
+      x += t.draw_mid(value, x, mid, DEVICE_SIZE, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 28
 
   # ---- clock and link badges (top-centre) -------------------------------------------------------
 
   def _draw_clock(self, rect: rl.Rectangle) -> None:
-    # Screen centre, nudged only as far as a wide guidance card requires.
-    guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
-    cx = rect.x + rect.width / 2
-    if guide is not None:
-      cx = max(cx, guide[0] + guide[2] + 260)
-    if tpms is not None:
-      cx = min(cx, tpms[0] - 260)
-    y = rect.y + 30
     show_datetime = self._show_date_time
-    if show_datetime > 0:
-      self._refresh_date_time_text(time.localtime())
-      if show_datetime in (1, 2):
-        self._type.draw(self._date_time_text, cx, y + 58, CLOCK_SIZE, hs.TEXT, hs.SEMI, align=0.5, shadow=True)
-        y += 58
-      if show_datetime in (1, 3):
-        y += 52 if show_datetime == 1 else 40
-        self._type.draw(self._date_text, cx, y, DATE_SIZE, hs.with_alpha(hs.TEXT, 218), hs.SEMI, align=0.5, shadow=True)
-    if y > rect.y + 40:
-      hs.top_boxes.append((cx - 240, rect.y, 480, y - rect.y + 16))
+    if show_datetime <= 0:
+      return
+    self._refresh_date_time_text(time.localtime())
+    t = self._type
+    clock = self._date_time_text if show_datetime in (1, 2) else ""
+    date = self._date_text if show_datetime in (1, 3) else ""
+
+    # One capsule at the top centre (time, hairline, date): the sky behind it is the brightest part of the frame.
+    # It slides only as far as the corner cards require and drops the date before it would touch them.
+    guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
+    lo = guide[0] + guide[2] + 24 if guide is not None else rect.x
+    hi = tpms[0] - 24 if tpms is not None else rect.x + rect.width
+    pad, sep = 38.0, 26.0
+    clock_w = t.width(clock, CLOCK_SIZE, hs.SEMI) if clock else 0.0
+    date_w = t.width(date, DATE_SIZE, hs.SEMI) if date else 0.0
+    w = pad * 2 + clock_w + date_w + (2 * sep + 2 if clock and date else 0.0)
+    if clock and date and w > hi - lo:
+      date, w = "", pad * 2 + clock_w
+    if w > hi - lo:
+      return
+    cx = min(max(rect.x + rect.width / 2, lo + w / 2), hi - w / 2)
+    x, top = cx - w / 2, rect.y + M_TOP
+    mid = top + CLOCK_H / 2
+    hs.chip(x, top, w, CLOCK_H)
+    x += pad
+    if clock:
+      x += t.draw(clock, x, mid + CLOCK_SIZE * hs.INTER_CAP / 2, CLOCK_SIZE, hs.TEXT, hs.SEMI)
+      if date:
+        hs.card(x + sep, mid - 22, 2, 44, hs.rgba(255, 255, 255, 56), 1, None)
+        x += 2 * sep + 2
+    if date:
+      t.draw(date, x, mid + DATE_SIZE * 0.39, DATE_SIZE, hs.TEXT_2, hs.SEMI)
+    hs.top_boxes.append((cx - w / 2, top, w, CLOCK_H))
 
   def _draw_status_capsule(self, rect: rl.Rectangle) -> None:
     """Link status in the top-right column, under the TPMS card when it is up there."""
-    tpms = hs.zones.get("tpms")
-    top = tpms[1] + tpms[3] + STACK_GAP if tpms is not None else rect.y + M_TOP
-    box = self._draw_system_badges(rect.x + rect.width - M_X, top)
+    box = self._draw_system_badges(rect.x + rect.width - M_X, self._right_column_top(rect))
     if box is not None:
       hs.top_boxes.append(box)
+      hs.zones["status"] = box
 
   def _draw_system_badges(self, right: float, top: float) -> tuple[float, float, float, float] | None:
     """One glass capsule, right-aligned: a lit dot per active link (APM keeps its blue); absent when all are off."""
@@ -893,7 +942,7 @@ class HudRenderer(Widget):
       return None
 
     t = self._type
-    dot, pad, sep = 8.5, 24.0, 22.0
+    dot, pad, sep = 10.0, 28.0, 22.0
     widths = [2 * dot + 11 + t.width(label, BADGE_SIZE, hs.BOLD, 1.5) for label, _ in items]
     w = sum(widths) + 2 * pad + 2 * sep * (len(items) - 1)
     x = right - w
@@ -902,11 +951,11 @@ class HudRenderer(Widget):
     x += pad
     for index, ((label, color), item_w) in enumerate(zip(items, widths, strict=True)):
       if index:
-        hs.card(x + sep - 1, mid - 11, 2, 22, hs.rgba(255, 255, 255, 40), 1, None)
+        hs.card(x + sep - 1, mid - 14, 2, 28, hs.rgba(255, 255, 255, 46), 1, None)
         x += 2 * sep
       hs.glow(x + dot, mid, dot * 2.8, hs.with_alpha(color, 150))
       hs.dot(x + dot, mid, dot, color)
-      t.draw_mid(label, x + 2 * dot + 11, mid, BADGE_SIZE, hs.TEXT_2, hs.BOLD, spacing=1.5)
+      t.draw_mid(label, x + 2 * dot + 11, mid, BADGE_SIZE, hs.TEXT, hs.BOLD, spacing=1.5)
       x += item_w
     return right - w, top, w, BADGE_H
 
@@ -958,10 +1007,13 @@ class HudRenderer(Widget):
     if not top:
       hs.panels.append((x, y, TPMS_W, TPMS_H))
     lows = tuple(self._get_tpms_color(value) == COLORS.TPMS_LOW for value in values)
-    self._draw_tpms_car(x + 160, y + 118, lows)
+    self._draw_tpms_car(x + TPMS_W / 2, y + TPMS_H / 2, lows)
 
     t = self._type
-    for value, low, vx, vy, align in zip(values, lows, (x + 102, x + 218, x + 102, x + 218), (y + 86, y + 86, y + 186, y + 186),
+    cx, cy = x + TPMS_W / 2, y + TPMS_H / 2
+    top_base, bottom_base = cy - 50 + TPMS_SIZE * hs.INTER_CAP / 2, cy + 50 + TPMS_SIZE * hs.INTER_CAP / 2
+    for value, low, vx, vy, align in zip(values, lows, (cx - 62, cx + 62, cx - 62, cx + 62),
+                                         (top_base, top_base, bottom_base, bottom_base),
                                          (1.0, 0.0, 1.0, 0.0), strict=True):
       t.draw(self._get_tpms_text(value).strip(), vx, vy, TPMS_SIZE, hs.WARN_RED if low else hs.TEXT, hs.SEMI, align=align)
 
@@ -1064,7 +1116,7 @@ class HudRenderer(Widget):
     hs.top_boxes.append((x, y, w, h))
     hs.zones["guide"] = (x, y, w, h)
 
-    gx, gy = x + 118, y + (122 if text else 98)
+    gx, gy = x + 120, y + (128 if text else 102)
     if camera:
       hs.regulatory_sign(gx, gy, extra, t, 0.92)
     elif not hs.maneuver_arrow(info["x_turn_info"], gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if info["atc_type"] else hs.TEXT):
@@ -1072,18 +1124,18 @@ class HudRenderer(Widget):
 
     if number:
       # Without an instruction line the distance sits on the arrow's centre.
-      base = y + 134 if text else gy + NAV_DISTANCE_SIZE * hs.INTER_CAP / 2
+      base = y + 140 if text else gy + NAV_DISTANCE_SIZE * hs.INTER_CAP / 2
       nw = t.draw(number, x + 234, base, NAV_DISTANCE_SIZE, hs.TEXT, hs.SEMI, spacing=-3)
-      t.draw(unit, x + 234 + nw + 14, base, NAV_UNIT_SIZE, hs.with_alpha(hs.TEXT, 184), hs.MEDIUM)
+      t.draw(unit, x + 234 + nw + 14, base, NAV_UNIT_SIZE, hs.TEXT_2, hs.MEDIUM)
     if text:
       text = t.ellipsize(text, NAV_TEXT_SIZE, w - 234 - 48, hs.SEMI)
-      t.draw(text, x + 236, y + 200, NAV_TEXT_SIZE, hs.TEXT, hs.SEMI)
+      t.draw(text, x + 236, y + 212, NAV_TEXT_SIZE, hs.TEXT, hs.SEMI)
 
     progress = self._progress(key, dist)
     bar_y = y + h - 40
-    hs.card(x + 30, bar_y, w - 60, 8, hs.rgba(255, 255, 255, 33), 4, None)
+    hs.card(x + 30, bar_y, w - 60, 10, hs.rgba(255, 255, 255, 38), 5, None)
     if progress > 0.01:
-      hs.card(x + 30, bar_y, max(8.0, (w - 60) * progress), 8, bar, 4, None)
+      hs.card(x + 30, bar_y, max(10.0, (w - 60) * progress), 10, bar, 5, None)
 
   # ---- trip capsule (bottom-right) ----------------------------------------------------------
 
@@ -1140,14 +1192,14 @@ class HudRenderer(Widget):
     if road:
       # Header: the road we are on, quiet, above a hairline.
       mid = y + TRIP_HEAD_H / 2 + 4
-      hs.dot(x + TRIP_COL_PAD + 7, mid, 7, NAV_BLUE)
-      t.draw_mid(road, x + TRIP_COL_PAD + 30, mid, TRIP_ROAD_SIZE, hs.TEXT_2, hs.SEMI)
+      hs.dot(x + TRIP_COL_PAD + 8, mid, 8, NAV_BLUE)
+      t.draw_mid(road, x + TRIP_COL_PAD + 32, mid, TRIP_ROAD_SIZE, hs.TEXT, hs.SEMI)
       hs.card(x + 26, y + TRIP_HEAD_H, w - 52, 2, hs.HAIRLINE, 1, None)
       top = y + TRIP_HEAD_H
 
     # Stats: big figure with its unit, caption underneath; columns split by hairlines.
-    base = top + 84
-    caption_mid = top + TRIP_STATS_H - 34
+    base = top + 96
+    caption_mid = top + TRIP_STATS_H - 38
     left = x
     for i, ((runs, caption), col_w) in enumerate(zip(columns, widths, strict=True)):
       cx = left + col_w / 2
@@ -1162,7 +1214,7 @@ class HudRenderer(Widget):
           tx += t.draw(text, tx, base, TRIP_SIZE, hs.TEXT, hs.SEMI, spacing=-1.0)
         else:
           tx += t.draw(text, tx, base, TRIP_UNIT_SIZE, hs.TEXT_3, hs.SEMI)
-      t.draw_mid(caption, cx, caption_mid, TRIP_LABEL_SIZE, hs.with_alpha(hs.TEXT, 150), hs.MEDIUM, align=0.5)
+      t.draw_mid(caption, cx, caption_mid, TRIP_LABEL_SIZE, hs.TEXT_3, hs.SEMI, align=0.5)
 
   def _banner_alert_active(self) -> bool:
     """Small/mid alerts take the top-centre slot from the clock."""

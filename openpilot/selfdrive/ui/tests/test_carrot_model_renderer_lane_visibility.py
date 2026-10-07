@@ -362,7 +362,7 @@ def test_blind_spot_barrier_vectorization_matches_scalar_reference(model_rendere
   np.testing.assert_array_equal(actual, expected)
 
 
-def test_blind_spot_segment_vectorization_fades_each_quad(model_renderer_module):
+def test_blind_spot_wall_is_one_continuous_fading_strip_with_rail(model_renderer_module, monkeypatch):
   module = model_renderer_module
   renderer = object.__new__(module.ModelRenderer)
   upper = np.array(
@@ -375,29 +375,47 @@ def test_blind_spot_segment_vectorization_fades_each_quad(model_renderer_module)
   )
   points = np.vstack((upper, lower[::-1]))
   color = module.rl.Color(255, 215, 0, 150)
+  renderer._rect = module.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
+
+  # The old implementation filled each quad separately; the approved wall is a single polygon.
   fills = []
   renderer._fade_fill_carrot = lambda quad, rgb, alpha, bell=False: fills.append((quad, rgb, alpha, bell))
-
-  expected_quads = []
-  count = points.shape[0]
-  half = count // 2
-  for i in range(0, half - 2, 2):
-    quad = np.array(
-      [points[i], points[i + 1], points[count - i - 3], points[count - i - 2]],
-      dtype=np.float32,
-    )
-    center = np.mean(quad, axis=0)
-    angles = np.arctan2(quad[:, 1] - center[1], quad[:, 0] - center[0])
-    expected_quads.append(quad[np.argsort(angles)])
+  polygons = []
+  monkeypatch.setattr(module, "draw_polygon", lambda rect, pts, gradient=None: polygons.append((rect, pts, gradient)))
+  rails = []
+  monkeypatch.setattr(module.rl, "draw_line_ex",
+                      lambda start, end, width, draw_color: rails.append((start, end, width, draw_color)))
 
   renderer._draw_blind_spot_segments_carrot(points, color)
 
-  assert len(fills) == len(expected_quads) == 2
-  for (quad, rgb, alpha, bell), expected in zip(fills, expected_quads, strict=True):
-    np.testing.assert_array_equal(quad, expected)
-    assert rgb == (255, 215, 0)
-    assert alpha == 150
-    assert bell is True
+  assert fills == []
+  assert len(polygons) == 1
+  rect, pts, gradient = polygons[0]
+  assert rect is renderer._rect
+  expected = module.hs.front_facing(np.ascontiguousarray(points, dtype=np.float32))
+  np.testing.assert_array_equal(pts, expected)
+  assert len(pts) == points.shape[0]
+
+  # One gradient across the whole wall: fully transparent at its near (largest screen y) edge,
+  # a translucent pane on the far stretch, and a coloured top rail that fades out before the near quarter.
+  y0 = float(expected[:, 1].min())
+  y1 = float(expected[:, 1].max())
+  near = y0 + 0.75 * (y1 - y0)
+
+  def frac(y):
+    return 1.0 - y / renderer._rect.height
+
+  np.testing.assert_allclose(gradient.stops, [frac(y1), frac(y0 + 0.3 * (y1 - y0)), frac(y0)], atol=1e-6)
+  assert [(c.r, c.g, c.b, c.a) for c in gradient.colors] == [
+    (255, 215, 0, 0), (255, 215, 0, 75), (255, 215, 0, 45),
+  ]
+
+  assert [(rail[0].x, rail[0].y, rail[1].x, rail[1].y, rail[2], rail[3].a) for rail in rails] == [
+    (120.0, 600.0, 130.0, 550.0, 4.0, int(235 * (near - 600.0) / (near - y0) * 2.0)),
+    (130.0, 550.0, 140.0, 500.0, 4.0, int(235 * (near - 550.0) / (near - y0) * 2.0)),
+    (140.0, 500.0, 150.0, 450.0, 4.0, 235),
+  ]
+  assert all(rail[3].r == 255 and rail[3].g == 215 and rail[3].b == 0 for rail in rails)
 
 
 def test_blind_spot_invalid_input_skips_draw(model_renderer_module):
