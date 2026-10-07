@@ -20,6 +20,128 @@ function disable_automatic_git_maintenance {
 
 disable_automatic_git_maintenance
 
+# --- warm-boot timing + fast path -----------------------------------------
+# The fast path skips dependency bootstrap, SCons and the Params checks when
+# the checkout fingerprint matches the stamp written by the previous full
+# successful boot. Everything here must stay cheap and must never break boot.
+
+function carrot_data_dir {
+  printf '%s\n' "${CARROT_DATA_DIR:-/data}"
+}
+
+function carrot_timing_now {
+  local now
+  now="$(date +%s.%3N 2>/dev/null || true)"
+  if [ -z "$now" ]; then
+    now="$(date +%s 2>/dev/null || true)"
+  fi
+  [ -n "$now" ] || now="0"
+  printf '%s\n' "$now"
+}
+
+function carrot_boot_timing_path {
+  if [ -z "${CARROT_BOOT_TIMING_LOG:-}" ]; then
+    local data_dir candidate
+    data_dir="$(carrot_data_dir)"
+    candidate="$data_dir/carrot_boot_timing.log"
+    if mkdir -p "$data_dir" 2>/dev/null && { [ -e "$candidate" ] || : >> "$candidate" 2>/dev/null; }; then
+      CARROT_BOOT_TIMING_LOG="$candidate"
+    else
+      CARROT_BOOT_TIMING_LOG="/tmp/carrot_boot_timing.log"
+    fi
+    export CARROT_BOOT_TIMING_LOG
+  fi
+  printf '%s\n' "$CARROT_BOOT_TIMING_LOG"
+}
+
+function boot_timing {
+  printf '%s %s\n' "$(carrot_timing_now)" "$1" >> "$(carrot_boot_timing_path)" 2>/dev/null || true
+}
+
+function boot_timing_start {
+  local log_path uptime="unknown"
+  log_path="$(carrot_boot_timing_path)"
+  if [ -f "$log_path" ] && command -v tail >/dev/null 2>&1; then
+    if tail -n 400 "$log_path" > "$log_path.tmp" 2>/dev/null; then
+      mv -f "$log_path.tmp" "$log_path" 2>/dev/null || rm -f "$log_path.tmp"
+    else
+      rm -f "$log_path.tmp"
+    fi
+  fi
+  if [ -r /proc/uptime ]; then
+    uptime="$(cut -d' ' -f1 /proc/uptime 2>/dev/null || true)"
+    [ -n "$uptime" ] || uptime="unknown"
+  fi
+  printf '%s boot_start uptime=%s\n' "$(carrot_timing_now)" "$uptime" >> "$log_path" 2>/dev/null || true
+}
+
+function carrot_boot_stamp_path {
+  printf '%s\n' "${CARROT_BOOT_STAMP_PATH:-$(carrot_data_dir)/carrot_boot_fastpath.stamp}"
+}
+
+function carrot_boot_force_path {
+  printf '%s\n' "${CARROT_FORCE_FULL_BOOT_FILE:-$(carrot_data_dir)/carrot_force_full_boot}"
+}
+
+function carrot_boot_fingerprint {
+  python3 "$DIR/scripts/carrot_boot_fingerprint.py" --root "$DIR" --pydeps "$PYDEPS" 2>/dev/null | tail -n 1
+}
+
+# Prints either "fast" or "full <reason>" and never fails.
+function carrot_fastpath_decision {
+  local stamp_path force_path fingerprint
+  stamp_path="$(carrot_boot_stamp_path)"
+  force_path="$(carrot_boot_force_path)"
+
+  if [ "${CARROT_FULL_BOOT:-}" = "1" ]; then
+    printf 'full CARROT_FULL_BOOT=1\n'
+    return 0
+  fi
+  if [ -e "$force_path" ]; then
+    printf 'full force-file\n'
+    return 0
+  fi
+  if [ ! -f "$stamp_path" ]; then
+    printf 'full stamp-missing\n'
+    return 0
+  fi
+
+  fingerprint="$(carrot_boot_fingerprint || true)"
+  if [ -z "$fingerprint" ]; then
+    printf 'full fingerprint-error\n'
+    return 0
+  fi
+  if [ "$fingerprint" != "$(cat "$stamp_path" 2>/dev/null)" ]; then
+    printf 'full fingerprint-mismatch\n'
+    return 0
+  fi
+  case "$fingerprint" in
+    *" ready=1") printf 'fast\n' ;;
+    *) printf 'full inputs-not-ready\n' ;;
+  esac
+}
+
+function carrot_drop_fastpath_stamp {
+  rm -f "$(carrot_boot_stamp_path)" 2>/dev/null || true
+}
+
+function carrot_write_fastpath_stamp {
+  local fingerprint stamp_path
+  fingerprint="$(carrot_boot_fingerprint || true)"
+  [ -n "$fingerprint" ] || return 0
+  # Only a boot that produced every native input may opt the next boot into
+  # the fast path; otherwise stay on the full path until the build is healthy.
+  case "$fingerprint" in
+    *" ready=1") ;;
+    *) return 0 ;;
+  esac
+  stamp_path="$(carrot_boot_stamp_path)"
+  if printf '%s\n' "$fingerprint" > "$stamp_path.tmp" 2>/dev/null && \
+     mv -f "$stamp_path.tmp" "$stamp_path" 2>/dev/null; then
+    rm -f "$(carrot_boot_force_path)" 2>/dev/null || true
+  fi
+}
+
 function cleanup_stale_git_lfs_hooks {
   # Some deployed checkouts still contain hooks installed by git-lfs even
   # though the executable is no longer part of the device image. Those hooks
@@ -399,7 +521,26 @@ function start_manager {
   fi
 }
 
+function carrot_fast_boot_skip_command {
+  # Commands that the last full healthy boot already validated; on the fast
+  # path they must not run at all.
+  [ "${CARROT_FAST_BOOT:-0}" = "1" ] || return 1
+  case "$*" in
+    *bootstrap_runtime_dependencies*|*ensure_params_build.sh*|*./build.py*|*params_check.py*) return 0 ;;
+  esac
+  return 1
+}
+
 function run_startup_command {
+  if carrot_fast_boot_skip_command "$@"; then
+    return 0
+  fi
+  case "$*" in
+    *bootstrap_runtime_dependencies*) boot_timing deps ;;
+    *ensure_params_build.sh*) boot_timing params_build ;;
+    *./build.py*) boot_timing scons ;;
+    *params_check.py*) boot_timing params_check ;;
+  esac
   "$@" 2>&1 | python3 -m openpilot.common.startup_recovery --capture-log /tmp/carrot_startup_failure.log
   return "${PIPESTATUS[0]}"
 }
@@ -421,6 +562,7 @@ function show_startup_failure {
 }
 
 function launch {
+  boot_timing_start
   # Protect the checkout throughout bootstrap, SCons and manager initialization.
   # The manager releases this inherited flock after init; background web/recovery
   # servers must not inherit it. Never delete the lock file itself.
@@ -504,16 +646,37 @@ function launch {
     fi
   fi
 
+  # Warm-boot fast path: an exactly matching stamp means this checkout already
+  # completed a full, healthy boot, so dependency bootstrap, the SCons
+  # dependency walk and the Params checks can be skipped. Any mismatch,
+  # failure or explicit force falls back to the full path.
+  local fast_boot=0
+  local fast_decision
+  fast_decision="$(carrot_fastpath_decision)"
+  case "$fast_decision" in
+    fast)
+      fast_boot=1
+      export CARROT_FAST_BOOT=1
+      boot_timing "fastpath=1"
+      ;;
+    *)
+      boot_timing "fastpath=0 reason=${fast_decision#full }"
+      ;;
+  esac
+
   # AGNOS must be current before installing its matching offline wheels. SCons
   # imports native dependency modules while building Params, so bootstrap them
-  # before the first SCons invocation.
+  # before the first SCons invocation. run_startup_command skips these on the
+  # fast path via CARROT_FAST_BOOT.
   if ! run_startup_command bootstrap_runtime_dependencies; then
+    carrot_drop_fastpath_stamp
     show_startup_failure "Runtime dependency installation failed"
   fi
 
   # Build Params before any long-running carrot service imports it.
   if ! run_startup_command bash "$DIR/scripts/ensure_params_build.sh"; then
     echo "Params registry build failed, not starting openpilot."
+    carrot_drop_fastpath_stamp
     show_startup_failure "Params registry build failed"
   fi
 
@@ -529,9 +692,13 @@ function launch {
 
 
   FORCE_REBUILD=0
-  prepare_big_model_if_needed
-  invalidate_modeld_build_if_needed
-  invalidate_native_build_if_needed
+  if [ "$fast_boot" = "0" ]; then
+    boot_timing big_model_probe
+    prepare_big_model_if_needed
+    boot_timing native_check
+    invalidate_modeld_build_if_needed
+    invalidate_native_build_if_needed
+  fi
 
   rm -f openpilot/selfdrive/pandad/*.so
   # write tmux scrollback to a file
@@ -539,9 +706,10 @@ function launch {
 
   # start manager
   cd openpilot/system/manager
-  if [ "$FORCE_REBUILD" = "1" ] || [ ! -f $DIR/prebuilt ]; then
+  if [ "$fast_boot" = "0" ] && { [ "$FORCE_REBUILD" = "1" ] || [ ! -f $DIR/prebuilt ]; }; then
     if ! run_startup_command ./build.py; then
       echo "openpilot build failed, not starting manager."
+      carrot_drop_fastpath_stamp
       show_startup_failure "openpilot build failed"
     fi
     if [ "$FORCE_REBUILD" = "1" ]; then
@@ -555,10 +723,19 @@ function launch {
   # Never start driving services if a rebuild left the Params registry stale.
   if ! run_startup_command python3 "$DIR/openpilot/system/manager/params_check.py"; then
     echo "Native Params still do not match this checkout; not starting manager."
+    carrot_drop_fastpath_stamp
     show_startup_failure "Native Params do not match this checkout"
   fi
+  if [ "$fast_boot" = "0" ]; then
+    # All build steps succeeded: remember this exact checkout so the next boot
+    # can take the fast path. The build has finished, so the fingerprint now
+    # reflects the built artifacts.
+    carrot_write_fastpath_stamp
+  fi
   start_big_model_update
+  boot_timing manager_exec
   if ! run_startup_command start_manager; then
+    carrot_drop_fastpath_stamp
     show_startup_failure "Manager failed to start"
   fi
   # Also release if manager failed before reaching main()/initialization.
@@ -569,4 +746,7 @@ function launch {
   while true; do sleep 1; done
 }
 
-launch
+# Run only when executed, so tests can source the functions above.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  launch "$@"
+fi

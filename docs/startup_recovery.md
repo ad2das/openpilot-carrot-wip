@@ -148,3 +148,51 @@ reboot failure, and mutual exclusion between rebuild and update. C4 536x240 and
 C3 2160x1080 desktop previews use a synthetic compiler error after the "No new
 commit" result. These checks do not establish physical touch/readability, actual
 device SCons cleanup/rebuild, or a successful vehicle reboot/recovery cycle.
+
+### 2026-10-07: warm-boot fast path — 따뜻한 부팅 빠른 경로
+
+정상 부팅이 끝나면 런처가 이 체크아웃의 지문을
+`/data/carrot_boot_fastpath.stamp`에 기록합니다. 다음 부팅에서 지문
+(HEAD/수정 상태, /VERSION, AGNOS_VERSION, python, pydeps, params_keys.h,
+eGPU 모델, Params/native 바이너리와 모델 산출물의 크기·mtime의 sha256)이
+정확히 같으면 의존성 부트스트랩, `ensure_params_build.sh`, 각종 invalidate
+검사, `build.py`(SCons 의존성 순회), 두 번의 params_check를 모두 건너뜁니다.
+부팅 락, 오버레이 업데이트 검사, 시계 보정, AGNOS 업데이트, Carrot Web,
+백그라운드 big-model 업데이트, manager 시작은 그대로 실행됩니다. 산출물이
+하나라도 없으면(`ready=0`) 스탬프를 쓰지 않으므로 빠른 경로는 성립하지
+않고, 지문 불일치·모든 실패·manager 시작 실패 시 스탬프가 삭제되어 다음
+부팅은 전체 경로로 돌아갑니다. 강제로 전체 부팅을 하려면
+`touch /data/carrot_force_full_boot` 또는 `CARROT_FULL_BOOT=1`을 사용합니다.
+
+After each healthy boot the launcher stores a fingerprint of this exact
+checkout in `/data/carrot_boot_fastpath.stamp`. When the next boot's fingerprint
+(sha256 over HEAD/dirty state, /VERSION, AGNOS_VERSION, python, pydeps,
+params_keys.h, eGPU model state, and size+mtime of the Params extension, native
+daemons and model artifacts) matches exactly, it skips the runtime dependency
+bootstrap, `ensure_params_build.sh`, the invalidation probes, `build.py`
+(the SCons dependency walk) and both params_check runs. The repository lock,
+overlay update check, clock floor, AGNOS update, Carrot Web, background big-model
+update and manager startup still run. A boot that did not produce every native
+artifact never writes the stamp, so the fast path cannot hide a missing build;
+any mismatch, any failure and a failed manager start delete the stamp. Force a
+full boot with `touch /data/carrot_force_full_boot` or `CARROT_FULL_BOOT=1`.
+
+부팅 시간 로그는 `/data/carrot_boot_timing.log`(쓰기 불가 시
+`/tmp/carrot_boot_timing.log`)에 `에포크초.밀리초 <단계>` 형식으로
+추가됩니다. 각 부팅의 첫 줄은 `boot_start uptime=…`이고, 런처가
+`fastpath=1` 또는 `fastpath=0 reason=…`, `deps`, `params_build`,
+`big_model_probe`, `native_check`, `scons`, `params_check`, `manager_exec`를,
+manager가 `ui_started`, `register`, `prepare`, `supported_cars`를 기록합니다.
+파일은 부팅 시작 시 약 400줄로 정리됩니다. 이 최적화는 데스크톱 bash/python
+테스트와 오프스크린 렌더로 검증했으며, 실제 C3/C3X 부팅 시간 단축은 아직
+차량에서 검증되지 않았습니다.
+
+Boot timing lines are appended to `/data/carrot_boot_timing.log` (fallback
+`/tmp/carrot_boot_timing.log`) as `<epoch seconds.ms> <phase>`. The first line
+of each boot is `boot_start uptime=…`; the launcher logs `fastpath=1` or
+`fastpath=0 reason=…`, `deps`, `params_build`, `big_model_probe`,
+`native_check`, `scons`, `params_check` and `manager_exec`, and the manager
+logs `ui_started`, `register`, `prepare` and `supported_cars`. The file is
+trimmed to roughly the last 400 lines at boot start. Desktop bash/python tests
+and offscreen renders validate the logic; the actual C3/C3X boot-time reduction
+is not yet device-validated.

@@ -4,6 +4,7 @@ import importlib
 import os
 import signal
 import sys
+import threading
 import time
 import traceback
 
@@ -42,6 +43,52 @@ def get_default_params_key():
   #default_params = get_default_params()
   #all_keys = [key for key, _ in default_params]
   #return all_keys
+
+
+def boot_timing(phase: str) -> None:
+  # Best-effort warm-boot timing log shared with launch_chffrplus.sh.
+  try:
+    path = os.environ.get("CARROT_BOOT_TIMING_LOG")
+    if not path:
+      candidate = os.path.join(os.environ.get("CARROT_DATA_DIR", "/data"), "carrot_boot_timing.log")
+      try:
+        with open(candidate, "a"):
+          pass
+        path = candidate
+      except OSError:
+        path = "/tmp/carrot_boot_timing.log"
+    now = datetime.datetime.now(datetime.UTC).timestamp()
+    with open(path, "a") as f:
+      f.write(f"{now:.3f} {phase}\n")
+  except Exception:
+    pass
+
+
+def start_early_ui() -> bool:
+  # Bring the display up while the manager is still initializing. The launcher
+  # keeps its recovery screen for later failures, so a failed manager_init
+  # stops this child again before the exception leaves main().
+  if os.getenv("PREPAREONLY") is not None:
+    return False
+  ui = managed_processes.get("ui")
+  if ui is None or not ui.enabled:
+    return False
+  ui.start()
+  boot_timing("ui_started")
+  return True
+
+
+def start_supported_cars_writer() -> threading.Thread:
+  def _write() -> None:
+    boot_timing("supported_cars")
+    try:
+      write_supported_cars_files()
+    except Exception:
+      cloudlog.exception("failed to write supported cars files")
+
+  thread = threading.Thread(target=_write, daemon=True)
+  thread.start()
+  return thread
 
 
 def write_supported_cars_files() -> None:
@@ -93,52 +140,66 @@ def manager_init() -> UpdateStatus:
   get_stopping_speed(params, blocking=True)
   configure_wide_camera(params)
 
-  # Create folders needed for msgq
+  # Start the UI before registration and preimports so the display comes up
+  # while the manager is still initializing. If initialization fails, stop it
+  # again so the launcher's recovery screen can take the display.
+  early_ui_started = start_early_ui()
   try:
-    os.mkdir(Paths.shm_path())
-  except FileExistsError:
-    pass
-  except PermissionError:
-    print(f"WARNING: failed to make {Paths.shm_path()}")
+    # Create folders needed for msgq
+    try:
+      os.mkdir(Paths.shm_path())
+    except FileExistsError:
+      pass
+    except PermissionError:
+      print(f"WARNING: failed to make {Paths.shm_path()}")
 
-  # set params
-  serial = HARDWARE.get_serial()
-  params.put("Version", build_metadata.openpilot.version)
-  params.put("GitCommit", build_metadata.openpilot.git_commit)
-  params.put("GitCommitDate", build_metadata.openpilot.git_commit_date)
-  params.put("GitBranch", build_metadata.channel)
-  params.put("GitRemote", build_metadata.openpilot.git_origin)
-  params.put_bool("IsTestedBranch", build_metadata.tested_channel)
-  params.put_bool("IsReleaseBranch", build_metadata.release_channel)
-  params.put("HardwareSerial", serial)
+    # set params
+    serial = HARDWARE.get_serial()
+    params.put("Version", build_metadata.openpilot.version)
+    params.put("GitCommit", build_metadata.openpilot.git_commit)
+    params.put("GitCommitDate", build_metadata.openpilot.git_commit_date)
+    params.put("GitBranch", build_metadata.channel)
+    params.put("GitRemote", build_metadata.openpilot.git_origin)
+    params.put_bool("IsTestedBranch", build_metadata.tested_channel)
+    params.put_bool("IsReleaseBranch", build_metadata.release_channel)
+    params.put("HardwareSerial", serial)
 
-  # set dongle id
-  reg_res = register(show_spinner=True)
-  if reg_res:
-    dongle_id = reg_res
-  else:
-    raise Exception(f"Registration failed for device {serial}")
-  os.environ['DONGLE_ID'] = dongle_id  # Needed for swaglog
-  os.environ['GIT_ORIGIN'] = build_metadata.openpilot.git_normalized_origin # Needed for swaglog
-  os.environ['GIT_BRANCH'] = build_metadata.channel # Needed for swaglog
-  os.environ['GIT_COMMIT'] = build_metadata.openpilot.git_commit # Needed for swaglog
+    # set dongle id
+    boot_timing("register")
+    reg_res = register(show_spinner=True)
+    if reg_res:
+      dongle_id = reg_res
+    else:
+      raise Exception(f"Registration failed for device {serial}")
+    os.environ['DONGLE_ID'] = dongle_id  # Needed for swaglog
+    os.environ['GIT_ORIGIN'] = build_metadata.openpilot.git_normalized_origin # Needed for swaglog
+    os.environ['GIT_BRANCH'] = build_metadata.channel # Needed for swaglog
+    os.environ['GIT_COMMIT'] = build_metadata.openpilot.git_commit # Needed for swaglog
 
-  if not build_metadata.openpilot.is_dirty:
-    os.environ['CLEAN'] = '1'
+    if not build_metadata.openpilot.is_dirty:
+      os.environ['CLEAN'] = '1'
 
-  # init logging
-  sentry.init(sentry.SentryProject.SELFDRIVE)
-  cloudlog.bind_global(dongle_id=dongle_id,
-                       version=build_metadata.openpilot.version,
-                       origin=build_metadata.openpilot.git_normalized_origin,
-                       branch=build_metadata.channel,
-                       commit=build_metadata.openpilot.git_commit,
-                       dirty=build_metadata.openpilot.is_dirty,
-                       device=HARDWARE.get_device_type())
+    # init logging
+    sentry.init(sentry.SentryProject.SELFDRIVE)
+    cloudlog.bind_global(dongle_id=dongle_id,
+                         version=build_metadata.openpilot.version,
+                         origin=build_metadata.openpilot.git_normalized_origin,
+                         branch=build_metadata.channel,
+                         commit=build_metadata.openpilot.git_commit,
+                         dirty=build_metadata.openpilot.is_dirty,
+                         device=HARDWARE.get_device_type())
 
-  # preimport all processes
-  for p in managed_processes.values():
-    p.prepare()
+    # preimport all processes
+    boot_timing("prepare")
+    for p in managed_processes.values():
+      p.prepare()
+  except BaseException:
+    if early_ui_started:
+      try:
+        managed_processes["ui"].stop()
+      except Exception:
+        pass
+    raise
 
   return update_status
 
@@ -196,6 +257,9 @@ def manager_thread(update_status: UpdateStatus) -> None:
 
   write_onroad_params(False, params)
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
+  # Writing the supported-cars files can import every car brand; do it after
+  # the first processes (including the early UI) are already running.
+  start_supported_cars_writer()
 
   print_timer = 0
 
@@ -264,7 +328,6 @@ def manager_thread(update_status: UpdateStatus) -> None:
 def main() -> None:
   try:
     update_status = manager_init()
-    write_supported_cars_files()
   finally:
     release_boot_lock()
 
