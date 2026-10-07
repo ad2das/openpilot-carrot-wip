@@ -65,10 +65,14 @@ BADGE_H = 52
 TPMS_W = 320
 TPMS_H = 236
 TPMS_SIZE = 50
-TRIP_H = 88
-TRIP_SIZE = 44
-TRIP_UNIT_SIZE = 34
-TRIP_ROAD_SIZE = 40
+TRIP_STATS_H = 150     # three-column stats row
+TRIP_HEAD_H = 66       # road-name header above it
+TRIP_COL_MIN = 196
+TRIP_COL_PAD = 34
+TRIP_SIZE = 64
+TRIP_UNIT_SIZE = 38
+TRIP_LABEL_SIZE = 30
+TRIP_ROAD_SIZE = 38
 STACK_GAP = 20
 DIM_GREY = hs.rgba(142, 147, 155)
 NAV_BLUE = hs.NAV
@@ -1083,8 +1087,8 @@ class HudRenderer(Widget):
 
   # ---- trip capsule (bottom-right) ----------------------------------------------------------
 
-  def _trip_runs(self, remain_sec: int, dist_m: int) -> list[list[tuple[str, bool]]]:
-    """Arrival time, remaining time and distance as groups of (text, is_number) runs."""
+  def _trip_runs(self, remain_sec: int, dist_m: int) -> list[tuple[list[tuple[str, bool]], str]]:
+    """Arrival time, remaining time and distance: ((text, is_number) runs, caption) per column."""
     # Arrival time is wall-clock based; monotonic time cannot be converted to local time.
     eta_tm = time.localtime(time.time() + remain_sec)  # noqa: TID251
     minutes = max(1, round(remain_sec / 60.0))
@@ -1093,19 +1097,22 @@ class HudRenderer(Widget):
     else:
       duration = [(str(minutes), True), ("분", False)]
     if ui_state.is_metric:
-      distance = [(f"{dist_m / 1000.0:.1f}", True), ("km", False)]
+      km = dist_m / 1000.0
+      distance = [(f"{km:.1f}" if km < 100 else f"{km:.0f}", True), ("km", False)]
     else:
-      distance = [(f"{dist_m / 1609.344:.1f}", True), ("mi", False)]
-    return [[(f"{eta_tm.tm_hour:02d}:{eta_tm.tm_min:02d}", True), ("도착", False)], duration, distance]
+      mi = dist_m / 1609.344
+      distance = [(f"{mi:.1f}" if mi < 100 else f"{mi:.0f}", True), ("mi", False)]
+    return [([(f"{eta_tm.tm_hour:02d}:{eta_tm.tm_min:02d}", True)], "도착 예정"),
+            (duration, "남은 시간"), (distance, "남은 거리")]
 
-  def _trip_line_width(self, remain_sec: int, dist_m: int) -> float:
+  def _trip_run_width(self, runs: list[tuple[str, bool]]) -> float:
     t = self._type
-    groups = self._trip_runs(remain_sec, dist_m)
-    width = 38.0 * (len(groups) - 1)
-    for group in groups:
-      for text, number in group:
-        width += t.width(text, TRIP_SIZE if number else TRIP_UNIT_SIZE, hs.SEMI) + 6
-    return width - 6
+    width = 0.0
+    for i, (text, number) in enumerate(runs):
+      if i:
+        width += 12 if number else 6  # unit hugs its figure; the next figure gets air
+      width += t.width(text, TRIP_SIZE, hs.SEMI, -1.0) if number else t.width(text, TRIP_UNIT_SIZE, hs.SEMI)
+    return width
 
   def _draw_trip(self, rect: rl.Rectangle, info: dict) -> None:
     remain_sec, dist_m = info["n_go_pos_time"], info["n_go_pos_dist"]
@@ -1113,37 +1120,49 @@ class HudRenderer(Widget):
       return
 
     t = self._type
-    groups = self._trip_runs(remain_sec, dist_m)
-    line_w = self._trip_line_width(remain_sec, dist_m)
+    columns = self._trip_runs(remain_sec, dist_m)
+    # Each column hugs its own figure, so a long duration does not widen the others.
+    widths = [max(TRIP_COL_MIN, max(self._trip_run_width(runs), t.width(caption, TRIP_LABEL_SIZE, hs.MEDIUM)) + TRIP_COL_PAD * 2)
+              for runs, caption in columns]
+    w = sum(widths)
     road = info["road_name"]
-    road_w = 0.0
     if road:
-      road = t.ellipsize(road, TRIP_ROAD_SIZE, 420, hs.SEMI)
-      road_w = t.width(road, TRIP_ROAD_SIZE, hs.SEMI) + 62
-    w = line_w + road_w + 80
+      road = t.ellipsize(road, TRIP_ROAD_SIZE, w - 2 * TRIP_COL_PAD - 34, hs.SEMI)
+    h = TRIP_STATS_H + (TRIP_HEAD_H if road else 0)
     right = rect.x + rect.width - M_X
-    y = rect.y + rect.height - M_BOTTOM - TRIP_H
+    y = rect.y + rect.height - M_BOTTOM - h
     x = right - w
-    hs.glass_card(x, y, w, TRIP_H, TRIP_H / 2)
-    hs.panels.append((x, y, w, TRIP_H))
-    hs.zones["trip"] = (x, y, w, TRIP_H)
+    hs.glass_card(x, y, w, h, CARD_R)
+    hs.panels.append((x, y, w, h))
+    hs.zones["trip"] = (x, y, w, h)
 
-    baseline = y + 60
-    mid = y + TRIP_H / 2
-    tx = x + 40
+    top = y
     if road:
-      tx += t.draw(road, tx, baseline, TRIP_ROAD_SIZE, hs.with_alpha(hs.TEXT, 178), hs.SEMI) + 30
-      hs.card(tx - 1, mid - 18, 3, 36, hs.rgba(255, 255, 255, 77), 1.5, None)
-      tx += 32
-    for index, group in enumerate(groups):
-      if index:
-        hs.dot(tx + 13, mid + 4, 3.5, hs.rgba(255, 255, 255, 110))
-        tx += 32
-      for text, number in group:
+      # Header: the road we are on, quiet, above a hairline.
+      mid = y + TRIP_HEAD_H / 2 + 4
+      hs.dot(x + TRIP_COL_PAD + 7, mid, 7, NAV_BLUE)
+      t.draw_mid(road, x + TRIP_COL_PAD + 30, mid, TRIP_ROAD_SIZE, hs.TEXT_2, hs.SEMI)
+      hs.card(x + 26, y + TRIP_HEAD_H, w - 52, 2, hs.HAIRLINE, 1, None)
+      top = y + TRIP_HEAD_H
+
+    # Stats: big figure with its unit, caption underneath; columns split by hairlines.
+    base = top + 84
+    caption_mid = top + TRIP_STATS_H - 34
+    left = x
+    for i, ((runs, caption), col_w) in enumerate(zip(columns, widths, strict=True)):
+      cx = left + col_w / 2
+      if i:
+        hs.card(left - 1, top + 30, 2, TRIP_STATS_H - 60, hs.HAIRLINE, 1, None)
+      left += col_w
+      tx = cx - self._trip_run_width(runs) / 2
+      for j, (text, number) in enumerate(runs):
+        if j:
+          tx += 12 if number else 6
         if number:
-          tx += t.draw(text, tx, baseline, TRIP_SIZE, hs.TEXT, hs.SEMI) + 6
+          tx += t.draw(text, tx, base, TRIP_SIZE, hs.TEXT, hs.SEMI, spacing=-1.0)
         else:
-          tx += t.draw(text, tx, baseline, TRIP_UNIT_SIZE, hs.with_alpha(hs.TEXT, 178), hs.SEMI) + 6
+          tx += t.draw(text, tx, base, TRIP_UNIT_SIZE, hs.TEXT_3, hs.SEMI)
+      t.draw_mid(caption, cx, caption_mid, TRIP_LABEL_SIZE, hs.with_alpha(hs.TEXT, 150), hs.MEDIUM, align=0.5)
 
   def _banner_alert_active(self) -> bool:
     """Small/mid alerts take the top-centre slot from the clock."""
