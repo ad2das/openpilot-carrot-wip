@@ -6,14 +6,13 @@ from msgq.visionipc import VisionStreamType
 from openpilot.selfdrive.ui import UI_BORDER_SIZE
 from openpilot.selfdrive.ui.carrot_param_cache import BorderParamSnapshot, TimedSnapshotCache, read_border_params
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
+from openpilot.selfdrive.ui.onroad import hud_style as hs
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
-from openpilot.selfdrive.ui.onroad.driver_preview import DriverPreview
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
 from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
 from openpilot.system.ui.lib.application import gui_app
-from openpilot.system.ui.lib.text_draw import draw_text_ui_style
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 
@@ -24,10 +23,13 @@ WIDE_CAM = VisionStreamType.VISION_STREAM_WIDE_ROAD
 DEFAULT_DEVICE_CAMERA = DEVICE_CAMERAS["tici", "ar0231"]
 
 BORDER_COLORS = {
-  UIStatus.DISENGAGED: rl.Color(0x12, 0x28, 0x39, 0xFF),  # Blue for disengaged state
-  UIStatus.OVERRIDE: rl.Color(0x89, 0x92, 0x8D, 0xFF),  # Gray for override state
-  UIStatus.ENGAGED: rl.Color(0x16, 0x7F, 0x40, 0xFF),  # Green for engaged state
+  UIStatus.DISENGAGED: rl.Color(0x17, 0x2A, 0x3D, 0xFF),  # Blue for disengaged state
+  UIStatus.OVERRIDE: rl.Color(0x7E, 0x87, 0x91, 0xFF),  # Gray for override state
+  UIStatus.ENGAGED: rl.Color(0x12, 0x8A, 0x4B, 0xFF),  # Green for engaged state
 }
+BLINKER_OFF = rl.Color(10, 12, 16, 255)
+BORDER_CORNER_RADIUS = 36.0
+BORDER_TEXT = rl.Color(255, 255, 255, 225)
 
 WIDE_CAM_MAX_SPEED = 10.0  # m/s (22 mph)
 ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
@@ -47,12 +49,12 @@ class AugmentedRoadView(CameraView):
     self._cached_matrix: np.ndarray | None = None
     self._content_rect = rl.Rectangle()
     self._suppress_camera_for_cluster = False
+    self._border_type: hs.Type | None = None
 
     self.model_renderer = ModelRenderer()
     self._render_diagnostics = RenderDiagnostics('ui')
     self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
-    self.driver_state_renderer = DriverPreview()
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
@@ -131,10 +133,7 @@ class AugmentedRoadView(CameraView):
     _t = time.monotonic()
     timing.call('alert', self.alert_renderer.render, self._content_rect)
     alert_ms = (time.monotonic() - _t) * 1000.0
-    _t = time.monotonic()
-    timing.call('driver_state', self.driver_state_renderer.draw_onroad, self._content_rect,
-                self.alert_renderer.get_alert(ui_state.sm) is not None)
-    ds_ms = (time.monotonic() - _t) * 1000.0
+    # The C3 onroad screen no longer shows the driver-camera preview card; ds_ms stays 0 in uiDebug.
 
     # Custom UI extension point - add custom overlays here
     # Use self._content_rect for positioning within camera bounds
@@ -165,11 +164,6 @@ class AugmentedRoadView(CameraView):
   def _handle_mouse_press(self, _):
     if not self._hud_renderer.user_interacting() and self._click_callback is not None:
       self._click_callback()
-
-  def close(self):
-    if preview := getattr(self, 'driver_state_renderer', None):
-      preview.close()
-    super().close()
 
   def _handle_mouse_release(self, _):
     # We only call click callback on press if not interacting with HUD
@@ -399,12 +393,21 @@ class AugmentedRoadView(CameraView):
       bottom_color
     )
 
+    # ---------- rounded camera corners ----------
+    # Fill each inner corner outside a quarter circle so the camera view reads as a rounded panel.
+    inner_r = BORDER_CORNER_RADIUS
+    left_cx, right_cx = x + thickness + inner_r, x + w - thickness - inner_r
+    top_cy, bottom_cy = y + thickness + inner_r, y + h - thickness - inner_r
+    for cx, cy, start, color in ((left_cx, top_cy, 180.0, top_color), (right_cx, top_cy, 270.0, top_color),
+                                 (right_cx, bottom_cy, 0.0, bottom_color), (left_cx, bottom_cy, 90.0, bottom_color)):
+      rl.draw_ring(rl.Vector2(cx, cy), inner_r, inner_r * 1.5, start, start + 90.0, 12, color)
+
     # ---------- blinkers ----------
     rl.draw_rectangle_rounded(
       left_blink_rect,
       roundness,
       segments,
-      rl.ORANGE if left_blink else rl.BLACK
+      hs.AMBER if left_blink else BLINKER_OFF
     )
     rl.draw_rectangle_rounded_lines_ex(
       left_blink_rect,
@@ -418,7 +421,7 @@ class AugmentedRoadView(CameraView):
       right_blink_rect,
       roundness,
       segments,
-      rl.ORANGE if right_blink else rl.BLACK
+      hs.AMBER if right_blink else BLINKER_OFF
     )
     rl.draw_rectangle_rounded_lines_ex(
       right_blink_rect,
@@ -429,9 +432,8 @@ class AugmentedRoadView(CameraView):
     )
 
     # ---------- text ----------
-    text_margin = 30.0
+    text_margin = 36.0
     font_size = 30.0
-    line_margin = 2.0
 
     top = str(car_state.logCarrot)
     top_left = ""
@@ -479,22 +481,19 @@ class AugmentedRoadView(CameraView):
     bottom_left = border_params.bottom_left
     bottom_right = border_params.bottom_right
 
-    # text positions
-    top_text_y = y + line_margin
-    bottom_text_y = bottom_y + bottom_h - font_size - 2
-    draw_text_ui_style(top, x + w / 2.0, top_text_y, font_size, rl.WHITE,
-                       align="center_top", y_offset=0.0)
-    draw_text_ui_style(top_left, x + text_margin, top_text_y, font_size, rl.WHITE,
-                       align="left_top", y_offset=0.0)
-    draw_text_ui_style(top_right, x + w - text_margin, top_text_y, font_size, rl.WHITE,
-                       align="right_top", y_offset=0.0)
-
-    draw_text_ui_style(bottom, x + w / 2.0, bottom_text_y, font_size, rl.WHITE,
-                       align="center_top", y_offset=0.0)
-    draw_text_ui_style(bottom_left, x + text_margin, bottom_text_y, font_size, rl.WHITE,
-                       align="left_top", y_offset=0.0)
-    draw_text_ui_style(bottom_right, x + w - text_margin, bottom_text_y, font_size, rl.WHITE,
-                       align="right_top", y_offset=0.0)
+    # Debug texts sit inside the border band itself, clear of the camera view.
+    text = getattr(self, "_border_type", None)
+    if text is None:
+      text = self._border_type = hs.Type()
+    top_baseline = y + thickness - 4
+    bottom_baseline = y + h - 4
+    for value, tx, baseline, align in ((top, x + w / 2.0, top_baseline, 0.5),
+                                       (top_left, x + text_margin, top_baseline, 0.0),
+                                       (top_right, x + w - text_margin, top_baseline, 1.0),
+                                       (bottom, x + w / 2.0, bottom_baseline, 0.5),
+                                       (bottom_left, x + text_margin, bottom_baseline, 0.0),
+                                       (bottom_right, x + w - text_margin, bottom_baseline, 1.0)):
+      text.draw(value, tx, baseline, font_size, BORDER_TEXT, hs.BOLD, align=align)
 
 if __name__ == "__main__":
   gui_app.init_window("OnRoad Camera View")

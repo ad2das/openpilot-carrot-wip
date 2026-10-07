@@ -17,6 +17,7 @@ def _method(path: Path, class_name: str, method_name: str) -> ast.FunctionDef:
 
 def test_both_device_huds_render_egpu_badge_with_shared_runtime_state():
   for path in HUD_PATHS:
+    is_mici = "mici" in path.parts
     render = _method(path, "HudRenderer", "_render")
     calls = [
       node for node in ast.walk(render)
@@ -26,9 +27,14 @@ def test_both_device_huds_render_egpu_badge_with_shared_runtime_state():
 
     badge = _method(path, "HudRenderer", "_draw_egpu_badge")
     badge_source = ast.unparse(badge)
-    assert "badge_w" in badge_source
     assert "rect.width / 2" not in badge_source
     assert "usbgpu_badge_state" in badge_source
+    if is_mici:
+      assert "badge_w" in badge_source
+    else:
+      # C3X redesign: a status capsule sized by the shared HUD type metrics.
+      assert "hs.chip" in badge_source
+      assert "draw_mid" in badge_source
     for attr in ("usbgpu_present", "usbgpu_compiled", "usbgpu_compile_pending", "usbgpu_loading", "usbgpu_active", "usbgpu_startup_failed"):
       assert any(
         isinstance(node, ast.Attribute)
@@ -40,6 +46,9 @@ def test_both_device_huds_render_egpu_badge_with_shared_runtime_state():
     for state in ("active", "loading", "error", "compile_pending", "not_compiled", "ready"):
       assert repr(state) in badge_source
     assert "eGPU REBOOT" in badge_source
+    # Non-ASCII (Jetlink) badge text must still reach the HUD renderer through the shared state.
+    assert "jetlink_badge" in badge_source
+    assert "usbgpu_delivery_badge" in badge_source
 
 
 def test_ui_state_reads_modeld_egpu_active_param():

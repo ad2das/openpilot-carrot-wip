@@ -91,9 +91,9 @@ The vehicle must report zero raw speed, standstill and Park together; only a tin
 
 ## Onroad DM display and warning sounds
 
-C4 displays an 84×84 DM inset immediately to the right of the D gear indicator, clear of the right status strip. VISION information sits above it; C3/C3X retain their existing position below the clock.
+C4 displays an 84×84 DM inset immediately to the right of the D gear indicator, clear of the right status strip. VISION information sits above it; the C3/C3X onroad HUD no longer draws a driver-camera inset.
 
-The inset appears while engaged or with Always On DM enabled, and hides during displayed alerts. An unavailable camera shows a steering-wheel symbol; stale data shows a check state instead of retaining an old face image.
+The C4 inset appears while engaged or with Always On DM enabled, and hides during displayed alerts. An unavailable camera shows a steering-wheel symbol; stale data shows a check state instead of retaining an old face image.
 
 Warnings progress from a silent visual notice to the first audible warning and then the final audible warning. **The first sound has a 70% minimum gain; the final sound always uses 100%.** General/engagement volume settings and ambient-noise attenuation cannot reduce these levels.
 

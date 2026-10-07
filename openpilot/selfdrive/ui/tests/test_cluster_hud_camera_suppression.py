@@ -147,4 +147,15 @@ def test_external_hud_skips_camera_and_model_but_retains_device_hud():
     if id(node) not in guarded_nodes:
       retained_renderers.append(callback.value.attr)
 
-  assert {"_hud_renderer", "alert_renderer", "driver_state_renderer"} <= set(retained_renderers)
+  assert {"_hud_renderer", "alert_renderer"} <= set(retained_renderers)
+  # The C3X redesign removed the onroad driver-camera preview; it stays on mici (C4).
+  assert "driver_state_renderer" not in retained_renderers
+
+
+def test_mici_road_view_still_retains_driver_state_renderer():
+  tree = ast.parse(MICI_ROAD_VIEW_PATH.read_text(encoding="utf-8"))
+  assert any(
+    isinstance(node, ast.Assign)
+    and any(_is_attr(target, "self", "_driver_state_renderer") for target in node.targets)
+    for node in ast.walk(tree)
+  )

@@ -2,6 +2,7 @@ import math
 import colorsys
 import numpy as np
 
+from openpilot.selfdrive.ui.onroad import hud_style as hs
 from openpilot.selfdrive.ui.onroad.path_geometry import project_path, sample_path
 from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
 import pyray as rl
@@ -39,6 +40,24 @@ NO_THROTTLE_COLORS = [
   rl.Color(242, 242, 242, 89),  # HSLF(112/360, 0.0, 0.95, 0.35)
   rl.Color(242, 242, 242, 0),   # HSLF(112/360, 0.0, 0.95, 0.0)
 ]
+
+
+# C3X path style. Refined hues in the legacy ShowPathColor index order (red, orange, yellow,
+# green, blue, navy, violet, amber, white, graphite), so every saved colour keeps its meaning.
+PATH_PALETTE = (
+  (255, 69, 58), (255, 149, 0), (255, 204, 0), (48, 209, 88), (10, 132, 255),
+  (72, 96, 214), (175, 82, 222), (230, 126, 34), (242, 244, 247), (22, 24, 28),
+)
+PATH_FILL_ALPHA = 150
+BRAKE_RGB = (255, 69, 58)
+LANE_WHITE = (240, 243, 247)
+LANE_YELLOW = (255, 196, 0)
+# Screen-space fade (0 = bottom of the view, 1 = top): opaque underfoot, gone by the horizon.
+FADE_STOPS = [0.0, 0.3, 0.5]
+LEAD_RED = rl.Color(255, 69, 58, 255)
+LEAD_AMBER = rl.Color(255, 159, 10, 255)
+LEAD_BLUE = rl.Color(10, 132, 255, 255)
+LEAD_TWO = rl.Color(230, 126, 34, 255)
 
 
 @dataclass
@@ -159,10 +178,16 @@ class ModelRenderer(Widget):
       self._render_diagnostics = RenderDiagnostics('uiModel')
     timing = self._render_diagnostics
     timing.start()
+    # Floating labels claim screen boxes in priority order: the lead readout first, then radar tags.
+    self._float_boxes = []
+    self._lead_capsule = None
     timing.call('path', self._draw_path_carrot, sm)
     timing.call('lanes', self._draw_lane_lines_carrot, sm)
+    timing.call('ar_turn', self._draw_ar_turn_carrot, sm)
     timing.call('blindspot', self._draw_blind_spot_carrot, sm)
     timing.call('radar', self._draw_radar_info_carrot, sm)
+    if self._lead_capsule is not None:
+      self._draw_lead_capsule_carrot(*self._lead_capsule)
     timing.values['native_draw'] = float(native_draw.active())
     timing.values['native_geometry'] = float(native_geometry.active())
     timing.values['native_text'] = float(native_text.active())
@@ -436,6 +461,9 @@ class ModelRenderer(Widget):
     self._carrot_lead_status = False
     self._carrot_radar_dist = 0.0
     self._carrot_vision_dist = 0.0
+    self._carrot_lead_speed = 0.0
+    self._float_boxes: list[tuple[float, float, float, float]] = []
+    self._lead_capsule = None
     self._carrot_x_state = 0
     self._carrot_traffic_state = 0
     self._carrot_v_ego = 0.0
@@ -452,18 +480,11 @@ class ModelRenderer(Widget):
     self._carrot_lead_two_xr = 0.0
     self._carrot_lead_two_y = 0.0
 
-    self._carrot_colors = [
-      rl.Color(255, 0, 0, 120),
-      rl.Color(255, 153, 0, 120),
-      rl.Color(218, 202, 37, 120),
-      rl.Color(0, 153, 0, 120),
-      rl.Color(0, 0, 255, 120),
-      rl.Color(0, 0, 128, 120),
-      rl.Color(0x8b, 0, 0xff, 120),
-      rl.Color(218, 111, 37, 120),
-      rl.Color(255, 255, 255, 120),
-      rl.Color(0, 0, 0, 120),
-    ]
+    self._carrot_colors = [rl.Color(*rgb, PATH_FILL_ALPHA) for rgb in PATH_PALETTE]
+    self._carrot_depth_top = 0.0
+    self._carrot_model_position = np.empty((0, 3), dtype=np.float32)
+    self._carrot_max_distance = MIN_DRAW_DISTANCE
+    self._type = hs.Type()
 
 
     self._carrot_lane_barrier_vertices = [
@@ -613,15 +634,11 @@ class ModelRenderer(Widget):
     left_pts = np.array([pts[0], pts[1], pts[2], pts[5]], dtype=np.float32)
     right_pts = np.array([pts[5], pts[2], pts[3], pts[4]], dtype=np.float32)
 
-    draw_polygon_solid(left_pts, fill_color)
-    draw_polygon_solid(right_pts, fill_color)
-
-    if color_idx >= 10 or brake_valid:
-      self._draw_polygon_outline_carrot(
-        pts,
-        rl.Color(255, 0, 0, 255) if brake_valid else rl.Color(255, 255, 255, 255),
-        2.0,
-      )
+    fill, edge = self._shape_colors_carrot(pts, fill_color, brake_valid, color_idx)
+    draw_polygon_solid(left_pts, fill)
+    draw_polygon_solid(right_pts, fill)
+    if edge is not None:
+      self._draw_polygon_outline_carrot(pts, edge, 2.5)
 
   def _draw_polygon_from_xy_carrot(self, xs, ys, fill_color: rl.Color, brake_valid: bool, color_idx: int):
     pts = np.column_stack((xs, ys)).astype(np.float32, copy=False)
@@ -645,14 +662,71 @@ class ModelRenderer(Widget):
     if pts.shape[0] < 3:
       return
 
-    draw_polygon_solid(pts, fill_color)
+    fill, edge = self._shape_colors_carrot(pts, fill_color, brake_valid, color_idx)
+    draw_polygon_solid(pts, fill)
+    if edge is not None:
+      self._draw_polygon_outline_carrot(pts, edge, 2.5)
 
-    if color_idx >= 10 or brake_valid:
-      self._draw_polygon_outline_carrot(
-        pts,
-        rl.Color(255, 0, 0, 255) if brake_valid else rl.Color(255, 255, 255, 255),
-        2.0,
-      )
+  def _depth_scale_carrot(self, y: float) -> float:
+    """0 at the path's far end, 1 at the bottom of the view."""
+    top = self._carrot_depth_top
+    bottom = self._rect.y + self._rect.height
+    if bottom - top < 1.0:
+      return 1.0
+    return min(1.0, max(0.0, (y - top) / (bottom - top)))
+
+  def _shape_colors_carrot(self, pts: np.ndarray, fill_color: rl.Color, brake_valid: bool, color_idx: int):
+    """Pieces fade with distance and again underfoot; colours >= 10 get a soft white rim, braking a red one."""
+    depth = self._depth_scale_carrot(float(pts[:, 1].mean()))
+    k = (0.2 + 0.6 * depth) * float(np.interp(depth, [0.65, 1.0], [1.0, 0.3]))
+    fill = rl.Color(fill_color.r, fill_color.g, fill_color.b, int(fill_color.a * k))
+    if brake_valid:
+      return fill, rl.Color(*BRAKE_RGB, int(240 * k))
+    if color_idx >= 10:
+      return fill, rl.Color(255, 255, 255, int(190 * k))
+    return fill, None
+
+  def _fade_fill_carrot(self, pts: np.ndarray, rgb, alpha: int, bell: bool = False) -> None:
+    """Long ribbons get a screen-space fade; short pieces a single depth-scaled alpha.
+
+    `bell` also fades the nearest metres, so lane markings do not run as wide bars under the
+    speed cluster and the guidance block at the bottom corners.
+    """
+    if len(pts) < 3:
+      return
+    if len(pts) > 8:
+      if bell:
+        colors = [rl.Color(*rgb, 0), rl.Color(*rgb, 0), rl.Color(*rgb, alpha), rl.Color(*rgb, int(alpha * 0.45)), rl.Color(*rgb, 0)]
+        stops = [0.0, 0.2, 0.32, 0.42, 0.5]
+      else:
+        colors = [rl.Color(*rgb, alpha), rl.Color(*rgb, int(alpha * 0.55)), rl.Color(*rgb, int(alpha * 0.12))]
+        stops = FADE_STOPS
+      draw_polygon(self._rect, pts, gradient=Gradient(start=(0.0, 1.0), end=(0.0, 0.0), colors=colors, stops=stops))
+    else:
+      depth = self._depth_scale_carrot(float(pts[:, 1].mean()))
+      k = 0.2 + 0.8 * depth
+      if bell:
+        k *= float(np.interp(depth, [0.0, 0.3, 0.5, 0.75], [1.0, 1.0, 0.45, 0.0]))
+      draw_polygon_solid(pts, rl.Color(*rgb, int(alpha * k)))
+
+  def _draw_path_carpet_carrot(self, mode: int, color_idx: int, brake_valid: bool) -> None:
+    """A soft lane carpet under every path mode."""
+    if mode == 0 or mode < 9 or mode in (13, 14, 15):
+      carpet = self._path.projected_points
+    else:
+      carpet = self._build_path_polygon_update_line_data_dist_carrot(
+        self._carrot_model_position, self._carrot_show_path_width, 1.22, 1.22, self._carrot_max_distance, False)
+    if len(carpet) < 4:
+      return
+    self._carrot_depth_top = float(carpet[:, 1].min())
+
+    rgb = BRAKE_RGB if brake_valid else PATH_PALETTE[color_idx % 10]
+    near = 130 if mode == 0 else (84 if 9 <= mode <= 12 else 56)
+    if not brake_valid and color_idx % 10 == 9:
+      rgb, near = (255, 255, 255), 44 if mode else 70
+    colors = [rl.Color(*rgb, near), rl.Color(*rgb, near * 2 // 5), rl.Color(*rgb, 0)]
+    draw_polygon(self._rect, carpet, gradient=Gradient(start=(0.0, 1.0), end=(0.0, 0.0), colors=colors, stops=FADE_STOPS))
+
 
   def _draw_line_segment_carrot(self, p0, p1, color: rl.Color, thickness: float):
     rl.draw_line_ex(
@@ -668,24 +742,6 @@ class ModelRenderer(Widget):
     rl.draw_rectangle_rounded(rect, 0.15, 12, fill_color)
     if stroke_width > 0.0:
       rl.draw_rectangle_rounded_lines_ex(rect, 0.15, 12, stroke_width, stroke_color)
-
-
-  def _draw_text_box_carrot(self, x: int, y: int, text: str, font_size: int, box_color: rl.Color):
-    w = max(40, int(len(text) * font_size * 0.8))
-    h = 42
-    self._draw_rect_fill_outline_carrot(x - w / 2, y - 20, w, h, box_color, box_color, 0.0)
-    draw_text_ui_style(
-      text,
-      x,
-      y,
-      font_size,
-      rl.Color(255, 255, 255, 255),
-      font=self._font_display,
-      align="center",
-      y_offset=0.0,
-      border_width=3.0,
-      shadow_offset=8.0,
-    )
 
 
   def _update_path_end_carrot(self, sm):
@@ -730,6 +786,7 @@ class ModelRenderer(Widget):
       y = float(-lead_one.yRel)
       self._carrot_radar_track_id = int(lead_one.radarTrackId)
       self._carrot_radar_dist = float(lead_one.dRel) if lead_one.radar else 0.0
+      self._carrot_lead_speed = float(lead_one.vLead) * (3.6 if ui_state.is_metric else 2.2369363)
       self._carrot_lead_status = True
 
     left_pt = self._map_to_screen(max_distance, y - 1.2, z + 1.22)
@@ -788,78 +845,111 @@ class ModelRenderer(Widget):
       self._carrot_lead_two_status = 0
 
 
-  def _draw_path_end_overlay_carrot(self):
-    x = self._carrot_path_x
-    y = self._carrot_path_y - 135
-    disp_y = y + 195
-
+  def _lead_runs_carrot(self) -> list[tuple]:
+    """Readout capsule contents: ('dot', colour) and ('text', text, size, colour) runs."""
     if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
-      draw_text_ui_style(text, x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-    else:
-      draw_dist = False
-      if self._carrot_long_active:
-        if self._carrot_x_state in (3, 5):
-          if self._carrot_v_ego < 1.0:
-            text = "Signal Error" if self._carrot_traffic_state >= 1000 else "Signal Ready"
-            draw_text_ui_style(text, x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-          else:
-            draw_text_ui_style("Signal slowing", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-        elif self._carrot_x_state == 4:
-          draw_text_ui_style("E2E주행중", x, disp_y, 50, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-        elif self._carrot_x_state in (0, 1, 2):
-          draw_dist = True
-      else:
-        draw_dist = True
+      return [("text", text, 42, hs.TEXT)]
+    if self._carrot_long_active:
+      if self._carrot_x_state in (3, 5):
+        if self._carrot_v_ego < 1.0:
+          return [("text", "Signal Error" if self._carrot_traffic_state >= 1000 else "Signal Ready", 42, hs.TEXT)]
+        return [("text", "Signal slowing", 42, hs.TEXT)]
+      if self._carrot_x_state == 4:
+        return [("text", "E2E주행중", 42, hs.TEXT)]
 
-      if draw_dist:
-        w = 80
-        text_color = rl.Color(255, 255, 255, 255) if self._carrot_x_state == 0 else (rl.Color(191, 191, 191, 255) if self._carrot_x_state == 1 else rl.Color(0, 203, 0, 255))
-        if self._carrot_radar_dist > 0.0:
-          dist_text = f"{self._carrot_radar_dist:.1f}"
-          box_color = rl.Color(255, 0, 0, 255) if self._carrot_radar_track_id < 1 else rl.Color(255, 175, 3, 255)
-          self._draw_text_box_carrot(x - w, disp_y, dist_text, 40, box_color)
-          draw_text_ui_style(dist_text, x - w, disp_y, 40, text_color, align="center", y_offset=0.0)
-        if self._carrot_vision_dist > 0.0:
-          dist_text = f"{self._carrot_vision_dist:.1f}"
-          self._draw_text_box_carrot(x + w, disp_y, dist_text, 40, rl.Color(0, 0, 255, 255))
-          draw_text_ui_style(dist_text, x + w, disp_y, 40, text_color, align="center", y_offset=0.0)
+    text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
+    runs: list[tuple] = []
+    if self._carrot_radar_dist > 0.0:
+      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER), ("text", f"{self._carrot_radar_dist:.1f}", 46, text_color)]
+    if self._carrot_vision_dist > 0.0:
+      runs += [("dot", LEAD_BLUE), ("text", f"{self._carrot_vision_dist:.1f}", 46, text_color)]
+    if runs:
+      runs.append(("unit", "m", 32, hs.with_alpha(hs.TEXT, 153)))
+    if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
+      if runs:
+        runs.append(("bar",))
+      runs += [("text", f"{self._carrot_lead_speed:.0f}", 46, hs.LABEL_AMBER),
+               ("unit", "km/h" if ui_state.is_metric else "mph", 32, hs.with_alpha(hs.TEXT, 153))]
+    return runs
+
+  def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
+    runs = self._lead_runs_carrot()
+    if not runs:
+      return
+    t = self._type
+    gaps = {"dot": 10.0, "text": 0.0, "unit": 8.0, "bar": 22.0}
+    width = 0.0
+    prev = None
+    for run in runs:
+      if prev is not None:
+        width += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
+      width += 14.0 if run[0] == "dot" else 3.0 if run[0] == "bar" else t.width(run[1], run[2], hs.SEMI)
+      if run[0] == "bar":
+        width += 22.0
+      prev = run[0]
+    h = 72.0
+    w = width + 60.0
+    mid = hs.clear_of_panels(cx, car_top - 60.0 - h / 2, w, h)
+    self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
+    self._lead_capsule = (runs, cx, mid, w, h, car_top)
+
+  def _draw_lead_capsule_carrot(self, runs, cx: float, mid: float, w: float, h: float, car_top: float) -> None:
+    t = self._type
+    gaps = {"dot": 10.0, "text": 0.0, "unit": 8.0, "bar": 22.0}
+    x = cx - w / 2
+    if mid + h / 2 < car_top - 8.0:
+      rl.draw_line_ex(rl.Vector2(cx, mid + h / 2), rl.Vector2(cx, car_top - 4.0), 3.0, hs.rgba(255, 255, 255, 128))
+    hs.chip(x, mid - h / 2, w, h)
+    x += 30.0
+    prev = None
+    for run in runs:
+      if prev is not None:
+        x += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
+      kind = run[0]
+      if kind == "dot":
+        hs.dot(x + 7.0, mid + 2.0, 7.0, run[1])
+        x += 14.0
+      elif kind == "bar":
+        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 18.0, 3.0, 36.0), 1.0, 4, hs.rgba(255, 255, 255, 64))
+        x += 3.0 + 22.0
+      else:
+        x += t.draw(run[1], x, mid + 46 * hs.INTER_CAP / 2, run[2], run[3], hs.SEMI)
+      prev = kind
+
+  def _draw_path_end_overlay_carrot(self):
+    x = float(self._carrot_path_x)
+    base = float(self._carrot_path_y)
+    w = float(self._carrot_path_width_px)
 
     self._draw_tf_marker_carrot()
 
     if self._carrot_lead_status:
-      rcolor = rl.Color(255, 0, 0, 255) if self._carrot_radar_track_id < 1 else rl.Color(255, 175, 3, 255)
       if self._carrot_lead_two_status > 0:
-        radar_stroke = rl.Color(218, 111, 37, 255)
-        path_width2 = int(self._carrot_lead_two_xr - self._carrot_lead_two_xl)
-        fill_color = rl.Color(255, 0, 0, 50) if self._carrot_lead_two_status == 2 else rl.Color(0, 0, 0, 20)
-        self._draw_rect_fill_outline_carrot(
-          self._carrot_lead_two_xl - 10,
-          self._carrot_lead_two_y - path_width2 * 0.8,
-          path_width2 + 20,
-          path_width2 * 0.8,
-          fill_color,
-          radar_stroke,
-          3.0,
-        )
+        x2 = (self._carrot_lead_two_xl + self._carrot_lead_two_xr) / 2.0
+        w2 = self._carrot_lead_two_xr - self._carrot_lead_two_xl
+        y2 = self._carrot_lead_two_y
+        if self._carrot_lead_two_status == 2:
+          hs.ellipse_glow(x2, y2 - 4, w2 * 0.7, w2 * 0.12, hs.with_alpha(LEAD_TWO, 150))
+        hs.curve((x2 - w2 * 0.45, y2 - 5), (x2, y2 + 10), (x2 + w2 * 0.45, y2 - 5), 3.5, LEAD_TWO)
 
-      radar_stroke = rcolor if self._carrot_radar_track_id >= 0 else rl.Color(0, 0, 255, 255)
-      self._draw_rect_fill_outline_carrot(
-        self._carrot_path_x - self._carrot_path_width_px / 2 - 10,
-        self._carrot_path_y - self._carrot_path_width_px * 0.8,
-        self._carrot_path_width_px + 20,
-        self._carrot_path_width_px * 0.8,
-        rl.Color(0, 0, 0, 20),
-        radar_stroke,
-        3.0,
-      )
+      # The lead stands in a pool of light in its source colour: radar red/amber, vision blue.
+      rcolor = LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER
+      stroke = rcolor if self._carrot_radar_track_id >= 0 else LEAD_BLUE
+      hs.ellipse_glow(x, base - 6, w * 0.74, w * 0.13, hs.with_alpha(stroke, 190))
+      hs.curve((x - w * 0.5, base - 8), (x, base + 14), (x + w * 0.5, base - 8), 5.0, stroke)
+
+    # Vehicle height is unknown: leave room for a truck so the readout never sits on the lead.
+    self._layout_lead_capsule_carrot(x, base - w * 1.3)
 
 
   def _draw_tf_marker_carrot(self):
     if self._carrot_tf_distance > 0.0 and self._carrot_tf_left is not None and self._carrot_tf_right is not None:
-      self._draw_line_segment_carrot(self._carrot_tf_left, self._carrot_tf_right, rl.Color(255, 255, 255, 255), 3.0)
-      draw_text_ui_style(f"{self._carrot_tf_distance:.0f} m", int(self._carrot_tf_right[0]) + 10, int(self._carrot_tf_right[1]),
-                         25, rl.Color(255, 255, 255, 255), align="left", y_offset=0.0)
+      # Desired following distance: a quiet rule across the lane.
+      lx, ly = float(self._carrot_tf_left[0]), float(self._carrot_tf_left[1])
+      rx, ry = float(self._carrot_tf_right[0]), float(self._carrot_tf_right[1])
+      inset = (rx - lx) * 0.18
+      hs.polyline([(lx + inset, ly), (rx - inset, ry)], 4.0, hs.rgba(255, 255, 255, 230))
 
   def _draw_lane_lines_carrot(self, sm):
     if self._carrot_show_lane_info < 1:
@@ -928,25 +1018,18 @@ class ModelRenderer(Widget):
     for i in range(4):
       if not lane_vertices[i]:
         continue
-      alpha = 220
-      stroke = 0.0
-      if i == 1:
-        color = rl.Color(218, 202, 37, alpha) if left_lane_line >= 20 else rl.Color(255, 255, 255, alpha)
-        stroke = 1.0 if left_lane_line >= 20 else 0.0
-      elif i == 2:
-        color = rl.Color(218, 202, 37, alpha) if right_lane_line >= 20 else rl.Color(255, 255, 255, alpha)
-      else:
-        color = rl.Color(255, 255, 255, alpha)
+      # Confidence sets the strength; yellow keeps the centre-line meaning.
+      alpha = int(np.interp(float(lane_line_probs[i]), [0.3, 0.8], [120, 235]))
+      yellow = (i == 1 and left_lane_line >= 20) or (i == 2 and right_lane_line >= 20)
+      rgb = LANE_YELLOW if yellow else LANE_WHITE
 
+      # Dashes are many short pieces; at full strength they read as a hatch, not a line.
+      seg_alpha = alpha if len(lane_vertices[i]) == 1 else int(alpha * 0.6)
       for lane_segment_vertices in lane_vertices[i]:
-        draw_polygon_solid(lane_segment_vertices, color)
-        if stroke > 0.0:
-          self._draw_polygon_outline_carrot(lane_segment_vertices, color, stroke)
+        self._fade_fill_carrot(lane_segment_vertices, rgb, seg_alpha, bell=True)
 
       if i == 1 and draw_double_left and lane_vertices_double.size != 0:
-        draw_polygon_solid(lane_vertices_double, color)
-        if stroke > 0.0:
-          self._draw_polygon_outline_carrot(lane_vertices_double, color, stroke)
+        self._fade_fill_carrot(lane_vertices_double, rgb, alpha, bell=True)
 
     if self._carrot_show_lane_info > 1:
       max_idx_road_edge = self._get_path_length_idx(lane_zero[:, 0], 100.0)
@@ -958,8 +1041,8 @@ class ModelRenderer(Widget):
         if road_vertices[i].size == 0:
           continue
         temp_f = float(np.clip(road_edge_stds[i] / 2.0, 0.0, 1.0))
-        color = rl.Color(int((1.0 - temp_f) * 255.0), 0, int(temp_f * 255.0), 255)
-        draw_polygon_solid(road_vertices[i], color)
+        rgb = tuple(int(a + (b - a) * temp_f) for a, b in zip(BRAKE_RGB, (10, 132, 255), strict=True))
+        self._fade_fill_carrot(road_vertices[i], rgb, 235, bell=True)
 
 
 
@@ -986,8 +1069,9 @@ class ModelRenderer(Widget):
       self._carrot_lane_barrier_vertices[1] = self._build_blind_spot_barrier_carrot(model_position, 1.7)
 
   def _draw_blind_spot_segments_carrot(self, points: np.ndarray, color: rl.Color):
+    # Same near fade as lane markings: the fence reads beside the car, not under the speed cluster.
     for quad in blindspot_barrier_quads(points):
-      self._draw_polygon_points_carrot(quad, color, False, 10)
+      self._fade_fill_carrot(np.asarray(quad, dtype=np.float32), (color.r, color.g, color.b), color.a, bell=True)
 
 
   @staticmethod
@@ -1027,8 +1111,9 @@ class ModelRenderer(Widget):
     if not (left_blindspot or right_blindspot or left_assist or right_assist):
       return
 
-    warn_color = rl.Color(255, 215, 0, 150)
-    assist_color = rl.Color(0, 204, 0, 150)
+    # Blind-spot barrier: flat amber (or green for an assisted change), no outline.
+    warn_color = rl.Color(255, 176, 32, 135)
+    assist_color = rl.Color(48, 209, 88, 135)
     self._update_blind_spot_barriers_carrot(
       sm,
       update_left=left_blindspot or left_assist,
@@ -1046,6 +1131,84 @@ class ModelRenderer(Widget):
       self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], assist_color)
 
 
+  # ---- AR turn guidance: the card's own manoeuvre icon standing on the road at the corner ------------
+
+  AR_NEAR, AR_FAR, AR_FADE_IN, AR_FADE_OUT = 12.0, 150.0, 25.0, 14.0
+  AR_LATERAL = 2.4         # corner offset from our path toward the turn, metres
+  AR_KEEP_LATERAL = 1.7    # keep-left/right signs stand on the lane line
+  AR_HEIGHT_M = 3.2        # sign height in the world...
+  AR_MIN_PX, AR_MAX_PX = 190.0, 360.0  # ...held legible far away and calm up close
+
+  def _ar_turn_state(self, sm):
+    """(turn, side, distance, glyph colour) for an approaching turn on an active route, else None."""
+    try:
+      cm = sm['carrotMan']
+      turn, dist = int(cm.xTurnInfo), float(cm.xDistToTurn)
+      route = int(cm.nGoPosDist) > 0 and int(cm.nGoPosTime) > 0
+      atc = bool(str(cm.atcType or ""))
+    except Exception:
+      return None
+    if not route or not (self.AR_NEAR < dist <= self.AR_FAR):
+      return None
+    # Lateral sign follows the device frame (+y is right); keep-lane pins stand at the lane line.
+    side = {1: -1.0, 2: 1.0, 3: -1.0, 4: 1.0, 6: -1.0, 7: -1.0, 8: 1.0}.get(turn)
+    if side is None:
+      return None
+    return turn, side, dist, (hs.LIVE_GREEN if atc else hs.TEXT)
+
+  def _project(self, pts: np.ndarray) -> np.ndarray | None:
+    """Car-space points (N, 3) to screen (N, 2) without the clip test; None if any lies behind the camera."""
+    q = pts.astype(np.float32) @ self._car_space_transform.T
+    if np.any(q[:, 2] < 1e-3):
+      return None
+    return q[:, :2] / q[:, 2:3]
+
+  def _ar_occluded(self, sm, dist: float, base_x: float) -> bool:
+    """True when the lead car stands in front of the pin's foot."""
+    try:
+      lead = sm['radarState'].leadOne
+      if not lead.status or float(lead.dRel) >= dist:
+        return False
+      d_rel, y_rel = float(lead.dRel), -float(lead.yRel)
+    except Exception:
+      return False
+    edges = self._project(np.array([[d_rel, y_rel - 1.3, 0.0], [d_rel, y_rel + 1.3, 0.0]]))
+    return edges is not None and min(edges[:, 0]) <= base_x <= max(edges[:, 0])
+
+  def _draw_ar_turn_carrot(self, sm) -> None:
+    state = self._ar_turn_state(sm)
+    raw = self._path.raw_points
+    if state is None or raw is None or len(raw) < 2:
+      return
+    turn, side, dist, color = state
+    if dist > float(raw[-1, 0]) or turn not in hs.AR_ICONS:
+      return
+    alpha = min(1.0, (self.AR_FAR - dist) / self.AR_FADE_IN, (dist - self.AR_NEAR) / self.AR_FADE_OUT)
+    offset = self.AR_KEEP_LATERAL if turn in (3, 4) else (0.0 if turn == 8 else self.AR_LATERAL)
+    lateral = float(np.interp(dist, raw[:, 0], raw[:, 1])) + side * offset
+    road_z = float(np.interp(dist, raw[:, 0], raw[:, 2])) + self._path_offset_z
+    pts = self._project(np.array([[dist, lateral, road_z], [dist, lateral, road_z - self.AR_HEIGHT_M],
+                                  [dist, lateral - 1.1, road_z], [dist, lateral + 1.1, road_z]]))
+    if pts is None:
+      return
+    foot_x, foot_y = (float(v) for v in pts[0])
+    height = min(self.AR_MAX_PX, max(self.AR_MIN_PX, foot_y - float(pts[1, 1])))
+    tint = hs.LIVE_GREEN if color is hs.LIVE_GREEN else hs.NAV
+
+    # Contact shadow on the road plants the sign. When the lead car stands in front of that spot the sign
+    # is behind it: no shadow, and the sign turns translucent so the car still reads in front.
+    occluded = self._ar_occluded(sm, dist, foot_x)
+    if occluded:
+      alpha *= 0.5
+    else:
+      rx = max(26.0, abs(float(pts[3, 0] - pts[2, 0])) / 2)
+      for grow, a in ((1.0, 70), (0.7, 60), (0.42, 70)):
+        rl.draw_ellipse(int(foot_x), int(foot_y), rx * grow, max(6.0, rx * grow * 0.22), rl.Color(0, 0, 0, int(a * alpha)))
+    box = hs.ar_sign(turn, foot_x, foot_y, height, tint, alpha)
+    if box is not None:
+      # Radar tags drawn later keep clear of the sign.
+      self._float_boxes.append(box)
+
   def _draw_radar_info_carrot(self, sm):
     if self._carrot_show_radar_info <= 0:
       return
@@ -1061,59 +1224,99 @@ class ModelRenderer(Widget):
     lane_x = np.array(lane_line.x, dtype=np.float32)
     lane_z = np.array(lane_line.z, dtype=np.float32)
 
-    for lead_group in (radar_state.leadsLeft, radar_state.leadsRight, radar_state.leadsCenter):
-      for lead in lead_group:
-        d_rel = float(lead.dRel)
-        if d_rel <= 2.5:
-          continue
+    # Nearest first, so the closest cars claim the clean spot above their roofs.
+    leads = sorted([*radar_state.leadsLeft, *radar_state.leadsRight, *radar_state.leadsCenter], key=lambda ld: ld.dRel)
+    for lead in leads:
+      d_rel = float(lead.dRel)
+      if d_rel <= 2.5:
+        continue
 
-        idx = self._get_path_length_idx(lane_x, d_rel)
-        if idx >= len(lane_z):
-          continue
+      idx = self._get_path_length_idx(lane_x, d_rel)
+      if idx >= len(lane_z):
+        continue
 
-        z = float(lane_z[idx]) - 0.61
-        side = self._map_to_screen(d_rel, -float(lead.yRel), z)
-        if side is None:
-          continue
+      road_z = float(lane_z[idx])
+      y_rel = float(lead.yRel)
+      side = self._map_to_screen(d_rel, -y_rel, road_z - 0.61)
+      if side is None:
+        continue
 
-        x, y = side
-        v = float(lead.vLeadK)
-        v_lat = float(lead.vLat)
-        y_rel = float(lead.yRel)
-        radar = bool(lead.radar)
-        model_prob = float(lead.modelProb)
-        v_abs = math.sqrt(v * v + v_lat * v_lat)
-        v_sum = v_abs if v >= 0.0 else -v_abs
+      x, y = side
+      v = float(lead.vLeadK)
+      v_lat = float(lead.vLat)
+      radar = bool(lead.radar)
+      model_prob = float(lead.modelProb)
+      v_abs = math.sqrt(v * v + v_lat * v_lat)
+      v_sum = v_abs if v >= 0.0 else -v_abs
 
-        if v_abs > 3.0:
-          t = self._carrot_radar_lat_factor
-          a_d_rel = max(2.0, d_rel + v * t)
-          a_y_rel = y_rel + v_lat * t
-          a_side = self._map_to_screen(a_d_rel, -a_y_rel, z)
+      if v_abs > 3.0:
+        speed_text = f"{(v_sum * 3.6):.0f}" if ui_state.is_metric else f"{(v_sum * 2.2369363):.0f}"
 
-          line_color = rl.Color(0, 203, 0, 255) if v_sum > 0.0 else rl.Color(255, 0, 0, 255)
-          if a_side is not None:
-            self._draw_line_segment_carrot(side, a_side, line_color, 3.0)
-            rl.draw_circle(int(a_side[0]), int(a_side[1]), 10.0, line_color)
+        if not radar:
+          ring = LEAD_BLUE
+        elif model_prob == 0.01:
+          ring = hs.LIVE_GREEN
+        elif v_sum > 0.0:
+          ring = hs.LABEL_AMBER
+        else:
+          ring = hs.WARN_RED
 
-          speed_text = f"{(v_sum * 3.6):.0f}" if ui_state.is_metric else f"{(v_sum * 2.2369363):.0f}"
+        # Same-direction traffic gets a pulling-away / closing cue relative to us.
+        trend = 0
+        if v >= 0.0:
+          rel = v - self._carrot_v_ego
+          trend = 1 if rel > 1.0 else (-1 if rel < -1.0 else 0)
 
-          if not radar:
-            box_color = rl.Color(0, 0, 255, 255)
-          elif model_prob == 0.01:
-            box_color = rl.Color(0, 203, 0, 255)
-          elif v_sum > 0.0:
-            box_color = rl.Color(255, 175, 3, 255)
-          else:
-            box_color = rl.Color(255, 0, 0, 255)
+        roof = self._map_to_screen(d_rel, -y_rel, road_z - 1.45)
+        roof_x, roof_y = roof if roof is not None else (x, y - 60.0)
+        box = self._draw_speed_tag_carrot(roof_x, roof_y, speed_text, ring, trend, d_rel)
 
-          self._draw_text_box_carrot(int(x), int(y), speed_text, 40, box_color)
+        if self._carrot_show_radar_info >= 2 and box is not None:
+          self._type.draw_mid(f"{d_rel:.1f}m  {y_rel:+.1f}", box[0], box[1] - box[2] / 2 - 20, 28, hs.TEXT_2, hs.BOLD,
+                              align=0.5, shadow=True)
+      elif self._carrot_show_radar_info >= 3:
+        hs.dot(x, y, 7.0, hs.rgba(255, 255, 255, 200))
 
-          if self._carrot_show_radar_info >= 2:
-            draw_text_ui_style(f"{y_rel:.1f}", int(x), int(y - 40), 30, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-            draw_text_ui_style(f"{d_rel:.1f}", int(x), int(y + 30), 30, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
-        elif self._carrot_show_radar_info >= 3:
-          draw_text_ui_style("*", int(x), int(y), 40, rl.Color(255, 255, 255, 255), align="center", y_offset=0.0)
+  def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: rl.Color, trend: int, d_rel: float):
+    """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
+
+    trend 1 = pulling away (green up), -1 = closing (red down). Returns (centre x, centre y, height) or None."""
+    near = d_rel < 40.0
+    size = 42 if near else 36
+    h = 62.0 if near else 54.0
+    glyph = 0.0 if trend == 0 else h * 0.36
+    text_w = self._type.width(text, size, hs.SEMI)
+    inner = text_w + (glyph + 10.0 if glyph else 0.0)
+    w = max(h * 1.6, inner + h * 0.8)
+    tail = 12.0
+    spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
+    if spot is None:
+      return None
+    tx, mid = spot
+    self._float_boxes.append((tx - w / 2, mid - h / 2, w, h))
+    left, bottom = tx - w / 2, mid + h / 2
+    fill = hs.CHIP_FILL
+    if abs(tx - x) < 1.0:
+      # Directly above: a callout tail, extended by a hairline stem if the label had to rise.
+      if y - bottom > tail + 2.0:
+        rl.draw_line_ex(rl.Vector2(x, bottom + tail - 1.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
+      hs.triangle((x - tail, bottom - 1.0), (x + tail, bottom - 1.0), (x, bottom + tail), fill)
+    else:
+      ex = min(max(x, left + h / 2), left + w - h / 2)
+      rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
+      hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
+    hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230))
+    cx = tx - inner / 2
+    if glyph:
+      gy, gh = mid, glyph * 0.8
+      gx = cx + glyph / 2
+      if trend > 0:
+        hs.triangle((gx - glyph / 2, gy + gh / 2), (gx + glyph / 2, gy + gh / 2), (gx, gy - gh / 2), hs.LIVE_GREEN)
+      else:
+        hs.triangle((gx - glyph / 2, gy - gh / 2), (gx + glyph / 2, gy - gh / 2), (gx, gy + gh / 2), hs.WARN_RED)
+      cx += glyph + 10.0
+    self._type.draw_mid(text, cx, mid, size, hs.TEXT, hs.SEMI, align=0.0)
+    return tx, mid, h
 
 
   def _build_path_polygon_update_line_data2_carrot(self, line: np.ndarray, width_apply: float, z_off_start: float, z_off_end: float, max_idx: int, allow_invert: bool = True) -> np.ndarray:
@@ -1220,6 +1423,8 @@ class ModelRenderer(Widget):
 
     max_distance = np.clip(model_position[-1, 0], MIN_DRAW_DISTANCE, MAX_DRAW_DISTANCE)
     max_distance -= 2.0
+    self._carrot_model_position = model_position
+    self._carrot_max_distance = float(max_distance)
 
     max_idx = self._get_path_length_idx(model_position[:, 0], max_distance)
     self._carrot_long_active = sm['selfdriveState'].enabled
@@ -1299,28 +1504,53 @@ class ModelRenderer(Widget):
       self._draw_polygon_from_xy_carrot(xp[2], yp[2], self._carrot_colors[color_idx % 10], brake_valid, color_idx)
 
 
+  def _path_rgb_carrot(self, color_idx: int, brake_valid: bool):
+    if brake_valid:
+      return BRAKE_RGB
+    if color_idx % 10 == 9:
+      return (255, 255, 255)
+    return PATH_PALETTE[color_idx % 10]
+
   def _draw_complex_path_carrot(self, color_idx: int, brake_valid: bool):
-    track_vertices = self._path.projected_points
-    track_vertices_len = len(track_vertices)
-    if track_vertices_len < 6:
+    """Lane edges as soft light rails over the carpet, with three quiet chevrons pointing ahead."""
+    pts = self._path.projected_points
+    half = len(pts) // 2
+    if half < 3:
+      return
+    left = pts[:half]
+    right = pts[::-1][:half]
+    rgb = self._path_rgb_carrot(color_idx, brake_valid)
+    bottom = self._rect.y + self._rect.height
+    top = float(min(left[:, 1].min(), right[:, 1].min()))
+    if bottom - top < 40.0:
       return
 
-    color_n = 0
-    for i in range(0, track_vertices_len // 2 - 1, 3):
-      e = track_vertices_len - i - 1
-      x = [0.0] * 6
-      y = [0.0] * 6
-      x[0] = float(track_vertices[i][0]); y[0] = float(track_vertices[i][1])
-      x[1] = float(track_vertices[i + 1][0]); y[1] = float(track_vertices[i + 1][1])
-      x[2] = (float(track_vertices[i + 2][0]) + float(track_vertices[e - 2][0])) / 2.0
-      y[2] = (float(track_vertices[i + 2][1]) + float(track_vertices[e - 2][1])) / 2.0
-      x[3] = float(track_vertices[e - 1][0]); y[3] = float(track_vertices[e - 1][1])
-      x[4] = float(track_vertices[e][0]); y[4] = float(track_vertices[e][1])
-      x[5] = (x[1] + x[3]) / 2.0; y[5] = (y[1] + y[3]) / 2.0
-      self._draw_two_quads_from_6pts_carrot(x, y, self._carrot_colors[color_idx % 10], brake_valid, color_idx)
-      color_n += 1
-      if color_n > 6:
-        color_n = 0
+    # Rails: wide faint, medium, narrow bright; thinner with distance, gone underfoot and at the horizon.
+    for side in (left, right):
+      depth = np.clip((side[:, 1] - top) / (bottom - top), 0.0, 1.0)
+      for width, alpha in ((18.0, 46), (9.0, 90), (4.0, 255)):
+        ribbon = hs.stroke_ribbon(side, width / 2.0 * (0.35 + 0.65 * depth))
+        hs.vertical_gradient(ribbon, top, bottom,
+                             (rl.Color(*rgb, int(alpha * 0.12)), rl.Color(*rgb, int(alpha * 0.9)), rl.Color(*rgb, 0)),
+                             (0.0, 0.78, 1.0))
+
+    # Chevrons at fixed screen depths, interpolated between the path's sample rows.
+    mid_y = (left[:, 1] + right[:, 1]) / 2.0
+    order = np.argsort(mid_y)
+    ys = mid_y[order]
+    for t, width, alpha in ((0.83, 12.0, 128), (0.55, 9.0, 97), (0.3, 7.0, 66)):
+      target = top + (bottom - top) * t
+      if target < ys[0] or target > ys[-1]:
+        continue
+      lx, ly = float(np.interp(target, ys, left[order, 0])), float(np.interp(target, ys, left[order, 1]))
+      rx, ry = float(np.interp(target, ys, right[order, 0])), float(np.interp(target, ys, right[order, 1]))
+      cx, cy = (lx + rx) / 2.0, (ly + ry) / 2.0
+      hx, hy = (rx - lx) / 2.0 * 0.8, (ry - ly) / 2.0 * 0.8
+      reach = math.hypot(hx, hy)
+      if reach < 12.0:
+        continue
+      hs.polyline([(cx - hx, cy - hy + reach * 0.25), (cx, cy - reach * 0.06), (cx + hx, cy + hy + reach * 0.25)],
+                  width, rl.Color(*rgb, alpha))
 
 
   def _draw_mode1_to_6_carrot(self, path_draw_seq: float, path_draw_seq2: int, mode: int, color_idx: int, brake_valid: bool):
@@ -1463,14 +1693,10 @@ class ModelRenderer(Widget):
 
     show_path_mode = self._carrot_show_path_mode
 
+    # Mode 0 is the carpet itself; every other mode draws its pieces on top of it.
+    self._draw_path_carpet_carrot(show_path_mode, show_path_color, brake_valid)
     if show_path_mode == 0:
-      draw_polygon_solid(self._path.projected_points, self._carrot_colors[show_path_color % 10])
-      if show_path_color >= 10 or brake_valid:
-        self._draw_polygon_outline_carrot(
-          self._path.projected_points,
-          rl.Color(255, 0, 0, 255) if brake_valid else rl.Color(255, 255, 255, 255),
-          2.0,
-        )
+      pass
     elif 13 <= show_path_mode <= 15:
       self._draw_special_modes_carrot(show_path_mode, show_path_color, brake_valid)
     elif show_path_mode >= 9:

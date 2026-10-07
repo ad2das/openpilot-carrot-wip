@@ -62,24 +62,41 @@ def model_renderer_module(monkeypatch):
   class Font:
     pass
 
+  class Texture:
+    pass
+
   raylib = types.ModuleType("pyray")
   raylib.Color = Color
   raylib.Rectangle = Rectangle
   raylib.Vector2 = Vector2
   raylib.Font = Font
+  raylib.Texture = Texture
   raylib.WHITE = Color(255, 255, 255, 255)
   raylib.RL_QUADS = 7
   raylib.get_time = lambda: 0.0
   for name in (
     "draw_circle",
+    "draw_circle_v",
+    "draw_circle_gradient",
     "draw_line_ex",
+    "draw_ring",
+    "draw_rectangle_gradient_h",
+    "draw_rectangle_gradient_v",
+    "draw_rectangle_lines_ex",
+    "draw_rectangle_rec",
     "draw_rectangle_rounded",
     "draw_rectangle_rounded_lines_ex",
+    "draw_triangle",
     "draw_triangle_fan",
+    "measure_text_ex",
     "rl_begin",
     "rl_color4ub",
     "rl_disable_texture",
     "rl_end",
+    "rl_pop_matrix",
+    "rl_push_matrix",
+    "rl_scalef",
+    "rl_translatef",
     "rl_vertex2f",
   ):
     setattr(raylib, name, lambda *args, **kwargs: None)
@@ -115,10 +132,11 @@ def model_renderer_module(monkeypatch):
     "openpilot.common.filter_simple": SimpleNamespace(FirstOrderFilter=FirstOrderFilter),
     "openpilot.common.params": SimpleNamespace(Params=Params),
     "openpilot.selfdrive.locationd.calibrationd": SimpleNamespace(HEIGHT_INIT=(1.22,)),
-    "openpilot.selfdrive.ui.ui_state": SimpleNamespace(ui_state=SimpleNamespace()),
+    "openpilot.selfdrive.ui.ui_state": SimpleNamespace(ui_state=SimpleNamespace(is_metric=True)),
     "openpilot.system.ui.lib.application": SimpleNamespace(
-      gui_app=SimpleNamespace(target_fps=20, font=lambda _weight: Font()),
-      FontWeight=SimpleNamespace(DISPLAY=0),
+      gui_app=SimpleNamespace(target_fps=20, width=2160, height=1080, font=lambda _weight: Font(),
+                              has_font=lambda _weight: False),
+      FontWeight=SimpleNamespace(NORMAL=0, MEDIUM=1, BOLD=2, SEMI_BOLD=3, DISPLAY=4),
     ),
     "openpilot.system.ui.lib.text_draw": SimpleNamespace(draw_text_ui_style=lambda *args, **kwargs: None),
     "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
@@ -161,10 +179,8 @@ def test_lane_draw_skips_zero_alpha_projection(model_renderer_module, monkeypatc
     return np.array([[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32)
 
   renderer._map_line_to_polygon = project
-  outlines = []
-  renderer._draw_polygon_outline_carrot = lambda *args: outlines.append(args)
-  draws = []
-  monkeypatch.setattr(module, "draw_polygon_solid", lambda *args: draws.append(args))
+  fills = []
+  renderer._fade_fill_carrot = lambda pts, rgb, alpha, bell=False: fills.append((pts, rgb, alpha, bell))
 
   class LaneSubMaster:
     valid = {"modelV2": True, "carState": True}
@@ -183,30 +199,31 @@ def test_lane_draw_skips_zero_alpha_projection(model_renderer_module, monkeypatc
   ]
   assert all(actual is expected for actual, expected in zip(actual_lines, expected_lines, strict=True))
   assert projected[1][1][-2:] == (True, -0.3)
-  assert len(draws) == 3
-  assert len(outlines) == 2
-  assert all(draw[1].a == 220 for draw in draws)
+  # One bell fade per visible lane, plus the second pass of the double-left lane.
+  assert len(fills) == 3
+  assert all(fill[3] for fill in fills)
+  # Lane type >= 20 paints the left lane yellow; the right lane stays white.
+  assert [fill[1] for fill in fills] == [module.LANE_YELLOW, module.LANE_YELLOW, module.LANE_WHITE]
+  assert fills[0][2] == fills[1][2]
 
   projected.clear()
-  draws.clear()
-  outlines.clear()
+  fills.clear()
   renderer._lane_line_probs = np.array([0.31, 0.3, 0.0, 0.0], dtype=np.float32)
 
   renderer._draw_lane_lines_carrot(LaneSubMaster())
 
   assert len(projected) == 1
   assert projected[0][0] is renderer._lane_lines[0].raw_points
-  assert len(draws) == 1
-  assert outlines == []
+  assert len(fills) == 1
 
   projected.clear()
-  draws.clear()
+  fills.clear()
   renderer._lane_line_probs = np.array([0.3, 0.0, np.nan, -1.0], dtype=np.float32)
 
   renderer._draw_lane_lines_carrot(LaneSubMaster())
 
   assert projected == []
-  assert draws == []
+  assert fills == []
 
 
 def test_lane_dash_segments_are_anchored_and_truncated(model_renderer_module):
@@ -246,9 +263,8 @@ def test_negative_lane_type_keeps_model_geometry_visible(model_renderer_module, 
     return np.array([[0.0, 1.0], [0.0, 0.0], [1.0, 0.0], [1.0, 1.0]], dtype=np.float32)
 
   renderer._map_line_to_polygon = project
-  renderer._draw_polygon_outline_carrot = lambda *_args: None
-  draws = []
-  monkeypatch.setattr(module, "draw_polygon_solid", lambda *args: draws.append(args))
+  fills = []
+  renderer._fade_fill_carrot = lambda pts, rgb, alpha, bell=False: fills.append((pts, rgb, alpha, bell))
 
   class LaneSubMaster:
     valid = {"modelV2": True, "carState": True}
@@ -261,44 +277,42 @@ def test_negative_lane_type_keeps_model_geometry_visible(model_renderer_module, 
 
   assert len(projected) == 4
   assert all(actual is expected.raw_points for actual, expected in zip(projected, renderer._lane_lines, strict=True))
-  assert len(draws) == 4
+  # Negative lane types have no dash classification: every lane keeps the solid style.
+  assert len(fills) == 4
+  assert all(fill[1] == module.LANE_WHITE for fill in fills)
 
 
-def test_mode9_complex_path_preserves_segment_fill_outline_order(model_renderer_module, monkeypatch):
+def test_mode9_complex_path_draws_lane_rails_and_chevrons(model_renderer_module, monkeypatch):
   module = model_renderer_module
   renderer = object.__new__(module.ModelRenderer)
+  # Two symmetric rails: six samples each, running from the bottom of the view towards the top.
+  left = np.array([[300.0 + i * 40.0, 1000.0 - i * 180.0] for i in range(6)], dtype=np.float32)
+  right = np.array([[800.0 + i * 40.0, 1000.0 - i * 180.0] for i in range(6)], dtype=np.float32)
   renderer._path = module.ModelPoints(
-    projected_points=np.array([[float(i), float(i) + 0.25] for i in range(12)], dtype=np.float32),
+    projected_points=np.concatenate([left, right[::-1]]).astype(np.float32),
   )
-  renderer._carrot_colors = [module.rl.Color(i, i + 1, i + 2, 120) for i in range(10)]
-  events = []
+  renderer._rect = module.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
 
-  monkeypatch.setattr(
-    module,
-    "draw_polygon_solid",
-    lambda points, color: events.append(("fill", points.copy(), color)),
-  )
-  renderer._draw_polygon_outline_carrot = (
-    lambda points, color, thickness: events.append(("outline", points.copy(), color, thickness))
-  )
+  gradients = []
+  monkeypatch.setattr(module.hs, "vertical_gradient",
+                      lambda ribbon, y0, y1, colors, stops: gradients.append((ribbon, y0, y1, colors, stops)))
+  chevrons = []
+  monkeypatch.setattr(module.hs, "polyline", lambda points, width, color: chevrons.append((points, width, color)))
 
   renderer._draw_complex_path_carrot(color_idx=20, brake_valid=False)
 
-  assert [event[0] for event in events] == ["fill", "fill", "outline", "fill", "fill", "outline"]
-  for offset in (0, 3):
-    left_fill = events[offset][1]
-    right_fill = events[offset + 1][1]
-    outline = events[offset + 2][1]
-    np.testing.assert_array_equal(left_fill, outline[[0, 1, 2, 5]])
-    np.testing.assert_array_equal(right_fill, outline[[5, 2, 3, 4]])
-    assert events[offset][2] is renderer._carrot_colors[0]
-    assert events[offset + 1][2] is renderer._carrot_colors[0]
-    assert events[offset + 2][2] == module.rl.Color(255, 255, 255, 255)
-    assert events[offset + 2][3] == 2.0
+  # Three rail strokes per side: wide faint, medium, narrow bright.
+  assert len(gradients) == 6
+  assert [gradient[3][0].a for gradient in gradients[:3]] == [5, 10, 30]
+  assert all(tuple(gradient[4]) == (0.0, 0.78, 1.0) for gradient in gradients)
+  assert gradients[0][1] == 100.0
+  assert gradients[0][2] == 1080.0
+  assert all(gradient[3][0].r == module.PATH_PALETTE[0][0] for gradient in gradients)
 
-  events.clear()
-  renderer._draw_complex_path_carrot(color_idx=5, brake_valid=False)
-  assert [event[0] for event in events] == ["fill", "fill", "fill", "fill"]
+  # Three chevrons at their fixed screen depths.
+  assert len(chevrons) == 3
+  assert [chevron[1] for chevron in chevrons] == [12.0, 9.0, 7.0]
+  assert all(chevron[2].r == module.PATH_PALETTE[0][0] for chevron in chevrons)
 
 
 @pytest.mark.parametrize("y_shift", (-1.7, 1.7))
@@ -348,7 +362,7 @@ def test_blind_spot_barrier_vectorization_matches_scalar_reference(model_rendere
   np.testing.assert_array_equal(actual, expected)
 
 
-def test_blind_spot_segment_vectorization_preserves_fill_outline_order(model_renderer_module, monkeypatch):
+def test_blind_spot_segment_vectorization_fades_each_quad(model_renderer_module):
   module = model_renderer_module
   renderer = object.__new__(module.ModelRenderer)
   upper = np.array(
@@ -361,15 +375,8 @@ def test_blind_spot_segment_vectorization_preserves_fill_outline_order(model_ren
   )
   points = np.vstack((upper, lower[::-1]))
   color = module.rl.Color(255, 215, 0, 150)
-  events = []
-  monkeypatch.setattr(
-    module,
-    "draw_polygon_solid",
-    lambda quad, fill_color: events.append(("fill", quad.copy(), fill_color)),
-  )
-  renderer._draw_polygon_outline_carrot = (
-    lambda quad, outline_color, thickness: events.append(("outline", quad.copy(), outline_color, thickness))
-  )
+  fills = []
+  renderer._fade_fill_carrot = lambda quad, rgb, alpha, bell=False: fills.append((quad, rgb, alpha, bell))
 
   expected_quads = []
   count = points.shape[0]
@@ -385,15 +392,12 @@ def test_blind_spot_segment_vectorization_preserves_fill_outline_order(model_ren
 
   renderer._draw_blind_spot_segments_carrot(points, color)
 
-  assert [event[0] for event in events] == ["fill", "outline", "fill", "outline"]
-  for index, expected in enumerate(expected_quads):
-    fill = events[index * 2]
-    outline = events[index * 2 + 1]
-    np.testing.assert_array_equal(fill[1], expected)
-    np.testing.assert_array_equal(outline[1], expected)
-    assert fill[2] == color
-    assert outline[2] == module.rl.WHITE
-    assert outline[3] == 2.0
+  assert len(fills) == len(expected_quads) == 2
+  for (quad, rgb, alpha, bell), expected in zip(fills, expected_quads, strict=True):
+    np.testing.assert_array_equal(quad, expected)
+    assert rgb == (255, 215, 0)
+    assert alpha == 150
+    assert bell is True
 
 
 def test_blind_spot_invalid_input_skips_draw(model_renderer_module):

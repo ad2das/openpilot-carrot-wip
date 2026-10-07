@@ -34,10 +34,14 @@ def hud_module(monkeypatch):
     x: float
     y: float
 
+  class Texture:
+    pass
+
   raylib = types.ModuleType("pyray")
   raylib.Color = Color
   raylib.Rectangle = Rectangle
   raylib.Vector2 = Vector2
+  raylib.Texture = Texture
   raylib.WHITE = Color(255, 255, 255, 255)
   raylib.BLACK = Color(0, 0, 0, 255)
   raylib.BLANK = Color(0, 0, 0, 0)
@@ -53,16 +57,16 @@ def hud_module(monkeypatch):
   ):
     setattr(raylib, name, lambda *args, **kwargs: None)
 
-  class FakeExpButton:
-    def __init__(self, *args):
-      self.is_pressed = False
-
-    def render(self, rect):
-      pass
-
   class Widget:
     def __init__(self):
       pass
+
+  @dataclass
+  class Gradient:
+    start: tuple[float, float]
+    end: tuple[float, float]
+    colors: list
+    stops: list[float]
 
   fake_ui_state = SimpleNamespace(
     params=None,
@@ -79,7 +83,10 @@ def hud_module(monkeypatch):
   )
   gui_app = SimpleNamespace(
     font=lambda weight: ("font", weight),
+    has_font=lambda weight: False,
     texture=lambda path: ("texture", path),
+    width=2160,
+    height=1080,
   )
 
   stubs = {
@@ -87,7 +94,6 @@ def hud_module(monkeypatch):
     "openpilot.common.constants": SimpleNamespace(
       CV=SimpleNamespace(MS_TO_KPH=3.6, MS_TO_MPH=2.2369362920544),
     ),
-    "openpilot.selfdrive.ui.onroad.exp_button": SimpleNamespace(ExpButton=FakeExpButton),
     "openpilot.system.hardware.usbgpu": SimpleNamespace(
       usbgpu_badge_state=lambda compiled, loading, active, failed, compile_pending=False: (
         "error" if failed else "loading" if loading else "compile_pending" if compile_pending
@@ -100,9 +106,15 @@ def hud_module(monkeypatch):
     ),
     "openpilot.system.ui.lib.application": SimpleNamespace(
       gui_app=gui_app,
+      GL_VERSION=3,
       FontWeight=SimpleNamespace(SEMI_BOLD=1, BOLD=2, MEDIUM=3, DISPLAY=4),
     ),
     "openpilot.system.ui.lib.multilang": SimpleNamespace(tr=lambda text: text),
+    "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
+      draw_polygon=lambda *args, **kwargs: None,
+      draw_polygon_solid=lambda *args, **kwargs: None,
+      Gradient=Gradient,
+    ),
     "openpilot.system.ui.lib.text_measure": SimpleNamespace(
       measure_text_cached=lambda font, text, size: Vector2(len(text) * size, size),
     ),
@@ -315,31 +327,43 @@ def test_speed_limit_snapshot_reads_submaster_once(hud_module):
   assert fake_ui_state.sm.calls == 1
 
 
-def test_speed_panel_reuses_one_snapshot(hud_module, monkeypatch):
-  module, _ = hud_module
+def test_drive_card_uses_one_limit_snapshot_and_keeps_draw_order(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
   renderer = object.__new__(module.HudRenderer)
-  renderer._blink_timer = 15
-  renderer._disp_timer = 63
-  speed_limit_info = (80, 2, 90)
-  snapshots = []
+  renderer._debug_speed_panel = False
+  renderer.speed = 40.0
+  renderer.is_cruise_set = False
+  renderer._engaged = False
   calls = []
+  labels = []
 
-  monkeypatch.setattr(renderer, "_get_speed_limit_info", lambda: calls.append("snapshot") or speed_limit_info)
-  monkeypatch.setattr(renderer, "_draw_carrot_main_background", lambda bx, by, info: (calls.append("background"), snapshots.append(info)))
-  monkeypatch.setattr(renderer, "_draw_carrot_traffic_light", lambda bx, by: calls.append("traffic"))
-  monkeypatch.setattr(renderer, "_draw_carrot_speed_panel", lambda bx, by: calls.append("speed"))
-  monkeypatch.setattr(renderer, "_draw_carrot_lower_status", lambda bx, by: calls.append("status"))
-  monkeypatch.setattr(renderer, "_draw_carrot_speed_limit_box", lambda bx, by, info: (calls.append("limit"), snapshots.append(info)))
-  monkeypatch.setattr(renderer, "_draw_carrot_device_state", lambda bx, by: calls.append("device"))
-  monkeypatch.setattr(renderer, "_draw_turn_info_hud", lambda rect: calls.append("navigation"))
+  renderer._type = SimpleNamespace(
+    width=lambda text, size, weight, spacing=0.0: float(len(text) * 10),
+    draw=lambda text, *args, **kwargs: (labels.append(text), 20.0)[1],
+    draw_mid=lambda text, *args, **kwargs: 20.0,
+  )
+  monkeypatch.setattr(renderer, "_cruise_text", lambda: (calls.append("cruise"), "--")[1])
+  monkeypatch.setattr(renderer, "_update_cruise_speed_animation", lambda text: calls.append("animation"))
+  limit_reads = []
 
-  renderer._draw_set_speed_carrot(module.rl.Rectangle(10, 20, 1000, 600))
+  def limit_state():
+    limit_reads.append(True)
+    calls.append("limit")
+    return 0, False, False
 
-  assert calls == ["snapshot", "background", "traffic", "speed", "status", "limit", "device", "navigation"]
-  assert snapshots[0] is speed_limit_info
-  assert snapshots[1] is speed_limit_info
-  assert renderer._blink_timer == 0
-  assert renderer._disp_timer == 0
+  monkeypatch.setattr(renderer, "_limit_state", limit_state)
+  monkeypatch.setattr(renderer, "_traffic_light", lambda: calls.append("light"))
+  monkeypatch.setattr(renderer, "_override_chip", lambda: (calls.append("chip"), None)[1])
+  monkeypatch.setattr(renderer, "_get_gear_text", lambda: (calls.append("gear"), "D")[1])
+  monkeypatch.setattr(renderer, "_get_cruise_gap", lambda: (calls.append("gap"), 3)[1])
+  monkeypatch.setattr(renderer, "_get_driving_mode_text_and_color", lambda: (calls.append("mode"), ("", module.hs.TEXT))[1])
+  monkeypatch.setattr(renderer, "_draw_device_state", lambda x, y: calls.append("device"))
+
+  renderer._draw_drive_card(module.rl.Rectangle(10, 20, 1000, 600))
+
+  assert limit_reads == [True]
+  assert calls == ["cruise", "animation", "limit", "light", "chip", "gear", "gap", "mode", "device"]
+  assert labels == ["SET", "--", "40", "km/h"]
 
 
 def test_device_info_updates_only_on_first_frame_or_new_service_frame(hud_module, monkeypatch):
@@ -512,37 +536,60 @@ def test_tpms_legacy_display_boundaries(hud_module, value, expected_text, expect
   assert renderer._get_tpms_color(value) == getattr(module.COLORS, expected_color_name)
 
 
-@pytest.mark.parametrize(("show_tpms", "expected_y"), (
-  (0, []),
-  (1, [180]),
-  (2, [675]),
-  (3, [180, 675]),
+@pytest.mark.parametrize(("show_tpms", "top", "drawn"), (
+  (0, True, False), (0, False, False),
+  (1, True, True), (1, False, False),
+  (2, True, False), (2, False, True),
+  (3, True, True), (3, False, True),
 ))
-def test_tpms_position_follows_show_tpms(hud_module, monkeypatch, show_tpms, expected_y):
+def test_tpms_draws_only_when_that_hud_edge_is_enabled(hud_module, monkeypatch, show_tpms, top, drawn):
   module, fake_ui_state = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_tpms = show_tpms
   fake_ui_state.sm = {
     "carState": SimpleNamespace(tpms=SimpleNamespace(fl=31, fr=32, rl=33, rr=34)),
   }
-  calls = []
-  monkeypatch.setattr(renderer, "_draw_tpms_values", lambda bx, by, dw, *values: calls.append((bx, by, dw, values)))
+  module.hs.zones.clear()
+  cards = []
+  cars = []
+  labels = []
+  monkeypatch.setattr(module.hs, "glass_card", lambda x, y, w, h, *args, **kwargs: cards.append((x, y, w, h)))
+  monkeypatch.setattr(renderer, "_draw_tpms_car", lambda cx, cy, lows: cars.append((cx, cy, lows)))
+  renderer._type = SimpleNamespace(
+    draw=lambda text, *args, **kwargs: (labels.append(text), 20.0)[1],
+    width=lambda *args, **kwargs: 20.0,
+    draw_mid=lambda *args, **kwargs: None,
+  )
+  rect = module.rl.Rectangle(10, 50, 1000, 750)
 
-  renderer._draw_tpms(module.rl.Rectangle(10, 50, 1000, 750))
+  renderer._draw_tpms(rect, top)
 
-  assert [call[1] for call in calls] == expected_y
-  assert all(call[0] == 885 and call[2] == 80 for call in calls)
-  assert all(call[3] == (31.0, 32.0, 33.0, 34.0) for call in calls)
+  assert (len(cards) == 1) == drawn
+  if drawn:
+    x = rect.x + rect.width - module.M_X - module.TPMS_W
+    y = rect.y + module.M_TOP if top else rect.y + rect.height - module.M_BOTTOM - module.TPMS_H
+    assert cards[0] == (x, y, module.TPMS_W, module.TPMS_H)
+    assert len(cars) == 1
+    assert labels == ["31", "32", "33", "34"]
+  else:
+    assert cars == []
 
 
-def test_date_text_formats_only_when_minute_key_changes(hud_module, monkeypatch):
+def test_clock_reformats_only_when_minute_key_changes(hud_module, monkeypatch):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
   renderer._show_date_time = 1
   renderer._date_time_minute_key = None
   renderer._date_time_text = ""
   renderer._date_text = ""
-  renderer._font_display = object()
+  module.hs.zones.clear()
+  module.hs.top_boxes.clear()
+  draws = []
+  renderer._type = SimpleNamespace(
+    draw=lambda text, *args, **kwargs: (draws.append(text), 20.0)[1],
+    width=lambda *args, **kwargs: 20.0,
+    draw_mid=lambda *args, **kwargs: None,
+  )
   moments = iter((
     stdlib_time.struct_time((2026, 7, 16, 12, 1, 1, 3, 197, 0)),
     stdlib_time.struct_time((2026, 7, 16, 12, 1, 59, 3, 197, 0)),
@@ -551,7 +598,7 @@ def test_date_text_formats_only_when_minute_key_changes(hud_module, monkeypatch)
   ))
   localtime_calls = []
   strftime_calls = []
-  draw_calls = []
+  real_strftime = stdlib_time.strftime
 
   def fake_localtime():
     localtime_calls.append(True)
@@ -559,62 +606,70 @@ def test_date_text_formats_only_when_minute_key_changes(hud_module, monkeypatch)
 
   def fake_strftime(fmt, now):
     strftime_calls.append((fmt, now.tm_hour, now.tm_min))
-    return f"{fmt}:{now.tm_hour:02d}:{now.tm_min:02d}"
+    return real_strftime(fmt, now)
 
   monkeypatch.setattr(module.time, "localtime", fake_localtime)
   monkeypatch.setattr(module.time, "strftime", fake_strftime)
-  monkeypatch.setattr(module, "draw_text_ui_style", lambda *args, **kwargs: draw_calls.append((args, kwargs)))
   rect = module.rl.Rectangle(0, 0, 1000, 600)
 
   for _ in range(4):
-    renderer._draw_date_time(rect)
+    renderer._draw_clock(rect)
 
   assert len(localtime_calls) == 4
-  assert len(strftime_calls) == 6
-  assert strftime_calls == [
-    ("%H:%M", 12, 1), ("%m-%d", 12, 1),
-    ("%H:%M", 12, 2), ("%m-%d", 12, 2),
-    ("%H:%M", 13, 2), ("%m-%d", 13, 2),
-  ]
-  assert len(draw_calls) == 8
+  # The wall-clock string is rebuilt only when the minute key changes.
+  assert strftime_calls == [("%H:%M", 12, 1), ("%H:%M", 12, 2), ("%H:%M", 13, 2)]
+  assert draws == ["12:01", "7월 16일 목요일", "12:01", "7월 16일 목요일",
+                   "12:02", "7월 16일 목요일", "13:02", "7월 16일 목요일"]
   assert renderer._date_time_minute_key == (2026, 197, 13, 2, 0)
-  assert renderer._date_text.endswith(f"({module.WEEKDAYS_KO[4]})")
+  assert renderer._date_text == "7월 16일 목요일"
 
   renderer._show_date_time = 0
-  monkeypatch.setattr(module.time, "localtime", lambda: pytest.fail("hidden date HUD read the clock"))
-  renderer._draw_date_time(rect)
-  assert len(draw_calls) == 8
+  monkeypatch.setattr(module.time, "localtime", lambda: pytest.fail("hidden clock read the clock"))
+  renderer._draw_clock(rect)
+  assert len(draws) == 8
 
 
 def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   module, _ = hud_module
   renderer = object.__new__(module.HudRenderer)
-  renderer.is_cruise_available = False
+  renderer.is_cruise_available = True
   renderer._show_plot_mode = 6
   renderer._font_display = object()
+  renderer._blink_timer = 0
+  renderer._disp_timer = 0
   calls = []
 
-  renderer._exp_button = SimpleNamespace(render=lambda rect: calls.append("button"))
   renderer._plot_renderer = SimpleNamespace(
     draw=lambda rect, font, mode: calls.append(("plot", mode)),
   )
   monkeypatch.setattr(renderer, "_refresh_hud_params", lambda now: calls.append(("params", now)))
-  monkeypatch.setattr(renderer, "_draw_date_time", lambda rect: calls.append("date"))
-  monkeypatch.setattr(renderer, "_draw_tpms", lambda rect: calls.append("tpms"))
+  monkeypatch.setattr(renderer, "_get_turn_info_hud_data", lambda: (calls.append("turns"), {})[1])
+  monkeypatch.setattr(renderer, "_draw_guidance_card", lambda rect, info: calls.append("guide"))
+  monkeypatch.setattr(renderer, "_draw_tpms", lambda rect, top: calls.append(("tpms", top)))
+  monkeypatch.setattr(renderer, "_draw_status_capsule", lambda rect: calls.append("status"))
+  monkeypatch.setattr(renderer, "_draw_trip", lambda rect, info: calls.append("trip"))
+  monkeypatch.setattr(renderer, "_draw_drive_card", lambda rect: calls.append("drive"))
+  monkeypatch.setattr(renderer, "_draw_clock", lambda rect: calls.append("clock"))
   monkeypatch.setattr(renderer, "_draw_egpu_badge", lambda rect: calls.append("egpu"))
   monkeypatch.setattr(renderer, "_draw_cruise_speed_animation", lambda rect: calls.append("animation"))
-  monkeypatch.setattr(module.rl, "draw_rectangle_gradient_v", lambda *args: calls.append("header"))
+  monkeypatch.setattr(module.rl, "draw_rectangle_gradient_v", lambda *args: calls.append("shade"))
   monkeypatch.setattr(module.time, "monotonic", lambda: 12.5)
 
   renderer._render(module.rl.Rectangle(0, 0, 1000, 600))
 
   assert calls == [
     ("params", 12.5),
-    "header",
-    "button",
+    "shade",
+    "shade",
+    "turns",
+    "guide",
+    ("tpms", True),
+    "status",
+    "trip",
+    ("tpms", False),
+    "drive",
     ("plot", 6),
-    "date",
-    "tpms",
+    "clock",
     "egpu",
     "animation",
   ]

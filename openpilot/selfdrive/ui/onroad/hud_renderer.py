@@ -1,15 +1,15 @@
+import math
 import time
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.deceleration_source import deceleration_source_presentation
-from openpilot.selfdrive.ui.onroad.exp_button import ExpButton
+from openpilot.selfdrive.ui.onroad import hud_style as hs
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.hardware.usbgpu import usbgpu_badge_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
 from openpilot.system.ui.lib.text_measure import measure_text_cached
-from openpilot.system.ui.lib.text_draw import draw_text_ui_style
 from openpilot.system.ui.widgets import Widget
 
 # Constants
@@ -19,9 +19,67 @@ CRUISE_DISABLED_CHAR = '–'
 CRUISE_SPEED_ANIMATION_START = 120
 CRUISE_SPEED_ANIMATION_MAX = 100
 CRUISE_SPEED_ANIMATION_STEP = 12
-CRUISE_SPEED_ANIMATION_START_SIZE = 300
+CRUISE_SPEED_ANIMATION_START_SIZE = 240
 HUD_PARAM_REFRESH_INTERVAL = 1.0
 WEEKDAYS_KO = ("일", "월", "화", "수", "목", "금", "토")
+
+# Layout, in content-rect pixels. Four instrument cards hold the corners (guidance top-left, tyres
+# top-right, drive bottom-left, trip bottom-right); the clock floats top-centre over the image.
+EDGE_X = 36
+M_X = 36
+M_TOP = 32
+M_BOTTOM = 30
+CARD_R = 38
+TOP_SHADE_H = 250
+BOTTOM_SHADE_H = 390
+DRIVE_W = 620
+DRIVE_H = 328
+SET_SIZE = 60
+SET_BASE = 74
+CHIP_SIZE = 36
+CHIP_H = 56
+SPEED_SIZE = 196
+SPEED_SIZE_3 = 152
+SPEED_BASE = 246
+UNIT_SIZE = 42
+SIGN_R = 86
+SIGN_RIGHT = 118
+SIGN_RIGHT_LIGHT = 198
+SIGN_Y = 156
+LIGHT_RIGHT = 62
+STATUS_MID = 286
+STATUS_SIZE = 40
+NAV_W_MIN = 520
+NAV_W_MAX = 900
+NAV_H = 276
+NAV_H_SHORT = 224
+NAV_TILE = 176
+NAV_DISTANCE_SIZE = 132
+NAV_UNIT_SIZE = 58
+NAV_TEXT_SIZE = 54
+NAV_PROGRESS_SPAN = 2000.0
+CLOCK_SIZE = 76
+DATE_SIZE = 40
+BADGE_SIZE = 28
+BADGE_H = 52
+TPMS_W = 320
+TPMS_H = 236
+TPMS_SIZE = 50
+TRIP_H = 88
+TRIP_SIZE = 44
+TRIP_UNIT_SIZE = 34
+TRIP_ROAD_SIZE = 40
+STACK_GAP = 20
+DIM_GREY = hs.rgba(142, 147, 155)
+NAV_BLUE = hs.NAV
+# SetSpeedOverrideState.speed_color_mode -> chip colour (eco, deceleration, vehicle navigation, external navigation).
+OVERRIDE_COLORS = {1: hs.LIVE_GREEN, 2: hs.PROMPT_AMBER, 3: hs.rgba(175, 82, 222), 4: hs.CARROT}
+# Speed-override reasons as short Korean words; unknown sources fall back to the raw label.
+OVERRIDE_LABELS = {
+  "eco": "에코", "apply": "감속", "cam": "단속", "section": "구간", "bump": "방지턱", "police": "경찰",
+  "road": "도로", "turn": "회전", "route": "경로", "school": "스쿨존", "gas": "주유", "vturn": "커브",
+  "model": "모델", "waze": "WAZE",
+}
 
 
 @dataclass(frozen=True)
@@ -155,23 +213,16 @@ class HudRenderer(Widget):
     self._font_medium = gui_app.font(FontWeight.MEDIUM)
     self._font_display = gui_app.font(FontWeight.DISPLAY)
 
-    self._exp_button = ExpButton(UI_CONFIG.button_size, UI_CONFIG.wheel_icon_size)
-
-    self._txt_speed_bg = gui_app.texture('images/speed_bg.png')
-
-    # traffic light icon들 이름은 실제 프로젝트 리소스 이름에 맞춰 수정 가능
-    self._traffic_red_icon = gui_app.texture('images/traffic_red.png')
-    self._traffic_green_icon = gui_app.texture('images/traffic_green.png')
-
-    self._ic_turn_l = gui_app.texture('images/turn_l.png')
-    self._ic_turn_r = gui_app.texture('images/turn_r.png')
-    self._ic_lane_change_l = gui_app.texture('images/lane_change_l.png')
-    self._ic_lane_change_r = gui_app.texture('images/lane_change_r.png')
-    self._ic_turn_u = gui_app.texture('images/turn_u.png')
+    self._type = hs.Type()
 
     self._set_speed_override = SetSpeedOverride()
     self._debug_speed_panel = False
     self._engaged = False
+    self._overspeed = False
+    self._progress_key: tuple | None = None
+    self._progress_start = NAV_PROGRESS_SPAN
+    self._progress_last = 0
+    self._set_anchor = (0.0, 0.0)
 
     # c3-wip cruise-speed animation: center popup -> left Carrot HUD target.
     self._cruise_speed_text_last = ""
@@ -273,37 +324,40 @@ class HudRenderer(Widget):
   def _render(self, rect: rl.Rectangle) -> None:
     """Render HUD elements to the screen."""
     self._refresh_hud_params(time.monotonic())
+    hs.panels.clear()
+    hs.zones.clear()
+    hs.top_boxes.clear()
+    self._blink_timer = (self._blink_timer + 1) % 16
+    self._disp_timer = (self._disp_timer + 1) % 64
 
-    # Draw the header background
-    rl.draw_rectangle_gradient_v(
-      int(rect.x),
-      int(rect.y),
-      int(rect.width),
-      UI_CONFIG.header_height,
-      COLORS.HEADER_GRADIENT_START,
-      COLORS.HEADER_GRADIENT_END,
-    )
+    # Soft shades under the top and bottom card rows; the cards themselves carry the contrast.
+    top, bottom = int(rect.y), int(rect.y + rect.height)
+    rl.draw_rectangle_gradient_v(int(rect.x), top, int(rect.width), TOP_SHADE_H, rl.Color(0, 0, 0, 140), rl.BLANK)
+    rl.draw_rectangle_gradient_v(int(rect.x), bottom - BOTTOM_SHADE_H, int(rect.width), BOTTOM_SHADE_H,
+                                 rl.BLANK, rl.Color(0, 0, 0, 158))
 
+    info = self._get_turn_info_hud_data()
+    self._draw_guidance_card(rect, info)
+    self._draw_tpms(rect, top=True)
+    self._draw_status_capsule(rect)
+    self._draw_trip(rect, info)
+    self._draw_tpms(rect, top=False)
     if self.is_cruise_available:
-      self._draw_set_speed_carrot(rect)
+      self._draw_drive_card(rect)
 
-    #self._draw_current_speed(rect)
-
-    button_x = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
-    button_y = rect.y + UI_CONFIG.border_size
-    self._exp_button.render(rl.Rectangle(button_x, button_y, UI_CONFIG.button_size, UI_CONFIG.button_size))
+    # The C3X HUD has no experimental-mode button; the toggle stays in Settings.
 
     if self._plot_renderer is None:
       self._plot_renderer = PlotRenderer()
     self._plot_renderer.draw(rect, self._font_display, self._show_plot_mode)
 
-    self._draw_date_time(rect)
-    self._draw_tpms(rect)
+    if not self._banner_alert_active():
+      self._draw_clock(rect)
     self._draw_egpu_badge(rect)
     self._draw_cruise_speed_animation(rect)
 
   def user_interacting(self) -> bool:
-    return self._exp_button.is_pressed
+    return False
 
   def _draw_egpu_badge(self, rect: rl.Rectangle) -> None:
     # Keep runtime state visible while the shared USB hub re-enumerates; a
@@ -323,35 +377,23 @@ class HudRenderer(Widget):
     if getattr(ui_state, 'jetlink_badge', None) and not ui_state.usbgpu_active:
       text, state = ui_state.jetlink_badge
     color = {
-      "active": COLORS.GREEN_210,
-      "loading": COLORS.YELLOW_210,
-      "error": COLORS.RED_210,
-      "compile_pending": COLORS.ORANGE_230,
-      "not_compiled": COLORS.ORANGE_230,
-      "ready": COLORS.WHITE_210,
+      "active": hs.GREEN,
+      "loading": hs.AMBER,
+      "error": hs.RED,
+      "compile_pending": hs.CARROT,
+      "not_compiled": hs.CARROT,
+      "ready": hs.TEXT_2,
     }[state]
-    font = gui_app.font(FontWeight.DISPLAY) if not text.isascii() else self._font_semi_bold
-    font_size = 30 if not text.isascii() else 38
-    text_size = measure_text_cached(font, text, font_size)
-    pad_x, pad_y = 18, 8
-    badge_w = text_size.x + pad_x * 2
-    exp_button_left = rect.x + rect.width - UI_CONFIG.border_size - UI_CONFIG.button_size
-    badge = rl.Rectangle(
-      exp_button_left - badge_w - 24,
-      rect.y + 24,
-      badge_w,
-      text_size.y + pad_y * 2,
-    )
-    rl.draw_rectangle_rounded(badge, 0.35, 8, rl.Color(0, 0, 0, 150))
-    rl.draw_rectangle_rounded_lines_ex(badge, 0.35, 8, 3, color)
-    rl.draw_text_ex(
-      font,
-      text,
-      rl.Vector2(badge.x + pad_x, badge.y + pad_y),
-      font_size,
-      0,
-      color,
-    )
+    # A capsule under the tyre card (or in its place), with a status dot. hs.Type swaps in the
+    # Hangul atlas for non-Latin badge text (e.g. Jetlink states), so mixed-script labels render.
+    t = self._type
+    w = t.width(text, BADGE_SIZE, hs.BOLD, 1.0) + 74
+    right = rect.x + rect.width - M_X
+    tpms = hs.zones.get("tpms")
+    y = tpms[1] + tpms[3] + 16 if tpms is not None else rect.y + M_TOP
+    hs.chip(right - w, y, w, 56)
+    hs.dot(right - w + 30, y + 28, 8, color)
+    t.draw_mid(text, right - w + 50, y + 28, BADGE_SIZE, color, hs.BOLD, spacing=1.0)
 
   def _draw_set_speed(self, rect: rl.Rectangle) -> None:
     """Draw the MAX speed indicator box."""
@@ -497,13 +539,13 @@ class HudRenderer(Widget):
       return "", COLORS.WHITE_TRANSLUCENT
 
     if mode_val == 1:   # eco
-      return tr("eco"), COLORS.GREEN_200
+      return tr("eco"), hs.GREEN
     if mode_val == 2:   # safe
-      return tr("safe"), COLORS.ORANGE_200
+      return tr("safe"), hs.AMBER
     if mode_val == 3:   # normal
-      return tr("norm"), COLORS.WHITE_TRANSLUCENT
+      return tr("norm"), hs.TEXT
     if mode_val == 4:   # high
-      return tr("high"), COLORS.RED_200
+      return tr("high"), hs.RED
 
     return "", COLORS.WHITE_TRANSLUCENT
 
@@ -622,105 +664,134 @@ class HudRenderer(Widget):
 
     return False
 
-  def _draw_carrot_traffic_light(self, bx: int, by: int):
+  # ---- speed limit / signals --------------------------------------------------------------------
+
+  def _limit_state(self) -> tuple[int, bool, bool]:
+    """(limit in display units, enforcement camera, camera alarm)."""
+    x_spd_limit, x_sign_type, road_limit_speed = self._get_speed_limit_info()
+    camera = x_spd_limit > 0 and x_sign_type != 22
+    limit = x_spd_limit if camera else road_limit_speed
+    limit_display = int(limit if ui_state.is_metric else limit * KM_TO_MILE + 0.5) if limit > 0 else 0
+    alarm = x_spd_limit > 0 and x_sign_type not in (22, 4)
+    return limit_display, camera, alarm
+
+  def _traffic_light(self) -> str | None:
     traffic_state = self._get_traffic_state()
     traffic_state_carrot = self._get_traffic_state_carrot()
+    if traffic_state == 1 or traffic_state_carrot == 1:
+      return "red"
+    if traffic_state == 2 or traffic_state_carrot == 2:
+      return "green"
+    return None
 
-    icon_size = 64
-    red_light = traffic_state == 1
-    green_light = traffic_state == 2
-
-    icon_red = icon_size
-    icon_green = icon_size
-
-    if traffic_state_carrot == 1:
-      red_light = True
-      icon_red = int(icon_red * 1.5)
-    elif traffic_state_carrot == 2:
-      green_light = True
-      icon_green = int(icon_green * 1.5)
-
-    x = bx
-    y = by + 270
-
-    if red_light:
-      self._draw_texture_rect(self._traffic_red_icon, x - icon_red / 2, y - icon_red / 2, icon_red, icon_red)
-    elif green_light:
-      self._draw_texture_rect(self._traffic_green_icon, x - icon_green / 2, y - icon_green / 2, icon_green, icon_green)
-
-  def _draw_carrot_speed_panel(self, bx: int, by: int):
-    sm = ui_state.sm
-    ov = self._set_speed_override.compute(sm, float(self.set_speed))
-
-    self._draw_texture_rect(self._txt_speed_bg, bx - 100, by - 60, 350, 150)
-
-    cur_speed_int = 123 if self._debug_speed_panel else int(round(self.speed))
-    cur_text = str(cur_speed_int)
-
-    draw_text_ui_style(
-      cur_text, bx, by + 50, 120, rl.WHITE,
-      font=self._font_display,
-      border_width=3.0,
-      shadow_offset=8.0,
-      align="center_bottom",
-    )
-
+  def _cruise_text(self) -> str:
     if self._engaged and self.is_cruise_set:
       set_speed = float(self.set_speed)
       if not ui_state.is_metric:
         set_speed *= KM_TO_MILE
-      cruise_text = str(int(round(set_speed)))
-    else:
-      cruise_text = "--"
+      return str(int(round(set_speed)))
+    return "--"
 
+  def _override_chip(self) -> tuple[str, str, rl.Color, bool] | None:
+    """(reason, speed, fill, white ink) for the solid pill beside SET, or None."""
+    ov = self._set_speed_override.compute(ui_state.sm, float(self.set_speed))
+    if not ov.active:
+      return None
+    ov_speed = float(ov.speed_kph)
+    if not ui_state.is_metric:
+      ov_speed *= KM_TO_MILE
+    label, value, mode = str(ov.label), str(int(round(ov_speed))), ov.speed_color_mode
+    if self._debug_speed_panel:
+      label, value = "vturn", "111"
+    label = OVERRIDE_LABELS.get(label.lower(), label.upper())
+    return label, value, OVERRIDE_COLORS.get(mode, hs.LIVE_GREEN), mode == 3
+
+  # ---- drive card (bottom-left): SET row, speed + sign, gear/gap/mode ------------------------
+
+  def _draw_drive_card(self, rect: rl.Rectangle) -> None:
+    t = self._type
+    x = rect.x + M_X
+    y = rect.y + rect.height - M_BOTTOM - DRIVE_H
+    right = x + DRIVE_W
+    hs.glass_card(x, y, DRIVE_W, DRIVE_H, 40)
+    hs.panels.append((x, y, DRIVE_W, DRIVE_H))
+    hs.zones["drive"] = (x, y, DRIVE_W, DRIVE_H)
+
+    cruise_text = self._cruise_text()
     self._update_cruise_speed_animation(cruise_text)
+    engaged = cruise_text != "--"
+    if engaged:
+      hs.hgradient_line(x + 60, y, DRIVE_W - 120, 4, hs.LIVE_GREEN)
 
-    draw_text_ui_style(
-      cruise_text, bx + 170, by + 15, 60, COLORS.CARROT_GREEN,
-      font=self._font_display,
-      border_width=1.0,
-      shadow_offset=5.0,
-      align="center_bottom",
-    )
+    # Right column: limit sign, pushed left when a traffic light takes the edge.
+    limit, _camera, alarm = self._limit_state()
+    light = self._traffic_light()
+    sign_x = right - (SIGN_RIGHT_LIGHT if light else SIGN_RIGHT)
+    column = sign_x - SIGN_R - 20 if limit > 0 else (right - LIGHT_RIGHT - 50 if light else right - 32)
 
-    if ov.active:
-      ov_speed = float(ov.speed_kph)
-      if not ui_state.is_metric:
-        ov_speed *= KM_TO_MILE
-      ov_text = str(int(round(ov_speed)))
-      ov_label = ov.label
+    # SET row: the label carries the engagement colour; an active override reads as a solid pill.
+    sx = x + 32
+    sx += t.draw("SET", sx, y + SET_BASE, 30, hs.LIVE_GREEN if engaged else DIM_GREY, hs.BOLD, spacing=2) + 14
+    number_w = t.draw(cruise_text, sx, y + SET_BASE, SET_SIZE, hs.TEXT if engaged else hs.with_alpha(hs.TEXT, 128), hs.SEMI)
+    self._set_anchor = (sx + number_w / 2, y + SET_BASE)
+    chip = self._override_chip()
+    if chip is not None:
+      label, value, fill, white = chip
+      ink = hs.TEXT if white else hs.INK
+      # The pill sits above the sign's crown, so only the card edge bounds it; the reason drops before the speed does.
+      cx = sx + number_w + 22
+      value_w = t.width(value, CHIP_SIZE, hs.BOLD)
+      label_w = t.width(label, 32, hs.BOLD) + 14
+      if cx + label_w + value_w + 52 > right - 32:
+        label, label_w = "", 0.0
+      cw = label_w + value_w + 52
+      mid = y + SET_BASE - SET_SIZE * hs.INTER_CAP / 2
+      hs.card(cx, mid - CHIP_H / 2, cw, CHIP_H, fill, CHIP_H / 2, None)
+      if label:
+        t.draw_mid(label, cx + 26, mid, 32, ink, hs.BOLD)
+      t.draw_mid(value, cx + 26 + label_w, mid, CHIP_SIZE, ink, hs.BOLD)
 
-      if ov.speed_color_mode == 1:
-        ov_color = rl.GREEN
-      elif ov.speed_color_mode == 2:
-        ov_color = COLORS.ORANGE_230
-      elif ov.speed_color_mode == 3:
-        ov_color = COLORS.VEHICLE_NAVI_LAVENDER
-      elif ov.speed_color_mode == 4:
-        ov_color = COLORS.EXTERNAL_NAVI_ORANGE
-      else:
-        ov_color = rl.GREEN
+    # Speed numerals, red over the limit, shrunk rather than run into the sign.
+    speed_text = "123" if self._debug_speed_panel else str(int(round(self.speed)))
+    size = SPEED_SIZE if len(speed_text) < 3 else SPEED_SIZE_3
+    unit = tr("km/h") if ui_state.is_metric else tr("mph")
+    room = column - (x + 26)
+    need = t.width(speed_text, size, hs.SEMI, -6 * size / SPEED_SIZE) + 18 + t.width(unit, UNIT_SIZE, hs.MEDIUM)
+    if need > room:
+      size *= max(0.7, room / need)
+    self._overspeed = limit > 0 and self.speed > limit + 2
+    w = t.draw(speed_text, x + 26, y + SPEED_BASE, size, hs.WARN_RED if self._overspeed else hs.TEXT, hs.SEMI,
+               spacing=-6 * size / SPEED_SIZE)
+    t.draw(unit, x + 26 + w + 18, y + SPEED_BASE, UNIT_SIZE, hs.with_alpha(hs.TEXT, 178), hs.MEDIUM)
 
-      if self._debug_speed_panel:
-        ov_text = "111"
-        ov_label = "vturn"
+    if limit > 0:
+      if alarm:
+        pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 2.0 * math.pi)
+        hs.glow(sign_x, y + SIGN_Y, 124, hs.rgba(255, 69, 58, int(90 + 90 * pulse)))
+      hs.regulatory_sign(sign_x, y + SIGN_Y, str(limit), t)
+    if light:
+      lx = right - LIGHT_RIGHT
+      hs.card(lx - 30, y + SIGN_Y - 78, 60, 156, hs.rgba(0, 0, 0, 140), 30, hs.rgba(255, 255, 255, 38), 1.5)
+      for cy, color, on in ((y + SIGN_Y - 34, hs.WARN_RED, light == "red"), (y + SIGN_Y + 34, hs.LIVE_GREEN, light == "green")):
+        if on:
+          hs.glow(lx, cy, 40, hs.with_alpha(color, 120))
+        hs.dot(lx, cy, 21, color if on else hs.with_alpha(color, 46))
 
-      draw_text_ui_style(
-        ov_text, bx + 250, by - 50 + 5, 50, ov_color,
-        font=self._font_display,
-        border_width=1.0,
-        shadow_offset=5.0,
-        align="center_bottom",
-      )
+    # Status row: gear tile and following-gap segments on the left, driving mode on the right.
+    mid = y + STATUS_MID
+    hs.card(x + 30, mid - 24, 56, 48, hs.with_alpha(hs.TEXT, 235), 12, None)
+    t.draw_mid(self._get_gear_text(), x + 58, mid, 36, hs.INK, hs.BOLD, align=0.5)
+    gap = self._get_cruise_gap()
+    gx = x + 108
+    for i in range(4):
+      hs.card(gx + i * 30, mid - 8, 24, 16, hs.TEXT if i < gap else hs.with_alpha(hs.TEXT, 56), 5, None)
+    mode_text, mode_color = self._get_driving_mode_text_and_color()
+    if self._debug_speed_panel:
+      mode_text, mode_color = "safe", hs.AMBER
+    if mode_text:
+      t.draw_mid(mode_text, right - 32, mid, STATUS_SIZE, mode_color, hs.SEMI, align=1.0)
 
-      draw_text_ui_style(
-        ov_label, bx + 250, by - 100, 30, ov_color,
-        font=self._font_display,
-        border_width=1.0,
-        shadow_offset=5.0,
-        align="center_bottom",
-      )
-
+    self._draw_device_state(x, y)
 
   def _update_cruise_speed_animation(self, cruise_text: str) -> None:
     if self._cruise_speed_text_last != cruise_text:
@@ -734,315 +805,106 @@ class HudRenderer(Widget):
     if self._cruise_speed_animation_time <= 0 or not self._cruise_speed_animation_text:
       return
 
-    # c3-wip's integer state machine, tuned for a smaller and quicker BIG popup.
-    # At 20 Hz this renders for 10 frames and starts shrinking almost at once.
+    # c3-wip's integer state machine: a large centre popup that settles onto the SET number.
     self._cruise_speed_animation_time -= CRUISE_SPEED_ANIMATION_STEP
     animation_time = self._cruise_speed_animation_time
     interpolation_time = min(animation_time, CRUISE_SPEED_ANIMATION_MAX)
+    t = interpolation_time / CRUISE_SPEED_ANIMATION_MAX
 
     start_x = rect.x + rect.width / 2.0
     start_y = rect.y + rect.height - 400.0
-    target_x = rect.x + 140.0 + 170.0
-    target_y = rect.y + rect.height - 230.0 + 15.0
-    target_size = 60
+    target_x, target_y = self._set_anchor
+    size = SET_SIZE + (CRUISE_SPEED_ANIMATION_START_SIZE - SET_SIZE) * t
 
-    x = int((start_x * interpolation_time + target_x * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
-            CRUISE_SPEED_ANIMATION_MAX)
-    y = int((start_y * interpolation_time + target_y * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
-            CRUISE_SPEED_ANIMATION_MAX)
-    font_size = int((CRUISE_SPEED_ANIMATION_START_SIZE * interpolation_time +
-                     target_size * (CRUISE_SPEED_ANIMATION_MAX - interpolation_time)) /
-                    CRUISE_SPEED_ANIMATION_MAX)
+    self._type.draw(self._cruise_speed_animation_text, target_x + (start_x - target_x) * t,
+                    target_y + (start_y - target_y) * t, size, hs.LIVE_GREEN, hs.SEMI, align=0.5, shadow=True)
 
-    if animation_time >= CRUISE_SPEED_ANIMATION_MAX:
-      border_width = 9.0
-      shadow_offset = 8.0
-    else:
-      border_width = 3.0
-      shadow_offset = 0.0
-
-    draw_text_ui_style(
-      self._cruise_speed_animation_text,
-      x,
-      y,
-      font_size,
-      COLORS.CARROT_GREEN,
-      font=self._font_display,
-      border_width=border_width,
-      shadow_offset=shadow_offset,
-      align="center_bottom",
-    )
-
-  def _draw_carrot_lower_status(self, bx: int, by: int):
-    mode_text, mode_color = self._get_driving_mode_text_and_color()
-    if self._debug_speed_panel:
-      mode_text = "safe"
-      mode_color = COLORS.ORANGE_230
-
-    # driving mode
-    if mode_text:
-      dx = bx - 50
-      dy = by + 175
-
-      self._draw_round_box(
-        dx - 55, dy - 38, 110, 48,
-        mode_color,
-        line_color=rl.WHITE,
-        roundness=0.25,
-        segments=8,
-        line_thickness=2,
-      )
-
-      draw_text_ui_style(
-        mode_text, dx, dy - 2, 32, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-
-      if self._gps_has_fix():
-        draw_text_ui_style(
-          "GPS", dx, dy - 45, 30, rl.GREEN,
-          font=self._font_display,
-          border_width=2.0,
-          shadow_offset=4.0,
-          align="center_bottom",
-        )
-
-    # gap number
-    gap = self._get_cruise_gap()
-    draw_text_ui_style(
-      str(gap), bx + 220, by + 77, 40, rl.WHITE,
-      font=self._font_display,
-      border_width=2.0,
-      shadow_offset=4.0,
-      align="center_bottom",
-    )
-
-    # gap bars
-    dx = bx + 270
-    dy = by + 185
-    ddy = 80.0 / 4.0
-    for i in range(max(0, min(gap, 4))):
-      self._draw_round_box(
-        dx,
-        dy - ddy * (i + 1) + 2,
-        70,
-        ddy - 2,
-        COLORS.GREEN_210,
-        line_color=rl.WHITE,
-        roundness=0.12,
-        segments=4,
-        line_thickness=2,
-      )
-
-    # gear
-    gear = self._get_gear_text()
-    gx = bx + 305
-    gy = by + 60
-
-    self._draw_round_box(
-      gx - 35, gy - 70, 70, 80,
-      COLORS.GREEN_210,
-      line_color=rl.WHITE,
-      roundness=0.20,
-      segments=8,
-      line_thickness=3,
-    )
-
-    draw_text_ui_style(
-      gear, gx, gy + 5, 70, rl.WHITE,
-      font=self._font_display,
-      border_width=2.0,
-      shadow_offset=4.0,
-      align="center_bottom",
-    )
-
-    # active carrot
-    active_carrot = self._get_active_carrot()
-    dx = bx + 200
-    dy = by + 175
-
-    if active_carrot >= 2:
-      self._draw_round_box(
-        dx - 55, dy - 38, 110, 48,
-        rl.GREEN,
-        line_color=rl.WHITE,
-        roundness=0.25,
-        segments=8,
-        line_thickness=2,
-      )
-      draw_text_ui_style(
-        "APN", dx, dy, 40, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-    elif active_carrot >= 1:
-      self._draw_round_box(
-        dx - 55, dy - 38, 110, 48,
-        COLORS.BLUE_210,
-        line_color=rl.WHITE,
-        roundness=0.25,
-        segments=8,
-        line_thickness=2,
-      )
-      draw_text_ui_style(
-        "APM", dx, dy, 40, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-
-    if self._get_nav_path_vertex_count() > 1:
-      draw_text_ui_style(
-        "ROUTE", dx, dy - 45, 30, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-
-  def _draw_carrot_speed_limit_box(self, bx: int, by: int, speed_limit_info: tuple[int, int, int]):
-    x_spd_limit, x_sign_type, road_limit_speed = speed_limit_info
-
-    dx = bx + 75
-    dy = by + 175
-
-    disp_speed = 0
-    limit_color = COLORS.GREEN_210
-    label = "LIMIT"
-
-    if x_spd_limit > 0 and x_sign_type != 22:
-      disp_speed = int(x_spd_limit if ui_state.is_metric else (x_spd_limit * KM_TO_MILE + 0.5))
-      label = "CAM"
-      if self._blink_timer <= 8:
-        limit_color = COLORS.RED_210
-      else:
-        limit_color = COLORS.YELLOW_210
-    else:
-      disp_speed = int(road_limit_speed if ui_state.is_metric else (road_limit_speed * KM_TO_MILE + 0.5))
-      if self.speed > disp_speed + 2:
-        limit_color = COLORS.RED_210
-      else:
-        limit_color = COLORS.WHITE_210
-
-    draw_text_ui_style(
-      label, dx, dy - 45, 30, rl.WHITE,
-      font=self._font_display,
-      border_width=2.0,
-      shadow_offset=4.0,
-      align="center_bottom",
-    )
-
-    self._draw_round_box(
-      dx - 55, dy - 38, 110, 48,
-      limit_color,
-      line_color=rl.WHITE,
-      roundness=0.25,
-      segments=8,
-      line_thickness=2,
-    )
-
-    draw_text_ui_style(
-      str(disp_speed), dx, dy, 40, rl.WHITE,
-      font=self._font_display,
-      border_width=2.0,
-      shadow_offset=4.0,
-      align="center_bottom",
-    )
-
-  def _draw_carrot_main_background(self, bx: int, by: int, speed_limit_info: tuple[int, int, int]):
-    x_spd_limit, x_sign_type, _ = speed_limit_info
-    cam_detected = x_spd_limit > 0 and x_sign_type not in (22, 4)
-
-    stroke_color = rl.WHITE
-    if cam_detected and self._blink_timer > 8:
-      bg_color = COLORS.RED_180
-    else:
-      bg_color = COLORS.BLACK_90
-
-    if self._show_device_state > 0:
-      self._draw_round_box(
-        bx - 120, by - 270, 475, 495,
-        bg_color,
-        line_color=stroke_color,
-        roundness=30.0 / 495.0,
-        segments=12,
-        line_thickness=2,
-      )
-    else:
-      self._draw_round_box(
-        bx - 120, by - 130, 475, 355,
-        bg_color,
-        line_color=stroke_color,
-        roundness=30.0 / 355.0,
-        segments=12,
-        line_thickness=2,
-      )
-
-  def _draw_carrot_device_state(self, bx: int, by: int):
+  def _draw_device_state(self, card_x: float, card_y: float) -> None:
     if self._show_device_state <= 0:
       return
 
-    dx = bx - 35
-    dy = by - 200
-    ok_color = COLORS.GREEN_190
-
-    # CPU
-    cpu_fill = COLORS.RED_SOLID if (self._cpu_temp > 80 and self._blink_timer <= 8) else ok_color
-    self._draw_round_box(dx - 65, dy - 38, 130, 90, cpu_fill, line_color=rl.WHITE, roundness=0.16, segments=8, line_thickness=2)
-    draw_text_ui_style("CPU", dx, dy - 5, 25, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-    draw_text_ui_style(self._cpu_temp_text, dx, dy + 40, 40, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-
-    # MEM
-    dx2 = dx + 150
-    mem_fill = COLORS.RED_SOLID if (self._memory_usage > 85 and self._blink_timer <= 8) else ok_color
-    self._draw_round_box(dx2 - 65, dy - 38, 130, 90, mem_fill, line_color=rl.WHITE, roundness=0.16, segments=8, line_thickness=2)
-    draw_text_ui_style("MEM", dx2, dy - 5, 25, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-    draw_text_ui_style(self._memory_usage_text, dx2, dy + 40, 40, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-
-    # DISK / VOLT
-    dx3 = dx2 + 150
-    self._draw_round_box(dx3 - 65, dy - 38, 130, 90, ok_color, line_color=rl.WHITE, roundness=0.16, segments=8, line_thickness=2)
-
+    blink = self._blink_timer <= 8
     if self._disp_timer < 32:
-      draw_text_ui_style("DISK", dx3, dy - 5, 25, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-      draw_text_ui_style(self._disk_usage_text, dx3, dy + 40, 40, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
+      last = ("DISK", self._disk_usage_text, False)
     else:
-      draw_text_ui_style("VOLT", dx3, dy - 5, 25, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
-      draw_text_ui_style(self._voltage_text, dx3, dy + 40, 40, rl.WHITE, font=self._font_display, border_width=1.0, shadow_offset=4.0, align="center_bottom")
+      last = ("VOLT", self._voltage_text, False)
+    items = (("CPU", self._cpu_temp_text, self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85), last)
 
-  def _draw_date_time(self, rect: rl.Rectangle) -> None:
+    # One capsule above the drive card.
+    t = self._type
+    width = 0.0
+    for label, value, _hot in items:
+      width += t.width(label, 28, hs.BOLD, 1.5) + 10 + t.width(value, 38, hs.SEMI) + 30
+    h = 60
+    top = card_y - 18 - h
+    hs.chip(card_x, top, width + 30, h)
+    x = card_x + 30
+    mid = top + h / 2
+    for label, value, hot in items:
+      x += t.draw_mid(label, x, mid, 28, hs.with_alpha(hs.TEXT, 150), hs.BOLD, spacing=1.5) + 10
+      x += t.draw_mid(value, x, mid, 38, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 30
+
+  # ---- clock and link badges (top-centre) -------------------------------------------------------
+
+  def _draw_clock(self, rect: rl.Rectangle) -> None:
+    # Screen centre, nudged only as far as a wide guidance card requires.
+    guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
+    cx = rect.x + rect.width / 2
+    if guide is not None:
+      cx = max(cx, guide[0] + guide[2] + 260)
+    if tpms is not None:
+      cx = min(cx, tpms[0] - 260)
+    y = rect.y + 30
     show_datetime = self._show_date_time
-    if show_datetime <= 0:
-      return
+    if show_datetime > 0:
+      self._refresh_date_time_text(time.localtime())
+      if show_datetime in (1, 2):
+        self._type.draw(self._date_time_text, cx, y + 58, CLOCK_SIZE, hs.TEXT, hs.SEMI, align=0.5, shadow=True)
+        y += 58
+      if show_datetime in (1, 3):
+        y += 52 if show_datetime == 1 else 40
+        self._type.draw(self._date_text, cx, y, DATE_SIZE, hs.with_alpha(hs.TEXT, 218), hs.SEMI, align=0.5, shadow=True)
+    if y > rect.y + 40:
+      hs.top_boxes.append((cx - 240, rect.y, 480, y - rect.y + 16))
 
-    self._refresh_date_time_text(time.localtime())
+  def _draw_status_capsule(self, rect: rl.Rectangle) -> None:
+    """Link status in the top-right column, under the TPMS card when it is up there."""
+    tpms = hs.zones.get("tpms")
+    top = tpms[1] + tpms[3] + STACK_GAP if tpms is not None else rect.y + M_TOP
+    box = self._draw_system_badges(rect.x + rect.width - M_X, top)
+    if box is not None:
+      hs.top_boxes.append(box)
 
-    x = int(rect.x + 170)
-    y = int(rect.y + 120)
+  def _draw_system_badges(self, right: float, top: float) -> tuple[float, float, float, float] | None:
+    """One glass capsule, right-aligned: a lit dot per active link (APM keeps its blue); absent when all are off."""
+    items = []
+    active_carrot = self._get_active_carrot()
+    if active_carrot >= 1:
+      items.append(("APN", hs.LIVE_GREEN) if active_carrot >= 2 else ("APM", NAV_BLUE))
+    if self._gps_has_fix():
+      items.append(("GPS", hs.LIVE_GREEN))
+    if self._get_nav_path_vertex_count() > 1:
+      items.append(("ROUTE", hs.LIVE_GREEN))
+    if not items:
+      return None
 
-    if show_datetime in (1, 2):
-      draw_text_ui_style(
-        self._date_time_text, x, y, 100, rl.WHITE,
-        font=self._font_display,
-        border_width=3.0,
-        shadow_offset=8.0,
-        align="center_bottom",
-      )
-
-    if show_datetime in (1, 3):
-      draw_text_ui_style(
-        self._date_text, x, y + 70, 60, rl.WHITE,
-        font=self._font_display,
-        border_width=3.0,
-        shadow_offset=8.0,
-        align="center_bottom",
-      )
+    t = self._type
+    dot, pad, sep = 8.5, 24.0, 22.0
+    widths = [2 * dot + 11 + t.width(label, BADGE_SIZE, hs.BOLD, 1.5) for label, _ in items]
+    w = sum(widths) + 2 * pad + 2 * sep * (len(items) - 1)
+    x = right - w
+    mid = top + BADGE_H / 2
+    hs.chip(x, top, w, BADGE_H)
+    x += pad
+    for index, ((label, color), item_w) in enumerate(zip(items, widths, strict=True)):
+      if index:
+        hs.card(x + sep - 1, mid - 11, 2, 22, hs.rgba(255, 255, 255, 40), 1, None)
+        x += 2 * sep
+      hs.glow(x + dot, mid, dot * 2.8, hs.with_alpha(color, 150))
+      hs.dot(x + dot, mid, dot, color)
+      t.draw_mid(label, x + 2 * dot + 11, mid, BADGE_SIZE, hs.TEXT_2, hs.BOLD, spacing=1.5)
+      x += item_w
+    return right - w, top, w, BADGE_H
 
   def _refresh_date_time_text(self, now: time.struct_time) -> None:
     minute_key = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min, now.tm_isdst)
@@ -1051,8 +913,10 @@ class HudRenderer(Widget):
 
     weekday = WEEKDAYS_KO[(now.tm_wday + 1) % 7]
     self._date_time_text = time.strftime("%H:%M", now)
-    self._date_text = f"{time.strftime('%m-%d', now)}({weekday})"
+    self._date_text = f"{now.tm_mon}월 {now.tm_mday}일 {weekday}요일"
     self._date_time_minute_key = minute_key
+
+  # ---- tyre pressure ------------------------------------------------------------------------
 
   def _get_tpms_color(self, tpms: float) -> rl.Color:
     if tpms < 5 or tpms > 60:
@@ -1066,119 +930,73 @@ class HudRenderer(Widget):
       return '  -'
     return f'{round(tpms):.0f}'
 
-  def _draw_tpms(self, rect: rl.Rectangle) -> None:
-    if self._show_tpms not in (1, 2, 3):
+  def _draw_tpms(self, rect: rl.Rectangle, top: bool) -> None:
+    if self._show_tpms not in ((1, 3) if top else (2, 3)):
       return
 
     try:
       tpms = ui_state.sm['carState'].tpms
-      fl = float(tpms.fl)
-      fr = float(tpms.fr)
-      rl_v = float(tpms.rl)
-      rr = float(tpms.rr)
+      values = (float(tpms.fl), float(tpms.fr), float(tpms.rl), float(tpms.rr))
     except Exception:
       return
 
-    bx = rect.x + rect.width - 125
-    dw = 80
+    x = rect.x + rect.width - M_X - TPMS_W
+    if top:
+      y = rect.y + M_TOP
+      hs.zones["tpms"] = (x, y, TPMS_W, TPMS_H)
+      hs.top_boxes.append((x, y, TPMS_W, TPMS_H))
+    else:
+      # Bottom-right corner, stacked above the trip capsule when it is shown.
+      trip = hs.zones.get("trip")
+      bottom = trip[1] if trip is not None else rect.y + rect.height - M_BOTTOM + STACK_GAP
+      y = bottom - STACK_GAP - TPMS_H
+    hs.glass_card(x, y, TPMS_W, TPMS_H, CARD_R)
+    if not top:
+      hs.panels.append((x, y, TPMS_W, TPMS_H))
+    lows = tuple(self._get_tpms_color(value) == COLORS.TPMS_LOW for value in values)
+    self._draw_tpms_car(x + 160, y + 118, lows)
 
-    if self._show_tpms in (1, 3):
-      self._draw_tpms_values(bx, rect.y + 130, dw, fl, fr, rl_v, rr)
-    if self._show_tpms in (2, 3):
-      self._draw_tpms_values(bx, rect.y + rect.height - 125, dw, fl, fr, rl_v, rr)
+    t = self._type
+    for value, low, vx, vy, align in zip(values, lows, (x + 102, x + 218, x + 102, x + 218), (y + 86, y + 86, y + 186, y + 186),
+                                         (1.0, 0.0, 1.0, 0.0), strict=True):
+      t.draw(self._get_tpms_text(value).strip(), vx, vy, TPMS_SIZE, hs.WARN_RED if low else hs.TEXT, hs.SEMI, align=align)
 
-  def _draw_tpms_values(
-    self, bx: float, by: float, dw: float,
-    fl: float, fr: float, rl_v: float, rr: float,
-  ) -> None:
-    draw_text_ui_style(
-      self._get_tpms_text(fl), bx - dw, by - 55, 40, self._get_tpms_color(fl),
-      font=self._font_display, border_width=1.0, shadow_offset=4.0, align='center_bottom',
-    )
-    draw_text_ui_style(
-      self._get_tpms_text(fr), bx + dw, by - 55, 40, self._get_tpms_color(fr),
-      font=self._font_display, border_width=1.0, shadow_offset=4.0, align='center_bottom',
-    )
-    draw_text_ui_style(
-      self._get_tpms_text(rl_v), bx - dw, by + 70, 40, self._get_tpms_color(rl_v),
-      font=self._font_display, border_width=1.0, shadow_offset=4.0, align='center_bottom',
-    )
-    draw_text_ui_style(
-      self._get_tpms_text(rr), bx + dw, by + 70, 40, self._get_tpms_color(rr),
-      font=self._font_display, border_width=1.0, shadow_offset=4.0, align='center_bottom',
-    )
+  @staticmethod
+  def _draw_tpms_car(cx: float, cy: float, low: tuple[bool, bool, bool, bool]) -> None:
+    """Top view: a quiet body outline and four tyres, red where the pressure is low."""
+    hs.card(cx - 30, cy - 78, 60, 156, hs.rgba(255, 255, 255, 18), 26, hs.rgba(255, 255, 255, 150), 2.5)
+    hs.card(cx - 21, cy - 34, 42, 54, hs.rgba(255, 255, 255, 26), 12, None)
+    for (tx, ty), is_low in zip(((cx - 39, cy - 58), (cx + 31, cy - 58), (cx - 39, cy + 30), (cx + 31, cy + 30)), low, strict=True):
+      hs.card(tx, ty, 8, 28, hs.WARN_RED if is_low else hs.rgba(255, 255, 255, 200), 3, None)
+
+  # ---- guidance (top-left): turn card or enforcement camera card ------------------------------
 
   def _get_turn_info_hud_data(self) -> dict:
     try:
       cm = ui_state.sm["carrotMan"]
     except Exception:
-      return {
-        "active_carrot": 0,
-        "x_turn_info": 0,
-        "x_dist_to_turn": 0,
-        "n_go_pos_dist": 0,
-        "n_go_pos_time": 0,
-        "atc_type": "",
-        "sdi_descr": "",
-        "road_name": "",
-        "tbt_main_text": "",
-      }
+      cm = None
 
-    try:
-      active_carrot = int(cm.activeCarrot)
-    except Exception:
-      active_carrot = 0
+    def field(name, cast, default):
+      try:
+        return cast(getattr(cm, name))
+      except Exception:
+        return default
 
-    try:
-      x_turn_info = int(cm.xTurnInfo)
-    except Exception:
-      x_turn_info = 0
-
-    try:
-      x_dist_to_turn = int(cm.xDistToTurn)
-    except Exception:
-      x_dist_to_turn = 0
-
-    try:
-      n_go_pos_dist = int(cm.nGoPosDist)
-    except Exception:
-      n_go_pos_dist = 0
-
-    try:
-      n_go_pos_time = int(cm.nGoPosTime)
-    except Exception:
-      n_go_pos_time = 0
-
-    try:
-      atc_type = str(cm.atcType or "")
-    except Exception:
-      atc_type = ""
-
-    try:
-      sdi_descr = str(cm.szSdiDescr or "")
-    except Exception:
-      sdi_descr = ""
-
-    try:
-      road_name = str(cm.szPosRoadName or "")
-    except Exception:
-      road_name = ""
-
-    try:
-      tbt_main_text = str(cm.szTBTMainText or "")
-    except Exception:
-      tbt_main_text = ""
+    def text(value) -> str:
+      return str(value or "")
 
     return {
-      "active_carrot": active_carrot,
-      "x_turn_info": x_turn_info,
-      "x_dist_to_turn": x_dist_to_turn,
-      "n_go_pos_dist": n_go_pos_dist,
-      "n_go_pos_time": n_go_pos_time,
-      "atc_type": atc_type,
-      "sdi_descr": sdi_descr,
-      "road_name": road_name,
-      "tbt_main_text": tbt_main_text,
+      "active_carrot": field("activeCarrot", int, 0),
+      "x_turn_info": field("xTurnInfo", int, 0),
+      "x_dist_to_turn": field("xDistToTurn", int, 0),
+      "x_spd_dist": field("xSpdDist", int, 0),
+      "n_go_pos_dist": field("nGoPosDist", int, 0),
+      "n_go_pos_time": field("nGoPosTime", int, 0),
+      "atc_type": field("atcType", text, ""),
+      "sdi_descr": field("szSdiDescr", text, ""),
+      "road_name": field("szPosRoadName", text, ""),
+      "tbt_main_text": field("szTBTMainText", text, ""),
     }
 
   def _format_turn_distance_text(self, dist_m: int) -> str:
@@ -1194,193 +1012,145 @@ class HudRenderer(Widget):
         return f"{int(dist_m * 3.28084)} ft"
       return f"{dist_m / 1609.344:.1f} mi"
 
-  def _format_eta_text(self, remain_sec: int) -> str:
-    if remain_sec <= 0:
-      return ""
+  def _progress(self, key: tuple, dist: int) -> float:
+    """Approach progress: fills over the last two kilometres, or from where a longer approach began."""
+    if key != self._progress_key or dist > self._progress_last + 50:
+      self._progress_key = key
+      self._progress_start = max(float(dist), NAV_PROGRESS_SPAN)
+    self._progress_last = dist
+    return min(1.0, max(0.0, 1.0 - dist / self._progress_start))
 
+  def _draw_guidance_card(self, rect: rl.Rectangle, info: dict) -> None:
+    t = self._type
+    x_spd_limit, x_sign_type, _ = self._get_speed_limit_info()
+    route = info["n_go_pos_dist"] > 0 and info["n_go_pos_time"] > 0
+    turn = route and info["x_turn_info"] > 0
+    cam_dist = info["x_spd_dist"]
+    camera = x_spd_limit > 0 and x_sign_type != 22 and cam_dist > 0
+    if camera and turn and info["x_dist_to_turn"] < cam_dist:
+      camera = False
+    if not (camera or turn):
+      self._progress_key = None
+      return
+
+    x, y = rect.x + M_X, rect.y + M_TOP
+    if camera:
+      limit = x_spd_limit if ui_state.is_metric else int(x_spd_limit * KM_TO_MILE + 0.5)
+      dist = cam_dist
+      text = info["sdi_descr"] or "과속 단속"
+      extra = str(limit)
+      body, bar = hs.CARD_WARN, hs.WARN_RED
+      key: tuple = ("camera", x_sign_type)
+    else:
+      dist = info["x_dist_to_turn"]
+      text, extra = info["tbt_main_text"], ""
+      body, bar = hs.CARD_BODY, hs.LIVE_GREEN if info["atc_type"] else NAV_BLUE
+      key = ("turn", info["x_turn_info"])
+
+    # The card hugs its content: no blank tail after the distance or the instruction line.
+    number, _, unit = self._format_turn_distance_text(dist).partition(" ")
+    content = 0.0
+    if number:
+      content = t.width(number, NAV_DISTANCE_SIZE, hs.SEMI, -3) + 14 + t.width(unit, NAV_UNIT_SIZE, hs.MEDIUM)
+    if text:
+      content = max(content, t.width(text, NAV_TEXT_SIZE, hs.SEMI))
+    w = min(NAV_W_MAX, max(NAV_W_MIN, 234 + content + 48))
+    h = NAV_H if text else NAV_H_SHORT
+    hs.glass_card(x, y, w, h, CARD_R, body)
+    hs.top_boxes.append((x, y, w, h))
+    hs.zones["guide"] = (x, y, w, h)
+
+    gx, gy = x + 118, y + (122 if text else 98)
+    if camera:
+      hs.regulatory_sign(gx, gy, extra, t, 0.92)
+    elif not hs.maneuver_arrow(info["x_turn_info"], gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if info["atc_type"] else hs.TEXT):
+      t.draw_mid(f"감속:{info['x_turn_info']}", gx, gy, 40, hs.TEXT, hs.BOLD, align=0.5)
+
+    if number:
+      # Without an instruction line the distance sits on the arrow's centre.
+      base = y + 134 if text else gy + NAV_DISTANCE_SIZE * hs.INTER_CAP / 2
+      nw = t.draw(number, x + 234, base, NAV_DISTANCE_SIZE, hs.TEXT, hs.SEMI, spacing=-3)
+      t.draw(unit, x + 234 + nw + 14, base, NAV_UNIT_SIZE, hs.with_alpha(hs.TEXT, 184), hs.MEDIUM)
+    if text:
+      text = t.ellipsize(text, NAV_TEXT_SIZE, w - 234 - 48, hs.SEMI)
+      t.draw(text, x + 236, y + 200, NAV_TEXT_SIZE, hs.TEXT, hs.SEMI)
+
+    progress = self._progress(key, dist)
+    bar_y = y + h - 40
+    hs.card(x + 30, bar_y, w - 60, 8, hs.rgba(255, 255, 255, 33), 4, None)
+    if progress > 0.01:
+      hs.card(x + 30, bar_y, max(8.0, (w - 60) * progress), 8, bar, 4, None)
+
+  # ---- trip capsule (bottom-right) ----------------------------------------------------------
+
+  def _trip_runs(self, remain_sec: int, dist_m: int) -> list[list[tuple[str, bool]]]:
+    """Arrival time, remaining time and distance as groups of (text, is_number) runs."""
     # Arrival time is wall-clock based; monotonic time cannot be converted to local time.
     eta_tm = time.localtime(time.time() + remain_sec)  # noqa: TID251
-    remain_min = remain_sec / 60.0
-    return f"도착: {remain_min:.1f}분({eta_tm.tm_hour:02d}:{eta_tm.tm_min:02d})"
-
-  def _format_go_pos_distance_text(self, dist_m: int) -> str:
-    if dist_m <= 0:
-      return ""
-
+    minutes = max(1, round(remain_sec / 60.0))
+    if minutes >= 60:
+      duration = [(str(minutes // 60), True), ("시간", False)] + ([(str(minutes % 60), True), ("분", False)] if minutes % 60 else [])
+    else:
+      duration = [(str(minutes), True), ("분", False)]
     if ui_state.is_metric:
-      return f"{dist_m / 1000.0:.1f}km"
+      distance = [(f"{dist_m / 1000.0:.1f}", True), ("km", False)]
     else:
-      return f"{dist_m / 1000.0 * KM_TO_MILE:.1f}mile"
+      distance = [(f"{dist_m / 1609.344:.1f}", True), ("mi", False)]
+    return [[(f"{eta_tm.tm_hour:02d}:{eta_tm.tm_min:02d}", True), ("도착", False)], duration, distance]
 
-  def _draw_text_left_bottom(self, text: str, x: float, y: float, size: int, color, font=None, border_width: float = 2.0, shadow_offset: float = 4.0):
-    if not text:
+  def _trip_line_width(self, remain_sec: int, dist_m: int) -> float:
+    t = self._type
+    groups = self._trip_runs(remain_sec, dist_m)
+    width = 38.0 * (len(groups) - 1)
+    for group in groups:
+      for text, number in group:
+        width += t.width(text, TRIP_SIZE if number else TRIP_UNIT_SIZE, hs.SEMI) + 6
+    return width - 6
+
+  def _draw_trip(self, rect: rl.Rectangle, info: dict) -> None:
+    remain_sec, dist_m = info["n_go_pos_time"], info["n_go_pos_dist"]
+    if rect.width < 1200 or not (dist_m > 0 and remain_sec > 0):
       return
 
-    draw_text_ui_style(
-      text, x, y, size, color,
-      font=font or self._font_display,
-      border_width=border_width,
-      shadow_offset=shadow_offset,
-      align="left_bottom",
-    )
+    t = self._type
+    groups = self._trip_runs(remain_sec, dist_m)
+    line_w = self._trip_line_width(remain_sec, dist_m)
+    road = info["road_name"]
+    road_w = 0.0
+    if road:
+      road = t.ellipsize(road, TRIP_ROAD_SIZE, 420, hs.SEMI)
+      road_w = t.width(road, TRIP_ROAD_SIZE, hs.SEMI) + 62
+    w = line_w + road_w + 80
+    right = rect.x + rect.width - M_X
+    y = rect.y + rect.height - M_BOTTOM - TRIP_H
+    x = right - w
+    hs.glass_card(x, y, w, TRIP_H, TRIP_H / 2)
+    hs.panels.append((x, y, w, TRIP_H))
+    hs.zones["trip"] = (x, y, w, TRIP_H)
 
-  def _draw_turn_icon(self, turn_info: int, bx: int, by: int, icon_size: int = 140):
-    if turn_info == 1:
-      self._draw_texture_rect(self._ic_turn_l, bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size)
-    elif turn_info == 2:
-      self._draw_texture_rect(self._ic_turn_r, bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size)
-    elif turn_info == 3:
-      self._draw_texture_rect(self._ic_lane_change_l, bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size)
-    elif turn_info == 4:
-      self._draw_texture_rect(self._ic_lane_change_r, bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size)
-    elif turn_info == 7:
-      self._draw_texture_rect(self._ic_turn_u, bx - icon_size / 2, by - icon_size / 2, icon_size, icon_size)
-    elif turn_info == 6:
-      draw_text_ui_style(
-        "TG", bx, by + 20, 35, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-    elif turn_info == 8:
-      draw_text_ui_style(
-        "목적지", bx, by + 20, 35, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
-    else:
-      draw_text_ui_style(
-        f"감속:{turn_info}", bx, by + 20, 35, rl.WHITE,
-        font=self._font_display,
-        border_width=2.0,
-        shadow_offset=4.0,
-        align="center_bottom",
-      )
+    baseline = y + 60
+    mid = y + TRIP_H / 2
+    tx = x + 40
+    if road:
+      tx += t.draw(road, tx, baseline, TRIP_ROAD_SIZE, hs.with_alpha(hs.TEXT, 178), hs.SEMI) + 30
+      hs.card(tx - 1, mid - 18, 3, 36, hs.rgba(255, 255, 255, 77), 1.5, None)
+      tx += 32
+    for index, group in enumerate(groups):
+      if index:
+        hs.dot(tx + 13, mid + 4, 3.5, hs.rgba(255, 255, 255, 110))
+        tx += 32
+      for text, number in group:
+        if number:
+          tx += t.draw(text, tx, baseline, TRIP_SIZE, hs.TEXT, hs.SEMI) + 6
+        else:
+          tx += t.draw(text, tx, baseline, TRIP_UNIT_SIZE, hs.with_alpha(hs.TEXT, 178), hs.SEMI) + 6
 
-  def _draw_turn_info_hud(self, rect: rl.Rectangle):
-    if rect.width < 1200:
-      return
-
-    info = self._get_turn_info_hud_data()
-    n_go_pos_dist = info["n_go_pos_dist"]
-    n_go_pos_time = info["n_go_pos_time"]
-
-    if not (n_go_pos_dist > 0 and n_go_pos_time > 0):
-      return
-
-    tbt_x = int(rect.x + rect.width - 800)
-    tbt_y = int(rect.y + rect.height - 250)
-
-    self._draw_round_box(
-      tbt_x,
-      tbt_y - 60,
-      790,
-      300,
-      rl.Color(0, 0, 0, 120),
-      line_color=rl.WHITE,
-      roundness=30.0 / 300.0,
-      segments=12,
-      line_thickness=2,
-    )
-
-    if info["tbt_main_text"]:
-      self._draw_text_left_bottom(
-        info["tbt_main_text"], tbt_x + 20, tbt_y - 15, 40, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
-
-    x_turn_info = info["x_turn_info"]
-    x_dist_to_turn = info["x_dist_to_turn"]
-
-    if x_turn_info > 0:
-      bx = tbt_x + 100
-      by = tbt_y + 85
-
-      if info["atc_type"]:
-        fill_color = rl.Color(0, 255, 0, 100) if "prepare" in info["atc_type"] else rl.GREEN
-        self._draw_round_box(
-          bx - 80, by - 90, 160, 230,
-          fill_color,
-          line_color=rl.BLACK,
-          roundness=15.0 / 230.0,
-          segments=8,
-          line_thickness=1,
-        )
-
-      self._draw_turn_icon(x_turn_info, bx, by, 140)
-
-      dist_text = self._format_turn_distance_text(x_dist_to_turn)
-      if dist_text:
-        draw_text_ui_style(
-          dist_text,
-          bx, by + 120, 40, rl.WHITE,
-          font=self._font_bold,
-          border_width=2.0,
-          shadow_offset=4.0,
-          align="center_bottom",
-        )
-
-    if info["sdi_descr"]:
-      label_x = tbt_x + 200
-      label_y = tbt_y + 200
-      size = measure_text_cached(self._font_bold, info["sdi_descr"], 40)
-      box_h = max(48, int(size.y + 13))
-      self._draw_round_box(
-        label_x - 10,
-        label_y - int(size.y) - 2,
-        int(size.x) + 20,
-        box_h,
-        rl.GREEN,
-        roundness=10.0 / box_h,
-        segments=8,
-        line_thickness=0,
-      )
-      self._draw_text_left_bottom(
-        info["sdi_descr"], label_x, label_y, 40, rl.WHITE,
-        font=self._font_bold, border_width=1.5, shadow_offset=3.0,
-      )
-    elif info["road_name"]:
-      self._draw_text_left_bottom(
-        info["road_name"], tbt_x + 200, tbt_y + 200, 40, rl.WHITE,
-        font=self._font_bold, border_width=1.5, shadow_offset=3.0,
-      )
-
-    eta_text = self._format_eta_text(n_go_pos_time)
-    if eta_text:
-      self._draw_text_left_bottom(
-        eta_text, tbt_x + 190, tbt_y + 80, 50, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
-
-    go_dist_text = self._format_go_pos_distance_text(n_go_pos_dist)
-    if go_dist_text:
-      self._draw_text_left_bottom(
-        go_dist_text, tbt_x + 310, tbt_y + 130, 50, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
-
-  def _draw_set_speed_carrot(self, rect: rl.Rectangle) -> None:
-    self._blink_timer = (self._blink_timer + 1) % 16
-    self._disp_timer = (self._disp_timer + 1) % 64
-
-    # C drawHud anchor
-    bx = int(rect.x + 140)
-    by = int(rect.y + rect.height - 230)
-
-    speed_limit_info = self._get_speed_limit_info()
-    self._draw_carrot_main_background(bx, by, speed_limit_info)
-    self._draw_carrot_traffic_light(bx, by)
-    self._draw_carrot_speed_panel(bx, by)
-
-    self._draw_carrot_lower_status(bx, by)
-    self._draw_carrot_speed_limit_box(bx, by, speed_limit_info)
-    self._draw_carrot_device_state(bx, by)
-
-    self._draw_turn_info_hud(rect)
-
+  def _banner_alert_active(self) -> bool:
+    """Small/mid alerts take the top-centre slot from the clock."""
+    try:
+      return int(ui_state.sm['selfdriveState'].alertSize.raw) in (1, 2)
+    except Exception:
+      return False
 
 
 class PlotRenderer:
@@ -1392,12 +1162,13 @@ class PlotRenderer:
     self._plot_queue = [[0.0] * self.PLOT_MAX for _ in range(3)]
     self._plot_min = 0.0
     self._plot_max = 0.0
-    self._plot_x = 350.0
+    self._plot_x = 480.0
     self._plot_width = 1000.0
     self._plot_y = 40.0
     self._plot_height = 300.0
     self._plot_dx = 2.0
     self._show_plot_mode_prev = -1
+    self._type = hs.Type()
 
   def _clear(self):
     self._plot_size = 0
@@ -1578,10 +1349,8 @@ class PlotRenderer:
       prev = pt
 
     if latest_x is not None and latest_y is not None:
-      draw_text_ui_style(
-        f'{latest_value:.2f}', latest_x + 50, latest_y + (40 if index > 0 else 0), 40, color,
-        font=font, border_width=2.0, shadow_offset=4.0, align='center_bottom',
-      )
+      # Latest values stack in a fixed legend column so close traces never overprint.
+      self._type.draw(f'{latest_value:.2f}', latest_x + 18, y_base + 44 + index * 44, 36, color, hs.BOLD, shadow=True)
 
   def draw(self, rect: rl.Rectangle, font, show_plot_mode: int) -> None:
     if show_plot_mode == 0:
@@ -1608,12 +1377,9 @@ class PlotRenderer:
 
     x_base = rect.x + self._plot_x
     y_base = rect.y + self._plot_y
-    colors = [rl.YELLOW, rl.GREEN, rl.Color(255, 165, 0, 255)]
+    colors = [hs.AMBER, hs.GREEN, hs.CARROT]
 
     for i in range(3):
       self._draw_plotting(i, x_base, y_base, colors[i], font)
 
-    draw_text_ui_style(
-      title, x_base + 400, y_base - 20, 25, rl.WHITE,
-      font=font, border_width=2.0, shadow_offset=4.0, align='center_bottom',
-    )
+    self._type.draw(title, x_base, y_base + 6, 32, hs.TEXT_2, hs.SEMI, shadow=True)

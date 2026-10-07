@@ -2,40 +2,53 @@ import time
 import pyray as rl
 from dataclasses import dataclass
 from openpilot.cereal import messaging, log
+from openpilot.selfdrive.ui.onroad import hud_style as hs
 from openpilot.selfdrive.ui.ui_state import ui_state
 from openpilot.system.hardware import TICI
-from openpilot.system.ui.lib.application import gui_app, FontWeight, TextAlignment, TextAlignmentVertical
+from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.multilang import tr
-from openpilot.system.ui.lib.text_measure import measure_text_cached
 from openpilot.system.ui.widgets import Widget
-from openpilot.system.ui.widgets.label import Label
 
 AlertSize = log.SelfdriveState.AlertSize
 AlertStatus = log.SelfdriveState.AlertStatus
 
 ALERT_MARGIN = 40
-ALERT_PADDING = 60
-ALERT_LINE_SPACING = 45
-ALERT_BORDER_RADIUS = 30
-
-ALERT_FONT_SMALL = 66
-ALERT_FONT_MEDIUM = 74
-ALERT_FONT_BIG = 88
+ALERT_BORDER_RADIUS = 40
+# Small/mid alerts are a banner in the top row, between the guidance card and the tyre card.
+BANNER_MAX_W = 960
+BANNER_MIN_W = 640
+BANNER_GAP = 30
+BANNER_TOP = 32
+BANNER_TITLE = 64
+BANNER_TITLE_MIN = 44
+BANNER_SUB = 42
 
 ALERT_HEIGHTS = {
-  AlertSize.small: 271,
-  AlertSize.mid: 420,
+  AlertSize.small: 136,
+  AlertSize.mid: 196,
 }
 
 SELFDRIVE_STATE_TIMEOUT = 5  # Seconds
 SELFDRIVE_UNRESPONSIVE_TIMEOUT = 10  # Seconds
 
-# Constants
-ALERT_COLORS = {
-  AlertStatus.normal: rl.Color(0x15, 0x15, 0x15, 20),      # #151515 with alpha 0xF1 -> 20
-  AlertStatus.userPrompt: rl.Color(0xDA, 0x6F, 0x25, 20),  # #DA6F25 with alpha 0xF1 -> 20
-  AlertStatus.critical: rl.Color(0xC9, 0x22, 0x31, 20),    # #C92231 with alpha 0xF1 -> 20
+# Banner fills: lit gradients in the status colour (neutral uses the card body), and their ink.
+ALERT_FILLS = {
+  AlertStatus.normal: hs.CARD_BODY,
+  AlertStatus.userPrompt: hs.TILE_AMBER,
+  AlertStatus.critical: hs.TILE_RED,
 }
+ALERT_TEXT = {
+  AlertStatus.normal: hs.TEXT,
+  AlertStatus.userPrompt: hs.rgba(26, 18, 4),
+  AlertStatus.critical: hs.TEXT,
+}
+# The full-screen variant keeps deep fills so its large white labels stay readable.
+ALERT_FULL_COLORS = {
+  AlertStatus.normal: (rl.Color(20, 24, 31, 236), rl.Color(8, 10, 14, 242)),
+  AlertStatus.userPrompt: (rl.Color(120, 76, 8, 246), rl.Color(70, 42, 4, 250)),
+  AlertStatus.critical: (rl.Color(160, 20, 28, 246), rl.Color(84, 8, 12, 250)),
+}
+FULL_TEXT = hs.TEXT
 
 
 @dataclass
@@ -74,12 +87,8 @@ class AlertRenderer(Widget):
     super().__init__()
     self.font_regular: rl.Font = gui_app.font(FontWeight.NORMAL)
     self.font_bold: rl.Font = gui_app.font(FontWeight.BOLD)
+    self._type = hs.Type()
 
-    # font size is set dynamically
-    self._full_text1_label = Label("", font_size=0, font_weight=FontWeight.BOLD, text_alignment=TextAlignment.CENTER,
-                                   text_alignment_vertical=TextAlignmentVertical.TOP)
-    self._full_text2_label = Label("", font_size=ALERT_FONT_BIG, text_alignment=TextAlignment.CENTER,
-                                   text_alignment_vertical=TextAlignmentVertical.TOP)
 
   def get_alert(self, sm: messaging.SubMaster) -> Alert | None:
     """Generate the current alert based on selfdrive state."""
@@ -119,60 +128,99 @@ class AlertRenderer(Widget):
     if not alert:
       return
 
-    alert_rect = self._get_alert_rect(rect, alert.size)
-    self._draw_background(alert_rect, alert)
+    if alert.size == AlertSize.full:
+      top, bottom = ALERT_FULL_COLORS.get(alert.status, ALERT_FULL_COLORS[AlertStatus.normal])
+      rl.draw_rectangle_gradient_v(int(rect.x), int(rect.y), int(rect.width), int(rect.height), top, bottom)
+      text_rect = rl.Rectangle(rect.x + 60, rect.y + 60, rect.width - 120, rect.height - 120)
+      self._draw_full_text(text_rect, alert, FULL_TEXT)
+      return
 
-    text_rect = rl.Rectangle(
-      alert_rect.x + ALERT_PADDING,
-      alert_rect.y + ALERT_PADDING,
-      alert_rect.width - 2 * ALERT_PADDING,
-      alert_rect.height - 2 * ALERT_PADDING
-    )
-    self._draw_text(text_rect, alert)
+    banner = self._get_alert_rect(rect, alert.size)
+    fill = ALERT_FILLS.get(alert.status, ALERT_FILLS[AlertStatus.normal])
+    if alert.status == AlertStatus.normal:
+      hs.glass_card(banner.x, banner.y, banner.width, banner.height, ALERT_BORDER_RADIUS)
+    else:
+      hs.soft_shadow(banner.x, banner.y, banner.width, banner.height, ALERT_BORDER_RADIUS)
+      hs.tile(banner.x, banner.y, banner.width, banner.height, ALERT_BORDER_RADIUS, fill, 90)
+    hs.top_boxes.append((banner.x, banner.y, banner.width, banner.height))
+    self._draw_banner_text(banner, alert)
 
   def _get_alert_rect(self, rect: rl.Rectangle, size: int) -> rl.Rectangle:
     if size == AlertSize.full:
       return rect
 
-    h = ALERT_HEIGHTS.get(size, rect.height)
-    return rl.Rectangle(rect.x + ALERT_MARGIN, rect.y + rect.height - h + ALERT_MARGIN,
-                        rect.width - ALERT_MARGIN * 2, h - ALERT_MARGIN * 2)
+    h = ALERT_HEIGHTS.get(size, ALERT_HEIGHTS[AlertSize.mid])
+    left = rect.x + ALERT_MARGIN
+    right = rect.x + rect.width - ALERT_MARGIN
+    guide = hs.zones.get("guide")
+    tpms = hs.zones.get("tpms")
+    if guide is not None:
+      left = guide[0] + guide[2] + BANNER_GAP
+    if tpms is not None:
+      right = tpms[0] - BANNER_GAP
+    w = min(BANNER_MAX_W, right - left)
+    if w < BANNER_MIN_W:
+      # Not enough room between the cards: take the width and let the banner cover them.
+      w = min(BANNER_MAX_W, rect.width - 2 * ALERT_MARGIN)
+      left, right = rect.x + (rect.width - w) / 2, rect.x + (rect.width + w) / 2
+    # Centred on the screen when that fits between the cards, otherwise centred in the gap.
+    x = rect.x + (rect.width - w) / 2
+    x = min(max(x, left), right - w)
+    return rl.Rectangle(x, rect.y + BANNER_TOP, w, h)
 
-  def _draw_background(self, rect: rl.Rectangle, alert: Alert) -> None:
-    color = ALERT_COLORS.get(alert.status, ALERT_COLORS[AlertStatus.normal])
+  def _draw_banner_text(self, rect: rl.Rectangle, alert: Alert) -> None:
+    ink = ALERT_TEXT.get(alert.status, hs.TEXT)
+    max_w = rect.width - 96
+    cx = rect.x + rect.width / 2
+    title = alert.text1 or alert.text2
+    size = float(BANNER_TITLE)
+    while size > BANNER_TITLE_MIN and self._type.width(title, size, hs.BOLD) > max_w:
+      size -= 4
+    title = self._type.ellipsize(title, size, max_w, hs.BOLD)
+    if alert.size == AlertSize.small or not (alert.text1 and alert.text2):
+      self._type.draw_mid(title, cx, rect.y + rect.height / 2, size, ink, hs.BOLD, align=0.5)
+      return
+    sub = self._type.ellipsize(alert.text2, BANNER_SUB, max_w, hs.SEMI)
+    self._type.draw_mid(title, cx, rect.y + 74, size, ink, hs.BOLD, align=0.5)
+    self._type.draw_mid(sub, cx, rect.y + 140, BANNER_SUB, hs.with_alpha(ink, 196), hs.SEMI, align=0.5)
 
-    if alert.size != AlertSize.full:
-      roundness = ALERT_BORDER_RADIUS / (min(rect.width, rect.height) / 2)
-      rl.draw_rectangle_rounded(rect, roundness, 10, color)
-    else:
-      rl.draw_rectangle_rec(rect, color)
+  def _wrap(self, text: str, size: float, weight: FontWeight, max_width: float) -> list[str]:
+    lines: list[str] = []
+    for paragraph in text.split('\n'):
+      line = ""
+      for word in paragraph.split():
+        candidate = f"{line} {word}" if line else word
+        if line and self._type.width(candidate, size, weight) > max_width:
+          lines.append(line)
+          line = word
+        else:
+          line = candidate
+      if line:
+        lines.append(line)
+    return lines
 
-  def _draw_text(self, rect: rl.Rectangle, alert: Alert) -> None:
-    if alert.size == AlertSize.small:
-      self._draw_centered(alert.text1, rect, self.font_bold, ALERT_FONT_MEDIUM)
+  def _draw_full_text(self, rect: rl.Rectangle, alert: Alert, fg: rl.Color) -> None:
+    # One centred block in the HUD typeface; the title shrinks until it fits on two lines.
+    max_width = rect.width - 2 * 160
+    title_size = 150.0
+    lines = self._wrap(alert.text1, title_size, hs.BOLD, max_width)
+    while len(lines) > 2 and title_size > 96:
+      title_size -= 18
+      lines = self._wrap(alert.text1, title_size, hs.BOLD, max_width)
+    sub_size = 76.0
+    sub_lines = self._wrap(alert.text2, sub_size, hs.MEDIUM, max_width) if alert.text2 else []
 
-    elif alert.size == AlertSize.mid:
-      self._draw_centered(alert.text1, rect, self.font_bold, ALERT_FONT_BIG, center_y=False)
-      rect.y += ALERT_FONT_BIG + ALERT_LINE_SPACING
-      self._draw_centered(alert.text2, rect, self.font_regular, ALERT_FONT_SMALL, center_y=False)
+    title_step = title_size * 1.12
+    sub_step = sub_size * 1.3
+    gap = 56.0 if sub_lines else 0.0
+    top = rect.y + (rect.height - (len(lines) * title_step + gap + len(sub_lines) * sub_step)) / 2
 
-    else:
-      is_long = len(alert.text1) > 15
-      font_size1 = 132 if is_long else 177
-
-      top_offset = 200 if is_long or '\n' in alert.text1 else 270
-      title_rect = rl.Rectangle(rect.x, rect.y + top_offset, rect.width, 600)
-      self._full_text1_label.set_font_size(font_size1)
-      self._full_text1_label.set_text(alert.text1)
-      self._full_text1_label.render(title_rect)
-
-      bottom_offset = 361 if is_long else 420
-      subtitle_rect = rl.Rectangle(rect.x, rect.y + rect.height - bottom_offset, rect.width, 300)
-      self._full_text2_label.set_text(alert.text2)
-      self._full_text2_label.render(subtitle_rect)
-
-  def _draw_centered(self, text, rect, font, font_size, center_y=True, color=rl.WHITE) -> None:
-    text_size = measure_text_cached(font, text, font_size)
-    x = rect.x + (rect.width - text_size.x) / 2
-    y = rect.y + ((rect.height - text_size.y) / 2 if center_y else 0)
-    rl.draw_text_ex(font, text, rl.Vector2(x, y), font_size, 0, color)
+    cx = rect.x + rect.width / 2
+    for line in lines:
+      self._type.draw_mid(line, cx, top + title_step / 2, title_size, fg, hs.BOLD, align=0.5)
+      top += title_step
+    top += gap
+    sub_color = hs.with_alpha(fg, 215)
+    for line in sub_lines:
+      self._type.draw_mid(line, cx, top + sub_step / 2, sub_size, sub_color, hs.MEDIUM, align=0.5)
+      top += sub_step
