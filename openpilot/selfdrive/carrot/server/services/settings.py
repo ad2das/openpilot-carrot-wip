@@ -198,11 +198,17 @@ def filter_settings_catalog_for_brand(
     group: [item for item in items if item.get("name") not in hidden_names]
     for group, items in groups.items()
   }
-  non_row_names = {
+  detail_names = {
     str(item.get("name"))
     for items in filtered_groups.values()
     for item in items
-    if item.get("detail_parent") or item.get("search_only")
+    if item.get("detail_parent")
+  }
+  search_only_names = {
+    str(item.get("name"))
+    for items in filtered_groups.values()
+    for item in items
+    if item.get("search_only")
   }
   filtered_groups_list = [
     {
@@ -230,7 +236,7 @@ def filter_settings_catalog_for_brand(
           1
           for section in visible_sections
           for name in section["items"]
-          if name not in non_row_names
+          if name not in detail_names and name not in search_only_names
         )
         if group["count"]:
           visible_groups.append(group)

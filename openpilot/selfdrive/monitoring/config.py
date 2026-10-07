@@ -10,7 +10,7 @@ def disabled_mode(params):
 
 
 def experimental_mode(params):
-  return os.environ.get("CARROT_DM_MODE", str(params.get_int("DriverMonitoringMode"))) == "1"
+  return params.get_int("DriverMonitoringMode") == 1
 
 
 def configure_monitoring(params, environ=None):
@@ -20,6 +20,6 @@ def configure_monitoring(params, environ=None):
     if params.get("CarrotVisionEnabled") is None:
       params.put_bool("CarrotVisionEnabled", params.get_int("DisableDM") == 2)
     params.put_int("DriverMonitoringMode", 0)
-  env["CARROT_DM_MODE"] = "1" if params.get_int("DriverMonitoringMode") == 1 else "0"
+  env.pop("CARROT_DM_MODE", None)  # Retired startup latch must not override live Params.
   mode = params.get_int("DisableDM")
   params.put_int("DisableDMActive", mode if mode in (1, 2) else 0)

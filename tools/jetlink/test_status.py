@@ -10,12 +10,22 @@ from openpilot.common import jetlink_status as status
   ({'backend': 'trt', 'device': 'Orin-sm87'}, 'jetSON'),
   ({'protocol': 2, 'backend': 'ort', 'device': 'coreml-Apple-M1'}, 'MAC'),
   ({'protocol': 2, 'backend': 'ort', 'device': 'ane-Apple_M1_Pro'}, 'MAC'),
+  ({'protocol': 3, 'backend': 'ort', 'device': 'ane-Apple_M4'}, 'MAC'),
   ({'protocol': 2, 'backend': 'ort', 'device': 'coreml-Apple_A17_Pro'}, 'Jetlink'),
   ({'backend': 'trt', 'device': 'RTX-sm89'}, 'Jetlink'),
   ({'carrot_host': 'untrusted text'}, 'Jetlink'), ({'carrot_host': []}, 'Jetlink'), (None, 'Jetlink'),
 ))
 def test_host_identity_compatibility(peer, expected):
   assert status.host_label(peer) == expected
+
+
+def test_phone_label_uses_explicit_transport_not_apple_m_chip_alone():
+  ipad = {'protocol': 3, 'backend': 'ort', 'device': 'ane-whole-Apple_M4'}
+  android = {'protocol': 3, 'backend': 'litert', 'device': 'gpu-Tensor_G4'}
+  assert status.host_label(ipad, 'ios') == 'iOS'
+  assert status.host_label(android, 'android') == 'Android'
+  assert status.host_label(ipad) == 'MAC'
+  assert status.host_label(android) == 'Jetlink'
 
 
 def test_active_ready_and_expired_host_status(tmp_path, monkeypatch):
@@ -43,16 +53,25 @@ def test_remote_badge_disappears_with_expired_snapshot(monkeypatch):
   assert params.external_compute_label() == ''
 
 
-def test_unplugged_optional_host_is_quiet_only_with_current_healthy_native_model(tmp_path, monkeypatch):
+def test_unplugged_optional_host_is_quiet_before_model_start_and_recovers_to_ready(tmp_path, monkeypatch):
   link, model = tmp_path / 'link', tmp_path / 'model'
   monkeypatch.setattr(status, 'LINK_STATUS', link)
   monkeypatch.setattr(status, 'MODEL_STATUS', model)
   monkeypatch.setattr(status.time, 'monotonic', lambda: 20.)
   link.write_text(json.dumps({'updated': 20., 'state': 'waiting', 'peer': {'carrot_host': 'jetson'}}))
-  model.write_text(json.dumps({'updated': 20., 'active': False, 'error': ''}))
   assert status.badge() is None
   assert status.diagnostics()['reason'] == 'Host not connected'
+  for report in ({'updated': 20., 'active': False, 'error': ''},
+                 {'updated': 10., 'active': False}):
+    model.write_text(json.dumps(report))
+    assert status.badge() is None
   for report in ({'updated': 20., 'active': False, 'error': 'inference timeout'},
-                 {'updated': 20., 'active': True}, {'updated': 10., 'active': False}):
+                 {'updated': 20., 'active': True}):
     model.write_text(json.dumps(report))
     assert status.badge() == ('jetSON ERROR', 'error')
+  model.unlink()
+  link.write_text(json.dumps({'updated': 20., 'state': 'ready', 'peer': {'carrot_host': 'jetson'},
+                             'telemetry_updated': 20., 'telemetry': {'carrot_health': {'age_s': 0., 'severity': 'ok'}}}))
+  assert status.badge() == ('jetSON READY', 'ready')
+  monkeypatch.setattr(status.time, 'monotonic', lambda: 24.)
+  assert status.badge() == ('jetSON ERROR', 'error')

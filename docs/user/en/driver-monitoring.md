@@ -1,11 +1,23 @@
 # Driver monitoring
 
-`DriverMonitoringMode` defaults to `0: Standard`; select `1: Experimental` separately. Reboot after changing the mode. The behavior below describes the default configuration with driver monitoring enabled.
+`DriverMonitoringEnabled` defaults to ON and saves your choice across drives and restarts. While monitoring is enabled, `DriverMonitoringMode` defaults to `0: Standard`; select `1: Experimental` separately. Mode changes apply live at roughly half-second intervals without rebooting. Switching preserves accumulated monitoring time, warning counts and lockout, and ends the previous interaction grace and forward-attention streak. Old `DisableDM` values do not opt into experimental monitoring.
 
 Applying a driving-control preset in initial setup saves a reset to standard driver monitoring. The reset takes effect after reboot.
 
 > [!CAUTION]
-> Experimental mode may violate applicable law. Use only for experiments in a controlled test environment. The times below are implementation choices, not statutory allowances or certification. Even mode 0 uses different timing from stock comma when camera monitoring is unavailable.
+> Leave driver monitoring ON. Turning it off removes driver-monitoring alerts, force deceleration, and lockout, and may violate applicable laws or driving requirements depending on where and how the vehicle is used. Experimental mode may also violate applicable law; use it only for experiments in a controlled test environment. The times below are implementation choices, not statutory allowances or certification. Even mode 0 uses different timing from stock comma when camera monitoring is unavailable.
+
+## Enabling and disabling monitoring
+
+`DriverMonitoringEnabled` is on by default and appears only through Carrot Web setting search. Search for `DriverMonitoringEnabled` to find it. The OFF option is intended for an absent or failed DM camera; leaving the default ON unchanged is recommended. With monitoring on, an unavailable camera automatically uses interaction monitoring. Turning the setting off stops use of the driver-monitoring model and policy during normal driving, including interaction monitoring, driver-monitoring alerts, monitoring-triggered force deceleration, and lockout. Driver View may still run the model solely for face preview, while alert, deceleration, and lockout enforcement remains neutral. It does not change the selected `DriverMonitoringMode` or the independent `CarrotVisionEnabled` road-video setting.
+
+File backups, QR backups, restores and setting profiles do not transfer `DriverMonitoringEnabled`. Restoring settings from another device therefore cannot turn monitoring off; a persistent OFF must be selected directly on the current device.
+
+Regardless of gear or speed, including at standstill, three presses of the physical vehicle CANCEL button within three seconds turn driver monitoring off. Gear and speed changes do not reset the count. Each count requires a new press after release. A held button, repeated CAN packets, Bluetooth remote CANCEL, and a vehicle echo of an automatic control CANCEL request do not count. Any received non-CANCEL vehicle-button event, whether a press or release, resets the sequence. Invalid or stale vehicle state, an input-stream gap, or allowing three seconds to pass from the first CANCEL also resets it. On stock-ACC configurations, an automatic speed-button echo may conservatively reset progress because it cannot be distinguished from intervening physical input.
+
+Echo filtering uses a short correlation window immediately after an automatic cancellation request and briefly suppresses its paired release. Hyundai/Kia/Genesis openpilot longitudinal control bypasses this filter because its internal cancellation level can stay high even though that path does not transmit a CANCEL button; the internal level therefore cannot hide the first physical press. On stock longitudinal control and other filtered paths, a physical CANCEL press interleaved with an actual echo may still be ignored, or the following press may need one extra release and press; this favors avoiding an unintended DM shutdown.
+
+The three-CANCEL gesture turns monitoring off only for the current ignition session and does not change the saved `DriverMonitoringEnabled` setting. The next ignition-on or manager/device restart clears only this temporary off state. Monitoring resumes under the saved `DriverMonitoringMode` if `DriverMonitoringEnabled` is ON. If you turned it OFF in Carrot Web, it remains OFF across drives and restarts until you manually turn that setting back ON.
 
 ## Four operating cases
 
@@ -18,11 +30,13 @@ Applying a driving-control preset in initial setup saves a reset to standard dri
 
 Times start from full attention and assume uninterrupted distraction or no response. Do not add the three numbers together. Stock low-speed exemptions below approximately 10 km/h, detection filtering and previous attention debt affect actual warning times. Terminal alerts and lockout are excluded from the resets described below.
 
+Experimental timing and interaction grace below apply outside the 20-second standard hold triggered by traffic appearance.
+
 ## When camera monitoring is available
 
 Mode 0 retains comma face, head-pose, eye-closure, sleep and phone detection, input handling and warnings. Normal forward attention recovers monitoring, so lack of interaction alone does not cause periodic vision warnings. Added vehicle/BT buttons do not reset this mode.
 
-Mode 1 uses twice the stock camera warning times, or four times with empty-road conditions, and widens head-pose tolerance by 20%. Eye-closure, sleep and phone detection probability thresholds remain unchanged, but their warning times are also extended. Additional head-pose tolerance is not applied during orange or terminal alerts.
+Mode 1 uses twice the stock camera warning times, or four times with empty-road conditions, and widens head-pose tolerance by 20%. Eye-closure and sleep detection probability thresholds remain unchanged; the phone threshold is relaxed to 0.98. Warning times for these detections are also extended. Additional head-pose tolerance is not applied during orange or terminal alerts.
 
 Fresh eligible driver or BT input resets monitoring before the terminal stage, including orange alerts. It then **defers camera warnings for 45 seconds, or 90 seconds with empty-road conditions**. The camera warning clock starts after this grace expires. If distraction persists immediately after input and conditions stay constant, the first warning can occur around 45+10=55 seconds later, or 90+20=110 seconds on an empty road. Terminal timing can likewise extend to approximately 71 or 142 seconds.
 
@@ -47,13 +61,17 @@ The additional doubling requires enabled, supported Hyundai/Kia corner radar, he
 
 Moving observations must be within -10 to 150 m longitudinally and 6 m on either side of the path, with **absolute ground speed at least 2 m/s (about 7.2 km/h)**. Equal-speed lead traffic counts; stationary and slow observations are excluded. This does not prove that stopped vehicles or blind spots are absent. Even a single candidate immediately revokes the empty-road bonus; approximately 0.2 seconds of continuous confirmation starts the 20-second hold. This is not complete radar-noise rejection.
 
-New confirmed moving traffic **removes the additional doubling for 20 seconds**. Unavailable-camera mode 1 returns to 15/30/45 seconds; camera mode 1 returns to 10/16/26 with at most 45-second interaction grace. Continuous observation of the same vehicle does not restart the hold, but its presence still prevents the empty-road condition.
+Only the transition from **no moving traffic to approximately 0.2 seconds of confirmed moving traffic starts 20 seconds of standard monitoring**. A healthy camera uses stock 5/8/13-second timing, detection and input handling; an unavailable camera uses 15/30/45-second interaction monitoring. Traffic presence alone does not force a warning while forward attention is normal.
 
-Elapsed time is retained. If traffic appears 50 seconds into a 90-second grace, the new 45-second allowance has expired, so grace ends and camera warning timing starts. An expired grace does not restart merely because the road clears again. Budget expansion alone cannot erase existing orange or terminal warnings.
+Neither continued observation nor additional vehicles extend the hold. Experimental monitoring resumes after 20 seconds, but remaining traffic still prevents the empty-road bonus. All observations must disappear beyond the two-second retention of the last observation before a later moving appearance starts another hold.
+
+Entry ends previous camera interaction grace and the forward-attention streak; BT, button and touch events cannot start experimental grace during the hold. Accumulated monitoring time, warnings and lockout remain; expiry cannot restore old grace or erase orange/terminal alerts. Invalid radar/road context uses standard criteria until healthy information returns.
 
 ## Eligible interactions
 
-Original steering-wheel touch input is supported on Ioniq 5 PE. Contact starts at the lowest reported level, `TOUCH_DETECT=1`; small fluctuations in raw `TOUCH1/2` alone are not treated as contact. Other platforms are not automatically enabled.
+Hyundai/Kia/Genesis CAN-FD platforms process original `STEER_TOUCH_2AF` reception without a vehicle-name whitelist. Message layout, checksum, counter progression and freshness must pass validation; contact starts at the lowest reported level, `TOUCH_DETECT=1`. Small fluctuations in raw `TOUCH1/2`, or CAN address `0x2AF` alone, are not contact evidence.
+
+Signals arriving after initial startup detection are also checked. Missing or invalid signals provide no touch credit. Physical touch behavior on other vehicles has not been validated; existing ADAS transmissions and torque-based steering detection are unchanged.
 
 With camera monitoring unavailable, both modes reset the interaction timer while valid contact continues. Releasing the wheel or losing the signal for more than 0.25 seconds resumes the normal timer. With a healthy camera in mode 1, only a new contact after a valid release starts interaction grace; holding the wheel or reconnecting does not repeatedly renew it. Healthy-camera mode 0 remains stock. Touch does not prove forward attention or wakefulness and cannot clear terminal alerts or lockout.
 
@@ -63,6 +81,20 @@ Vehicle speed buttons are excluded where stock ACC uses automatic speed-button i
 
 ## Terminal warnings and web video
 
-Once a terminal alert is reached, input, forward attention or context changes alone cannot clear it. Existing deceleration requests and lockout remain. This does not introduce guaranteed emergency stopping, and stock ACC cannot be assumed to execute equivalent deceleration.
+While driver monitoring is on, ordinary input, forward attention, and context changes alone cannot clear a terminal alert. Existing deceleration requests and lockout remain while driving. Turning monitoring off with the three-CANCEL sequence blocks the normal-driving model, alerts, monitoring-triggered force deceleration, and lockout together. The Driver View face-preview exception does not change this neutral enforcement state. This feature does not introduce guaranteed emergency stopping, and stock ACC cannot be assumed to execute equivalent deceleration.
 
-`CarrotVisionEnabled` independently controls web road video. Carrot Vision is unavailable while the USB cluster is enabled.
+**One continuous second of valid Park, standstill and disengaged status** resets accumulated warnings and the usage restriction. This exception to stock comma behavior applies in both modes with or without a camera. Engagement remains manual after parking, and monitoring continues.
+
+The vehicle must report zero raw speed, standstill and Park together; only a tiny settling residue in filtered speed is allowed. Zero speed in Drive, Neutral or Reverse, engagement OFF/ON alone, stale or invalid signals, and driver-camera preview cannot release the restriction. Vehicles that do not report Park cannot use this release condition.
+
+`CarrotVisionEnabled` independently controls web road video. Only the video function of old `DisableDM=2` is migrated once; monitoring starts in standard mode. Carrot Vision is unavailable while the USB cluster is enabled.
+
+## Onroad DM display and warning sounds
+
+C4 displays an 84×84 DM inset immediately to the right of the D gear indicator, clear of the right status strip. VISION information sits above it; C3/C3X retain their existing position below the clock.
+
+The inset appears while engaged or with Always On DM enabled, and hides during displayed alerts. An unavailable camera shows a steering-wheel symbol; stale data shows a check state instead of retaining an old face image.
+
+Warnings progress from a silent visual notice to the first audible warning and then the final audible warning. **The first sound has a 70% minimum gain; the final sound always uses 100%.** General/engagement volume settings and ambient-noise attenuation cannot reduce these levels.
+
+This sound policy applies to modes 0 and 1 with camera or interaction monitoring. Navigation and other events sharing the same sound assets retain their existing volume; percentages describe software output gain, not measured speaker sound pressure.

@@ -640,7 +640,7 @@ async function applySettingInlineSearch(query = settingInlineSearchView.getQuery
   CURRENT_SETTING_DETAIL = null;
   const restoreInputFocus = settingInlineSearchView.isFocused();
   showSettingScreen("items", !wasSearching);
-  renderGroups({ animateGroups: false });
+  if (!wasSearching) renderGroups({ animateGroups: false });
   mountSettingInlineSearch("items");
   if (restoreInputFocus) settingInlineSearchView.focus();
   history.replaceState({ page: "setting", screen: "items", group: CURRENT_GROUP, inlineSearchQuery: nextQuery }, "");
@@ -731,6 +731,9 @@ function formatSettingDisplayValue(p, value) {
 function formatSettingRangeMeta(p) {
   if (String(p?.name || "") === "SoundLanguageSetting") {
     return "";
+  }
+  if (p?.options && getDeclaredSettingOptionLabel(p.name, p.default) !== null) {
+    return `${getUIText("default_value", "Default")}: ${formatSettingDisplayValue(p, p.default)}`;
   }
   return [
     `min=${formatSettingDisplayValue(p, p?.min)}`,
@@ -1513,7 +1516,6 @@ function highlightSettingSearchText(text, query) {
 async function selectSettingSearchEntry(entry) {
   try {
     const detailParent = String(entry.detailParent || "");
-    pendingSettingFocus = { group: entry.group, name: entry.name };
     if (entry.source === "profile" && entry.profileId && entry.originalGroup) {
       settingProfileSectionExpandedState.set(`${entry.profileId}:${entry.originalGroup}`, true);
     }
@@ -1524,6 +1526,14 @@ async function selectSettingSearchEntry(entry) {
       await applySettingInlineSearch(entry.name);
       return;
     }
+    if (entry.searchOnly) {
+      // This row is intentionally absent from its normal group. Render the
+      // matching live control in the inline-search virtual group instead.
+      await applySettingInlineSearch(entry.name);
+      focusSettingItem(entry.name);
+      return;
+    }
+    pendingSettingFocus = { group: entry.group, name: entry.name };
     if (CURRENT_GROUP === entry.group && !CURRENT_SETTING_DETAIL && screenItems && screenItems.style.display !== "none") {
       focusSettingItem(entry.name);
       return;
@@ -2335,10 +2345,6 @@ async function renderItems(group, options = {}) {
   const allowHidden = options.allowHidden === true;
   const requestedScrollTop = Number.isFinite(options.scrollTop) ? options.scrollTop : null;
   destroySettingProfileActionMenus();
-  itemsBox.innerHTML = "";
-  delete itemsBox.dataset.renderedGroup;
-  delete itemsBox.dataset.renderedDetail;
-  itemsBox.dataset.renderedSearchQuery = group === SETTING_INLINE_SEARCH_GROUP ? settingInlineSearchQuery : "";
 
   const allEntries = getSettingItemEntriesForGroup(group);
   const detailEntry = detailMode ? getSettingDetailEntry(group, detailName) : null;
@@ -2379,6 +2385,14 @@ async function renderItems(group, options = {}) {
   ) {
     return;
   }
+
+  // Clear only once the fresh values are ready: the inline search re-enters
+  // here on every debounced keystroke, and emptying the list up front made
+  // each keystroke flash like a full refresh.
+  itemsBox.innerHTML = "";
+  delete itemsBox.dataset.renderedGroup;
+  delete itemsBox.dataset.renderedDetail;
+  itemsBox.dataset.renderedSearchQuery = group === SETTING_INLINE_SEARCH_GROUP ? settingInlineSearchQuery : "";
 
   if (!list.length && detailMode) {
     settingViewRuntime.renderEmptyState(itemsBox, {
@@ -2488,6 +2502,7 @@ async function renderItems(group, options = {}) {
     `;
 
     const controlConfig = getSettingControlConfig(p);
+    top.classList.toggle("settingTop--choices", controlConfig.kind === "segmented" && Boolean(p.options));
     const compactNumeric = controlConfig.kind === "slider";
     // The markup comes from the shared component; this file keeps the wiring.
     const control = window.CarrotUI.settingRow.createControl({

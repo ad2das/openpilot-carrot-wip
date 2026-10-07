@@ -17,6 +17,7 @@ from ..services.param_changes import (
 )
 from ..services.params import (
   HAS_PARAMS,
+  INTERNAL_SESSION_PARAMS,
   ParamKeyType,
   build_params_qr_payload,
   clamp_numeric,
@@ -25,6 +26,7 @@ from ..services.params import (
   get_qr_dependency_status,
   parse_params_qr_payload,
   preview_param_restore_values,
+  read_param_backup_values,
   restore_param_values_validated,
   restore_param_values_from_backup,
   set_param_value,
@@ -81,6 +83,8 @@ async def api_param_set(request: web.Request) -> web.Response:
 
   if not name:
     return web.json_response({"ok": False, "error": "missing name"}, status=400)
+  if name in INTERNAL_SESSION_PARAMS:
+    return web.json_response({"ok": False, "error": "driver monitoring is controlled by the vehicle CANCEL gesture"}, status=403)
 
   # clamp using settings if numeric
   p = None
@@ -198,10 +202,19 @@ async def handle_download_params_backup(request: web.Request) -> web.Response:
   if not os.path.exists(path):
     return web.json_response({"ok": False, "error": "file not found"}, status=404)
 
-  return web.FileResponse(
-    path,
-    headers={"Content-Disposition": "attachment; filename=params_backup.json"},
-  )
+  try:
+    values = await asyncio.to_thread(read_param_backup_values, path)
+    return web.json_response(
+      values,
+      headers={
+        "Content-Disposition": "attachment; filename=params_backup.json",
+        "Cache-Control": "no-store",
+      },
+    )
+  except FileNotFoundError:
+    return web.json_response({"ok": False, "error": "file not found"}, status=404)
+  except Exception as e:
+    return web.json_response({"ok": False, "error": str(e)}, status=500)
 
 
 async def api_params_restore(request: web.Request) -> web.Response:

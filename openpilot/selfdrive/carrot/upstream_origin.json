@@ -1,8 +1,8 @@
 {
   "remote": "https://github.com/ajouatom/openpilot.git",
   "branch": "carrot-wip",
-  "commit": "38bc4eeeea136f8f117880a840164b0e1dd1186e",
-  "short_commit": "38bc4eee",
-  "commit_date": "'1790588996 2026-09-28 18:49:56 +0900'",
-  "commit_datetime": "2026-09-28 18:49:56"
+  "commit": "deb9b425fc9264c90f6ef8b81f94574ee9ce220d",
+  "short_commit": "deb9b425",
+  "commit_date": "'1791369971 2026-10-07 19:46:11 +0900'",
+  "commit_datetime": "2026-10-07 19:46:11"
 }

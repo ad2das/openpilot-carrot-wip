@@ -79,13 +79,14 @@ export function createSettingsDerivedModel(options = {}) {
   }
 
   function getFavoriteEntries() {
-    return favorites.map(findItemByName).filter((entry) => entry && !entry.item?.detail_parent);
+    return favorites.map(findItemByName)
+      .filter((entry) => entry && !entry.item?.detail_parent && !entry.item?.search_only);
   }
 
   function getProfileEntries(profile) {
     return Object.keys(profile?.values || {})
       .map(findItemByName)
-      .filter(Boolean)
+      .filter((entry) => entry && !entry.item?.search_only)
       .sort((left, right) => {
         const leftGroup = groupIndex.get(left.group)?.index ?? 9999;
         const rightGroup = groupIndex.get(right.group)?.index ?? 9999;
@@ -269,9 +270,11 @@ export function createSettingsDerivedModel(options = {}) {
       contextGroupLabel,
       contextLabel,
       name: item.name,
-      searchOnly: item.search_only === true,
       title,
       descr,
+      // Search-only controls do not exist in their catalog group's ordinary
+      // row list. Search selection must render them through inline search.
+      searchOnly: item?.search_only === true,
       // Empty for a top-level item; a detail child points at the parent whose
       // detail screen must be open before the child row exists.
       detailParent: parentItem ? String(parentItem.name || "") : "",

@@ -10,6 +10,7 @@ from openpilot.cereal import car, log
 from openpilot.common.params import Params
 from openpilot.common.realtime import config_realtime_process, Priority, Ratekeeper
 from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
+from opendbc.can.native import BACKEND as CAN_BACKEND
 from openpilot.common.swaglog import cloudlog, ForwardingHandler
 
 from opendbc.car import DT_CTRL, structs
@@ -314,6 +315,13 @@ class Car:
       self.params.put_bool_nonblocking("ControlsReady", True)
 
     if self.sm.all_alive(['carControl']):
+      # Guard the final application boundary, including a queued pre-reboot CC.
+      if self.params.get_bool("ImpactDashcamReboot"):
+        CC = CC.as_builder()
+        CC.enabled = CC.latActive = CC.longActive = False
+        CC.actuators = car.CarControl.Actuators.new_message()
+        CC.cruiseControl.resume = CC.cruiseControl.override = False
+        CC.cruiseControl.cancel = CS.cruiseState.enabled
       # send car controls over can
       apply_start_ns = time.monotonic_ns()
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
@@ -396,6 +404,7 @@ class Car:
     self.initialized_prev = initialized
     self.CS_prev = CS
     self.runtime_diagnostics.record(
+      context={'can_backend': CAN_BACKEND},
       work_ms=(time.monotonic_ns() - self.card_diag_recv_ns) / 1e6,
       thread_cpu_ms=(time.thread_time() - cpu_start) * 1000,
       **{f'{name}_ms': value / 1000 for name, value in self.card_diag_stage_current.items()},

@@ -296,6 +296,38 @@ def test_wide_camera_fallback_setting_is_exposed(settings, params):
   assert '{"UseWideCamera", {PERSISTENT, BOOL, "1"}}' in params_keys
 
 
+def test_driver_monitoring_setting_is_default_on_search_only_and_session_state_is_internal(settings, params):
+  by_name = {p["name"]: p for p in params}
+  enabled = by_name["DriverMonitoringEnabled"]
+  assert (enabled["min"], enabled["max"], enabled["default"]) == (0, 1, 1)
+  assert enabled["control"] == "toggle"
+  assert enabled["risk"] == "high"
+  assert enabled["search_only"] is True
+  assert "DM 카메라" in enabled["descr"] and "법규" in enabled["descr"]
+  assert "DM camera" in enabled["edescr"] and "laws" in enabled["edescr"]
+  assert "DriverMonitoringSessionDisabled" not in by_name
+
+  vehicle = next(category for category in settings["menu"] if category["id"] == "VEHICLE")
+  driver_monitoring = next(group for group in vehicle["groups"] if group["id"] == "VEH_DM")
+  assert driver_monitoring["params"][:2] == ["DriverMonitoringEnabled", "DriverMonitoringMode"]
+
+  groups, indexed, _ = group_index(settings)
+  categories = build_menu_categories(settings, indexed)
+  driver_monitoring_view = next(
+    group for category in categories for group in category["groups"] if group["id"] == "VEH_DM"
+  )
+  assert "DriverMonitoringEnabled" in driver_monitoring_view["sections"][0]["items"]
+  assert driver_monitoring_view["count"] == sum(
+    1 for name in driver_monitoring["params"]
+    if not indexed[name].get("detail_parent") and not indexed[name].get("search_only")
+  )
+  assert enabled in groups[enabled["group"]]
+
+  params_keys = PARAMS_KEYS_PATH.read_text(encoding="utf-8")
+  assert '{"DriverMonitoringEnabled", {PERSISTENT, BOOL, "1"}}' in params_keys
+  assert '{"DriverMonitoringSessionDisabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}}' in params_keys
+
+
 def test_vehicle_navi_can_control_exposes_route_filter_modes(settings, params):
   by_name = {p["name"]: p for p in params}
   control = by_name["VehicleNaviCanControl"]
