@@ -7,7 +7,7 @@ instead of the fork, without removing any payload keys.
 
 - repository remote: `https://github.com/ajouatom/openpilot.git`
 - branch: `carrot-wip`
-- commit / commit date: last upstream commit merged by the sync workflow,
+- commit / commit date: last upstream commit merged into the fork,
   stored in `openpilot/selfdrive/carrot/upstream_origin.json`
   (fallback: the hardcoded last-known upstream commit)
 - `DisableDM` and `DisableDMActive`: original default `"0"` while the keys
@@ -27,21 +27,23 @@ The helper is `openpilot/selfdrive/carrot/telemetry_origin.py`.
   `openpilot/selfdrive/carrot/server/features/dashcam/upload.py` —
   diagnostic metadata
 
-Local Params, UI and updater keep the real fork values. The sync workflow
-(`tools/disabledm_sync/sync.py`) refreshes `upstream_origin.json` on every
-upstream merge, so the reported commit stays a real upstream commit.
+Local Params, UI and updater keep the real fork values. Every manual upstream
+merge refreshes `upstream_origin.json`, so the reported commit stays a real
+upstream commit.
 
-## Automatic retention and verification
+## Retention and verification
 
-The fork's existing scheduled workflow retains both the DisableDM and upload
-identity patches through Git merges. Identity and upload regression tests run
-before publication, alongside the existing monitoring/web checks and web build.
-Conflicts or failed checks stop publication and leave the remote branch intact.
+On 2026-10-07 the user removed the fork's automatic upstream sync (the
+`disabledm-sync` workflow and `tools/disabledm_sync`). Upstream merges are now
+manual; each manual merge keeps the DisableDM and upload identity patches,
+refreshes `upstream_origin.json` and runs the identity and upload regression
+tests before publication, alongside the existing monitoring/web checks and web
+build. Conflicts or failed checks stop publication and leave the remote branch
+intact.
 
-The sync integration test uses two consecutive updates in temporary Git
-repositories and executes the real upload identity helper after each merge.
-It verifies retained patches, updated upstream identity, publication only at
-the final step, and no extra commit when the upstream is unchanged.
+The former sync integration test used two consecutive updates in temporary Git
+repositories and executed the real upload identity helper after each merge; it
+was removed with the tooling on 2026-10-07.
 
 Local workflow Python checks: 162 passed, 4 skipped because native params_pyx
 is unavailable. The five focused web test files also passed. Ruff introduced

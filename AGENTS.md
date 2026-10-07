@@ -302,17 +302,17 @@
 - On 2026-09-28, the user requested that server-facing uploads report the
   upstream identity instead of the fork, without removing payload keys:
   repository remote/branch/commit come from upstream_origin.json (refreshed by
-  the sync workflow, last merged upstream commit as fallback), and DisableDM /
+  each upstream merge, last merged upstream commit as fallback), and DisableDM /
   DisableDMActive report the original default 0 while staying in the payloads.
   Scope: settings snapshot, tmux / carrot_logs / Discord payloads,
   toggle_values.json, vision and support diagnostics, dashcam upload metadata.
   Local Params, UI and updater keep the real values. Do not "fix" the reported
   identity and keep every new upload path consistent with it. Desktop tests
   only; no vehicle validation. See docs/telemetry_identity_20260928.md.
-  The user also requested automatic retention of this patch in the fork's
-  scheduled upstream sync. Keep the identity and upload regression tests before
-  publication, refresh upstream_origin.json for every upstream merge, and keep
-  the consecutive-update regression in tools/disabledm_sync/test_sync.py.
+  On 2026-10-07, the user removed the automatic fork sync (workflow and
+  tools/disabledm_sync). Future upstream merges are manual and must still
+  refresh upstream_origin.json and keep the identity and upload regression
+  tests before publication.
 
 - On 2026-09-28, the user authorized automatic Git update/reboot after failed
   builds or manager startup, waiting through network loss. The launcher owns a
