@@ -478,7 +478,8 @@ jobs:
           published=0
           for attempt in 1 2 3 4 5 6; do
             PREV="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha 2>/dev/null || true)"
-            if [ -n "$PREV" ]; then
+            # gh api prints the 404 error JSON to stdout; only accept a SHA.
+            if [[ "$PREV" =~ ^[0-9a-f]{40}$ ]]; then
               BODY="$(jq -n --arg msg "$MSG" --arg tree "$T_FULL" --arg prev "$PREV" \
                 '{message: $msg, tree: $tree, parents: [$prev],
                   author: {name: "ad2das", email: "ad2das@gmail.com"},
