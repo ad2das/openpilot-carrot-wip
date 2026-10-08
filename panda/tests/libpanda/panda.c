@@ -17,6 +17,11 @@ void can_tx_comms_resume_spi(void) { };
 #include "boards/board_declarations.h"
 #include "safety.h"
 #include "main_definitions.h"
+
+// can_set_mode() reads the harness status; the host build has no harness driver
+#include "drivers/harness_declarations.h"
+struct harness_t harness;
+
 #include "drivers/can_common.h"
 
 can_ring *rx_q = &can_rx_q;
