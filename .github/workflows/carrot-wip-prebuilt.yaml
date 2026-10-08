@@ -1,0 +1,464 @@
+# Build the comma 3 / 3X (AGNOS) prebuilt tree for carrot-wip and publish it to
+# the append-only `carrot-wip-prebuilt` branch, so a device that switches to
+# that branch can skip the on-device SCons build after an update.
+#
+# The build runs inside the device's own AGNOS system image (the "system"
+# partition from openpilot/system/hardware/tici/agnos.json) at the device path
+# /data/openpilot, using the same steps as launch_chffrplus.sh:
+#   bootstrap_runtime_dependencies -> scripts/ensure_params_build.sh -> build.py
+# then validates the result, applies the shared release cleanup
+# (scripts/prebuilt_cleanup.sh) and writes the `prebuilt` marker.
+#
+# /AGNOS is hidden inside the build chroot: build.py's device-only power/IRQ
+# setup (Tici.set_power_save) cannot run on a server VM (no Qualcomm CPUs, no
+# devicetree, no i2c amplifier) and does not affect build outputs. SConstruct
+# still sees /TICI, so the tree is built for larch64 exactly like the device.
+#
+# Publishing is append-only: the new commit's parent is the current remote head
+# and the ref update is server-side fast-forward checked (GitHub API
+# force=false). New blobs are seeded through a force-pushed scratch branch in
+# bounded batches so no single push is huge; the real branch only fast-forwards.
+#
+# A push to carrot-wip triggers the workflow; workflow_dispatch is available for
+# manual runs (e.g. from a development branch).
+
+name: carrot-wip prebuilt
+
+# Spike phase: manual dispatch only. The push trigger for carrot-wip is enabled
+# in the follow-up commit once a dispatch run has produced a valid branch.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: carrot-wip-prebuilt
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  AGNOS_IMAGE_URL: https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz
+  AGNOS_IMAGE_SHA256: 077d42186def98025ffad9723774c96f45da10c87cc6fedbc58d0cf4fa65ffd4
+  AGNOS_IMAGE_NAME: system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz
+  PREBUILT_BRANCH: carrot-wip-prebuilt
+  UPLOAD_BRANCH: carrot-wip-prebuilt-upload
+
+jobs:
+  build-prebuilt:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 350
+    steps:
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup /usr/local/share/boost
+          sudo apt-get clean
+          df -h / /mnt 2>/dev/null || df -h /
+
+      - name: Checkout carrot-wip source
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup working directories
+        run: |
+          set -euo pipefail
+          CACHE_ROOT="$RUNNER_TEMP/carrot-prebuilt"
+          mkdir -p "$CACHE_ROOT/agnos-image" "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/params"
+          # Put the multi-gigabyte raw disk image on the filesystem with the
+          # most free space (the ephemeral /mnt when it is larger).
+          WORK_ROOT="$CACHE_ROOT"
+          if [ -d /mnt ] && [ "$(df -Pk --output=avail /mnt | tail -1)" -gt "$(df -Pk --output=avail / | tail -1)" ]; then
+            WORK_ROOT=/mnt/carrot-prebuilt
+          fi
+          sudo mkdir -p "$WORK_ROOT"
+          sudo chown "$(id -u):$(id -g)" "$WORK_ROOT"
+          echo "CACHE_ROOT=$CACHE_ROOT" >> "$GITHUB_ENV"
+          echo "WORK_ROOT=$WORK_ROOT" >> "$GITHUB_ENV"
+          echo "cache root: $CACHE_ROOT"
+          echo "work root:  $WORK_ROOT"
+          df -h / /mnt "$WORK_ROOT" 2>/dev/null || df -h /
+
+      - name: Restore AGNOS system image cache
+        id: agnos-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ runner.temp }}/carrot-prebuilt/agnos-image
+          key: agnos-system-${{ env.AGNOS_IMAGE_SHA256 }}
+          fail-on-cache-miss: false
+
+      - name: Download and verify AGNOS system image
+        run: |
+          set -euo pipefail
+          IMG_DIR="$CACHE_ROOT/agnos-image"
+          IMG="$IMG_DIR/$AGNOS_IMAGE_NAME"
+          mkdir -p "$IMG_DIR"
+          if [ ! -f "$IMG" ] || ! echo "$AGNOS_IMAGE_SHA256  $IMG" | sha256sum -c - >/dev/null 2>&1; then
+            echo "downloading $AGNOS_IMAGE_URL"
+            curl -fL --retry 4 --retry-delay 5 --retry-all-errors -o "$IMG.part" "$AGNOS_IMAGE_URL"
+            mv -f "$IMG.part" "$IMG"
+          else
+            echo "using cached image"
+          fi
+          echo "$AGNOS_IMAGE_SHA256  $IMG" | sha256sum -c -
+          ls -l "$IMG"
+
+      - name: Save AGNOS system image cache
+        if: steps.agnos-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ runner.temp }}/carrot-prebuilt/agnos-image
+          key: agnos-system-${{ env.AGNOS_IMAGE_SHA256 }}
+
+      - name: Restore SCons cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/carrot-prebuilt/scons_cache
+          key: scons-cache-v1-${{ github.run_id }}
+          restore-keys: |
+            scons-cache-v1-
+
+      - name: Convert AGNOS sparse image to raw
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+            sudo apt-get update -qq && break
+            sleep 5
+          done
+          sudo apt-get install -y -qq android-sdk-libsparse-utils
+          sudo file -s "$CACHE_ROOT/agnos-image/$AGNOS_IMAGE_NAME"
+
+          RAW_DIR="$WORK_ROOT/agnos-raw"
+          mkdir -p "$RAW_DIR"
+          cd "$RAW_DIR"
+          xz -dc "$CACHE_ROOT/agnos-image/$AGNOS_IMAGE_NAME" > system.sparse.img
+          ls -l system.sparse.img
+          simg2img system.sparse.img system.raw.img
+          rm -f system.sparse.img
+          ls -l system.raw.img
+          sudo file -s system.raw.img
+          df -h "$WORK_ROOT" "$RUNNER_TEMP"
+
+      - name: Mount AGNOS rootfs and set up chroot
+        run: |
+          set -euo pipefail
+          AGNOS_ROOT=/mnt/agnos
+          LOWER=/mnt/agnos-lower
+          RAW_IMG="$WORK_ROOT/agnos-raw/system.raw.img"
+
+          sudo mkdir -p "$AGNOS_ROOT" "$LOWER"
+          sudo mount -o loop,ro "$RAW_IMG" "$LOWER"
+          echo "--- image rootfs ---"
+          ls "$LOWER" | head -40
+
+          sudo mkdir -p "$WORK_ROOT/upper" "$WORK_ROOT/work"
+          sudo mount -t overlay overlay \
+            -o "lowerdir=$LOWER,upperdir=$WORK_ROOT/upper,workdir=$WORK_ROOT/work" \
+            "$AGNOS_ROOT"
+          echo "--- merged rootfs ---"
+          ls "$AGNOS_ROOT" | head -40
+
+          test -f "$AGNOS_ROOT/TICI" || { echo "::error::AGNOS image has no /TICI; refusing to build for the wrong target"; exit 1; }
+          if [ -f "$AGNOS_ROOT/AGNOS" ]; then
+            # Hide the device marker for the build; see the header comment.
+            sudo rm -f "$AGNOS_ROOT/AGNOS"
+            echo "hid /AGNOS for the build chroot"
+          fi
+
+          sudo mount --rbind /dev "$AGNOS_ROOT/dev"
+          sudo mount -t proc proc "$AGNOS_ROOT/proc"
+          sudo mount -t sysfs sysfs "$AGNOS_ROOT/sys"
+          sudo rm -f "$AGNOS_ROOT/etc/resolv.conf"
+          sudo cp /etc/resolv.conf "$AGNOS_ROOT/etc/resolv.conf"
+
+          sudo mkdir -p "$AGNOS_ROOT/data/openpilot" "$AGNOS_ROOT/data/params" "$AGNOS_ROOT/data/scons_cache"
+          sudo mount --bind "$GITHUB_WORKSPACE" "$AGNOS_ROOT/data/openpilot"
+          sudo mount --bind "$CACHE_ROOT/scons_cache" "$AGNOS_ROOT/data/scons_cache"
+          mkdir -p "$CACHE_ROOT/params"
+          sudo mount --bind "$CACHE_ROOT/params" "$AGNOS_ROOT/data/params"
+
+          mount | grep -E 'agnos' || true
+
+      - name: Build inside the AGNOS chroot
+        run: |
+          set -euo pipefail
+          sudo tee /mnt/agnos/tmp/ci_build.sh >/dev/null <<'CHROOT_BUILD_EOF'
+          #!/bin/bash
+          set -Eeuo pipefail
+          export HOME=/root
+          export CI=1
+          cd /data/openpilot
+          export PYDEPS=/data/openpilot/pydeps
+          export PYTHONPATH="$PYDEPS:/data/openpilot"
+          mkdir -p "$PYDEPS"
+
+          echo "=== AGNOS chroot environment ==="
+          uname -m
+          cat /VERSION 2>/dev/null || true
+          python3 --version
+          command -v python3 || true
+          command -v pip3 || true
+          command -v uv || true
+          df -h / /data
+
+          # The device launcher resolves scons from its PATH; if the default
+          # chroot PATH lacks it, fall back to the image's usual locations.
+          if ! command -v scons >/dev/null 2>&1; then
+            for d in /usr/local/bin /usr/bin /usr/local/sbin /usr/local/venv/bin; do
+              if [ -x "$d/scons" ]; then export PATH="$d:$PATH"; break; fi
+            done
+          fi
+          if ! command -v scons >/dev/null 2>&1; then
+            echo "::error::scons is not available inside the AGNOS image"
+            exit 1
+          fi
+          echo "scons: $(command -v scons)"
+          scons --version
+
+          source /data/openpilot/launch_env.sh
+          source /data/openpilot/launch_chffrplus.sh
+
+          echo "=== bootstrap_runtime_dependencies ==="
+          bootstrap_runtime_dependencies
+
+          echo "=== scripts/ensure_params_build.sh ==="
+          bash /data/openpilot/scripts/ensure_params_build.sh
+
+          echo "=== openpilot/system/manager/build.py ==="
+          cd /data/openpilot/openpilot/system/manager
+          python3 build.py
+
+          echo "=== build finished ==="
+          df -h / /data
+          du -sh /data/openpilot /data/scons_cache 2>/dev/null || true
+          CHROOT_BUILD_EOF
+          sudo chmod +x /mnt/agnos/tmp/ci_build.sh
+          sudo chroot /mnt/agnos /bin/bash /tmp/ci_build.sh
+
+      - name: Validate the built tree inside the chroot
+        run: |
+          set -euo pipefail
+          sudo tee /mnt/agnos/tmp/ci_validate.sh >/dev/null <<'CHROOT_VALIDATE_EOF'
+          #!/bin/bash
+          set -Eeuo pipefail
+          export HOME=/root
+          cd /data/openpilot
+          export PYDEPS=/data/openpilot/pydeps
+          export PYTHONPATH="$PYDEPS:/data/openpilot"
+
+          echo "=== params_check.py ==="
+          python3 openpilot/system/manager/params_check.py
+
+          echo "=== native binaries ==="
+          for b in openpilot/system/loggerd/loggerd openpilot/system/loggerd/encoderd openpilot/system/camerad/camerad; do
+            test -x "$b" || { echo "::error::missing or non-executable: $b"; exit 1; }
+            echo "ok: $b ($(stat -c '%s' "$b") bytes)"
+          done
+
+          echo "=== python imports of built modules ==="
+          python3 - <<'PY'
+          from openpilot.common.params import Params
+          keys = Params().all_keys()
+          assert len(keys) > 100, len(keys)
+          import openpilot.cereal.messaging as messaging
+          messaging.new_message('deviceState')
+          print('python imports OK:', len(keys), 'params keys')
+          PY
+
+          echo "=== ldd scan for unresolved libraries ==="
+          scan_fail=0
+          elf_count=0
+          while IFS= read -r -d '' f; do
+            magic="$(head -c 4 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+            [ "$magic" = "7f454c46" ] || continue
+            elf_count=$((elf_count + 1))
+            out="$(ldd "$f" 2>&1 || true)"
+            if printf '%s' "$out" | grep -q 'not found'; then
+              echo "MISSING LIBS: $f"
+              printf '%s\n' "$out" | grep 'not found'
+              scan_fail=1
+            fi
+          done < <(find . -path ./.git -prune -o -type f -print0)
+          echo "scanned $elf_count ELF files"
+          [ "$scan_fail" = 0 ] || { echo "::error::ldd found unresolved libraries"; exit 1; }
+
+          echo "=== release shell tests ==="
+          bash release/tests/test_build_carrot.sh
+          bash release/tests/test_prebuilt_cleanup.sh
+
+          echo "=== hardware-free pytest suites ==="
+          if ! python3 -m pytest --version >/dev/null 2>&1; then
+            installed=0
+            if python3 -m pip --version >/dev/null 2>&1; then
+              python3 -m pip install --disable-pip-version-check --no-input --timeout 30 --retries 3 --target /tmp/pytestdeps pytest && installed=1
+            elif command -v uv >/dev/null 2>&1; then
+              uv pip install --python "$(command -v python3)" --target /tmp/pytestdeps pytest && installed=1
+            elif python3 -m ensurepip --upgrade >/dev/null 2>&1 && python3 -m pip --version >/dev/null 2>&1; then
+              python3 -m pip install --disable-pip-version-check --no-input --timeout 30 --retries 3 --target /tmp/pytestdeps pytest && installed=1
+            fi
+            [ "$installed" = 1 ] || { echo "::error::pytest could not be installed inside the chroot"; exit 1; }
+          fi
+          export PYTHONPATH="/tmp/pytestdeps:$PYTHONPATH"
+          python3 -m pytest -o addopts='' -q -c /dev/null --rootdir=/data/openpilot \
+            openpilot/system/tests/test_launch_order.py \
+            openpilot/system/tests/test_model_build_cache.py \
+            openpilot/system/tests/test_c3_agnos_manifest.py \
+            openpilot/common/tests/test_repo_update.py
+          CHROOT_VALIDATE_EOF
+          sudo chmod +x /mnt/agnos/tmp/ci_validate.sh
+          sudo chroot /mnt/agnos /bin/bash /tmp/ci_validate.sh
+
+      - name: Fix cache ownership
+        run: |
+          set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" "$CACHE_ROOT" "$WORK_ROOT" 2>/dev/null || true
+          du -sh "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/agnos-image" 2>/dev/null || true
+
+      - name: Clean the tree with the shared release rules
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          echo "--- before cleanup ---"
+          du -sh . 2>/dev/null || true
+          bash scripts/prebuilt_cleanup.sh "$GITHUB_WORKSPACE"
+          echo "--- after cleanup ---"
+          du -sh . 2>/dev/null || true
+          echo "changed/untracked entries:"
+          git status --porcelain | wc -l
+
+      - name: Publish append-only to carrot-wip-prebuilt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+
+          SRC_SHA="$(git rev-parse HEAD)"
+          echo "source commit: $SRC_SHA"
+
+          # The workflow GITHUB_TOKEN may not push commits that create or update
+          # .github/workflows files, and a device tree has no use for them.
+          # Drop them from the published tree (they remain on the source branch).
+          rm -rf "$GITHUB_WORKSPACE/.github/workflows"
+
+          export GIT_AUTHOR_NAME=ad2das GIT_AUTHOR_EMAIL=ad2das@gmail.com
+          export GIT_COMMITTER_NAME=ad2das GIT_COMMITTER_EMAIL=ad2das@gmail.com
+
+          # Seed the new blobs through a force-pushable scratch branch in
+          # bounded batches; carrot-wip-prebuilt itself only fast-forwards.
+          export GIT_INDEX_FILE="$RUNNER_TEMP/prebuilt-publish.index"
+          rm -f "$GIT_INDEX_FILE"
+          git read-tree "$SRC_SHA"
+
+          BATCH_BYTES=$((32 * 1024 * 1024))
+          batch_paths=()
+          batch_bytes=0
+          batch_index=0
+
+          push_scratch() {
+            git push --quiet --force origin "$1:refs/heads/$UPLOAD_BRANCH"
+          }
+
+          mapfile -d '' -t ALL_PATHS < <(
+            {
+              git diff --name-only -z
+              git ls-files --others -z
+            } | sort -zu
+          )
+          echo "changed/untracked entries: ${#ALL_PATHS[@]}"
+
+          for path in "${ALL_PATHS[@]}"; do
+            size=0
+            if [ -e "$path" ] || [ -L "$path" ]; then
+              size="$(stat -c '%s' -- "$path")"
+            fi
+            if [ "${#batch_paths[@]}" -gt 0 ] && [ $((batch_bytes + size)) -gt "$BATCH_BYTES" ]; then
+              git add -f -A -- "${batch_paths[@]}"
+              tree="$(git write-tree)"
+              batch_index=$((batch_index + 1))
+              commit="$(git commit-tree "$tree" -p "$SRC_SHA" -m "prebuilt upload batch $batch_index")"
+              push_scratch "$commit"
+              echo "batch $batch_index pushed"
+              batch_paths=()
+              batch_bytes=0
+            fi
+            batch_paths+=("$path")
+            batch_bytes=$((batch_bytes + size))
+          done
+          if [ "${#batch_paths[@]}" -gt 0 ]; then
+            git add -f -A -- "${batch_paths[@]}"
+            tree="$(git write-tree)"
+            batch_index=$((batch_index + 1))
+            commit="$(git commit-tree "$tree" -p "$SRC_SHA" -m "prebuilt upload batch $batch_index")"
+            push_scratch "$commit"
+            echo "batch $batch_index pushed"
+          fi
+
+          # Final full stage (catches files created while batching).
+          git add -f -A
+          T_FULL="$(git write-tree)"
+          C_FULL="$(git commit-tree "$T_FULL" -p "$SRC_SHA" -m "prebuilt upload complete")"
+          push_scratch "$C_FULL"
+          echo "tree $T_FULL seeded"
+
+          TREE_BYTES="$(git ls-tree -r -l "$T_FULL" | awk '{s += $4} END {print s + 0}')"
+          TREE_FILES="$(git ls-tree -r "$T_FULL" | wc -l)"
+          echo "published tree: $TREE_FILES files, $TREE_BYTES bytes of blobs"
+
+          MSG="prebuilt build of $SRC_SHA
+
+          Source-Commit: $SRC_SHA
+          Workflow-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
+          Workflow-Ref: ${GITHUB_REF}
+          Tree-Bytes: $TREE_BYTES
+
+          Docs-Not-Needed: CI-generated device build artifacts for the append-only carrot-wip-prebuilt branch; the source commits carry their own documentation.
+          Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+
+          published=0
+          for attempt in 1 2 3 4 5 6; do
+            PREV="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha 2>/dev/null || true)"
+            if [ -n "$PREV" ]; then
+              BODY="$(jq -n --arg msg "$MSG" --arg tree "$T_FULL" --arg prev "$PREV" \
+                '{message: $msg, tree: $tree, parents: [$prev],
+                  author: {name: "ad2das", email: "ad2das@gmail.com"},
+                  committer: {name: "ad2das", email: "ad2das@gmail.com"}}')"
+              NEW="$(printf '%s' "$BODY" | gh api --method POST "repos/${GITHUB_REPOSITORY}/git/commits" --input - --jq .sha)"
+              if gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${PREBUILT_BRANCH}" \
+                   -f "sha=$NEW" -F force=false >/dev/null 2>&1; then
+                echo "carrot-wip-prebuilt: $PREV -> $NEW (fast-forward)"
+                published=1
+                break
+              fi
+              echo "ref update rejected (a newer head appeared); retrying"
+            else
+              BODY="$(jq -n --arg msg "$MSG" --arg tree "$T_FULL" \
+                '{message: $msg, tree: $tree,
+                  author: {name: "ad2das", email: "ad2das@gmail.com"},
+                  committer: {name: "ad2das", email: "ad2das@gmail.com"}}')"
+              NEW="$(printf '%s' "$BODY" | gh api --method POST "repos/${GITHUB_REPOSITORY}/git/commits" --input - --jq .sha)"
+              if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
+                   -f "ref=refs/heads/${PREBUILT_BRANCH}" -f "sha=$NEW" >/dev/null 2>&1; then
+                echo "carrot-wip-prebuilt created at $NEW"
+                published=1
+                break
+              fi
+              echo "branch creation raced; retrying"
+            fi
+            sleep 3
+          done
+          [ "$published" = 1 ] || { echo "::error::failed to publish $PREBUILT_BRANCH"; exit 1; }
+
+          HEAD_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
+          [ "$HEAD_SHA" = "$NEW" ] || { echo "::error::published ref does not match"; exit 1; }
+          echo "carrot-wip-prebuilt head: $HEAD_SHA"
+
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq '"branch head: " + .object.sha' 2>/dev/null || echo "no prebuilt branch yet"
+          df -h / /mnt 2>/dev/null || df -h /

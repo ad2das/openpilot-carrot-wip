@@ -316,14 +316,11 @@ BUILD_BRANCH="release-build/${VERSION}-$(date +%s)-$$"
 git switch -c "$BUILD_BRANCH" "$SOURCE_COMMIT"
 
 log "Cleaning build-only files"
-find . -type f \( -name '*.a' -o -name '*.o' -o -name '*.os' -o -name '*.pyc' -o -name 'moc_*' \) -delete
-find . -type d -name '__pycache__' -prune -exec rm -rf -- {} +
-rm -rf -- .sconsign.dblite Jenkinsfile release/
-rm -f -- openpilot/selfdrive/modeld/models/*.onnx
-touch prebuilt
-
-BIG_FILES="$(find . -type f -not -path './.git/*' -size +95M -print)"
-[[ -z "$BIG_FILES" ]] || die "files exceeding the GitHub size limit were found:\n$BIG_FILES"
+# Shared with the carrot-wip-prebuilt CI workflow so the cleanup and size
+# rules never diverge between device releases and CI builds.
+if ! bash "$SOURCE_DIR/scripts/prebuilt_cleanup.sh" "$SOURCE_DIR"; then
+  die "prebuilt tree cleanup failed"
+fi
 
 REMOTE_SHA="$PREFLIGHT_SHA"
 

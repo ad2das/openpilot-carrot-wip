@@ -23,6 +23,10 @@ git -C "$SOURCE_DIR" add README .gitignore
 git -C "$SOURCE_DIR" commit -m base >/dev/null
 BASE_SHA="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
 
+# build_carrot.sh now applies the shared prebuilt cleanup script.
+mkdir -p "$SOURCE_DIR/scripts"
+cp "$SCRIPT_DIR/../scripts/prebuilt_cleanup.sh" "$SOURCE_DIR/scripts/prebuilt_cleanup.sh"
+
 git -c init.templateDir= init --bare "$REMOTE_DIR" >/dev/null
 git -C "$SOURCE_DIR" remote add origin "$REMOTE_DIR"
 git -C "$SOURCE_DIR" push origin HEAD:refs/heads/main >/dev/null
