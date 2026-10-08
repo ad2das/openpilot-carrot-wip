@@ -309,6 +309,13 @@ jobs:
           PY
 
           echo "=== ldd scan for unresolved libraries ==="
+          # pydeps holds installed wheels whose auditwheel-renamed bundles are
+          # resolved by their package's own loader setup (and their imports are
+          # already checked by bootstrap). Scan the build's own ELF outputs and
+          # give the loader the MPC generated-code dirs like the acados runtime
+          # package does on the device.
+          mpc_dirs="$(find . -type d -name c_generated_code -print | tr '\n' ':')"
+          export LD_LIBRARY_PATH="${mpc_dirs}${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           scan_fail=0
           elf_count=0
           while IFS= read -r -d '' f; do
@@ -321,8 +328,8 @@ jobs:
               printf '%s\n' "$out" | grep 'not found'
               scan_fail=1
             fi
-          done < <(find . -path ./.git -prune -o -type f -print0)
-          echo "scanned $elf_count ELF files"
+          done < <(find . -path ./.git -prune -o -path ./pydeps -prune -o -type f -print0)
+          echo "scanned $elf_count ELF files (pydeps excluded)"
           [ "$scan_fail" = 0 ] || { echo "::error::ldd found unresolved libraries"; exit 1; }
 
           echo "=== release shell tests ==="
