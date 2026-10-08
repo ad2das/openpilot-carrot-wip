@@ -525,3 +525,49 @@ def test_lead_run_width_trend_slot_is_independent_of_digit_shapes():
 
   assert renderer._lead_run_width(narrow, slot=True) == renderer._lead_run_width(wide, slot=True)
   assert renderer._lead_run_width(narrow) != renderer._lead_run_width(wide)
+
+
+def speed_tag_renderer():
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._float_boxes = []
+  renderer._type = SimpleNamespace(
+    width=lambda text, size, weight: 10.0,
+    draw_mid=lambda *args, **kwargs: None,
+  )
+  return renderer
+
+
+def test_speed_tag_drops_when_label_lands_beyond_reach(monkeypatch):
+  renderer = speed_tag_renderer()
+  placed = []
+  monkeypatch.setattr(
+    model_renderer.hs,
+    "place_label",
+    lambda x, y, w, h, claimed, gap=0.0: placed.append((x, y, w, h)) or (x + 300.0, y),
+  )
+  monkeypatch.setattr(model_renderer.hs, "chip", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "triangle", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
+
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+
+  assert result is None
+  assert renderer._float_boxes == []
+  assert len(placed) == 1
+
+
+def test_speed_tag_keeps_label_within_reach(monkeypatch):
+  renderer = speed_tag_renderer()
+  spot = (960.0 + 120.0, 501.0)
+  monkeypatch.setattr(model_renderer.hs, "place_label", lambda *args, **kwargs: spot)
+  monkeypatch.setattr(model_renderer.hs, "chip", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "triangle", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
+
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+
+  assert result is not None
+  assert result[:2] == spot
+  assert len(renderer._float_boxes) == 1

@@ -29,7 +29,7 @@ BORDER_COLORS = {
 }
 BLINKER_OFF = rl.Color(10, 12, 16, 255)
 BORDER_CORNER_RADIUS = 36.0
-BORDER_TEXT = rl.Color(255, 255, 255, 225)
+BORDER_TEXT = rl.Color(255, 255, 255, 170)  # debug read-outs in the band: legible, never louder than the HUD
 
 WIDE_CAM_MAX_SPEED = 10.0  # m/s (22 mph)
 ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
@@ -493,7 +493,7 @@ class AugmentedRoadView(CameraView):
                                        (bottom, x + w / 2.0, bottom_baseline, 0.5),
                                        (bottom_left, x + text_margin, bottom_baseline, 0.0),
                                        (bottom_right, x + w - text_margin, bottom_baseline, 1.0)):
-      text.draw(value, tx, baseline, font_size, BORDER_TEXT, hs.BOLD, align=align)
+      text.draw(value, tx, baseline, font_size, BORDER_TEXT, hs.SEMI, align=align)
 
 if __name__ == "__main__":
   gui_app.init_window("OnRoad Camera View")

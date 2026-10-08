@@ -60,8 +60,8 @@ LEAD_AMBER = rl.Color(255, 159, 10, 255)
 LEAD_SIZE = 58
 LEAD_SIZE_2 = 40
 LEAD_UNIT_SIZE = 36
-LEAD_BADGE_SIZE = 36
-LEAD_BADGE_H = 50.0
+LEAD_BADGE_SIZE = 42
+LEAD_BADGE_H = 56.0
 LEAD_BADGE_PAD = 14.0
 LEAD_STATE_SIZE = 48
 LEAD_CAPSULE_H = 86.0
@@ -743,7 +743,7 @@ class ModelRenderer(Widget):
     self._carrot_depth_top = float(carpet[:, 1].min())
 
     rgb = BRAKE_RGB if brake_valid else PATH_PALETTE[color_idx % 10]
-    near = 130 if mode == 0 else (84 if 9 <= mode <= 12 else 56)
+    near = 104 if mode == 0 else (58 if 9 <= mode <= 12 else 44)
     if not brake_valid and color_idx % 10 == 9:
       rgb, near = (255, 255, 255), 44 if mode else 70
     colors = [rl.Color(*rgb, near), rl.Color(*rgb, near * 2 // 5), rl.Color(*rgb, 0)]
@@ -1452,6 +1452,8 @@ class ModelRenderer(Widget):
         return True
     return False
 
+  TAG_DROP_REACH = 160.0  # px beyond which a tag would point across the road, so it is not drawn
+
   def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", trend: int, d_rel: float):
     """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
 
@@ -1465,7 +1467,9 @@ class ModelRenderer(Widget):
     w = max(h * 1.6, inner + h * 0.8)
     tail = 10.0
     spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
-    if spot is None:
+    if spot is None or abs(spot[0] - x) - w / 2 > self.TAG_DROP_REACH:
+      # No room near this car (it hides behind the lead readout or another tag): a leader drawn across
+      # the road would point at the wrong car, so this tag stays out.
       return None
     tx, mid = spot
     left, bottom = tx - w / 2, mid + h / 2
