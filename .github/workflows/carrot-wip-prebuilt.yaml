@@ -369,7 +369,9 @@ jobs:
       - name: Fix cache ownership
         run: |
           set -euo pipefail
-          sudo chown -R "$(id -u):$(id -g)" "$CACHE_ROOT" "$WORK_ROOT" 2>/dev/null || true
+          # The chroot runs as root, so give the workspace and caches back to
+          # the runner user before the host-side cleanup and publish steps.
+          sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CACHE_ROOT" "$WORK_ROOT" 2>/dev/null || true
           du -sh "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/agnos-image" 2>/dev/null || true
 
       - name: Clean the tree with the shared release rules
