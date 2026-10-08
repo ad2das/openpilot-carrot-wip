@@ -108,11 +108,13 @@ def hud_module(monkeypatch):
       gui_app=gui_app,
       GL_VERSION=3,
       FontWeight=SimpleNamespace(SEMI_BOLD=1, BOLD=2, MEDIUM=3, DISPLAY=4),
+      FONT_DIR=Path("openpilot/system/assets/fonts"),
     ),
     "openpilot.system.ui.lib.multilang": SimpleNamespace(tr=lambda text: text),
     "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
       draw_polygon=lambda *args, **kwargs: None,
       draw_polygon_solid=lambda *args, **kwargs: None,
+      draw_polygons=lambda *args, **kwargs: None,
       Gradient=Gradient,
     ),
     "openpilot.system.ui.lib.text_measure": SimpleNamespace(

@@ -106,6 +106,39 @@ def test_gradient_polygon_keeps_custom_shader_path(shader_polygon_module, monkey
   assert calls[4] == "end"
 
 
+def test_batched_gradient_polygons_share_one_shader_pass(shader_polygon_module, monkeypatch):
+  module = shader_polygon_module
+  rect = module.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
+  first = np.array([[1.0, 10.0], [2.0, 5.0], [8.0, 5.0], [9.0, 10.0]], dtype=np.float32)
+  second = np.array([[11.0, 20.0], [12.0, 15.0], [18.0, 15.0], [19.0, 20.0]], dtype=np.float32)
+  tint = module.rl.Color(255, 255, 255, 46)
+  gradient = module.Gradient(
+    start=(0.0, 1.0),
+    end=(0.0, 0.0),
+    colors=[module.rl.Color(255, 0, 0, 31), module.rl.Color(0, 255, 0, 230)],
+    stops=[0.0, 0.78],
+  )
+  calls = []
+  state = SimpleNamespace(shader="gradient-shader", initialize=lambda: calls.append("initialize"))
+
+  monkeypatch.setattr(module.ShaderState, "get_instance", classmethod(lambda cls: state))
+  monkeypatch.setattr(module, "_configure_shader_color", lambda *args: calls.append("configure"))
+  monkeypatch.setattr(module.rl, "begin_shader_mode", lambda shader: calls.append(("begin", shader)), raising=False)
+  monkeypatch.setattr(module.rl, "draw_triangle_strip", lambda *args: calls.append(("draw", args)), raising=False)
+  monkeypatch.setattr(module.rl, "end_shader_mode", lambda: calls.append("end"), raising=False)
+
+  # A too-short ribbon is dropped instead of drawing a degenerate strip.
+  module.draw_polygons(rect, [(first, tint), (np.ones((2, 2), dtype=np.float32), tint), (second, tint)], gradient)
+
+  assert calls[0:3] == ["initialize", "configure", ("begin", "gradient-shader")]
+  assert calls[-1] == "end"
+  draws = [call for call in calls if isinstance(call, tuple) and call[0] == "draw"]
+  assert len(draws) == 2
+  assert draws[0][1][0] == module.triangulate(first)
+  assert draws[1][1][0] == module.triangulate(second)
+  assert all(draw[1][2] is tint for draw in draws)
+
+
 @pytest.mark.parametrize(
   "color, gradient",
   [

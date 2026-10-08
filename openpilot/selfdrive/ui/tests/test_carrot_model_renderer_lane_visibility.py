@@ -137,11 +137,13 @@ def model_renderer_module(monkeypatch):
       gui_app=SimpleNamespace(target_fps=20, width=2160, height=1080, font=lambda _weight: Font(),
                               has_font=lambda _weight: False),
       FontWeight=SimpleNamespace(NORMAL=0, MEDIUM=1, BOLD=2, SEMI_BOLD=3, DISPLAY=4),
+      FONT_DIR=Path("openpilot/system/assets/fonts"),
     ),
     "openpilot.system.ui.lib.text_draw": SimpleNamespace(draw_text_ui_style=lambda *args, **kwargs: None),
     "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
       draw_polygon=lambda *args, **kwargs: None,
       draw_polygon_solid=lambda *args, **kwargs: None,
+      draw_polygons=lambda *args, **kwargs: None,
       Gradient=Gradient,
     ),
     "openpilot.system.ui.widgets": SimpleNamespace(Widget=Widget),
@@ -294,20 +296,25 @@ def test_mode9_complex_path_draws_lane_rails_and_chevrons(model_renderer_module,
   renderer._rect = module.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
 
   gradients = []
-  monkeypatch.setattr(module.hs, "vertical_gradient",
-                      lambda ribbon, y0, y1, colors, stops: gradients.append((ribbon, y0, y1, colors, stops)))
+  monkeypatch.setattr(module.hs, "vertical_gradients",
+                      lambda ribbons, y0, y1, colors, stops: gradients.append((ribbons, y0, y1, colors, stops)))
   chevrons = []
   monkeypatch.setattr(module.hs, "polyline", lambda points, width, color: chevrons.append((points, width, color)))
 
   renderer._draw_complex_path_carrot(color_idx=20, brake_valid=False)
 
-  # Three rail strokes per side: wide faint, medium, narrow bright.
-  assert len(gradients) == 6
-  assert [gradient[3][0].a for gradient in gradients[:3]] == [5, 10, 30]
-  assert all(tuple(gradient[4]) == (0.0, 0.78, 1.0) for gradient in gradients)
-  assert gradients[0][1] == 100.0
-  assert gradients[0][2] == 1080.0
-  assert all(gradient[3][0].r == module.PATH_PALETTE[0][0] for gradient in gradients)
+  # Three rail strokes per side, all six batched into one shader pass; the per-stroke tint
+  # scales the shared gradient so only one pass is needed.
+  assert len(gradients) == 1
+  ribbons, y0, y1, colors, stops = gradients[0]
+  assert len(ribbons) == 6
+  assert [int(tint.a) for _, tint in ribbons] == [46, 90, 255, 46, 90, 255]
+  assert all((tint.r, tint.g, tint.b) == (255, 255, 255) for _, tint in ribbons)
+  assert all(pts.shape == (12, 2) for pts, _ in ribbons)
+  assert (y0, y1) == (100.0, 1080.0)
+  assert [color.a for color in colors] == [31, 230, 0]
+  assert tuple(stops) == (0.0, 0.78, 1.0)
+  assert all(color.r == module.PATH_PALETTE[0][0] for color in colors)
 
   # Three chevrons at their fixed screen depths.
   assert len(chevrons) == 3

@@ -31,6 +31,7 @@ class Gradient:
 
 FRAGMENT_SHADER = GL_VERSION + """
 in vec2 fragTexCoord;
+in vec4 fragColor;
 out vec4 finalColor;
 
 uniform vec4 fillColor;
@@ -69,7 +70,9 @@ vec4 getGradientColor(vec2 p) {
 
 void main() {
   // TODO: do proper antialiasing
-  finalColor = useGradient == 1 ? getGradientColor(gl_FragCoord.xy) : fillColor;
+  // The vertex colour tints the fill (white for draw_polygon), so ribbons sharing one gradient
+  // shape but differing in colour/strength can be drawn in a single shader pass.
+  finalColor = (useGradient == 1 ? getGradientColor(gl_FragCoord.xy) : fillColor) * fragColor;
 }
 """
 
@@ -77,11 +80,14 @@ void main() {
 VERTEX_SHADER = GL_VERSION + """
 in vec3 vertexPosition;
 in vec2 vertexTexCoord;
+in vec4 vertexColor;
 out vec2 fragTexCoord;
+out vec4 fragColor;
 uniform mat4 mvp;
 
 void main() {
   fragTexCoord = vertexTexCoord;
+  fragColor = vertexColor;
   gl_Position = mvp * vec4(vertexPosition, 1.0);
 }
 """
@@ -243,6 +249,21 @@ def draw_polygon(origin_rect: rl.Rectangle, points: np.ndarray,
   # Draw strip, color here doesn't matter
   rl.begin_shader_mode(state.shader)
   _draw_ribbon(pts, rl.WHITE)
+  rl.end_shader_mode()
+
+
+def draw_polygons(origin_rect: rl.Rectangle, ribbons, gradient: Gradient):
+  """Draw several ribbons with one gradient in a single shader pass; each (points, tint) is
+  multiplied by its tint, so the gradient colours act as a shared shape (white = unchanged)."""
+  ribbons = [(np.ascontiguousarray(pts, dtype=np.float32), tint) for pts, tint in ribbons if len(pts) >= 3]
+  if not ribbons:
+    return
+  state = ShaderState.get_instance()
+  state.initialize()
+  _configure_shader_color(state, None, gradient, origin_rect)
+  rl.begin_shader_mode(state.shader)
+  for pts, tint in ribbons:
+    _draw_ribbon(pts, tint)
   rl.end_shader_mode()
 
 

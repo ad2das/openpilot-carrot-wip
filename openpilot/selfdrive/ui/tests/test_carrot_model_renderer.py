@@ -202,6 +202,7 @@ def test_lane_draw_reuses_cached_raw_points():
     for i in range(2)
   ]
   renderer._get_path_length_idx = lambda *_: 1
+  renderer._rect = model_renderer.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
   projected_inputs = []
 
   def project(line, *_args, **_kwargs):
@@ -244,6 +245,7 @@ def test_lane_draw_builds_cached_optional_geometry():
     for i in range(2)
   ]
   renderer._get_path_length_idx = lambda *_: 1
+  renderer._rect = model_renderer.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
   projected_inputs = []
 
   def project(line, *_args, **_kwargs):

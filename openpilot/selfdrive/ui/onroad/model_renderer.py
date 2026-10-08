@@ -18,7 +18,7 @@ from openpilot.selfdrive.ui.road_markings import (
 )
 from openpilot.system.ui.lib.application import gui_app, FontWeight
 from openpilot.system.ui.lib.text_draw import draw_text_ui_style
-from openpilot.system.ui.lib.shader_polygon import draw_polygon, draw_polygon_solid, Gradient
+from openpilot.system.ui.lib.shader_polygon import draw_polygon, draw_polygon_solid, draw_polygons, Gradient
 from openpilot.system.ui.lib import native_draw, native_geometry, native_text
 from openpilot.system.ui.widgets import Widget
 
@@ -186,6 +186,7 @@ class ModelRenderer(Widget):
     timing.start()
     # Floating labels claim screen boxes in priority order: the lead readout first, then radar tags.
     self._float_boxes = []
+    self._ar_box = None
     self._lead_capsule = None
     timing.call('path', self._draw_path_carrot, sm)
     timing.call('lanes', self._draw_lane_lines_carrot, sm)
@@ -468,6 +469,8 @@ class ModelRenderer(Widget):
     self._carrot_radar_dist = 0.0
     self._carrot_vision_dist = 0.0
     self._carrot_lead_speed = 0.0
+    self._carrot_lead_vrel = 0.0
+    self._lead_w = 0.0
     self._float_boxes: list[tuple[float, float, float, float]] = []
     self._lead_capsule = None
     self._carrot_x_state = 0
@@ -701,6 +704,11 @@ class ModelRenderer(Widget):
     if len(pts) < 3:
       return
     if len(pts) > 8:
+      batch = getattr(self, '_bell_batch', None)
+      if bell and batch is not None:
+        # Collected and drawn together by _flush_bell_batch_carrot: one shader pass for every lane.
+        batch.append((pts, rl.Color(*rgb, alpha)))
+        return
       if bell:
         colors = [rl.Color(*rgb, 0), rl.Color(*rgb, 0), rl.Color(*rgb, alpha), rl.Color(*rgb, int(alpha * 0.45)), rl.Color(*rgb, 0)]
         stops = [0.0, 0.2, 0.32, 0.42, 0.5]
@@ -709,11 +717,15 @@ class ModelRenderer(Widget):
         stops = FADE_STOPS
       draw_polygon(self._rect, pts, gradient=Gradient(start=(0.0, 1.0), end=(0.0, 0.0), colors=colors, stops=stops))
     else:
-      depth = self._depth_scale_carrot(float(pts[:, 1].mean()))
+      # Dashes come by the dozen each frame: plain arithmetic instead of numpy scalar calls.
+      depth = self._depth_scale_carrot(float(pts[:, 1].sum()) / len(pts))
       k = 0.2 + 0.8 * depth
       if bell:
-        k *= float(np.interp(depth, [0.0, 0.3, 0.5, 0.75], [1.0, 1.0, 0.45, 0.0]))
-      draw_polygon_solid(pts, rl.Color(*rgb, int(alpha * k)))
+        # 1 to 0.3 deep, then down to 0.45 at 0.5 and gone from 0.75 (underfoot).
+        k *= 1.0 if depth <= 0.3 else 1.0 - 2.75 * (depth - 0.3) if depth <= 0.5 else max(0.0, 0.45 - 1.8 * (depth - 0.5))
+      a = int(alpha * k)
+      if a > 0:
+        draw_polygon_solid(pts, rl.Color(*rgb, a))
 
   def _draw_path_carpet_carrot(self, mode: int, color_idx: int, brake_valid: bool) -> None:
     """A soft lane carpet under every path mode."""
@@ -781,6 +793,7 @@ class ModelRenderer(Widget):
     else:
       self._carrot_vision_dist = 0.0
 
+    self._carrot_lead_status_prev = self._carrot_lead_status
     self._carrot_lead_status = False
     self._carrot_radar_track_id = -1
     self._carrot_radar_dist = 0.0
@@ -793,6 +806,8 @@ class ModelRenderer(Widget):
       self._carrot_radar_track_id = int(lead_one.radarTrackId)
       self._carrot_radar_dist = float(lead_one.dRel) if lead_one.radar else 0.0
       self._carrot_lead_speed = float(lead_one.vLead) * (3.6 if ui_state.is_metric else 2.2369363)
+      vrel = float(lead_one.vRel) * (3.6 if ui_state.is_metric else 2.2369363)
+      self._carrot_lead_vrel = vrel if not self._carrot_lead_status_prev else self._carrot_lead_vrel * 0.8 + vrel * 0.2
       self._carrot_lead_status = True
 
     left_pt = self._map_to_screen(max_distance, y - 1.2, z + 1.22)
@@ -852,7 +867,8 @@ class ModelRenderer(Widget):
 
 
   def _lead_runs_carrot(self) -> list[tuple]:
-    """Readout capsule contents: ('dot', colour) and ('text'/'unit', text, size, colour) runs on one baseline."""
+    """Readout contents on one baseline: ('dot', colour, r), ('num'/'text'/'unit', text, size, colour), ('bar',)
+    and ('trend', sign, text, size). The capsule is sized for widest-digit 'num' slots so it does not breathe as digits change."""
     if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
       return [("text", text, LEAD_STATE_SIZE, hs.TEXT)]
@@ -868,65 +884,109 @@ class ModelRenderer(Widget):
     runs: list[tuple] = []
     radar = self._carrot_radar_dist > 0.0
     if radar:
-      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER),
-               ("text", f"{self._carrot_radar_dist:.1f}", LEAD_SIZE, text_color)]
+      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER, 8.0),
+               ("num", f"{self._carrot_radar_dist:.1f}", LEAD_SIZE, text_color)]
     if self._carrot_vision_dist > 0.0:
       # Beside a radar distance the vision estimate is a cross-check, so it steps down a size.
-      runs += [("dot", LEAD_BLUE), ("text", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2 if radar else LEAD_SIZE,
-                                     hs.TEXT_3 if radar else text_color)]
+      runs += [("dot", LEAD_BLUE, 6.0 if radar else 8.0),
+               ("num", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2 if radar else LEAD_SIZE, hs.TEXT_3 if radar else text_color)]
     if runs:
       runs.append(("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3))
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       if runs:
         runs.append(("bar",))
-      runs += [("text", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
+      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
                ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
+      # Speed relative to us, in the radar tags' language: green up = pulling away, red down = closing.
+      rel = round(self._carrot_lead_vrel)
+      if abs(rel) >= 2:
+        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_SIZE_2))
     return runs
+
+  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 22.0, "trend": 18.0}
+
+  def _lead_run_width(self, run, slot: bool = False) -> float:
+    kind = run[0]
+    if kind == "dot":
+      return run[2] * 2.0
+    if kind == "bar":
+      return 3.0 + 22.0
+    if kind == "num" and slot:
+      # Widest-digit slot: Inter's figures are proportional.
+      return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], hs.SEMI)
+    if kind == "trend":
+      return run[3] * 0.5 + 6.0 + self._type.width(run[2], run[3], hs.SEMI)
+    return self._type.width(run[1], run[2], hs.SEMI)
+
+  def _lead_run_gap(self, prev, kind) -> float:
+    if prev is None:
+      return 0.0
+    if prev == "dot":
+      return 9.0
+    return 24.0 if kind == "dot" else self._LEAD_GAPS[kind]
 
   def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
     runs = self._lead_runs_carrot()
     if not runs:
+      self._lead_w = 0.0
       return
-    t = self._type
-    gaps = {"dot": 10.0, "text": 0.0, "unit": 8.0, "bar": 22.0}
-    width = 0.0
+    content = slots = 0.0
     prev = None
     for run in runs:
-      if prev is not None:
-        width += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
-      width += 16.0 if run[0] == "dot" else 3.0 if run[0] == "bar" else t.width(run[1], run[2], hs.SEMI)
-      if run[0] == "bar":
-        width += 22.0
+      gap = self._lead_run_gap(prev, run[0])
+      content += gap + self._lead_run_width(run)
+      slots += gap + self._lead_run_width(run, slot=True)
       prev = run[0]
     h = LEAD_CAPSULE_H
-    w = width + 64.0
-    mid = hs.clear_of_panels(cx, car_top - 60.0 - h / 2, w, h)
+    target = slots + 64.0
+    # Ease width changes (a figure gaining a digit, the trend cue appearing) instead of snapping.
+    self._lead_w = target if self._lead_w <= 0.0 or abs(target - self._lead_w) > 160.0 else self._lead_w * 0.7 + target * 0.3
+    w = max(self._lead_w, content + 48.0)
+    # The tail tip sits just above the (truck-height) roof estimate.
+    mid = hs.clear_of_panels(cx, car_top - 28.0 - h / 2, w, h)
     self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
-    self._lead_capsule = (runs, cx, mid, w, h, car_top)
+    self._lead_capsule = (runs, cx, mid, w, h, car_top, content)
 
-  def _draw_lead_capsule_carrot(self, runs, cx: float, mid: float, w: float, h: float, car_top: float) -> None:
+  def _draw_lead_capsule_carrot(self, runs, cx: float, mid: float, w: float, h: float, car_top: float, content: float) -> None:
     t = self._type
-    gaps = {"dot": 10.0, "text": 0.0, "unit": 8.0, "bar": 22.0}
-    x = cx - w / 2
-    if mid + h / 2 < car_top - 8.0:
-      rl.draw_line_ex(rl.Vector2(cx, mid + h / 2), rl.Vector2(cx, car_top - 4.0), 3.0, hs.rgba(255, 255, 255, 128))
-    hs.chip(x, mid - h / 2, w, h)
-    x += 32.0
+    bottom = mid + h / 2
+    tail = 12.0
+    if bottom + tail < car_top - 40.0:
+      # Pushed up by a HUD card: extend the tail with a stem that fades out (the lead's real height is unknown).
+      rl.draw_rectangle_gradient_v(int(cx) - 1, int(bottom + tail - 2.0), 3, int(car_top - bottom - tail),
+                                   hs.rgba(255, 255, 255, 150), hs.rgba(255, 255, 255, 0))
+    hs.chip(cx - w / 2, mid - h / 2, w, h)
+    if bottom + tail < car_top:
+      hs.triangle((cx - tail, bottom - 1.0), (cx + tail, bottom - 1.0), (cx, bottom + tail), hs.CHIP_FILL)
+    x = cx - content / 2
     # Every run shares the large figures' baseline; smaller figures and units sit on it.
-    base = mid + max((run[2] for run in runs if run[0] == "text"), default=LEAD_SIZE) * hs.INTER_CAP / 2
+    base = mid + max((run[2] for run in runs if run[0] in ("num", "text")), default=LEAD_SIZE) * hs.INTER_CAP / 2
     prev = None
-    for run in runs:
-      if prev is not None:
-        x += 24.0 if run[0] == "dot" and prev != "dot" else gaps[run[0]]
+    for i, run in enumerate(runs):
       kind = run[0]
+      x += self._lead_run_gap(prev, kind)
+      width = self._lead_run_width(run)
       if kind == "dot":
-        hs.dot(x + 8.0, mid, 8.0, run[1])
-        x += 16.0
+        # A source dot is centred on the cap height of the figure it labels.
+        size = runs[i + 1][2] if i + 1 < len(runs) and runs[i + 1][0] == "num" else LEAD_SIZE
+        hs.dot(x + run[2], base - size * hs.INTER_CAP / 2, run[2], run[1])
       elif kind == "bar":
         rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 22.0, 3.0, 44.0), 1.0, 4, hs.rgba(255, 255, 255, 70))
-        x += 3.0 + 22.0
+      elif kind == "num":
+        t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
+      elif kind == "trend":
+        size = run[3]
+        color = hs.LIVE_GREEN if run[1] > 0 else hs.WARN_RED
+        g, gy = size * 0.5, base - size * hs.INTER_CAP / 2
+        gh = g * 0.82
+        if run[1] > 0:
+          hs.triangle((x, gy + gh / 2), (x + g, gy + gh / 2), (x + g / 2, gy - gh / 2), color)
+        else:
+          hs.triangle((x, gy - gh / 2), (x + g, gy - gh / 2), (x + g / 2, gy + gh / 2), color)
+        t.draw(run[2], x + g + 6.0, base, size, color, hs.SEMI)
       else:
-        x += t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
+        t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
+      x += width
       prev = kind
 
   def _draw_path_end_overlay_carrot(self):
@@ -943,13 +1003,14 @@ class ModelRenderer(Widget):
         y2 = self._carrot_lead_two_y
         if self._carrot_lead_two_status == 2:
           hs.ellipse_glow(x2, y2 - 4, w2 * 0.7, w2 * 0.12, hs.with_alpha(LEAD_TWO, 150))
-        hs.curve((x2 - w2 * 0.45, y2 - 5), (x2, y2 + 10), (x2 + w2 * 0.45, y2 - 5), 3.5, LEAD_TWO)
+        hs.taper_curve((x2 - w2 * 0.45, y2 - 5), (x2, y2 + 10), (x2 + w2 * 0.45, y2 - 5), 5.0, LEAD_TWO)
 
-      # The lead stands in a pool of light in its source colour: radar red/amber, vision blue.
+      # The lead stands in a pool of light in its source colour (radar red/amber, vision blue),
+      # underlined by a crescent that tapers to points at the wheels.
       rcolor = LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER
       stroke = rcolor if self._carrot_radar_track_id >= 0 else LEAD_BLUE
-      hs.ellipse_glow(x, base - 6, w * 0.74, w * 0.13, hs.with_alpha(stroke, 190))
-      hs.curve((x - w * 0.5, base - 8), (x, base + 14), (x + w * 0.5, base - 8), 5.0, stroke)
+      hs.ellipse_glow(x, base - 4, w * 0.66, w * 0.11, hs.with_alpha(stroke, 170))
+      hs.taper_curve((x - w * 0.52, base - 9), (x, base + 15), (x + w * 0.52, base - 9), 7.0, stroke)
 
     # Vehicle height is unknown: leave room for a truck so the readout never sits on the lead.
     self._layout_lead_capsule_carrot(x, base - w * 1.3)
@@ -963,7 +1024,19 @@ class ModelRenderer(Widget):
       inset = (rx - lx) * 0.18
       hs.polyline([(lx + inset, ly), (rx - inset, ry)], 4.0, hs.rgba(255, 255, 255, 230))
 
+  _BELL = Gradient(start=(0.0, 1.0), end=(0.0, 0.0), colors=[rl.Color(255, 255, 255, 0), rl.Color(255, 255, 255, 0),
+                   rl.Color(255, 255, 255, 255), rl.Color(255, 255, 255, 115), rl.Color(255, 255, 255, 0)],
+                   stops=[0.0, 0.2, 0.32, 0.42, 0.5])
+
   def _draw_lane_lines_carrot(self, sm):
+    self._bell_batch = []
+    try:
+      self._draw_lane_lines_body_carrot(sm)
+    finally:
+      batch, self._bell_batch = self._bell_batch, None
+      draw_polygons(self._rect, batch, self._BELL)
+
+  def _draw_lane_lines_body_carrot(self, sm):
     if self._carrot_show_lane_info < 1:
       return
     if not sm.valid['modelV2'] or not sm.valid['carState']:
@@ -1246,6 +1319,7 @@ class ModelRenderer(Widget):
     if box is not None:
       # Radar tags drawn later keep clear of the sign.
       self._float_boxes.append(box)
+      self._ar_box = box
 
   def _draw_radar_info_carrot(self, sm):
     if self._carrot_show_radar_info <= 0:
@@ -1315,6 +1389,19 @@ class ModelRenderer(Widget):
       elif self._carrot_show_radar_info >= 3:
         hs.dot(x, y, 7.0, hs.rgba(255, 255, 255, 200))
 
+  def _crosses_ar_sign(self, x0: float, y0: float, x1: float, y1: float) -> bool:
+    box = getattr(self, '_ar_box', None)
+    if box is None:
+      return False
+    bx, by, bw, bh = box
+    # The sign texture has transparent margins; test against its inner 80%.
+    bx, by, bw, bh = bx + bw * 0.1, by + bh * 0.1, bw * 0.8, bh * 0.8
+    for t in np.linspace(0.0, 1.0, 16):
+      px, py = x0 + (x1 - x0) * t, y0 + (y1 - y0) * t
+      if bx <= px <= bx + bw and by <= py <= by + bh:
+        return True
+    return False
+
   def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", trend: int, d_rel: float):
     """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
 
@@ -1331,8 +1418,12 @@ class ModelRenderer(Widget):
     if spot is None:
       return None
     tx, mid = spot
-    self._float_boxes.append((tx - w / 2, mid - h / 2, w, h))
     left, bottom = tx - w / 2, mid + h / 2
+    ex = min(max(x, left + h / 2), left + w - h / 2)
+    if abs(tx - x) >= 1.0 and self._crosses_ar_sign(ex, bottom, x, y):
+      # A leader drawn across the turn sign would read as part of it; the sign wins.
+      return None
+    self._float_boxes.append((tx - w / 2, mid - h / 2, w, h))
     fill = hs.CHIP_FILL
     if abs(tx - x) < 1.0:
       # Directly above: a callout tail, extended by a hairline stem if the label had to rise.
@@ -1340,7 +1431,6 @@ class ModelRenderer(Widget):
         rl.draw_line_ex(rl.Vector2(x, bottom + tail - 1.0), rl.Vector2(x, y), 2.0, hs.rgba(255, 255, 255, 110))
       hs.triangle((x - tail * 0.7, bottom - 1.0), (x + tail * 0.7, bottom - 1.0), (x, bottom + tail * 0.7), fill)
     else:
-      ex = min(max(x, left + h / 2), left + w - h / 2)
       rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
       hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
     hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230) if ring is not None else None, ring_width=3.0)
@@ -1564,13 +1654,13 @@ class ModelRenderer(Widget):
       return
 
     # Rails: wide faint, medium, narrow bright; thinner with distance, gone underfoot and at the horizon.
+    # All six strokes share one gradient shape, scaled per stroke by its tint: one shader pass.
+    rails = []
     for side in (left, right):
-      depth = np.clip((side[:, 1] - top) / (bottom - top), 0.0, 1.0)
+      taper = 0.35 + 0.65 * np.clip((side[:, 1] - top) / (bottom - top), 0.0, 1.0)
       for width, alpha in ((18.0, 46), (9.0, 90), (4.0, 255)):
-        ribbon = hs.stroke_ribbon(side, width / 2.0 * (0.35 + 0.65 * depth))
-        hs.vertical_gradient(ribbon, top, bottom,
-                             (rl.Color(*rgb, int(alpha * 0.12)), rl.Color(*rgb, int(alpha * 0.9)), rl.Color(*rgb, 0)),
-                             (0.0, 0.78, 1.0))
+        rails.append((hs.stroke_ribbon(side, width / 2.0 * taper), rl.Color(255, 255, 255, alpha)))
+    hs.vertical_gradients(rails, top, bottom, (rl.Color(*rgb, 31), rl.Color(*rgb, 230), rl.Color(*rgb, 0)), (0.0, 0.78, 1.0))
 
     # Chevrons at fixed screen depths, interpolated between the path's sample rows.
     mid_y = (left[:, 1] + right[:, 1]) / 2.0
