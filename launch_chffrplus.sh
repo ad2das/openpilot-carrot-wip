@@ -411,32 +411,75 @@ function big_model_artifact_ready {
   python3 -c 'from openpilot.selfdrive.modeld.helpers import active_usbgpu_compiled_path; raise SystemExit(0 if active_usbgpu_compiled_path() is not None else 1)' 2>/dev/null
 }
 
+function carrot_model_backend_guard {
+  # A device must never run host-built CPU model artifacts. Off-device the
+  # helper passes so desktop checkouts and the publish pipeline stay usable.
+  python3 "$DIR/scripts/carrot_model_backend_check.py" \
+    "$DIR/openpilot/selfdrive/modeld/models/tg_input_devices.json" \
+    --tici-marker "${CARROT_TICI_MARKER:-/TICI}"
+}
+
 function invalidate_modeld_build_if_needed {
   local stamp_path="$DIR/openpilot/selfdrive/modeld/models/.build_stamp"
   local big_stamp_path="$DIR/openpilot/selfdrive/modeld/models/.big_model_build_stamp"
   local tg_devices_path="$DIR/openpilot/selfdrive/modeld/models/tg_input_devices.json"
   local driving_pkl_path="$DIR/openpilot/selfdrive/modeld/models/driving_tinygrad.pkl"
+  local dm_pkl_path="$DIR/openpilot/selfdrive/modeld/models/dmonitoring_model_tinygrad.pkl"
+  local dm_metadata_path="$DIR/openpilot/selfdrive/modeld/models/dmonitoring_model_metadata.pkl"
+  local prebuilt_json="$DIR/prebuilt.json"
   local old_stamp
   local old_big_stamp
+  local prebuilt_models=""
+  local prebuilt_model_inputs=""
+
+  MODEL_REBUILD=0
 
   MODEL_BUILD_STAMP_VALUE="$(git rev-parse HEAD:openpilot/selfdrive/modeld HEAD:tinygrad_repo HEAD:openpilot/common/file_chunker.py 2>/dev/null | tr '\n' ':')"
   if [ -z "$MODEL_BUILD_STAMP_VALUE" ]; then
     MODEL_BUILD_STAMP_VALUE="$(git rev-parse HEAD 2>/dev/null || true)"
   fi
 
+  if [ -f "$prebuilt_json" ]; then
+    prebuilt_models="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("models", ""))' "$prebuilt_json" 2>/dev/null || true)"
+    prebuilt_model_inputs="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model_inputs", ""))' "$prebuilt_json" 2>/dev/null || true)"
+  fi
+
   old_stamp="$(cat "$stamp_path" 2>/dev/null || true)"
-  if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
-    echo "Model/tinygrad artifacts are missing; revalidating with SCons."
-    # Keep generated artifacts. SCons tracks the compiler, tinygrad and model
-    # dependencies and will rebuild only stale targets. Deleting everything
-    # here caused unrelated modeld changes to trigger long full recompiles.
-    FORCE_REBUILD=1
-  elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
-    # The stamp lives inside the hashed modeld tree, so a prebuilt tree cannot
-    # ship it (the value would have to describe itself). Trust the shipped
-    # artifacts when they are present and refresh the stamp instead; a source
-    # checkout keeps forcing the SCons revalidation on any mismatch.
-    if [ -f "$DIR/prebuilt" ]; then
+  if [ "$prebuilt_models" = "device" ]; then
+    # CI prebuilt tree: it intentionally ships no compiled model artifacts, so
+    # the first boot builds the model targets for this device. The manifest's
+    # model inputs are the stamp value a matching source checkout writes.
+    MODEL_BUILD_STAMP_VALUE="$prebuilt_model_inputs"
+    if [ ! -f "$tg_devices_path" ] || \
+       { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; } || \
+       { [ ! -f "$dm_pkl_path" ] && [ ! -f "$dm_pkl_path.chunkmanifest" ]; } || \
+       [ ! -f "$dm_metadata_path" ]; then
+      echo "CI prebuilt model artifacts are missing; scheduling the device model build."
+      MODEL_REBUILD=1
+    elif [ -z "$prebuilt_model_inputs" ]; then
+      echo "CI prebuilt manifest has no model inputs; scheduling the device model build."
+      MODEL_REBUILD=1
+    elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
+      echo "CI prebuilt model stamp is not for this checkout; scheduling the device model build."
+      MODEL_REBUILD=1
+    elif ! carrot_model_backend_guard; then
+      echo "CI prebuilt models are not QCOM-compiled; scheduling the device model build."
+      MODEL_REBUILD=1
+    fi
+  elif [ -f "$DIR/prebuilt" ]; then
+    # Legacy on-device prebuilt tree: trust the shipped artifacts, which were
+    # compiled on a device, but never trust a host-built CPU backend.
+    if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
+      echo "Model/tinygrad artifacts are missing; revalidating with SCons."
+      # Keep generated artifacts. SCons tracks the compiler, tinygrad and model
+      # dependencies and will rebuild only stale targets. Deleting everything
+      # here caused unrelated modeld changes to trigger long full recompiles.
+      FORCE_REBUILD=1
+    elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
+      # The stamp lives inside the hashed modeld tree, so a prebuilt tree cannot
+      # ship it (the value would have to describe itself). Trust the shipped
+      # artifacts when they are present and refresh the stamp instead; a source
+      # checkout keeps forcing the SCons revalidation on any mismatch.
       if mkdir -p "$(dirname "$stamp_path")" && \
          printf '%s' "$MODEL_BUILD_STAMP_VALUE" > "$stamp_path.tmp" 2>/dev/null && \
          mv -f "$stamp_path.tmp" "$stamp_path" 2>/dev/null; then
@@ -445,7 +488,20 @@ function invalidate_modeld_build_if_needed {
         echo "Could not record the model build stamp; revalidating with SCons."
         FORCE_REBUILD=1
       fi
-    else
+    fi
+    if ! carrot_model_backend_guard; then
+      echo "Prebuilt models are not QCOM-compiled; revalidating with SCons."
+      FORCE_REBUILD=1
+    fi
+  else
+    # Source checkout: unchanged behaviour.
+    if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
+      echo "Model/tinygrad artifacts are missing; revalidating with SCons."
+      # Keep generated artifacts. SCons tracks the compiler, tinygrad and model
+      # dependencies and will rebuild only stale targets. Deleting everything
+      # here caused unrelated modeld changes to trigger long full recompiles.
+      FORCE_REBUILD=1
+    elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
       echo "Model/tinygrad inputs changed or artifacts are missing; revalidating with SCons."
       FORCE_REBUILD=1
     fi
@@ -530,6 +586,41 @@ function invalidate_native_build_if_needed {
   # added. Check the loaded registry, not just the presence of native binaries.
   if ! python3 "$DIR/openpilot/system/manager/params_check.py"; then
     FORCE_REBUILD=1
+  fi
+}
+
+function run_full_build {
+  if ! run_startup_command ./build.py; then
+    echo "openpilot build failed, not starting manager."
+    carrot_drop_fastpath_stamp
+    show_startup_failure "openpilot build failed"
+  fi
+  if [ "$FORCE_REBUILD" = "1" ]; then
+    mkdir -p "$DIR/openpilot/selfdrive/modeld/models"
+    echo -n "$MODEL_BUILD_STAMP_VALUE" > "$DIR/openpilot/selfdrive/modeld/models/.build_stamp"
+    if [ -n "$BIG_MODEL_SHA" ] && big_model_artifact_ready; then
+      echo -n "$BIG_MODEL_SHA" > "$DIR/openpilot/selfdrive/modeld/models/.big_model_build_stamp"
+    fi
+  fi
+}
+
+function run_model_build {
+  # A CI prebuilt tree ships the source but not the device's compiled model
+  # artifacts; build only the model targets so the first boot stays bounded.
+  if ! run_startup_command ./build.py --targets openpilot/selfdrive/modeld/models; then
+    echo "model build failed, not starting manager."
+    carrot_drop_fastpath_stamp
+    show_startup_failure "model build failed"
+  fi
+  mkdir -p "$DIR/openpilot/selfdrive/modeld/models"
+  echo -n "$MODEL_BUILD_STAMP_VALUE" > "$DIR/openpilot/selfdrive/modeld/models/.build_stamp"
+}
+
+function carrot_build_if_needed {
+  if [ "$fast_boot" = "0" ] && { [ "$FORCE_REBUILD" = "1" ] || [ ! -f "$DIR/prebuilt" ]; }; then
+    run_full_build
+  elif [ "$fast_boot" = "0" ] && [ "$MODEL_REBUILD" = "1" ]; then
+    run_model_build
   fi
 }
 
@@ -716,6 +807,7 @@ function launch {
 
 
   FORCE_REBUILD=0
+  MODEL_REBUILD=0
   if [ "$fast_boot" = "0" ]; then
     boot_timing big_model_probe
     prepare_big_model_if_needed
@@ -730,20 +822,7 @@ function launch {
 
   # start manager
   cd openpilot/system/manager
-  if [ "$fast_boot" = "0" ] && { [ "$FORCE_REBUILD" = "1" ] || [ ! -f $DIR/prebuilt ]; }; then
-    if ! run_startup_command ./build.py; then
-      echo "openpilot build failed, not starting manager."
-      carrot_drop_fastpath_stamp
-      show_startup_failure "openpilot build failed"
-    fi
-    if [ "$FORCE_REBUILD" = "1" ]; then
-      mkdir -p "$DIR/openpilot/selfdrive/modeld/models"
-      echo -n "$MODEL_BUILD_STAMP_VALUE" > "$DIR/openpilot/selfdrive/modeld/models/.build_stamp"
-      if [ -n "$BIG_MODEL_SHA" ] && big_model_artifact_ready; then
-        echo -n "$BIG_MODEL_SHA" > "$DIR/openpilot/selfdrive/modeld/models/.big_model_build_stamp"
-      fi
-    fi
-  fi
+  carrot_build_if_needed
   # Never start driving services if a rebuild left the Params registry stale.
   if ! run_startup_command python3 "$DIR/openpilot/system/manager/params_check.py"; then
     echo "Native Params still do not match this checkout; not starting manager."

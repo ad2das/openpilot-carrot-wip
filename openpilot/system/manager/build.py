@@ -226,7 +226,7 @@ def build_usbgpu_model(spinner: Spinner) -> bool:
   write_big_model_status(model_cache_dir(), "error", detail="compile failed; using internal model", **status_values)
   return False
 
-def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
+def build(spinner: Spinner, dirty: bool = False, minimal: bool = False, targets: list[str] | None = None) -> None:
   env = os.environ.copy()
   env['SCONS_PROGRESS'] = "1"
   env['PYTHONUNBUFFERED'] = "1"
@@ -235,6 +235,7 @@ def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
     nproc = 2
 
   extra_args = ["--minimal"] if minimal else []
+  target_args = list(targets) if targets else []
 
   if AGNOS:
     HARDWARE.set_power_save(False)
@@ -245,7 +246,7 @@ def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
   compile_output: list[bytes] = []
   for n in (nproc, nproc/2, 1):
     compile_output.clear()
-    scons: subprocess.Popen = subprocess.Popen(["scons", f"-j{int(n)}", "--cache-populate", *extra_args], cwd=BASEDIR, env=env,
+    scons: subprocess.Popen = subprocess.Popen(["scons", f"-j{int(n)}", "--cache-populate", *extra_args, *target_args], cwd=BASEDIR, env=env,
                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     assert scons.stdout is not None
 
@@ -301,8 +302,15 @@ def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
 
 
 if __name__ == "__main__":
+  import argparse
+
+  parser = argparse.ArgumentParser(description="Build openpilot with the device's SCons setup")
+  parser.add_argument("--targets", nargs="+", default=[], metavar="PATH",
+                      help="build only these SCons targets instead of the default set")
+  args = parser.parse_args()
+
   with Spinner() as spinner:
     spinner.update_progress(0, 100)
     build_metadata = get_build_metadata()
-    build(spinner, build_metadata.openpilot.is_dirty, minimal = AGNOS)
+    build(spinner, build_metadata.openpilot.is_dirty, minimal = AGNOS, targets=args.targets)
     build_usbgpu_model(spinner)

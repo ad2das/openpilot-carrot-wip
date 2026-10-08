@@ -18,8 +18,8 @@ def test_selected_egpu_delivery_precedes_build_and_manager(tmp_path, present, su
   prepare = source[source.index('function prepare_big_model_if_needed {'):source.index('function start_big_model_update {')]
   launch = source[source.index('function launch {'):]
   prepare_call = launch.index('  prepare_big_model_if_needed\n')
-  assert prepare_call < launch.index('  invalidate_modeld_build_if_needed\n') < launch.index('run_startup_command ./build.py')
-  assert launch.index('run_startup_command ./build.py') < launch.index('run_startup_command start_manager')
+  assert prepare_call < launch.index('  invalidate_modeld_build_if_needed\n') < launch.index('  carrot_build_if_needed\n')
+  assert launch.index('  carrot_build_if_needed\n') < launch.index('run_startup_command start_manager')
   # Execute the real shell function. A background delivery would return before
   # the marker is written, so an old-model startup race fails this test.
   harness = '''
@@ -123,7 +123,7 @@ def test_recovery_and_agnos_precede_params_build() -> None:
   dependencies = launch.index("  if ! run_startup_command bootstrap_runtime_dependencies; then")
   params_build = launch.index('bash "$DIR/scripts/ensure_params_build.sh"')
   web = launch.index("  start_carrot_web")
-  build = launch.index("    if ! run_startup_command ./build.py; then")
+  build = launch.index("  carrot_build_if_needed")
   manager = launch.index("  if ! run_startup_command start_manager; then")
 
   assert pythonpath < ssh_access < recovery < agnos_update < clock_floor < dependencies < params_build < web < build < manager

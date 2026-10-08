@@ -40,7 +40,14 @@ jobs:
             openpilot/selfdrive/modeld/tests/test_helpers.py::test_usbgpu_compiled_path_waits_for_selected_model_instead_of_previous \
             openpilot/system/tests/test_model_build_cache.py \
             openpilot/system/tests/test_prebuilt_boot.py \
+            openpilot/system/tests/test_model_backend_check.py \
+            openpilot/system/tests/test_build_targets.py \
             openpilot/system/tests/test_launch_order.py
+
+      - name: Check prebuilt cleanup modes and release tooling
+        run: |
+          bash release/tests/test_prebuilt_cleanup.sh
+          bash release/tests/test_build_carrot.sh
 
   dm_cadence:
     name: DM live restart cadence

@@ -7,7 +7,29 @@
 # /data/openpilot, using the same steps as launch_chffrplus.sh:
 #   bootstrap_runtime_dependencies -> scripts/ensure_params_build.sh -> build.py
 # then validates the result, applies the shared release cleanup
-# (scripts/prebuilt_cleanup.sh) and writes the `prebuilt` marker.
+# (scripts/prebuilt_cleanup.sh --mode ci) and writes the `prebuilt` marker plus
+# a `prebuilt.json` manifest.
+#
+# Device parity is enforced before publishing (scripts/ci_prebuilt_parity_gate.py):
+#   G1 every source-tracked path survives byte-identical (allowlist in
+#      scripts/prebuilt_allowed_changes.txt)
+#   G2 no untracked file under openpilot/selfdrive/modeld/models/
+#   G3 camerad and visionipc_pyx.so use the ION backend, not /dev/shm
+#   G4 every non-panda C/C++ compile carries -D__TICI__
+#   G5 every untracked ELF is AArch64
+#   G6 prebuilt.json matches the source commit's model inputs
+# and G7 simulates the device's first boot inside the chroot. The publish step
+# is skipped when any gate fails, and the published commit is re-fetched and
+# checked again afterwards.
+#
+# /dev/ion: the chroot's /dev is an rbind of the runner's /dev, so the build
+# step creates a placeholder /dev/ion immediately before SCons (msgq selects
+# visionbuf_ion.cc only when it exists) and removes it again as soon as the
+# build finishes, before any in-chroot test runs. Nothing opens it at runtime.
+#
+# Models are built on the device, never shipped: the CI tree keeps only the
+# tracked .onnx inputs, and the launcher builds
+# `openpilot/selfdrive/modeld/models` with QCOM on the first boot.
 #
 # /AGNOS is hidden inside the build chroot: build.py's device-only power/IRQ
 # setup (Tici.set_power_save) cannot run on a server VM (no Qualcomm CPUs, no
@@ -254,8 +276,29 @@ jobs:
           echo "=== bootstrap_runtime_dependencies ==="
           bootstrap_runtime_dependencies
 
+          echo "=== ION placeholder for the msgq visionbuf probe ==="
+          # msgq_repo/SConscript selects visionbuf_ion.cc only when /dev/ion
+          # exists. /dev is an rbind of the runner's /dev, so this creates a
+          # plain placeholder file on the runner. The trap removes it as soon
+          # as this build script exits, before any in-chroot test runs, and
+          # nothing may open it at runtime.
+          rm -f /dev/ion
+          touch /dev/ion
+          trap 'rm -f /dev/ion' EXIT
+
           echo "=== scripts/ensure_params_build.sh ==="
           bash /data/openpilot/scripts/ensure_params_build.sh
+
+          echo "=== scons verbose dry run (gate G4 evidence) ==="
+          # The real build reads cached objects and prints abbreviated actions,
+          # so a verbose dry run right before it records the full compile
+          # command lines for the -D__TICI__ parity gate.
+          if ! ( cd /data/openpilot && SCONS_PROGRESS=1 PYTHONUNBUFFERED=1 \
+                  scons -n -j4 --cache-populate --minimal --verbose ) > /data/ci_scons_dryrun.log 2>&1; then
+            echo "::warning::the scons dry run exited nonzero; gate G4 will judge the log"
+          fi
+          wc -l /data/ci_scons_dryrun.log || true
+          tail -n 3 /data/ci_scons_dryrun.log || true
 
           echo "=== openpilot/system/manager/build.py (device: minimal=AGNOS) ==="
           # The device build.py computes minimal=AGNOS, so /AGNOS is hidden here
@@ -274,12 +317,20 @@ jobs:
             build_usbgpu_model(spinner)
           CI_BUILD_MAIN_EOF
 
+          rm -f /dev/ion
+          echo "=== ION placeholder removed before any in-chroot tests ==="
           echo "=== build finished ==="
           df -h / /data
           du -sh /data/openpilot /data/scons_cache 2>/dev/null || true
           CHROOT_BUILD_EOF
           sudo chmod +x /mnt/agnos/tmp/ci_build.sh
           sudo chroot /mnt/agnos /bin/bash /tmp/ci_build.sh
+          echo "SCONS_DRY_RUN_LOG=/mnt/agnos/data/ci_scons_dryrun.log" >> "$GITHUB_ENV"
+          if [ -s /mnt/agnos/data/ci_scons_dryrun.log ]; then
+            echo "dry run log: $(wc -l < /mnt/agnos/data/ci_scons_dryrun.log) lines"
+          else
+            echo "::warning::the scons dry run log is missing or empty"
+          fi
 
       - name: Validate the built tree inside the chroot
         run: |
@@ -343,83 +394,6 @@ jobs:
           bash release/tests/test_build_carrot.sh
           bash release/tests/test_prebuilt_cleanup.sh
 
-          echo "=== simulated device first boot on the published tree ==="
-          # The device must not recompile on the first boot after an update even
-          # though its /data/scons_cache has no Params stamp and models/.build_stamp
-          # cannot ship (it lives inside the hashed modeld tree). Reproduce the
-          # launcher's decision functions with a fresh cache and a failing scons
-          # shim; any rebuild forces this publish to fail.
-          cat > /tmp/ci_first_boot_sim.sh <<'SIM_EOF'
-          #!/bin/bash
-          # No set -u: the launcher functions rely on optional variables unset.
-          set -Eeo pipefail
-          export HOME=/root
-          cd /data/openpilot
-
-          SIM=/tmp/first_boot_sim
-          rm -rf "$SIM"
-          mkdir -p "$SIM/bin" "$SIM/scons_cache"
-          cat > "$SIM/bin/scons" <<'SIM_SCONS_EOF'
-          #!/bin/bash
-          printf 'SCONS INVOKED: %s\n' "$*" >> /tmp/first_boot_sim/scons_calls.log
-          exit 97
-          SIM_SCONS_EOF
-          chmod +x "$SIM/bin/scons"
-          export PATH="$SIM/bin:$PATH"
-          export SCONS_CACHE_DIR="$SIM/scons_cache"
-
-          # The published tree carries the marker and no self-referential stamp.
-          touch /data/openpilot/prebuilt
-          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp
-          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.big_model_build_stamp
-
-          # The chroot runs as root while the workspace is owned by the runner.
-          git config --global --add safe.directory /data/openpilot
-
-          source /data/openpilot/launch_env.sh
-          source /data/openpilot/launch_chffrplus.sh
-
-          run_sim_step() {
-            local label="$1"
-            shift
-            local start end rc
-            start="$(date +%s.%N)"
-            if "$@"; then rc=0; else rc=$?; fi
-            end="$(date +%s.%N)"
-            printf 'first-boot sim: %-36s rc=%d %ss\n' "$label" "$rc" \
-              "$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", e - s }')"
-            return "$rc"
-          }
-
-          echo "--- bootstrap_runtime_dependencies"
-          run_sim_step bootstrap_runtime_dependencies bootstrap_runtime_dependencies
-          echo "--- scripts/ensure_params_build.sh (fresh cache)"
-          run_sim_step ensure_params_build bash /data/openpilot/scripts/ensure_params_build.sh
-          FORCE_REBUILD=0
-          echo "--- invalidate_modeld_build_if_needed"
-          run_sim_step invalidate_modeld invalidate_modeld_build_if_needed
-          echo "--- invalidate_native_build_if_needed"
-          run_sim_step invalidate_native invalidate_native_build_if_needed
-
-          if [ "$FORCE_REBUILD" != 0 ]; then
-            echo "::error::simulated device first boot would rebuild (FORCE_REBUILD=$FORCE_REBUILD)"
-            exit 1
-          fi
-          if [ -e "$SIM/scons_calls.log" ]; then
-            echo "::error::scons was invoked during the simulated device first boot:"
-            cat "$SIM/scons_calls.log"
-            exit 1
-          fi
-          test -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp || {
-            echo "::error::simulated first boot did not refresh the model build stamp"
-            exit 1
-          }
-          echo "simulated first boot OK: FORCE_REBUILD=0, scons not invoked, model stamp refreshed"
-          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp
-          SIM_EOF
-          chmod +x /tmp/ci_first_boot_sim.sh
-          bash /tmp/ci_first_boot_sim.sh
-
           echo "=== hardware-free pytest suites ==="
           if ! python3 -m pytest --version >/dev/null 2>&1; then
             installed=0
@@ -437,6 +411,8 @@ jobs:
             openpilot/system/tests/test_launch_order.py \
             openpilot/system/tests/test_model_build_cache.py \
             openpilot/system/tests/test_prebuilt_boot.py \
+            openpilot/system/tests/test_model_backend_check.py \
+            openpilot/system/tests/test_build_targets.py \
             openpilot/system/tests/test_c3_agnos_manifest.py \
             openpilot/common/tests/test_repo_update.py
           CHROOT_VALIDATE_EOF
@@ -457,11 +433,161 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           echo "--- before cleanup ---"
           du -sh . 2>/dev/null || true
-          bash scripts/prebuilt_cleanup.sh "$GITHUB_WORKSPACE"
+          bash scripts/prebuilt_cleanup.sh --mode ci "$GITHUB_WORKSPACE"
+          echo "--- prebuilt manifest ---"
+          cat prebuilt.json
           echo "--- after cleanup ---"
           du -sh . 2>/dev/null || true
           echo "changed/untracked entries:"
           git status --porcelain | wc -l
+
+      - name: Device-parity gates (G1-G6)
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          SRC_SHA="$(git rev-parse HEAD)"
+          echo "SRC_SHA=$SRC_SHA" >> "$GITHUB_ENV"
+          echo "source commit: $SRC_SHA"
+          if ! command -v readelf >/dev/null 2>&1; then
+            sudo apt-get install -y -qq binutils
+          fi
+          # Any failing gate exits nonzero here, so the publish step is skipped.
+          python3 scripts/ci_prebuilt_parity_gate.py \
+            --mode worktree --tree "$GITHUB_WORKSPACE" \
+            --source-sha "$SRC_SHA" \
+            --allowlist "$GITHUB_WORKSPACE/scripts/prebuilt_allowed_changes.txt" \
+            --scons-log "${SCONS_DRY_RUN_LOG}" \
+            --gates G1,G2,G3,G4,G5,G6
+
+      - name: First-boot simulation on the published tree (G7)
+        run: |
+          set -euo pipefail
+          sudo tee /mnt/agnos/tmp/ci_first_boot_sim.sh >/dev/null <<'SIM_EOF'
+          #!/bin/bash
+          # G7: simulate the device's first boot on the cleaned, prebuilt tree.
+          # No set -u: the launcher functions rely on optional variables unset.
+          set -Eeo pipefail
+          export HOME=/root
+          cd /data/openpilot
+          if [ -d /usr/local/venv/bin ]; then
+            export PATH="/usr/local/venv/bin:$PATH"
+          fi
+          export PYDEPS=/data/openpilot/pydeps
+          export PYTHONPATH="$PYDEPS:/data/openpilot"
+          git config --global --add safe.directory /data/openpilot
+
+          SIM=/tmp/first_boot_sim
+          rm -rf "$SIM"
+          mkdir -p "$SIM/scons_cache"
+          LOG="$SIM/invocations.log"
+          MODELS=/data/openpilot/openpilot/selfdrive/modeld/models
+          MODEL_INPUTS="$(python3 -c 'import json; print(json.load(open("/data/openpilot/prebuilt.json"))["model_inputs"])')"
+
+          source /data/openpilot/launch_env.sh
+          source /data/openpilot/launch_chffrplus.sh
+
+          # The device's fresh /data/scons_cache has no Params stamp; give the
+          # simulation its own cache instead of touching the mounted one.
+          export SCONS_CACHE_DIR="$SIM/scons_cache"
+
+          # The scons/build shim: every startup command the launcher would
+          # execute is recorded here and reports success, so the decision logic
+          # is what gets tested.
+          run_startup_command() {
+            printf 'STARTUP %s\n' "$*" >> "$LOG"
+            return 0
+          }
+
+          fast_boot=0
+
+          reset_models() {
+            rm -f "$MODELS/tg_input_devices.json" \
+                  "$MODELS/driving_tinygrad.pkl" \
+                  "$MODELS/dmonitoring_model_tinygrad.pkl" \
+                  "$MODELS/dmonitoring_model_metadata.pkl" \
+                  "$MODELS/.build_stamp" "$MODELS/.big_model_build_stamp"
+          }
+
+          run_decision() {
+            FORCE_REBUILD=0
+            MODEL_REBUILD=0
+            invalidate_modeld_build_if_needed
+            invalidate_native_build_if_needed
+            carrot_build_if_needed
+          }
+
+          build_calls() {
+            grep -c '^STARTUP ./build.py' "$LOG" || true
+          }
+
+          expect_model_build() {
+            local label="$1" calls
+            calls="$(build_calls)"
+            [ "$calls" = "1" ] || { echo "::error::${label}: expected exactly one build invocation, got $calls"; cat "$LOG"; exit 1; }
+            grep -Fxq 'STARTUP ./build.py --targets openpilot/selfdrive/modeld/models' "$LOG" || {
+              echo "::error::${label}: the invocation was not the model-only target"; cat "$LOG"; exit 1; }
+            [ "$FORCE_REBUILD" = "0" ] || { echo "::error::${label}: FORCE_REBUILD=$FORCE_REBUILD"; exit 1; }
+            [ "$MODEL_REBUILD" = "1" ] || { echo "::error::${label}: MODEL_REBUILD=$MODEL_REBUILD"; exit 1; }
+            [ "$(cat "$MODELS/.build_stamp" 2>/dev/null)" = "$MODEL_INPUTS" ] || {
+              echo "::error::${label}: the model stamp was not refreshed"; exit 1; }
+          }
+
+          expect_no_build() {
+            local label="$1" calls
+            calls="$(build_calls)"
+            [ "$calls" = "0" ] || { echo "::error::${label}: expected no build invocation, got $calls"; cat "$LOG"; exit 1; }
+            [ "$FORCE_REBUILD" = "0" ] || { echo "::error::${label}: FORCE_REBUILD=$FORCE_REBUILD"; exit 1; }
+            [ "$MODEL_REBUILD" = "0" ] || { echo "::error::${label}: MODEL_REBUILD=$MODEL_REBUILD"; exit 1; }
+          }
+
+          echo "G7 prebuilt.json model_inputs=$MODEL_INPUTS"
+          echo "G7 /TICI present: $(test -f /TICI && echo yes || echo no)"
+
+          # (a) The published tree ships no compiled models: the first boot
+          # builds only the model targets.
+          reset_models
+          : > "$LOG"
+          run_decision
+          echo "G7(a): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
+          expect_model_build "G7(a)"
+          echo "G7(a) pass: exactly one model-only build, FORCE_REBUILD=0"
+
+          # (b) Already-built QCOM artifacts with the manifest stamp: nothing
+          # to rebuild.
+          reset_models
+          : > "$LOG"
+          printf '%s' '{"openpilot.selfdrive.modeld.modeld": {"default": {"WARP_DEV": "QCOM", "QUEUE_DEV": "QCOM"}, "usbgpu": {"WARP_DEV": "QCOM", "QUEUE_DEV": "AMD"}}, "openpilot.selfdrive.modeld.dmonitoringmodeld": {"default": {"DEV": "QCOM"}}}' > "$MODELS/tg_input_devices.json"
+          printf '%s' "$MODEL_INPUTS" > "$MODELS/.build_stamp"
+          touch "$MODELS/driving_tinygrad.pkl" "$MODELS/dmonitoring_model_tinygrad.pkl" "$MODELS/dmonitoring_model_metadata.pkl"
+          run_decision
+          echo "G7(b): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
+          expect_no_build "G7(b)"
+          echo "G7(b) pass: QCOM artifacts with the matching stamp trigger nothing"
+
+          # (c) CPU-backend artifacts (the defect being fixed): the model-only
+          # rebuild runs.
+          reset_models
+          : > "$LOG"
+          printf '%s' '{"openpilot.selfdrive.modeld.modeld": {"default": {"WARP_DEV": "CPU", "QUEUE_DEV": "CPU"}, "usbgpu": {"WARP_DEV": "CPU", "QUEUE_DEV": "AMD"}}, "openpilot.selfdrive.modeld.dmonitoringmodeld": {"default": {"DEV": "CPU"}}}' > "$MODELS/tg_input_devices.json"
+          printf '%s' "$MODEL_INPUTS" > "$MODELS/.build_stamp"
+          touch "$MODELS/driving_tinygrad.pkl" "$MODELS/dmonitoring_model_tinygrad.pkl" "$MODELS/dmonitoring_model_metadata.pkl"
+          run_decision
+          echo "G7(c): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
+          expect_model_build "G7(c)"
+          echo "G7(c) pass: a CPU backend triggers the model-only rebuild"
+
+          # Leave the published tree exactly as it was.
+          reset_models
+          git status --porcelain -- openpilot/selfdrive/modeld/models > "$SIM/status.txt"
+          if [ -s "$SIM/status.txt" ]; then
+            echo "::error::the first-boot simulation left files behind:"
+            cat "$SIM/status.txt"
+            exit 1
+          fi
+          echo "G7 pass: tree clean after the simulation"
+          SIM_EOF
+          sudo chmod +x /mnt/agnos/tmp/ci_first_boot_sim.sh
+          sudo chroot /mnt/agnos /bin/bash /tmp/ci_first_boot_sim.sh
 
       - name: Publish append-only to carrot-wip-prebuilt
         env:
@@ -590,12 +716,36 @@ jobs:
           HEAD_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
           [ "$HEAD_SHA" = "$NEW" ] || { echo "::error::published ref does not match"; exit 1; }
           echo "carrot-wip-prebuilt head: $HEAD_SHA"
+          echo "PUBLISHED_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
 
           # The scratch branch existed only to seed blobs for this commit; the
           # published commit now references them, so drop it. Cleanup failure
           # must not fail an otherwise successful publish.
           git push --quiet origin --delete "$UPLOAD_BRANCH" || \
             echo "::warning::could not delete scratch branch $UPLOAD_BRANCH"
+
+      - name: Post-publish verification
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          PUB_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
+          if [ -z "${PUBLISHED_SHA:-}" ] || [ "$PUB_SHA" != "$PUBLISHED_SHA" ]; then
+            echo "::error::published ref is $PUB_SHA but this run published ${PUBLISHED_SHA:-nothing}"
+            exit 1
+          fi
+          git fetch --no-tags origin "refs/heads/${PREBUILT_BRANCH}"
+          FETCHED="$(git rev-parse FETCH_HEAD)"
+          [ "$FETCHED" = "$PUB_SHA" ] || { echo "::error::fetched $FETCHED but published $PUB_SHA"; exit 1; }
+          # Re-run the parity gates G1-G3+G6 against the fetched published
+          # commit; fail loudly if it differs from the verified tree.
+          python3 scripts/ci_prebuilt_parity_gate.py \
+            --mode commit --tree "$GITHUB_WORKSPACE" \
+            --source-sha "$SRC_SHA" --published-sha "$PUB_SHA" \
+            --allowlist "$GITHUB_WORKSPACE/scripts/prebuilt_allowed_changes.txt" \
+            --gates G1,G2,G3,G6
+          echo "post-publish verification OK: $PUB_SHA (parent $(git rev-parse "$PUB_SHA^"))"
 
       - name: Report
         if: always()

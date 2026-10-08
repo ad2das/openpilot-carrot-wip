@@ -317,8 +317,9 @@ git switch -c "$BUILD_BRANCH" "$SOURCE_COMMIT"
 
 log "Cleaning build-only files"
 # Shared with the carrot-wip-prebuilt CI workflow so the cleanup and size
-# rules never diverge between device releases and CI builds.
-if ! bash "$SOURCE_DIR/scripts/prebuilt_cleanup.sh" "$SOURCE_DIR"; then
+# rules never diverge; this on-device release uses the device-release mode
+# that keeps the device-compiled model pickles.
+if ! bash "$SOURCE_DIR/scripts/prebuilt_cleanup.sh" --mode device-release "$SOURCE_DIR"; then
   die "prebuilt tree cleanup failed"
 fi
 
