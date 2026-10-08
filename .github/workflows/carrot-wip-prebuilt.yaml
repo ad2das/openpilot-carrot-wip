@@ -184,7 +184,9 @@ jobs:
           set -euo pipefail
           sudo tee /mnt/agnos/tmp/ci_build.sh >/dev/null <<'CHROOT_BUILD_EOF'
           #!/bin/bash
-          set -Eeuo pipefail
+          # Same shell options as the device launcher (no set -u: launch_env.sh
+          # and the launcher functions rely on optional variables being unset).
+          set -Eeo pipefail
           export HOME=/root
           export CI=1
           cd /data/openpilot
