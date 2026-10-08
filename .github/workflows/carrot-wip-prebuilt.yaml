@@ -291,10 +291,12 @@ jobs:
 
           echo "=== scons verbose dry run (gate G4 evidence) ==="
           # The real build reads cached objects and prints abbreviated actions,
-          # so a verbose dry run right before it records the full compile
-          # command lines for the -D__TICI__ parity gate.
+          # so a verbose dry run records the full compile command lines for the
+          # -D__TICI__ parity gate. The restored SCons cache would let SCons
+          # skip most actions, so the listing disables caching to enumerate
+          # every compile the build would perform.
           if ! ( cd /data/openpilot && SCONS_PROGRESS=1 PYTHONUNBUFFERED=1 \
-                  scons -n -j4 --cache-populate --minimal --verbose ) > /data/ci_scons_dryrun.log 2>&1; then
+                  scons -n -j4 --cache-disable --minimal --verbose ) > /data/ci_scons_dryrun.log 2>&1; then
             echo "::warning::the scons dry run exited nonzero; gate G4 will judge the log"
           fi
           wc -l /data/ci_scons_dryrun.log || true

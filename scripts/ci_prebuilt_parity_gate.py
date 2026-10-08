@@ -193,6 +193,7 @@ def gate_g4(log_path: str, min_commands: int) -> bool:
 def gate_g5(repo: str, root: str) -> bool:
   untracked = z_split(git_out(repo, "ls-files", "--others", "-z"))
   checked = 0
+  firmware = 0
   offenders: list[tuple[str, str]] = []
   for rel in untracked:
     full = os.path.join(root, rel)
@@ -206,6 +207,10 @@ def gate_g5(repo: str, root: str) -> bool:
       continue
     if magic != b"\x7fELF":
       continue
+    # panda firmware images target the Cortex-M MCU and are ARM by design.
+    if rel.startswith("panda/board/"):
+      firmware += 1
+      continue
     checked += 1
     result = subprocess.run(["readelf", "-h", full], capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -218,7 +223,8 @@ def gate_g5(repo: str, root: str) -> bool:
         break
     if machine != "AArch64":
       offenders.append((rel, machine))
-  print(f"G5 untracked ELF architecture: {checked} untracked ELF files scanned, {len(offenders)} not AArch64")
+  print(f"G5 untracked ELF architecture: {checked} untracked ELF files scanned, {firmware} panda firmware ELFs skipped, "
+        f"{len(offenders)} not AArch64")
   for rel, machine in offenders:
     print(f"G5   FAIL   {rel}: {machine}")
   ok = not offenders and checked > 0
