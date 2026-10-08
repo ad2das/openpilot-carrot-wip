@@ -529,10 +529,12 @@ jobs:
             "$ARTIFACT_DIR/$SRC_SHA.json" "$ARTIFACT_DIR/$SRC_SHA.tar.xz"
 
           # Prune assets so only the newest 30 commits (by upload time) remain.
+          # The assets JSON goes through the environment: a heredoc already
+          # owns python's stdin, so piping into it would deliver nothing.
           ASSETS_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ARTIFACT_RELEASE_TAG}" --jq '.assets')"
-          DELETE_LIST="$(printf '%s' "$ASSETS_JSON" | python3 - <<'PRUNE_EOF'
-          import collections, json, re, sys
-          assets = json.load(sys.stdin)
+          DELETE_LIST="$(ASSETS_JSON="$ASSETS_JSON" python3 - <<'PRUNE_EOF'
+          import collections, json, os, re
+          assets = json.loads(os.environ["ASSETS_JSON"])
           by_sha = collections.defaultdict(str)
           for asset in assets:
             sha = asset["name"][:40]
