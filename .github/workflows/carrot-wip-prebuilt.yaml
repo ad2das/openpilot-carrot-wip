@@ -170,6 +170,14 @@ jobs:
           sudo mount --rbind /dev "$AGNOS_ROOT/dev"
           sudo mount -t proc proc "$AGNOS_ROOT/proc"
           sudo mount -t sysfs sysfs "$AGNOS_ROOT/sys"
+
+          # The device reports its model from the devicetree; provide the same
+          # file so device-aware imports (root conftest, manager) behave like
+          # the hardware instead of failing on the missing path.
+          sudo mount -t tmpfs tmpfs "$AGNOS_ROOT/sys/firmware"
+          sudo mkdir -p "$AGNOS_ROOT/sys/firmware/devicetree/base"
+          printf 'comma tizi' | sudo tee "$AGNOS_ROOT/sys/firmware/devicetree/base/model" >/dev/null
+
           sudo rm -f "$AGNOS_ROOT/etc/resolv.conf"
           sudo cp /etc/resolv.conf "$AGNOS_ROOT/etc/resolv.conf"
 
