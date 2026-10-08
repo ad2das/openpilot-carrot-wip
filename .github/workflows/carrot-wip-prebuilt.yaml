@@ -26,9 +26,9 @@
 
 name: carrot-wip prebuilt
 
-# Spike phase: manual dispatch only. The push trigger for carrot-wip is enabled
-# in the follow-up commit once a dispatch run has produced a valid branch.
 on:
+  push:
+    branches: [carrot-wip]
   workflow_dispatch:
 
 concurrency:
@@ -513,6 +513,12 @@ jobs:
           HEAD_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
           [ "$HEAD_SHA" = "$NEW" ] || { echo "::error::published ref does not match"; exit 1; }
           echo "carrot-wip-prebuilt head: $HEAD_SHA"
+
+          # The scratch branch existed only to seed blobs for this commit; the
+          # published commit now references them, so drop it. Cleanup failure
+          # must not fail an otherwise successful publish.
+          git push --quiet origin --delete "$UPLOAD_BRANCH" || \
+            echo "::warning::could not delete scratch branch $UPLOAD_BRANCH"
 
       - name: Report
         if: always()
