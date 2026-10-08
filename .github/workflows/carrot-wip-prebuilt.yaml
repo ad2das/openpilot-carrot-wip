@@ -217,6 +217,22 @@ jobs:
           echo "scons: $(command -v scons)"
           scons --version
 
+          # GitHub ARM runners have 4 CPUs, while the larch64 model-compile step
+          # pins itself to the device's isolated CPU 7 (openpilot/selfdrive/
+          # modeld/SConscript). Provide a CI-only taskset that runs the command
+          # unpinned when that CPU does not exist, instead of failing the build.
+          cat > /usr/local/bin/taskset <<'CI_TASKSET_EOF'
+          #!/bin/bash
+          if /usr/bin/taskset -c 7 true >/dev/null 2>&1; then
+            exec /usr/bin/taskset "$@"
+          fi
+          if [ "${1:-}" = "-c" ] && [ "${2:-}" = "7" ]; then
+            shift 2
+          fi
+          exec "$@"
+          CI_TASKSET_EOF
+          chmod +x /usr/local/bin/taskset
+
           source /data/openpilot/launch_env.sh
           source /data/openpilot/launch_chffrplus.sh
 
