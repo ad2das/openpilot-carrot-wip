@@ -1249,6 +1249,10 @@ class ModelRenderer(Widget):
   AR_KEEP_LATERAL = 1.7    # keep-left/right signs stand on the lane line
   AR_HEIGHT_M = 3.2        # sign height in the world...
   AR_MIN_PX, AR_MAX_PX = 190.0, 360.0  # ...held legible far away and calm up close
+  AR_LEAD_HEIGHT_M = 3.2   # lead silhouette height kept clear: a truck, since the vehicle class is unknown
+  AR_LEAD_GAP = 18.0       # screen clearance between sign and lead, px
+  AR_PUSH_MAX = 4.0        # furthest extra sideways step toward the turn, metres
+  AR_PUSH_EASE = 0.2       # per-frame easing of that step
 
   def _ar_turn_state(self, sm):
     """(turn, side, distance, glyph colour) for an approaching turn on an active route, else None."""
@@ -1274,41 +1278,76 @@ class ModelRenderer(Widget):
       return None
     return q[:, :2] / q[:, 2:3]
 
-  def _ar_occluded(self, sm, dist: float, base_x: float) -> bool:
-    """True when the lead car stands in front of the pin's foot."""
+  def _ar_lead_box(self, sm, raw: np.ndarray) -> tuple | None:
+    """Screen box (x, y, w, h) of the lead car's silhouette: 2.6 m wide, truck-high, on the road."""
     try:
       lead = sm['radarState'].leadOne
-      if not lead.status or float(lead.dRel) >= dist:
-        return False
+      if not lead.status:
+        return None
       d_rel, y_rel = float(lead.dRel), -float(lead.yRel)
     except Exception:
-      return False
-    edges = self._project(np.array([[d_rel, y_rel - 1.3, 0.0], [d_rel, y_rel + 1.3, 0.0]]))
-    return edges is not None and min(edges[:, 0]) <= base_x <= max(edges[:, 0])
+      return None
+    z = float(np.interp(d_rel, raw[:, 0], raw[:, 2])) + self._path_offset_z
+    pts = self._project(np.array([[d_rel, y_rel - 1.3, z], [d_rel, y_rel + 1.3, z], [d_rel, y_rel, z - self.AR_LEAD_HEIGHT_M]]))
+    if pts is None:
+      return None
+    x0, x1 = float(min(pts[:2, 0])), float(max(pts[:2, 0]))
+    y0, y1 = float(pts[2, 1]), float(max(pts[:2, 1]))
+    return x0, y0, x1 - x0, y1 - y0
+
+  @staticmethod
+  def _boxes_overlap(a: tuple, b: tuple, gap: float) -> bool:
+    return a[0] < b[0] + b[2] + gap and b[0] < a[0] + a[2] + gap and a[1] < b[1] + b[3] + gap and b[1] < a[1] + a[3] + gap
 
   def _draw_ar_turn_carrot(self, sm) -> None:
     state = self._ar_turn_state(sm)
     raw = self._path.raw_points
     if state is None or raw is None or len(raw) < 2:
+      self.__dict__.pop('_ar_push', None)  # a new sign starts where it belongs, not mid-glide
       return
     turn, side, dist, color = state
     if dist > float(raw[-1, 0]) or turn not in hs.AR_ICONS:
       return
     alpha = min(1.0, (self.AR_FAR - dist) / self.AR_FADE_IN, (dist - self.AR_NEAR) / self.AR_FADE_OUT)
     offset = self.AR_KEEP_LATERAL if turn in (3, 4) else (0.0 if turn == 8 else self.AR_LATERAL)
-    lateral = float(np.interp(dist, raw[:, 0], raw[:, 1])) + side * offset
+    centre = float(np.interp(dist, raw[:, 0], raw[:, 1]))
     road_z = float(np.interp(dist, raw[:, 0], raw[:, 2])) + self._path_offset_z
-    pts = self._project(np.array([[dist, lateral, road_z], [dist, lateral, road_z - self.AR_HEIGHT_M],
-                                  [dist, lateral - 1.1, road_z], [dist, lateral + 1.1, road_z]]))
-    if pts is None:
+
+    def place(lateral: float):
+      pts = self._project(np.array([[dist, lateral, road_z], [dist, lateral, road_z - self.AR_HEIGHT_M],
+                                    [dist, lateral - 1.1, road_z], [dist, lateral + 1.1, road_z]]))
+      if pts is None:
+        return None
+      foot_x, foot_y = float(pts[0, 0]), float(pts[0, 1])
+      return pts, foot_x, foot_y, min(self.AR_MAX_PX, max(self.AR_MIN_PX, foot_y - float(pts[1, 1])))
+
+    # The lead car is what the driver must see: the sign steps out sideways, toward the turn, until it
+    # clears the car's silhouette, and eases there so it never jumps.
+    lead = self._ar_lead_box(sm, raw)
+    push = 0.0
+    if lead is not None:
+      for step in np.arange(0.0, self.AR_PUSH_MAX + 1e-3, 0.25):
+        placed = place(centre + side * (offset + step))
+        if placed is None:
+          break
+        box = hs.ar_sign_box(turn, placed[1], placed[2], placed[3])
+        if box is None or not self._boxes_overlap(box, lead, self.AR_LEAD_GAP):
+          push = float(step)
+          break
+      else:
+        push = self.AR_PUSH_MAX
+    self._ar_push = getattr(self, '_ar_push', push)
+    self._ar_push += (push - self._ar_push) * self.AR_PUSH_EASE
+    placed = place(centre + side * (offset + self._ar_push))
+    if placed is None:
       return
-    foot_x, foot_y = (float(v) for v in pts[0])
-    height = min(self.AR_MAX_PX, max(self.AR_MIN_PX, foot_y - float(pts[1, 1])))
+    pts, foot_x, foot_y, height = placed
     tint = hs.LIVE_GREEN if color is hs.LIVE_GREEN else hs.NAV
 
-    # Contact shadow on the road plants the sign. When the lead car stands in front of that spot the sign
-    # is behind it: no shadow, and the sign turns translucent so the car still reads in front.
-    occluded = self._ar_occluded(sm, dist, foot_x)
+    # Contact shadow on the road plants the sign. Should it still cover the lead car (no room left beside
+    # it), the sign is drawn translucent and without a shadow so the car still reads in front.
+    sign_box = hs.ar_sign_box(turn, foot_x, foot_y, height)
+    occluded = lead is not None and sign_box is not None and self._boxes_overlap(sign_box, lead, 0.0)
     if occluded:
       alpha *= 0.5
     else:

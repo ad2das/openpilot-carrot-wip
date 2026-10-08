@@ -789,15 +789,25 @@ def maneuver_arrow(turn_info: int, cx: float, cy: float, k: float, color: rl.Col
   return True
 
 
-def ar_sign(turn_info: int, foot_x: float, foot_y: float, height: float, tint: rl.Color, alpha: float) -> tuple | None:
-  """AR manoeuvre sign standing with its shaft end on (foot_x, foot_y); returns its screen box."""
+def ar_sign_box(turn_info: int, foot_x: float, foot_y: float, height: float) -> tuple | None:
+  """Screen box (x, y, w, h) the AR sign would cover with its shaft end on (foot_x, foot_y)."""
   name = AR_ICONS.get(turn_info)
   if name is None:
     return None
-  base, fill = _texture(f"ar_{name}_base"), _texture(f"ar_{name}_fill")
+  base = _texture(f"ar_{name}_base")
   w = height * base.width / base.height
   fx, fy = AR_FEET[name]
-  x, y = foot_x - fx * w, foot_y - fy * height
+  return foot_x - fx * w, foot_y - fy * height, w, height
+
+
+def ar_sign(turn_info: int, foot_x: float, foot_y: float, height: float, tint: rl.Color, alpha: float) -> tuple | None:
+  """AR manoeuvre sign standing with its shaft end on (foot_x, foot_y); returns its screen box."""
+  box = ar_sign_box(turn_info, foot_x, foot_y, height)
+  if box is None:
+    return None
+  name = AR_ICONS[turn_info]
+  base, fill = _texture(f"ar_{name}_base"), _texture(f"ar_{name}_fill")
+  x, y, w, height = box
   a = max(0, min(255, int(255 * alpha)))
   _blit(base, x, y, w, height, rgba(255, 255, 255, a))
   _blit(fill, x, y, w, height, rgba(tint.r, tint.g, tint.b, a))

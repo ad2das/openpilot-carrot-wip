@@ -1019,11 +1019,16 @@ class HudRenderer(Widget):
 
   @staticmethod
   def _draw_tpms_car(cx: float, cy: float, low: tuple[bool, bool, bool, bool]) -> None:
-    """Top view: a quiet body outline and four tyres, red where the pressure is low."""
-    hs.card(cx - 30, cy - 78, 60, 156, hs.rgba(255, 255, 255, 18), 26, hs.rgba(255, 255, 255, 150), 2.5)
-    hs.card(cx - 21, cy - 34, 42, 54, hs.rgba(255, 255, 255, 26), 12, None)
-    for (tx, ty), is_low in zip(((cx - 39, cy - 58), (cx + 31, cy - 58), (cx - 39, cy + 30), (cx + 31, cy + 30)), low, strict=True):
-      hs.card(tx, ty, 8, 28, hs.WARN_RED if is_low else hs.rgba(255, 255, 255, 200), 3, None)
+    """Top view: body outline with glass, roof and mirrors, and four tyres, red where the pressure is low."""
+    for (tx, ty), is_low in zip(((cx - 40, cy - 60), (cx + 30, cy - 60), (cx - 40, cy + 30), (cx + 30, cy + 30)), low, strict=True):
+      hs.card(tx, ty, 10, 30, hs.WARN_RED if is_low else hs.rgba(255, 255, 255, 210), 4, None)
+    hs.card(cx - 30, cy - 78, 60, 156, hs.rgba(28, 31, 38, 255), 26, hs.rgba(255, 255, 255, 150), 2.5)
+    # Mirrors at the A-pillars, then windscreen, roof and rear window, lit from the front.
+    for sx in (-1.0, 1.0):
+      hs.card(cx + sx * 33 - 5, cy - 25, 10, 7, hs.rgba(255, 255, 255, 150), 3, None)
+    hs.quad((cx - 22, cy - 46), (cx + 22, cy - 46), (cx + 18, cy - 22), (cx - 18, cy - 22), hs.rgba(255, 255, 255, 92))
+    hs.card(cx - 18, cy - 18, 36, 46, hs.rgba(255, 255, 255, 24), 8, None)
+    hs.quad((cx - 18, cy + 32), (cx + 18, cy + 32), (cx + 21, cy + 48), (cx - 21, cy + 48), hs.rgba(255, 255, 255, 60))
 
   # ---- guidance (top-left): turn card or enforcement camera card ------------------------------
 

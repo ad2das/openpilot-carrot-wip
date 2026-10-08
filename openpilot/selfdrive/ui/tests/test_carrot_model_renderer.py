@@ -1,3 +1,5 @@
+import struct
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
@@ -302,3 +304,115 @@ def test_render_stale_data_skips_overlays(monkeypatch):
   renderer._render(object())
 
   assert calls == []
+
+
+AR_ASSETS = Path(__file__).parents[2] / "assets" / "images" / "nav"
+
+
+def png_size(name: str) -> tuple[int, int]:
+  with open(AR_ASSETS / f"{name}.png", "rb") as f:
+    header = f.read(24)
+  assert header[:8] == b"\x89PNG\r\n\x1a\n"
+  return struct.unpack(">II", header[16:24])
+
+
+def ar_submaster(*, turn=2, dist=15.0, lead=True, d_rel=12.0, y_rel=-0.6, route=True):
+  carrot_man = SimpleNamespace(
+    xTurnInfo=turn,
+    xDistToTurn=dist,
+    nGoPosDist=100 if route else 0,
+    nGoPosTime=10,
+    atcType="",
+  )
+  lead_one = SimpleNamespace(status=lead, dRel=d_rel, yRel=y_rel)
+  return FakeSubMaster(carrotMan=carrot_man, radarState=SimpleNamespace(leadOne=lead_one))
+
+
+def ar_renderer(monkeypatch):
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._path = SimpleNamespace(raw_points=np.array([[0.0, 0.0, 0.0], [100.0, 0.0, 0.0]], dtype=np.float32))
+  renderer._path_offset_z = 0.0
+  renderer._float_boxes = []
+
+  def project(pts):
+    pts = np.asarray(pts, dtype=np.float64)
+    return np.column_stack((960.0 + 1000.0 * pts[:, 1] / pts[:, 0], 540.0 + 1000.0 * pts[:, 2] / pts[:, 0]))
+
+  def texture(name):
+    width, height = png_size(name)
+    return SimpleNamespace(width=width, height=height, id=0)
+
+  monkeypatch.setattr(renderer, "_project", project)
+  monkeypatch.setattr(model_renderer.hs, "_texture", texture)
+  monkeypatch.setattr(model_renderer.hs, "_blit", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.rl, "draw_ellipse", lambda *args, **kwargs: None)
+  return renderer
+
+
+def ar_sign_box_for(renderer, turn, dist, lateral):
+  pts = renderer._project(np.array([[dist, lateral, 0.0], [dist, lateral, -renderer.AR_HEIGHT_M],
+                                    [dist, lateral - 1.1, 0.0], [dist, lateral + 1.1, 0.0]]))
+  foot_x, foot_y = (float(v) for v in pts[0])
+  height = min(renderer.AR_MAX_PX, max(renderer.AR_MIN_PX, foot_y - float(pts[1, 1])))
+  return model_renderer.hs.ar_sign_box(turn, foot_x, foot_y, height)
+
+
+def test_boxes_overlap_true_false_and_edge_gap():
+  overlap = model_renderer.ModelRenderer._boxes_overlap
+  a = (0.0, 0.0, 100.0, 50.0)
+
+  assert overlap(a, (60.0, 20.0, 100.0, 50.0), 0.0)
+  assert overlap((60.0, 20.0, 100.0, 50.0), a, 0.0)
+
+  right = (120.0, 20.0, 100.0, 50.0)
+  assert not overlap(a, right, 0.0)
+  assert not overlap(a, right, 20.0)
+  assert overlap(a, right, 21.0)
+
+  below = (0.0, 60.0, 100.0, 50.0)
+  assert not overlap(a, below, 0.0)
+  assert not overlap(a, below, 10.0)
+  assert overlap(a, below, 11.0)
+
+
+def test_ar_turn_sign_pushes_toward_turn_side_until_lead_clears(monkeypatch):
+  renderer = ar_renderer(monkeypatch)
+  sm = ar_submaster()
+
+  lead = renderer._ar_lead_box(sm, renderer._path.raw_points)
+  assert lead is not None
+  unpushed = ar_sign_box_for(renderer, turn=2, dist=15.0, lateral=renderer.AR_LATERAL)
+  assert renderer._boxes_overlap(unpushed, lead, renderer.AR_LEAD_GAP)
+
+  for _ in range(10):
+    renderer._draw_ar_turn_carrot(sm)
+
+  assert renderer._ar_push == pytest.approx(1.0)
+  assert renderer._ar_box is not None
+  assert not renderer._boxes_overlap(renderer._ar_box, lead, 0.0)
+  # The right-turn sign (side +1) ends clear of the lead's right edge.
+  assert renderer._ar_box[0] > lead[0] + lead[2]
+
+
+def test_ar_turn_sign_without_lead_keeps_the_old_placement(monkeypatch):
+  renderer = ar_renderer(monkeypatch)
+  sm = ar_submaster(lead=False)
+  expected = ar_sign_box_for(renderer, turn=2, dist=15.0, lateral=renderer.AR_LATERAL)
+
+  renderer._draw_ar_turn_carrot(sm)
+
+  assert renderer._ar_push == 0.0
+  assert renderer._ar_box == pytest.approx(expected)
+  assert len(renderer._float_boxes) == 1
+  assert renderer._float_boxes[0] == pytest.approx(expected)
+
+
+def test_ar_push_is_cleared_when_the_turn_state_disappears(monkeypatch):
+  renderer = ar_renderer(monkeypatch)
+  renderer._draw_ar_turn_carrot(ar_submaster())
+  assert renderer._ar_push > 0.0
+  assert "_ar_push" in renderer.__dict__
+
+  renderer._draw_ar_turn_carrot(ar_submaster(route=False))
+
+  assert "_ar_push" not in renderer.__dict__
