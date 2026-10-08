@@ -15,7 +15,24 @@ STAMP="$CACHE_DIR/carrot_params_keys.sha256"
 HEADER_HASH="$(sha256sum "$HEADER" | awk '{print $1}')"
 BUILT_HASH="$(cat "$STAMP" 2>/dev/null || true)"
 
+record_stamp() {
+  printf '%s\n' "$HEADER_HASH" > "$STAMP.tmp"
+  mv -f "$STAMP.tmp" "$STAMP"
+}
+
 if [ "$HEADER_HASH" = "$BUILT_HASH" ] && [ -f "$MODULE" ]; then
+  exit 0
+fi
+
+# A prebuilt tree ships params_pyx.so compiled from this checkout's header but
+# not the device-local stamp above, so the first boot after an update would
+# otherwise drop the module and rebuild it with SCons. Trust the shipped module
+# when its full Params registry still matches the header, and only record the
+# stamp; any mismatch (or an unloadable module) falls through to the rebuild.
+if [ -f "$ROOT/prebuilt" ] && [ -f "$MODULE" ] && \
+   PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" python3 "$ROOT/openpilot/system/manager/params_check.py"; then
+  echo "Prebuilt Params module matches this checkout; recording the keys stamp."
+  record_stamp
   exit 0
 fi
 

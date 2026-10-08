@@ -15,13 +15,20 @@ mkdir -p "$WORK/openpilot/selfdrive/modeld/models" \
          "$WORK/release/tests" \
          "$WORK/pkg/sub" \
          "$WORK/pkg/__pycache__" \
-         "$WORK/pkg/sub/__pycache__"
+         "$WORK/pkg/sub/__pycache__" \
+         "$WORK/pkg/.pytest_cache" \
+         "$WORK/.ruff_cache" \
+         "$WORK/.mypy_cache" \
+         "$WORK/.hypothesis"
 touch "$WORK/openpilot/selfdrive/modeld/models/driving.onnx"
 touch "$WORK/openpilot/selfdrive/modeld/models/keep.pkl"
+touch "$WORK/openpilot/selfdrive/modeld/models/.build_stamp"
+touch "$WORK/openpilot/selfdrive/modeld/models/.big_model_build_stamp"
 touch "$WORK/release/build_carrot.sh" "$WORK/Jenkinsfile"
 touch "$WORK/pkg/a.o" "$WORK/pkg/b.a" "$WORK/pkg/c.os" "$WORK/pkg/d.pyc"
 touch "$WORK/pkg/sub/moc_widget.cpp"
 touch "$WORK/pkg/__pycache__/x.pyc" "$WORK/pkg/sub/__pycache__/y.pyc"
+touch "$WORK/pkg/.pytest_cache/state" "$WORK/.ruff_cache/state" "$WORK/.mypy_cache/state" "$WORK/.hypothesis/state"
 touch "$WORK/.sconsign.dblite"
 mkdir -p "$WORK/pkg/sub"
 touch "$WORK/pkg/sub/.sconsign.dblite"
@@ -31,6 +38,8 @@ bash "$CLEANUP" "$WORK"
 [[ -f "$WORK/prebuilt" ]]
 [[ ! -e "$WORK/openpilot/selfdrive/modeld/models/driving.onnx" ]]
 [[ -f "$WORK/openpilot/selfdrive/modeld/models/keep.pkl" ]]
+[[ ! -e "$WORK/openpilot/selfdrive/modeld/models/.build_stamp" ]]
+[[ ! -e "$WORK/openpilot/selfdrive/modeld/models/.big_model_build_stamp" ]]
 [[ ! -e "$WORK/release" && ! -e "$WORK/Jenkinsfile" ]]
 [[ ! -e "$WORK/.sconsign.dblite" ]]
 # Only the tree-root .sconsign.dblite is removed, matching the historical rule.
@@ -38,6 +47,7 @@ bash "$CLEANUP" "$WORK"
 [[ ! -e "$WORK/pkg/a.o" && ! -e "$WORK/pkg/b.a" && ! -e "$WORK/pkg/c.os" && ! -e "$WORK/pkg/d.pyc" ]]
 [[ ! -e "$WORK/pkg/sub/moc_widget.cpp" ]]
 [[ ! -e "$WORK/pkg/__pycache__" && ! -e "$WORK/pkg/sub/__pycache__" ]]
+[[ ! -e "$WORK/pkg/.pytest_cache" && ! -e "$WORK/.ruff_cache" && ! -e "$WORK/.mypy_cache" && ! -e "$WORK/.hypothesis" ]]
 
 # A file above GitHub's 95 MiB limit must be rejected, after the prebuilt
 # marker is written (same order as the historical on-device release rule).

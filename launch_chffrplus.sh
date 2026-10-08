@@ -425,12 +425,30 @@ function invalidate_modeld_build_if_needed {
   fi
 
   old_stamp="$(cat "$stamp_path" 2>/dev/null || true)"
-  if [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ] || [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
-    echo "Model/tinygrad inputs changed or artifacts are missing; revalidating with SCons."
+  if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
+    echo "Model/tinygrad artifacts are missing; revalidating with SCons."
     # Keep generated artifacts. SCons tracks the compiler, tinygrad and model
     # dependencies and will rebuild only stale targets. Deleting everything
     # here caused unrelated modeld changes to trigger long full recompiles.
     FORCE_REBUILD=1
+  elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
+    # The stamp lives inside the hashed modeld tree, so a prebuilt tree cannot
+    # ship it (the value would have to describe itself). Trust the shipped
+    # artifacts when they are present and refresh the stamp instead; a source
+    # checkout keeps forcing the SCons revalidation on any mismatch.
+    if [ -f "$DIR/prebuilt" ]; then
+      if mkdir -p "$(dirname "$stamp_path")" && \
+         printf '%s' "$MODEL_BUILD_STAMP_VALUE" > "$stamp_path.tmp" 2>/dev/null && \
+         mv -f "$stamp_path.tmp" "$stamp_path" 2>/dev/null; then
+        echo "Prebuilt model artifacts present; refreshed the model build stamp."
+      else
+        echo "Could not record the model build stamp; revalidating with SCons."
+        FORCE_REBUILD=1
+      fi
+    else
+      echo "Model/tinygrad inputs changed or artifacts are missing; revalidating with SCons."
+      FORCE_REBUILD=1
+    fi
   fi
 
   if [ -n "$BIG_MODEL_SHA" ]; then

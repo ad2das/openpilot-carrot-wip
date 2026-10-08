@@ -344,6 +344,83 @@ jobs:
           bash release/tests/test_build_carrot.sh
           bash release/tests/test_prebuilt_cleanup.sh
 
+          echo "=== simulated device first boot on the published tree ==="
+          # The device must not recompile on the first boot after an update even
+          # though its /data/scons_cache has no Params stamp and models/.build_stamp
+          # cannot ship (it lives inside the hashed modeld tree). Reproduce the
+          # launcher's decision functions with a fresh cache and a failing scons
+          # shim; any rebuild forces this publish to fail.
+          cat > /tmp/ci_first_boot_sim.sh <<'SIM_EOF'
+          #!/bin/bash
+          # No set -u: the launcher functions rely on optional variables unset.
+          set -Eeo pipefail
+          export HOME=/root
+          cd /data/openpilot
+
+          SIM=/tmp/first_boot_sim
+          rm -rf "$SIM"
+          mkdir -p "$SIM/bin" "$SIM/scons_cache"
+          cat > "$SIM/bin/scons" <<'SIM_SCONS_EOF'
+          #!/bin/bash
+          printf 'SCONS INVOKED: %s\n' "$*" >> /tmp/first_boot_sim/scons_calls.log
+          exit 97
+          SIM_SCONS_EOF
+          chmod +x "$SIM/bin/scons"
+          export PATH="$SIM/bin:$PATH"
+          export SCONS_CACHE_DIR="$SIM/scons_cache"
+
+          # The published tree carries the marker and no self-referential stamp.
+          touch /data/openpilot/prebuilt
+          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp
+          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.big_model_build_stamp
+
+          # The chroot runs as root while the workspace is owned by the runner.
+          git config --global --add safe.directory /data/openpilot
+
+          source /data/openpilot/launch_env.sh
+          source /data/openpilot/launch_chffrplus.sh
+
+          run_sim_step() {
+            local label="$1"
+            shift
+            local start end rc
+            start="$(date +%s.%N)"
+            if "$@"; then rc=0; else rc=$?; fi
+            end="$(date +%s.%N)"
+            printf 'first-boot sim: %-36s rc=%d %ss\n' "$label" "$rc" \
+              "$(awk -v s="$start" -v e="$end" 'BEGIN { printf "%.2f", e - s }')"
+            return "$rc"
+          }
+
+          echo "--- bootstrap_runtime_dependencies"
+          run_sim_step bootstrap_runtime_dependencies bootstrap_runtime_dependencies
+          echo "--- scripts/ensure_params_build.sh (fresh cache)"
+          run_sim_step ensure_params_build bash /data/openpilot/scripts/ensure_params_build.sh
+          FORCE_REBUILD=0
+          echo "--- invalidate_modeld_build_if_needed"
+          run_sim_step invalidate_modeld invalidate_modeld_build_if_needed
+          echo "--- invalidate_native_build_if_needed"
+          run_sim_step invalidate_native invalidate_native_build_if_needed
+
+          if [ "$FORCE_REBUILD" != 0 ]; then
+            echo "::error::simulated device first boot would rebuild (FORCE_REBUILD=$FORCE_REBUILD)"
+            exit 1
+          fi
+          if [ -e "$SIM/scons_calls.log" ]; then
+            echo "::error::scons was invoked during the simulated device first boot:"
+            cat "$SIM/scons_calls.log"
+            exit 1
+          fi
+          test -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp || {
+            echo "::error::simulated first boot did not refresh the model build stamp"
+            exit 1
+          }
+          echo "simulated first boot OK: FORCE_REBUILD=0, scons not invoked, model stamp refreshed"
+          rm -f /data/openpilot/openpilot/selfdrive/modeld/models/.build_stamp
+          SIM_EOF
+          chmod +x /tmp/ci_first_boot_sim.sh
+          bash /tmp/ci_first_boot_sim.sh
+
           echo "=== hardware-free pytest suites ==="
           if ! python3 -m pytest --version >/dev/null 2>&1; then
             installed=0
@@ -360,6 +437,7 @@ jobs:
           python3 -m pytest -o addopts='' -q -c /dev/null --rootdir=/data/openpilot \
             openpilot/system/tests/test_launch_order.py \
             openpilot/system/tests/test_model_build_cache.py \
+            openpilot/system/tests/test_prebuilt_boot.py \
             openpilot/system/tests/test_c3_agnos_manifest.py \
             openpilot/common/tests/test_repo_update.py
           CHROOT_VALIDATE_EOF
