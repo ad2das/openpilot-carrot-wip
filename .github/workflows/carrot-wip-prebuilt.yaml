@@ -192,6 +192,12 @@ jobs:
           export HOME=/root
           export CI=1
           cd /data/openpilot
+          # The device launcher runs with the AGNOS venv first on PATH; it
+          # provides scons and the python3 with the device's native modules
+          # (pyzmq, capnp, acados, ...). Match that here.
+          if [ -d /usr/local/venv/bin ]; then
+            export PATH="/usr/local/venv/bin:$PATH"
+          fi
           export PYDEPS=/data/openpilot/pydeps
           export PYTHONPATH="$PYDEPS:/data/openpilot"
           mkdir -p "$PYDEPS"
@@ -276,6 +282,10 @@ jobs:
           set -Eeuo pipefail
           export HOME=/root
           cd /data/openpilot
+          # Same interpreter selection as the build step and the device.
+          if [ -d /usr/local/venv/bin ]; then
+            export PATH="/usr/local/venv/bin:$PATH"
+          fi
           export PYDEPS=/data/openpilot/pydeps
           export PYTHONPATH="$PYDEPS:/data/openpilot"
 
