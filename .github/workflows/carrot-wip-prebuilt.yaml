@@ -11,8 +11,10 @@
 #
 # /AGNOS is hidden inside the build chroot: build.py's device-only power/IRQ
 # setup (Tici.set_power_save) cannot run on a server VM (no Qualcomm CPUs, no
-# devicetree, no i2c amplifier) and does not affect build outputs. SConstruct
-# still sees /TICI, so the tree is built for larch64 exactly like the device.
+# devicetree, no i2c amplifier). Because build.py derives minimal=AGNOS, the
+# same build() call is reproduced with minimal=True explicitly, so the built
+# tree matches a device build. SConstruct still sees /TICI, so the tree is
+# built for larch64 exactly like the device.
 #
 # Publishing is append-only: the new commit's parent is the current remote head
 # and the ref update is server-side fast-forward checked (GitHub API
@@ -242,9 +244,22 @@ jobs:
           echo "=== scripts/ensure_params_build.sh ==="
           bash /data/openpilot/scripts/ensure_params_build.sh
 
-          echo "=== openpilot/system/manager/build.py ==="
-          cd /data/openpilot/openpilot/system/manager
-          python3 build.py
+          echo "=== openpilot/system/manager/build.py (device: minimal=AGNOS) ==="
+          # The device build.py computes minimal=AGNOS, so /AGNOS is hidden here
+          # for its hardware init and the device build() call is reproduced with
+          # minimal=True explicitly (same function, same steps, same flags).
+          cd /data/openpilot
+          python3 - <<'CI_BUILD_MAIN_EOF'
+          from openpilot.common.spinner import Spinner
+          from openpilot.system.manager.build import build, build_usbgpu_model
+          from openpilot.system.version import get_build_metadata
+
+          with Spinner() as spinner:
+            spinner.update_progress(0, 100)
+            build_metadata = get_build_metadata()
+            build(spinner, build_metadata.openpilot.is_dirty, minimal=True)
+            build_usbgpu_model(spinner)
+          CI_BUILD_MAIN_EOF
 
           echo "=== build finished ==="
           df -h / /data
