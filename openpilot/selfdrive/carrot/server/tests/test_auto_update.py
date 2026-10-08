@@ -420,6 +420,7 @@ def test_missing_artifact_for_a_fresh_commit_postpones(monkeypatch):
   fetched = []
   writes = []
   monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: (fetched.append(sha), 3)[1])
+  monkeypatch.setattr(auto_update, "read_auto_update_state", dict)
   monkeypatch.setattr(auto_update, "write_auto_update_event",
                       lambda status, **fields: (writes.append((status, fields)), {"status": status})[1])
   monkeypatch.setattr(auto_update, "_git", _recent_commit_git(60))
@@ -429,6 +430,34 @@ def test_missing_artifact_for_a_fresh_commit_postpones(monkeypatch):
   assert writes[0][0] == "waiting"
   assert writes[0][1]["error_code"] == "artifact_not_ready"
   assert writes[0][1]["target_head"] == target
+
+
+def test_repeated_artifact_postpones_for_the_same_target_write_one_event(monkeypatch):
+  target = "f" * 40
+  other = "9" * 40
+  state: dict = {}
+  writes = []
+
+  def fake_write(status, **fields):
+    writes.append((status, dict(fields)))
+    state.update({"status": status, **fields})
+    return dict(state)
+
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: 3)
+  monkeypatch.setattr(auto_update, "read_auto_update_state", lambda: dict(state))
+  monkeypatch.setattr(auto_update, "write_auto_update_event", fake_write)
+  monkeypatch.setattr(auto_update, "_git", _recent_commit_git(60))
+
+  for _ in range(3):
+    assert asyncio.run(auto_update._postpone_for_missing_artifact(target)) is True
+  assert len(writes) == 1, writes
+  assert writes[0][0] == "waiting"
+  assert writes[0][1]["target_head"] == target
+
+  # A different update target is a new state and records a new event.
+  assert asyncio.run(auto_update._postpone_for_missing_artifact(other)) is True
+  assert len(writes) == 2, writes
+  assert writes[1][1]["target_head"] == other
 
 
 def test_artifact_postponing_expires_after_45_minutes(monkeypatch):
@@ -485,6 +514,7 @@ def test_attempt_update_postpones_before_touching_the_checkout(monkeypatch):
   monkeypatch.setattr(auto_update, "get_git_status", status)
   monkeypatch.setattr(auto_update, "repo_lock", lock)
   monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: (calls.append(sha), 3)[1])
+  monkeypatch.setattr(auto_update, "read_auto_update_state", dict)
   monkeypatch.setattr(auto_update, "_git", fake_git)
   monkeypatch.setattr(auto_update, "write_auto_update_event", lambda status, **fields: {"status": status})
   monkeypatch.setattr(auto_update, "_last_pull_at", float("-inf"))

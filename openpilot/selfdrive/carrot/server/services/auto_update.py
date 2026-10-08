@@ -244,12 +244,21 @@ async def _postpone_for_missing_artifact(target_head: str) -> bool:
     return False
   if age >= ARTIFACT_POSTPONE_MAX_AGE:
     return False
-  write_auto_update_event(
-    "waiting",
-    error_code="artifact_not_ready",
-    error=f"CI build artifact for {target_head[:12]} is not published yet; retrying",
-    target_head=target_head,
+  # One waiting event per target, not one per 60-second poll: the bounded
+  # event history must keep the real update outcomes visible.
+  state = read_auto_update_state()
+  already_waiting = (
+    state.get("status") == "waiting"
+    and state.get("error_code") == "artifact_not_ready"
+    and str(state.get("target_head") or "") == target_head
   )
+  if not already_waiting:
+    write_auto_update_event(
+      "waiting",
+      error_code="artifact_not_ready",
+      error=f"CI build artifact for {target_head[:12]} is not published yet; retrying",
+      target_head=target_head,
+    )
   print(f"[auto_update] waiting: artifact for {target_head[:12]} is not published yet (age {int(age)}s)", flush=True)
   return True
 

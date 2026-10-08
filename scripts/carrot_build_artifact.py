@@ -122,19 +122,85 @@ def http_get(url: str, timeout: float) -> bytes:
     return response.read()
 
 
+class _DownloadDeadlineExceeded(Exception):
+  pass
+
+
+def _read_verification_marker(path: str) -> str:
+  try:
+    with open(path, encoding="utf-8") as f:
+      return f.read().strip()
+  except OSError:
+    return ""
+
+
+def _write_verification_marker(path: str, digest: str) -> bool:
+  tmp = f"{path}.tmp.{os.getpid()}"
+  try:
+    with open(tmp, "w", encoding="utf-8") as f:
+      f.write(digest)
+    os.replace(tmp, path)
+    return True
+  except OSError:
+    _remove_quietly(tmp)
+    return False
+
+
+def _cached_artifact_ready(sha: str, root: str) -> bool:
+  """True when the cache holds the verified tarball for this exact sha.
+
+  The manifest and the tarball size are the cheap checks; the verification
+  marker proves the sha256 without re-hashing the tarball. A missing marker
+  (older cache, interrupted write) re-hashes once and repairs it; a stale or
+  corrupt cache drops the tarball so fetch downloads it again.
+  """
+  manifest, _ = load_manifest(sha, root)
+  if manifest is None:
+    return False
+  try:
+    tarball_size = int(manifest["tarball_size"])
+    tarball_sha256 = str(manifest["tarball_sha256"])
+  except (KeyError, TypeError, ValueError):
+    return False
+
+  destination = cache_dir(root, sha)
+  tarball_path = os.path.join(destination, f"{sha}.tar.xz")
+  marker_path = os.path.join(destination, f"{sha}.verified")
+  if not os.path.isfile(tarball_path) or os.path.getsize(tarball_path) != tarball_size:
+    return False
+  if _read_verification_marker(marker_path) == tarball_sha256:
+    return True
+  if sha256_file(tarball_path) == tarball_sha256:
+    _write_verification_marker(marker_path, tarball_sha256)
+    return True
+  _remove_quietly(tarball_path)
+  _remove_quietly(marker_path)
+  return False
+
+
 def fetch(sha: str, timeout: float, root: str) -> int:
   if not SHA_RE.match(sha):
     log(f"not a commit sha: {sha!r}")
     return EXIT_ERROR
 
+  deadline = time.monotonic() + timeout
   destination = cache_dir(root, sha)
   os.makedirs(destination, exist_ok=True)
+
+  # The mobile-data fix: a verified cache entry costs no network at all. The
+  # update loop retries fetch every poll while the device is behind, and a
+  # failed pull must not turn into a fresh 23 MB download each minute.
+  if _cached_artifact_ready(sha, root):
+    log(f"artifact {sha[:12]} already cached")
+    return EXIT_OK
+
   manifest_url = f"{base_url()}/{sha}.json"
   tarball_url = f"{base_url()}/{sha}.tar.xz"
 
   # A short probe first: a missing network or a 404 must skip the whole fetch
-  # instead of holding the boot for the full download timeout.
-  probe_timeout = min(PROBE_TIMEOUT, timeout)
+  # instead of holding the boot for the full download timeout. Every request
+  # also respects the total wall-clock deadline started above.
+  probe_timeout = min(PROBE_TIMEOUT, timeout, max(deadline - time.monotonic(), 0.001))
   try:
     manifest_bytes = http_get(manifest_url, probe_timeout)
   except urllib.error.HTTPError as exc:
@@ -176,15 +242,24 @@ def fetch(sha: str, timeout: float, root: str) -> int:
   request = urllib.request.Request(tarball_url, headers={"User-Agent": USER_AGENT})
   written = 0
   try:
-    with urllib.request.urlopen(request, timeout=timeout) as response, open(tmp_path, "wb") as f:
+    request_timeout = min(timeout, max(deadline - time.monotonic(), 0.001))
+    with urllib.request.urlopen(request, timeout=request_timeout) as response, open(tmp_path, "wb") as f:
       while True:
         chunk = response.read(1024 * 1024)
         if not chunk:
           break
+        # The socket timeout is per operation, so the wall clock is the only
+        # bound that survives a slow-but-alive link feeding one chunk at a time.
+        if time.monotonic() > deadline:
+          raise _DownloadDeadlineExceeded()
         written += len(chunk)
         if written > tarball_size:
           raise OSError(f"download exceeds the manifest size ({tarball_size} bytes)")
         f.write(chunk)
+  except _DownloadDeadlineExceeded:
+    _remove_quietly(tmp_path)
+    log("download deadline exceeded")
+    return EXIT_ERROR
   except urllib.error.HTTPError as exc:
     _remove_quietly(tmp_path)
     log(f"tarball request failed: HTTP {exc.code}")
@@ -205,6 +280,8 @@ def fetch(sha: str, timeout: float, root: str) -> int:
     return EXIT_ERROR
 
   os.replace(tmp_path, tarball_path)
+  if not _write_verification_marker(os.path.join(destination, f"{sha}.verified"), tarball_sha256):
+    log(f"could not record the verification marker for {sha[:12]}")
   prune_cache(root, sha)
   log(f"artifact {sha[:12]} ready: {written} bytes")
   return EXIT_OK
@@ -343,6 +420,17 @@ def check(repo: str, root: str) -> int:
         return 1
     except OSError:
       return 1
+  # The artifact is equivalent to a completed build only while the tracked tree
+  # still matches HEAD outside the files the build itself regenerates. An edited
+  # source file is exactly what the on-device build would have compiled, so it
+  # must invalidate the artifact and fall back to the full build.
+  regenerated = installed.get("tracked_regenerated") or []
+  if not isinstance(regenerated, list):
+    regenerated = []
+  tracked_generated = {str(rel) for rel in regenerated}
+  for rel in tracked_modifications(repo):
+    if rel not in tracked_generated:
+      return 1
   return 0
 
 
@@ -422,7 +510,9 @@ def install(sha: str, repo: str, root: str, tici_marker: str, ion_path: str) -> 
       log(f"install error while applying files: {exc}")
       return EXIT_ERROR
     write_json_atomic(installed_manifest_path(root),
-                      {"sha": sha, "files": {rel: {"sha256": files[rel]["sha256"], "size": files[rel]["size"]} for rel in sorted(files)}})
+                      {"sha": sha,
+                       "tracked_regenerated": sorted(regenerated_set),
+                       "files": {rel: {"sha256": files[rel]["sha256"], "size": files[rel]["size"]} for rel in sorted(files)}})
   finally:
     shutil.rmtree(staging_root, ignore_errors=True)
   log(f"installed artifact {sha[:12]} ({len(files)} files)")

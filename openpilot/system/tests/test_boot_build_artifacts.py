@@ -1,9 +1,13 @@
 import hashlib
+import io
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -232,6 +236,120 @@ def test_legacy_prebuilt_tree_still_skips_the_build(tmp_path: Path) -> None:
 
   assert result.returncode == 0, result.stdout + result.stderr
   assert not log.exists()
+
+
+def _git(repo: Path, *args: str) -> str:
+  result = subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True, check=False)
+  if result.returncode:
+    raise AssertionError(f"git {' '.join(args)} failed: {result.stderr}")
+  return result.stdout.strip()
+
+
+def _artifact_arch() -> str:
+  machine = platform.machine().lower()
+  if machine in ("aarch64", "arm64"):
+    return "larch64"
+  if machine in ("x86_64", "amd64"):
+    return "x86_64"
+  return machine
+
+
+def _make_installable_artifact(art: Path, sha: str, files: dict[str, bytes], tracked_regenerated: list[str]) -> None:
+  art.mkdir(parents=True, exist_ok=True)
+  tarball = art / f"{sha}.tar.xz"
+  with tarfile.open(tarball, "w:xz", preset=1) as tar:
+    for rel, data in sorted(files.items()):
+      info = tarfile.TarInfo(rel)
+      info.size = len(data)
+      info.mode = 0o644
+      tar.addfile(info, io.BytesIO(data))
+  manifest = {
+    "format": 1,
+    "source_commit": sha,
+    "agnos_version": BOOT_ARTIFACT_AGNOS,
+    "arch": _artifact_arch(),
+    "ion": False,
+    "tici": False,
+    "tarball": f"{sha}.tar.xz",
+    "tarball_sha256": hashlib.sha256(tarball.read_bytes()).hexdigest(),
+    "tarball_size": tarball.stat().st_size,
+    "files": {rel: {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data), "mode": "0644"}
+              for rel, data in files.items()},
+    "tracked_regenerated": tracked_regenerated,
+    "gates": {},
+  }
+  (art / f"{sha}.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+
+BOOT_ARTIFACT_AGNOS = "boot-artifact-agnos"
+
+
+def test_installed_artifact_with_dirty_tracked_source_forces_full_build(tmp_path: Path) -> None:
+  # A post-install edit of a tracked source file must fail the launcher's
+  # artifact check; the install retry rejects the dirty tree, so the boot falls
+  # back to the full build exactly like a source checkout.
+  repo = tmp_path / "tree"
+  repo.mkdir()
+  _git(repo, "init", "-q", "-b", "main")
+  _git(repo, "config", "user.name", "boot artifact test")
+  _git(repo, "config", "user.email", "boot-artifact@example.com")
+  (repo / "scripts").mkdir()
+  (repo / "scripts" / "build_artifact_tracked_outputs.txt").write_text("generated.txt\n", encoding="utf-8")
+  shutil.copy2(Path(BASEDIR) / "scripts" / "carrot_build_artifact.py", repo / "scripts" / "carrot_build_artifact.py")
+  (repo / "generated.txt").write_text("old\n", encoding="utf-8")
+  (repo / "src.cc").write_text("int value = 1;\n", encoding="utf-8")
+  _git(repo, "add", "-A")
+  _git(repo, "commit", "-q", "-m", "init")
+  sha = _git(repo, "rev-parse", "HEAD")
+
+  data = tmp_path / "data"
+  art = tmp_path / "art"
+  files = {"generated.txt": b"new\n", "build/bin/app": b"binary"}
+  _make_installable_artifact(art, sha, files, tracked_regenerated=["generated.txt"])
+  cache = data / "carrot_build_cache" / sha
+  cache.mkdir(parents=True)
+  shutil.copy2(art / f"{sha}.json", cache / f"{sha}.json")
+  shutil.copy2(art / f"{sha}.tar.xz", cache / f"{sha}.tar.xz")
+
+  env = dict(os.environ)
+  env["AGNOS_VERSION"] = BOOT_ARTIFACT_AGNOS
+  install = subprocess.run(
+    [sys.executable, str(Path(BASEDIR) / "scripts" / "carrot_build_artifact.py"),
+     "--root", str(data), "install", sha, "--repo", str(repo),
+     "--tici-marker", str(tmp_path / "no-tici"), "--ion-path", str(tmp_path / "no-ion")],
+    capture_output=True, text=True, env=env, check=False)
+  assert install.returncode == 0, install.stdout + install.stderr
+
+  (repo / "src.cc").write_text("int value = 2;\n", encoding="utf-8")
+
+  log = tmp_path / "calls.log"
+  harness = "\n".join(_launcher_function(name) for name in (
+    "carrot_data_dir", "carrot_prepare_build_artifact", "carrot_drop_fastpath_stamp",
+    "run_full_build", "run_model_build", "carrot_build_if_needed",
+  ))
+  script = (
+    f"DIR={shlex.quote(repo.as_posix())}\n"
+    f"export CARROT_DATA_DIR={shlex.quote(data.as_posix())}\n"
+    f"LOG={shlex.quote(log.as_posix())}\n"
+    f"REAL_PYTHON={shlex.quote(sys.executable.replace(chr(92), '/'))}\n"
+    f"export AGNOS_VERSION={shlex.quote(BOOT_ARTIFACT_AGNOS)}\n"
+    "MODEL_BUILD_STAMP_VALUE=stamp:value\n"
+    "BIG_MODEL_SHA=\n"
+    "big_model_artifact_ready() { return 1; }\n"
+    "boot_timing() { :; }\n"
+    "run_startup_command() { printf 'STARTUP %s\\n' \"$*\" >> \"$LOG\"; return 0; }\n"
+    "show_startup_failure() { echo \"SHOW: $*\"; exit 42; }\n"
+    "python3() { \"$REAL_PYTHON\" \"$@\"; }\n"
+    + harness + "\n"
+    "FORCE_REBUILD=0\nMODEL_REBUILD=0\nfast_boot=0\n"
+    "carrot_prepare_build_artifact\n"
+    "echo \"ARTIFACT_OK=$ARTIFACT_OK\"\n"
+    "carrot_build_if_needed\n"
+  )
+  result = subprocess.run([_bash(), "-c", script], capture_output=True, text=True, timeout=120, check=False, env=env)
+  assert result.returncode == 0, result.stdout + result.stderr
+  assert "ARTIFACT_OK=0" in result.stdout, result.stdout
+  assert log.read_text(encoding="utf-8").splitlines() == ["STARTUP ./build.py"]
 
 
 ENSURE_HARNESS = r'''#!/usr/bin/env bash

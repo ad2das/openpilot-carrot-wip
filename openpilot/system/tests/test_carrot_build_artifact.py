@@ -5,6 +5,7 @@ paths run it) against throwaway git repositories, fake artifact tarballs and a
 local HTTP server standing in for the GitHub release.
 """
 import hashlib
+import importlib.util
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import urllib.request
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -177,6 +179,55 @@ def test_check_rejects_other_commit(tmp_path: Path) -> None:
   (repo / "extra.txt").write_text("x", encoding="utf-8")
   git(repo, "add", "-A")
   git(repo, "commit", "-q", "-m", "next")
+  assert run_tool(root, "check", "--repo", str(repo)).returncode == 1
+
+
+def test_check_fails_on_tracked_modification_outside_tracked_regenerated(tmp_path: Path) -> None:
+  repo, sha = make_repo(tmp_path, {
+    ALLOWLIST: "generated.txt\n",
+    "generated.txt": "old\n",
+    "src.py": "x\n",
+  })
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "art", sha, {"generated.txt": b"new\n"},
+                                    tracked_regenerated=["generated.txt"])
+  stage_cache(root, sha, manifest, tarball)
+  assert run_install(root, repo, sha).returncode == 0
+  # generated.txt differs from HEAD but the artifact regenerated it.
+  assert run_tool(root, "check", "--repo", str(repo)).returncode == 0
+  (repo / "src.py").write_text("edited\n", encoding="utf-8")
+  assert run_tool(root, "check", "--repo", str(repo)).returncode == 1
+
+
+def test_check_accepts_modification_inside_tracked_regenerated(tmp_path: Path) -> None:
+  repo, sha = make_repo(tmp_path, {ALLOWLIST: "generated.txt\n", "generated.txt": "old\n"})
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "art", sha, {"generated.txt": b"new\n"},
+                                    tracked_regenerated=["generated.txt"])
+  stage_cache(root, sha, manifest, tarball)
+  assert run_install(root, repo, sha).returncode == 0
+  installed = json.loads((root / "carrot_build_artifacts/installed.json").read_text(encoding="utf-8"))
+  assert installed["tracked_regenerated"] == ["generated.txt"]
+  assert (repo / "generated.txt").read_text(encoding="utf-8") == "new\n"
+  assert run_tool(root, "check", "--repo", str(repo)).returncode == 0
+
+
+def test_check_treats_missing_tracked_regenerated_as_empty(tmp_path: Path) -> None:
+  repo, sha = make_repo(tmp_path, {ALLOWLIST: "generated.txt\n", "generated.txt": "old\n"})
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "art", sha, {"out/a": b"a"})
+  stage_cache(root, sha, manifest, tarball)
+  assert run_install(root, repo, sha).returncode == 0
+
+  # An installed.json from before tracked_regenerated existed has no list; the
+  # safe interpretation is "nothing is expected to be modified".
+  installed_path = root / "carrot_build_artifacts/installed.json"
+  installed = json.loads(installed_path.read_text(encoding="utf-8"))
+  installed.pop("tracked_regenerated")
+  installed_path.write_text(json.dumps(installed), encoding="utf-8")
+  assert run_tool(root, "check", "--repo", str(repo)).returncode == 0
+
+  (repo / "generated.txt").write_text("dirty\n", encoding="utf-8")
   assert run_tool(root, "check", "--repo", str(repo)).returncode == 1
 
 
@@ -383,6 +434,148 @@ def test_fetch_unreachable_network_is_error(tmp_path: Path) -> None:
                     env={"CARROT_BUILD_ARTIFACT_URL": "http://127.0.0.1:1"},
                     timeout=30)
   assert result.returncode == 1, result.stdout + result.stderr
+
+
+def _load_tool_module():
+  spec = importlib.util.spec_from_file_location("carrot_build_artifact_under_test", TOOL)
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module
+
+
+class _FakeResponse:
+  def __init__(self, data: bytes):
+    self._data = data
+    self._offset = 0
+
+  def read(self, size: int = -1) -> bytes:
+    if self._offset >= len(self._data):
+      return b""
+    end = len(self._data) if size is None or size < 0 else min(self._offset + size, len(self._data))
+    chunk = self._data[self._offset:end]
+    self._offset = end
+    return chunk
+
+  def __enter__(self):
+    return self
+
+  def __exit__(self, *exc):
+    return False
+
+
+def _fake_urlopen(url_to_bytes: dict[str, bytes], calls: list[str]):
+  def fake_urlopen(request, timeout=None):
+    del timeout
+    url = getattr(request, "full_url", None) or str(request)
+    calls.append(url)
+    if url not in url_to_bytes:
+      raise AssertionError(f"unexpected request: {url}")
+    return _FakeResponse(url_to_bytes[url])
+  return fake_urlopen
+
+
+def test_fetch_second_call_uses_cache_without_network(tmp_path: Path, monkeypatch, capsys) -> None:
+  tool = _load_tool_module()
+  sha = "a" * 40
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "serve", sha, {"out/a": b"hello"})
+  tarball_bytes = tarball.read_bytes()
+  digest = hashlib.sha256(tarball_bytes).hexdigest()
+  urls = {
+    f"http://artifact.test/{sha}.json": manifest.read_bytes(),
+    f"http://artifact.test/{sha}.tar.xz": tarball_bytes,
+  }
+  calls: list[str] = []
+  monkeypatch.setenv("CARROT_BUILD_ARTIFACT_URL", "http://artifact.test")
+  monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen(urls, calls))
+
+  assert tool.fetch(sha, 30.0, str(root)) == 0
+  cache = root / "carrot_build_cache" / sha
+  assert (cache / f"{sha}.verified").read_text(encoding="utf-8") == digest
+  assert calls == [f"http://artifact.test/{sha}.json", f"http://artifact.test/{sha}.tar.xz"]
+  capsys.readouterr()
+
+  # A second fetch for the same sha must not touch the network at all.
+  calls.clear()
+  monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen({}, calls))
+  assert tool.fetch(sha, 30.0, str(root)) == 0
+  assert calls == []
+  assert f"artifact {sha[:12]} already cached" in capsys.readouterr().out
+
+
+def test_fetch_missing_marker_hashes_once_without_download(tmp_path: Path, monkeypatch) -> None:
+  tool = _load_tool_module()
+  sha = "b" * 40
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "serve", sha, {"out/a": b"hello"})
+  tarball_bytes = tarball.read_bytes()
+  cache = stage_cache(root, sha, manifest, tarball)
+  calls: list[str] = []
+  monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen({}, calls))
+
+  assert tool.fetch(sha, 30.0, str(root)) == 0
+  assert calls == []
+  assert (cache / f"{sha}.verified").read_text(encoding="utf-8") == hashlib.sha256(tarball_bytes).hexdigest()
+
+
+def test_fetch_corrupt_cached_tarball_is_redownloaded(tmp_path: Path, monkeypatch) -> None:
+  tool = _load_tool_module()
+  sha = "c" * 40
+  root = tmp_path / "data"
+  manifest, tarball = make_artifact(tmp_path / "serve", sha, {"out/a": b"hello"})
+  tarball_bytes = tarball.read_bytes()
+  cache = stage_cache(root, sha, manifest, tarball)
+  corrupt = bytearray(tarball_bytes)
+  corrupt[0] ^= 0xFF
+  (cache / f"{sha}.tar.xz").write_bytes(bytes(corrupt))
+  urls = {
+    f"http://artifact.test/{sha}.json": manifest.read_bytes(),
+    f"http://artifact.test/{sha}.tar.xz": tarball_bytes,
+  }
+  calls: list[str] = []
+  monkeypatch.setenv("CARROT_BUILD_ARTIFACT_URL", "http://artifact.test")
+  monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen(urls, calls))
+
+  assert tool.fetch(sha, 30.0, str(root)) == 0
+  assert calls == [f"http://artifact.test/{sha}.json", f"http://artifact.test/{sha}.tar.xz"]
+  assert (cache / f"{sha}.tar.xz").read_bytes() == tarball_bytes
+  assert (cache / f"{sha}.verified").read_text(encoding="utf-8") == hashlib.sha256(tarball_bytes).hexdigest()
+
+
+def test_fetch_deadline_aborts_a_slow_download(tmp_path: Path, monkeypatch, capsys) -> None:
+  tool = _load_tool_module()
+  sha = "d" * 40
+  root = tmp_path / "data"
+  manifest, _ = make_artifact(tmp_path / "serve", sha, {"out/a": b"hello"})
+  manifest_bytes = manifest.read_bytes()
+  clock = {"now": 0.0}
+
+  class StallingResponse:
+    def read(self, size=-1):
+      clock["now"] += 3600.0
+      return b"x" * 4096
+
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *exc):
+      return False
+
+  def fake_urlopen(request, timeout=None):
+    del timeout
+    url = getattr(request, "full_url", None) or str(request)
+    if url.endswith(".json"):
+      return _FakeResponse(manifest_bytes)
+    return StallingResponse()
+
+  monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+  monkeypatch.setattr(tool.time, "monotonic", lambda: clock["now"])
+
+  assert tool.fetch(sha, 30.0, str(root)) == 1
+  cache = root / "carrot_build_cache" / sha
+  assert not (cache / f"{sha}.tar.xz.tmp").exists()
+  assert not (cache / f"{sha}.tar.xz").exists()
+  assert "download deadline exceeded" in capsys.readouterr().out
 
 
 def test_fetch_prunes_cache_to_three_entries(tmp_path: Path, served) -> None:
