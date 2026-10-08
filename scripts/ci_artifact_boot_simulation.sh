@@ -254,11 +254,12 @@ with tarfile.open(path, "r:xz") as src, tarfile.open(tmp, "w:xz", preset=6) as d
     if not member.isfile() or member.name.endswith(".pyc"):
       continue
     data = src.extractfile(member).read()
-    if first is None:
+    if first is None and data:
       first = member.name
-      data += b"tampered"
-    info = member
-    dst.addfile(info, __import__("io").BytesIO(data))
+      # Flip one byte without changing the size: the rejection must come from
+      # the sha256 verification, not merely from a size mismatch.
+      data = bytes([data[0] ^ 0xFF]) + data[1:]
+    dst.addfile(member, __import__("io").BytesIO(data))
 if first is None:
   raise SystemExit("no file was tampered")
 os.replace(tmp, path)
