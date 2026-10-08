@@ -491,6 +491,9 @@ jobs:
           export PYDEPS=/data/openpilot/pydeps
           export AGNOS_VERSION="19.8-carrot-bt1"
           cd /data/openpilot
+          # tee below writes the simulation log into the work dir; create it
+          # first so the pipe never fails and the evidence survives a failure.
+          mkdir -p /data/ci_boot_sim
           bash /data/openpilot/scripts/ci_artifact_boot_simulation.sh \
             --repo /data/openpilot \
             --sha "$(cat /data/ci_boot_artifact/sha)" \

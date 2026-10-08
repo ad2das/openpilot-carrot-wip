@@ -68,11 +68,18 @@ mkdir -p "$DATA" "$WORK/scons_cache"
 touch /dev/ion
 
 # The launcher bypasses the fast path when the stamp is absent; keep every run
-# on the full path.
+# on the full path. carrot_build_if_needed reads this launcher global, which is
+# otherwise only set by the real boot flow.
 export CARROT_BOOT_STAMP_PATH="$WORK/fastpath.stamp"
+fast_boot=0
 
 source "$REPO/launch_env.sh"
 source "$REPO/launch_chffrplus.sh"
+
+# The launcher resolves DIR from its own location; point it at the simulated
+# device checkout so the artifact install, Params check and model decisions all
+# operate on $TREE, exactly like a device where DIR is the installed tree.
+DIR="$TREE"
 
 # Shim every startup command (scons and ./build.py run through these) and record
 # the invocation instead of executing it.
