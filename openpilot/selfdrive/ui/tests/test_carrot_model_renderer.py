@@ -416,3 +416,112 @@ def test_ar_push_is_cleared_when_the_turn_state_disappears(monkeypatch):
   renderer._draw_ar_turn_carrot(ar_submaster(route=False))
 
   assert "_ar_push" not in renderer.__dict__
+
+
+def lead_renderer(**overrides):
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  defaults = {
+    "_carrot_soft_hold_active": False,
+    "_carrot_brake_hold_active": False,
+    "_carrot_carrot_cruise": False,
+    "_carrot_long_active": False,
+    "_carrot_x_state": 0,
+    "_carrot_radar_dist": 0.0,
+    "_carrot_vision_dist": 0.0,
+    "_carrot_radar_track_id": -1,
+    "_carrot_lead_status": False,
+    "_carrot_lead_speed": 0.0,
+    "_carrot_lead_vrel": 0.0,
+  }
+  for key, value in {**defaults, **overrides}.items():
+    setattr(renderer, key, value)
+  return renderer
+
+
+def test_lead_runs_radar_and_vision_primary_carries_unit_and_cross_check(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  renderer = lead_renderer(
+    _carrot_radar_dist=12.5,
+    _carrot_vision_dist=14.3,
+    _carrot_radar_track_id=0,
+    _carrot_lead_status=True,
+    _carrot_lead_speed=30.0,
+    _carrot_lead_vrel=-12.0,
+  )
+
+  assert renderer._lead_runs_carrot() == [
+    ("dot", model_renderer.LEAD_RED, 8.0),
+    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+    ("dot", model_renderer.LEAD_BLUE, 5.0),
+    ("num", "14.3", model_renderer.LEAD_SIZE_2, model_renderer.LEAD_CROSS),
+    ("bar",),
+    ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+    ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE),
+  ]
+
+
+def test_lead_runs_vision_only_leads_blue_without_cross_check(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  renderer = lead_renderer(_carrot_vision_dist=8.7)
+
+  assert renderer._lead_runs_carrot() == [
+    ("dot", model_renderer.LEAD_BLUE, 8.0),
+    ("num", "8.7", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+  ]
+
+
+def test_lead_runs_radar_only_has_no_vision_cross_check(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  renderer = lead_renderer(_carrot_radar_dist=12.5, _carrot_radar_track_id=7)
+
+  runs = renderer._lead_runs_carrot()
+
+  assert runs == [
+    ("dot", model_renderer.LEAD_AMBER, 8.0),
+    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+  ]
+  assert not any(run[0] == "dot" and run[2] == 5.0 for run in runs)
+
+
+def test_lead_runs_trend_badge_needs_two_kph_and_keeps_sign(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+
+  for vrel in (-1.4, 0.0, 1.4):
+    renderer = lead_renderer(
+      _carrot_radar_dist=12.5,
+      _carrot_lead_status=True,
+      _carrot_lead_speed=30.0,
+      _carrot_lead_vrel=vrel,
+    )
+    assert not any(run[0] == "trend" for run in renderer._lead_runs_carrot())
+
+  closing = lead_renderer(
+    _carrot_radar_dist=12.5,
+    _carrot_lead_status=True,
+    _carrot_lead_speed=30.0,
+    _carrot_lead_vrel=-12.0,
+  )
+  assert closing._lead_runs_carrot()[-1] == ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE)
+
+  pulling_away = lead_renderer(
+    _carrot_radar_dist=12.5,
+    _carrot_lead_status=True,
+    _carrot_lead_speed=30.0,
+    _carrot_lead_vrel=12.4,
+  )
+  assert pulling_away._lead_runs_carrot()[-1] == ("trend", 1, "12", model_renderer.LEAD_BADGE_SIZE)
+
+
+def test_lead_run_width_trend_slot_is_independent_of_digit_shapes():
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._type = SimpleNamespace(width=lambda text, size, weight: float(sum(10 if c == "1" else 20 for c in text)))
+
+  narrow = ("trend", -1, "11", model_renderer.LEAD_BADGE_SIZE)
+  wide = ("trend", -1, "88", model_renderer.LEAD_BADGE_SIZE)
+
+  assert renderer._lead_run_width(narrow, slot=True) == renderer._lead_run_width(wide, slot=True)
+  assert renderer._lead_run_width(narrow) != renderer._lead_run_width(wide)

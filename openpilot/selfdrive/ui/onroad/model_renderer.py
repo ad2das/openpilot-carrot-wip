@@ -60,9 +60,13 @@ LEAD_AMBER = rl.Color(255, 159, 10, 255)
 LEAD_SIZE = 58
 LEAD_SIZE_2 = 40
 LEAD_UNIT_SIZE = 36
+LEAD_BADGE_SIZE = 36
+LEAD_BADGE_H = 50.0
+LEAD_BADGE_PAD = 14.0
 LEAD_STATE_SIZE = 48
 LEAD_CAPSULE_H = 86.0
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
+LEAD_CROSS = rl.Color(255, 255, 255, 150)  # vision cross-check figure beside a radar distance
 LEAD_TWO = rl.Color(230, 126, 34, 255)
 
 
@@ -883,39 +887,43 @@ class ModelRenderer(Widget):
     text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
     runs: list[tuple] = []
     radar = self._carrot_radar_dist > 0.0
-    if radar:
-      runs += [("dot", LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER, 8.0),
-               ("num", f"{self._carrot_radar_dist:.1f}", LEAD_SIZE, text_color)]
-    if self._carrot_vision_dist > 0.0:
-      # Beside a radar distance the vision estimate is a cross-check, so it steps down a size.
-      runs += [("dot", LEAD_BLUE, 6.0 if radar else 8.0),
-               ("num", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2 if radar else LEAD_SIZE, hs.TEXT_3 if radar else text_color)]
-    if runs:
-      runs.append(("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3))
+    vision = self._carrot_vision_dist > 0.0
+    # The distance that drives the car leads in its source colour and carries the unit; beside a radar
+    # distance the vision estimate is a quiet cross-check that follows it, a size down, unit-less.
+    if radar or vision:
+      primary = self._carrot_radar_dist if radar else self._carrot_vision_dist
+      source = (LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER) if radar else LEAD_BLUE
+      runs += [("dot", source, 8.0), ("num", f"{primary:.1f}", LEAD_SIZE, text_color),
+               ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
+      if radar and vision:
+        runs += [("dot", LEAD_BLUE, 5.0), ("num", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2, LEAD_CROSS)]
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       if runs:
         runs.append(("bar",))
       runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
                ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
-      # Speed relative to us, in the radar tags' language: green up = pulling away, red down = closing.
+      # Speed relative to us as a tinted badge, in the radar tags' language: green up = pulling away,
+      # red down = closing.
       rel = round(self._carrot_lead_vrel)
       if abs(rel) >= 2:
-        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_SIZE_2))
+        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_BADGE_SIZE))
     return runs
 
-  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 22.0, "trend": 18.0}
+  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 24.0, "trend": 18.0}
 
   def _lead_run_width(self, run, slot: bool = False) -> float:
     kind = run[0]
     if kind == "dot":
       return run[2] * 2.0
     if kind == "bar":
-      return 3.0 + 22.0
+      return 2.0 + 24.0
     if kind == "num" and slot:
       # Widest-digit slot: Inter's figures are proportional.
       return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], hs.SEMI)
     if kind == "trend":
-      return run[3] * 0.5 + 6.0 + self._type.width(run[2], run[3], hs.SEMI)
+      # Badge: padding, arrow, gap, figure (widest-digit slot so the badge does not breathe either).
+      figure = "".join("0" for _ in run[2]) if slot else run[2]
+      return 2 * LEAD_BADGE_PAD + run[3] * 0.5 + 6.0 + self._type.width(figure, run[3], hs.BOLD)
     return self._type.width(run[1], run[2], hs.SEMI)
 
   def _lead_run_gap(self, prev, kind) -> float:
@@ -923,7 +931,7 @@ class ModelRenderer(Widget):
       return 0.0
     if prev == "dot":
       return 9.0
-    return 24.0 if kind == "dot" else self._LEAD_GAPS[kind]
+    return (18.0 if prev == "unit" else 24.0) if kind == "dot" else self._LEAD_GAPS[kind]
 
   def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
     runs = self._lead_runs_carrot()
@@ -971,19 +979,22 @@ class ModelRenderer(Widget):
         size = runs[i + 1][2] if i + 1 < len(runs) and runs[i + 1][0] == "num" else LEAD_SIZE
         hs.dot(x + run[2], base - size * hs.INTER_CAP / 2, run[2], run[1])
       elif kind == "bar":
-        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 22.0, 3.0, 44.0), 1.0, 4, hs.rgba(255, 255, 255, 70))
+        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 24.0, 2.0, 48.0), 1.0, 4, hs.rgba(255, 255, 255, 56))
       elif kind == "num":
         t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
       elif kind == "trend":
         size = run[3]
         color = hs.LIVE_GREEN if run[1] > 0 else hs.WARN_RED
-        g, gy = size * 0.5, base - size * hs.INTER_CAP / 2
-        gh = g * 0.82
+        bh = LEAD_BADGE_H
+        hs.card(x, mid - bh / 2, width, bh, hs.with_alpha(color, 46), bh / 2, hs.with_alpha(color, 90), 1.5)
+        g = size * 0.5
+        gh = g * 0.86
+        gx, gy = x + LEAD_BADGE_PAD, mid
         if run[1] > 0:
-          hs.triangle((x, gy + gh / 2), (x + g, gy + gh / 2), (x + g / 2, gy - gh / 2), color)
+          hs.triangle((gx, gy + gh / 2), (gx + g, gy + gh / 2), (gx + g / 2, gy - gh / 2), color)
         else:
-          hs.triangle((x, gy - gh / 2), (x + g, gy - gh / 2), (x + g / 2, gy + gh / 2), color)
-        t.draw(run[2], x + g + 6.0, base, size, color, hs.SEMI)
+          hs.triangle((gx, gy - gh / 2), (gx + g, gy - gh / 2), (gx + g / 2, gy + gh / 2), color)
+        t.draw(run[2], gx + g + 6.0, mid + size * hs.INTER_CAP / 2, size, color, hs.BOLD)
       else:
         t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
       x += width
