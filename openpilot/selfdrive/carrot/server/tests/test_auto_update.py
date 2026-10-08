@@ -405,3 +405,89 @@ def test_manual_pull_does_not_clear_unrelated_or_reboot_errors(monkeypatch):
   ]:
     monkeypatch.setattr(auto_update, "read_auto_update_state", lambda state=state: state)
     auto_update.clear_recovered_git_ref_error()
+
+
+def _recent_commit_git(age: float):
+  async def fake_git(args, timeout):
+    del timeout
+    assert args[:3] == ["show", "-s", "--format=%ct"], args
+    return 0, str(int(auto_update.time.time() - age))
+  return fake_git
+
+
+def test_missing_artifact_for_a_fresh_commit_postpones(monkeypatch):
+  target = "a" * 40
+  fetched = []
+  writes = []
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: (fetched.append(sha), 3)[1])
+  monkeypatch.setattr(auto_update, "write_auto_update_event",
+                      lambda status, **fields: (writes.append((status, fields)), {"status": status})[1])
+  monkeypatch.setattr(auto_update, "_git", _recent_commit_git(60))
+
+  assert asyncio.run(auto_update._postpone_for_missing_artifact(target)) is True
+  assert fetched == [target]
+  assert writes[0][0] == "waiting"
+  assert writes[0][1]["error_code"] == "artifact_not_ready"
+  assert writes[0][1]["target_head"] == target
+
+
+def test_artifact_postponing_expires_after_45_minutes(monkeypatch):
+  writes = []
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: 3)
+  monkeypatch.setattr(auto_update, "write_auto_update_event",
+                      lambda status, **fields: writes.append((status, fields)) or {"status": status})
+  monkeypatch.setattr(auto_update, "_git", _recent_commit_git(46 * 60))
+
+  assert asyncio.run(auto_update._postpone_for_missing_artifact("b" * 40)) is False
+  assert writes == []
+
+
+@pytest.mark.parametrize("fetch_rc", [0, 1, 2, -1])
+def test_non_404_fetch_result_never_postpones(monkeypatch, fetch_rc):
+  async def fail_git(args, timeout):
+    raise AssertionError(f"commit age must not be queried on fetch rc {fetch_rc}")
+
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: fetch_rc)
+  monkeypatch.setattr(auto_update, "_git", fail_git)
+  monkeypatch.setattr(auto_update, "write_auto_update_event",
+                      lambda *args, **kwargs: pytest.fail("no state write for proceed"))
+
+  assert asyncio.run(auto_update._postpone_for_missing_artifact("c" * 40)) is False
+
+
+def test_unreadable_commit_time_never_postpones(monkeypatch):
+  async def broken_git(args, timeout):
+    return 1, "unknown revision"
+
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: 3)
+  monkeypatch.setattr(auto_update, "_git", broken_git)
+  monkeypatch.setattr(auto_update, "write_auto_update_event",
+                      lambda *args, **kwargs: pytest.fail("no state write for proceed"))
+
+  assert asyncio.run(auto_update._postpone_for_missing_artifact("d" * 40)) is False
+
+
+def test_attempt_update_postpones_before_touching_the_checkout(monkeypatch):
+  monitor = type("Monitor", (), {"ready": lambda self: True})()
+  calls = []
+
+  async def status():
+    return {"available": True, "state": "ok", "behind": 1, "target_head": "e" * 40,
+            "head": "old", "branch": "carrot-wip"}
+
+  def lock():
+    raise AssertionError("the checkout lock must not be taken while postponing")
+
+  async def fake_git(args, timeout):
+    assert args[:3] == ["show", "-s", "--format=%ct"], args
+    return 0, str(int(auto_update.time.time()))
+
+  monkeypatch.setattr(auto_update, "get_git_status", status)
+  monkeypatch.setattr(auto_update, "repo_lock", lock)
+  monkeypatch.setattr(auto_update, "fetch_build_artifact", lambda repo, sha: (calls.append(sha), 3)[1])
+  monkeypatch.setattr(auto_update, "_git", fake_git)
+  monkeypatch.setattr(auto_update, "write_auto_update_event", lambda status, **fields: {"status": status})
+  monkeypatch.setattr(auto_update, "_last_pull_at", float("-inf"))
+
+  assert asyncio.run(auto_update._attempt_update(monitor)) == (False, False, "")
+  assert calls == ["e" * 40]

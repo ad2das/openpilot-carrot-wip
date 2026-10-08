@@ -8,6 +8,7 @@ import threading
 import time
 
 from openpilot.common.repo_update import child_lock_kwargs, recover_stale_index_lock, repo_lock
+from openpilot.common.build_artifact_fetch import UPDATE_FETCH_TIMEOUT, fetch_build_artifact
 from openpilot.common.reboot import reboot_device
 from openpilot.selfdrive.carrot.server.services.git_config import prepare_git_pull
 
@@ -85,6 +86,12 @@ def pull_current_branch(repo: Path) -> tuple[str, bool]:
   rc, detail, target = prepare_git_pull(str(repo))
   if rc or not target:
     raise RuntimeError(detail or 'Unable to fetch the current branch.')
+  # Warm the build-artifact cache for the update target so the next boot can
+  # install it instead of compiling. Best effort: never blocks or fails the update.
+  try:
+    fetch_build_artifact(repo, target, UPDATE_FETCH_TIMEOUT)
+  except Exception as exc:
+    print(f'Startup recovery artifact fetch skipped: {exc}', flush=True)
   git('merge', '--ff-only', target)
   if git('rev-parse', 'HEAD') != target:
     raise RuntimeError('Local commits differ from the update. Resolve them in the recovery terminal.')

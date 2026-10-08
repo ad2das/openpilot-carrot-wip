@@ -44,8 +44,8 @@ def _launcher_function(name: str) -> str:
   return source[start:end]
 
 
-def _write_model_tree(root: Path, *, prebuilt: bool, prebuilt_json: bool = False, stamp: str | None = None,
-                      artifacts: bool = True, tg: str | None = None, model_inputs: str = "stamp:") -> Path:
+def _write_model_tree(root: Path, *, prebuilt: bool, stamp: str | None = None,
+                      artifacts: bool = True, tg: str | None = None) -> Path:
   models = root / "openpilot" / "selfdrive" / "modeld" / "models"
   models.mkdir(parents=True, exist_ok=True)
   scripts = root / "scripts"
@@ -53,10 +53,6 @@ def _write_model_tree(root: Path, *, prebuilt: bool, prebuilt_json: bool = False
   shutil.copy2(Path(BASEDIR) / "scripts" / "carrot_model_backend_check.py", scripts / "carrot_model_backend_check.py")
   if prebuilt:
     (root / "prebuilt").write_text("", encoding="utf-8")
-  if prebuilt_json:
-    (root / "prebuilt.json").write_text(json.dumps({
-      "builder": "ci", "models": "device", "source_commit": "source-sha", "model_inputs": model_inputs,
-    }), encoding="utf-8")
   if stamp is not None:
     (models / ".build_stamp").write_text(stamp, encoding="utf-8")
   if artifacts:
@@ -69,11 +65,12 @@ def _write_model_tree(root: Path, *, prebuilt: bool, prebuilt_json: bool = False
 
 
 def _run_model_stamp(root: Path, *, big_model_sha: str = "", big_ready: bool = False,
-                     tici_marker: Path | None = None) -> str:
+                     tici_marker: Path | None = None, artifact_ok: bool = False) -> str:
   script = (f"DIR={shlex.quote(root.as_posix())}\n"
             f"BIG_MODEL_SHA={shlex.quote(big_model_sha)}\n"
             "FORCE_REBUILD=0\n"
             "MODEL_REBUILD=0\n"
+            f"ARTIFACT_OK={1 if artifact_ok else 0}\n"
             "git() { echo stamp; }\n"
             f"big_model_artifact_ready() {{ return {0 if big_ready else 1}; }}\n"
             + _launcher_function("carrot_model_backend_guard") + "\n"
@@ -86,9 +83,9 @@ def _run_model_stamp(root: Path, *, big_model_sha: str = "", big_ready: bool = F
   return result.stdout.strip().splitlines()[-1]
 
 
-# (prebuilt, prebuilt_json, stamp, tg, artifacts, on_device, expected FORCE_REBUILD:MODEL_REBUILD)
+# (prebuilt, artifact_ok, stamp, tg, artifacts, on_device, expected FORCE_REBUILD:MODEL_REBUILD)
 MODEL_STAMP_CASES = [
-  # Source checkout: byte-for-byte the previous behaviour.
+  # Source checkout (ARTIFACT_OK=0, no legacy prebuilt marker): unchanged.
   (False, False, "stamp:", QCOM_TG, True, False, "0:0"),
   (False, False, None, QCOM_TG, True, False, "1:0"),
   (False, False, "stamp:", None, False, False, "1:0"),
@@ -100,27 +97,27 @@ MODEL_STAMP_CASES = [
   (True, False, None, None, True, False, "1:0"),
   (True, False, "stamp:", CPU_TG, True, True, "1:0"),
   (True, False, None, CPU_TG, True, True, "1:0"),
-  # CI prebuilt: the tree ships no compiled models, so the device builds them.
-  (True, True, None, None, False, False, "0:1"),
-  (True, True, None, QCOM_TG, True, False, "0:1"),
-  (True, True, "stamp:", QCOM_TG, True, False, "0:0"),
-  (True, True, "stamp:", QCOM_TG, True, True, "0:0"),
-  (True, True, "outdated:", QCOM_TG, True, True, "0:1"),
-  (True, True, "stamp:", CPU_TG, True, True, "0:1"),
-  (True, True, None, QCOM_TG, True, True, "0:1"),
+  # Installed CI build artifact (ARTIFACT_OK=1): a missing or stale model tree
+  # schedules only the device model build, never a full SCons rebuild.
+  (False, True, None, None, False, False, "0:1"),
+  (False, True, None, QCOM_TG, True, False, "0:1"),
+  (False, True, "stamp:", QCOM_TG, True, False, "0:0"),
+  (False, True, "stamp:", QCOM_TG, True, True, "0:0"),
+  (False, True, "outdated:", QCOM_TG, True, True, "0:1"),
+  (False, True, "stamp:", CPU_TG, True, True, "0:1"),
+  (False, True, None, QCOM_TG, True, True, "0:1"),
 ]
 
 
-@pytest.mark.parametrize("prebuilt, prebuilt_json, stamp, tg, artifacts, on_device, expected", MODEL_STAMP_CASES)
-def test_model_stamp_decision(tmp_path: Path, prebuilt: bool, prebuilt_json: bool, stamp: str | None, tg: str | None,
+@pytest.mark.parametrize("prebuilt, artifact_ok, stamp, tg, artifacts, on_device, expected", MODEL_STAMP_CASES)
+def test_model_stamp_decision(tmp_path: Path, prebuilt: bool, artifact_ok: bool, stamp: str | None, tg: str | None,
                               artifacts: bool, on_device: bool, expected: str) -> None:
   marker = tmp_path / "TICI"
   if on_device:
     marker.write_text("", encoding="utf-8")
-  _write_model_tree(tmp_path, prebuilt=prebuilt, prebuilt_json=prebuilt_json, stamp=stamp,
-                    artifacts=artifacts, tg=tg)
+  _write_model_tree(tmp_path, prebuilt=prebuilt, stamp=stamp, artifacts=artifacts, tg=tg)
 
-  assert _run_model_stamp(tmp_path, tici_marker=marker) == expected
+  assert _run_model_stamp(tmp_path, tici_marker=marker, artifact_ok=artifact_ok) == expected
 
 
 def test_prebuilt_stamp_refresh_behaviour(tmp_path: Path) -> None:
@@ -136,18 +133,22 @@ def test_prebuilt_stamp_refresh_behaviour(tmp_path: Path) -> None:
   assert (source_models / ".build_stamp").read_text(encoding="utf-8") == "outdated:"
 
 
-@pytest.mark.parametrize("big_stamp, ready, expected", [
-  ("model-sha", True, "0:0"),
-  ("model-sha", False, "1:0"),
-  (None, True, "1:0"),
+@pytest.mark.parametrize("big_stamp, ready, artifact_ok, expected", [
+  ("model-sha", True, False, "0:0"),
+  ("model-sha", False, False, "1:0"),
+  (None, True, False, "1:0"),
+  # With an installed artifact a stale eGPU model stays a model-only rebuild.
+  ("model-sha", True, True, "0:0"),
+  ("model-sha", False, True, "0:1"),
 ])
-def test_model_stamp_keeps_egpu_invalidation(tmp_path: Path, big_stamp: str | None, ready: bool, expected: str) -> None:
-  models = _write_model_tree(tmp_path, prebuilt=True, stamp="stamp:", artifacts=True, tg=QCOM_TG)
+def test_model_stamp_keeps_egpu_invalidation(tmp_path: Path, big_stamp: str | None, ready: bool,
+                                             artifact_ok: bool, expected: str) -> None:
+  models = _write_model_tree(tmp_path, prebuilt=not artifact_ok, stamp="stamp:", artifacts=True, tg=QCOM_TG)
   if big_stamp is not None:
     (models / ".big_model_build_stamp").write_text(big_stamp, encoding="utf-8")
 
   assert _run_model_stamp(tmp_path, big_model_sha="model-sha", big_ready=ready,
-                          tici_marker=tmp_path / "no-tici-marker") == expected
+                          tici_marker=tmp_path / "no-tici-marker", artifact_ok=artifact_ok) == expected
 
 
 def _build_harness_functions() -> str:
@@ -169,10 +170,10 @@ def _build_harness(tmp_path: Path, *, startup_rc: int, phases: str) -> subproces
 
 
 def test_model_build_runs_targets_and_writes_stamp(tmp_path: Path) -> None:
-  models = _write_model_tree(tmp_path, prebuilt=True, prebuilt_json=True, stamp=None, artifacts=False)
+  models = _write_model_tree(tmp_path, prebuilt=False, stamp=None, artifacts=False)
   log = tmp_path / "calls.log"
   result = _build_harness(tmp_path, startup_rc=0, phases=f"LOG={shlex.quote(log.as_posix())}\n"
-                          "FORCE_REBUILD=0\nMODEL_REBUILD=1\nfast_boot=0\n"
+                          "FORCE_REBUILD=0\nMODEL_REBUILD=1\nARTIFACT_OK=1\nfast_boot=0\n"
                           "carrot_build_if_needed\n")
 
   assert result.returncode == 0, result.stdout + result.stderr
@@ -181,12 +182,12 @@ def test_model_build_runs_targets_and_writes_stamp(tmp_path: Path) -> None:
 
 
 def test_model_build_failure_drops_stamp_and_shows_failure(tmp_path: Path) -> None:
-  models = _write_model_tree(tmp_path, prebuilt=True, prebuilt_json=True, stamp=None, artifacts=False)
+  models = _write_model_tree(tmp_path, prebuilt=False, stamp=None, artifacts=False)
   stamp_file = tmp_path / "fastpath.stamp"
   stamp_file.write_text("fingerprint", encoding="utf-8")
   log = tmp_path / "calls.log"
   result = _build_harness(tmp_path, startup_rc=1, phases=f"LOG={shlex.quote(log.as_posix())}\n"
-                          "FORCE_REBUILD=0\nMODEL_REBUILD=1\nfast_boot=0\n"
+                          "FORCE_REBUILD=0\nMODEL_REBUILD=1\nARTIFACT_OK=1\nfast_boot=0\n"
                           "carrot_build_if_needed\n")
 
   assert result.returncode == 42, result.stdout + result.stderr
@@ -195,22 +196,42 @@ def test_model_build_failure_drops_stamp_and_shows_failure(tmp_path: Path) -> No
   assert not (models / ".build_stamp").exists()
 
 
-def test_build_dispatch_full_then_model_only(tmp_path: Path) -> None:
-  models = _write_model_tree(tmp_path, prebuilt=True, prebuilt_json=True, stamp=None, artifacts=False)
-  log_full = tmp_path / "full.log"
+def test_build_dispatch_matrix(tmp_path: Path) -> None:
+  _write_model_tree(tmp_path, prebuilt=False, stamp=None, artifacts=False)
+  log_force = tmp_path / "force.log"
   log_model = tmp_path / "model.log"
+  log_artifact_idle = tmp_path / "artifact_idle.log"
+  log_source_full = tmp_path / "source_full.log"
+  log_source_model = tmp_path / "source_model.log"
   log_fast = tmp_path / "fast.log"
   result = _build_harness(tmp_path, startup_rc=0, phases=(
-    f"LOG={shlex.quote(log_full.as_posix())}\nFORCE_REBUILD=1\nMODEL_REBUILD=0\nfast_boot=0\ncarrot_build_if_needed\n"
-    f"LOG={shlex.quote(log_model.as_posix())}\nFORCE_REBUILD=0\nMODEL_REBUILD=1\nfast_boot=0\ncarrot_build_if_needed\n"
-    f"LOG={shlex.quote(log_fast.as_posix())}\nFORCE_REBUILD=1\nMODEL_REBUILD=1\nfast_boot=1\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_force.as_posix())}\nFORCE_REBUILD=1\nMODEL_REBUILD=0\nARTIFACT_OK=1\nfast_boot=0\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_model.as_posix())}\nFORCE_REBUILD=0\nMODEL_REBUILD=1\nARTIFACT_OK=1\nfast_boot=0\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_artifact_idle.as_posix())}\nFORCE_REBUILD=0\nMODEL_REBUILD=0\nARTIFACT_OK=1\nfast_boot=0\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_source_full.as_posix())}\nFORCE_REBUILD=0\nMODEL_REBUILD=0\nARTIFACT_OK=0\nfast_boot=0\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_source_model.as_posix())}\nFORCE_REBUILD=0\nMODEL_REBUILD=1\nARTIFACT_OK=0\nfast_boot=0\ncarrot_build_if_needed\n"
+    f"LOG={shlex.quote(log_fast.as_posix())}\nFORCE_REBUILD=1\nMODEL_REBUILD=1\nARTIFACT_OK=1\nfast_boot=1\ncarrot_build_if_needed\n"
   ))
 
   assert result.returncode == 0, result.stdout + result.stderr
-  assert log_full.read_text(encoding="utf-8").splitlines() == ["./build.py"]
+  assert log_force.read_text(encoding="utf-8").splitlines() == ["./build.py"]
   assert log_model.read_text(encoding="utf-8").splitlines() == ["./build.py --targets openpilot/selfdrive/modeld/models"]
+  assert not log_artifact_idle.exists()
+  assert log_source_full.read_text(encoding="utf-8").splitlines() == ["./build.py"]
+  assert log_source_model.read_text(encoding="utf-8").splitlines() == ["./build.py"]
   assert not log_fast.exists()
-  assert (models / ".build_stamp").read_text(encoding="utf-8") == "stamp:value"
+  assert (tmp_path / "openpilot/selfdrive/modeld/models/.build_stamp").read_text(encoding="utf-8") == "stamp:value"
+
+
+def test_legacy_prebuilt_tree_still_skips_the_build(tmp_path: Path) -> None:
+  _write_model_tree(tmp_path, prebuilt=True, stamp="stamp:", artifacts=True, tg=QCOM_TG)
+  log = tmp_path / "calls.log"
+  result = _build_harness(tmp_path, startup_rc=0, phases=f"LOG={shlex.quote(log.as_posix())}\n"
+                          "FORCE_REBUILD=0\nMODEL_REBUILD=0\nARTIFACT_OK=0\nfast_boot=0\n"
+                          "carrot_build_if_needed\n")
+
+  assert result.returncode == 0, result.stdout + result.stderr
+  assert not log.exists()
 
 
 ENSURE_HARNESS = r'''#!/usr/bin/env bash
@@ -238,7 +259,7 @@ HEADER_CONTENT = b'{"Foo", {PERSISTENT, BOOL}};\n'
 
 
 def _run_ensure_params_build(tmp_path: Path, *, prebuilt: bool, module: bool, stamp: str | None,
-                             python_rc: str = "0", scons_rc: str = "0"):
+                             python_rc: str = "0", scons_rc: str = "0", artifact: bool = False):
   root = tmp_path / "tree"
   (root / "scripts").mkdir(parents=True)
   shutil.copy2(Path(BASEDIR) / "scripts" / "ensure_params_build.sh", root / "scripts" / "ensure_params_build.sh")
@@ -260,6 +281,8 @@ def _run_ensure_params_build(tmp_path: Path, *, prebuilt: bool, module: bool, st
   sim = tmp_path / "sim"
   env = dict(os.environ)
   env.update({"PYTHON_RC": python_rc, "SCONS_RC": scons_rc, "SCONS_CACHE_DIR": cache.as_posix()})
+  if artifact:
+    env["CARROT_BUILD_ARTIFACT"] = "1"
   result = subprocess.run([_bash(), harness.as_posix(), (root / "scripts" / "ensure_params_build.sh").as_posix(),
                            sim.as_posix()], env=env, capture_output=True, text=True, timeout=60, check=False)
   return result, root, cache, sim
@@ -276,8 +299,22 @@ def test_prebuilt_params_module_is_trusted_and_stamped(tmp_path: Path) -> None:
   assert "params_check.py" in (sim / "python.log").read_text(encoding="utf-8")
 
 
-def test_prebuilt_params_check_failure_falls_back_to_rebuild(tmp_path: Path) -> None:
-  result, root, cache, sim = _run_ensure_params_build(tmp_path, prebuilt=True, module=True, stamp=None, python_rc="1")
+def test_artifact_params_module_is_trusted_and_stamped(tmp_path: Path) -> None:
+  # An installed CI build artifact (CARROT_BUILD_ARTIFACT=1) gets the same trust
+  # as a legacy on-device prebuilt tree: record the stamp, no SCons.
+  result, root, cache, sim = _run_ensure_params_build(tmp_path, prebuilt=False, module=True, stamp=None, artifact=True)
+
+  assert result.returncode == 0, result.stdout + result.stderr
+  assert not (sim / "scons.log").exists()
+  assert (root / "openpilot" / "common" / "params_pyx.so").exists()
+  header_hash = hashlib.sha256((root / "openpilot" / "common" / "params_keys.h").read_bytes()).hexdigest()
+  assert (cache / "carrot_params_keys.sha256").read_text(encoding="utf-8").strip() == header_hash
+  assert "params_check.py" in (sim / "python.log").read_text(encoding="utf-8")
+
+
+def test_artifact_params_check_failure_falls_back_to_rebuild(tmp_path: Path) -> None:
+  result, root, cache, sim = _run_ensure_params_build(tmp_path, prebuilt=False, module=True, stamp=None,
+                                                      python_rc="1", artifact=True)
 
   assert result.returncode != 0
   assert "-u -j4 openpilot/common/params_pyx.so" in (sim / "scons.log").read_text(encoding="utf-8")
@@ -285,7 +322,8 @@ def test_prebuilt_params_check_failure_falls_back_to_rebuild(tmp_path: Path) -> 
   assert not (cache / "carrot_params_keys.sha256").exists()
 
 
-def test_source_checkout_still_rebuilds_without_prebuilt_marker(tmp_path: Path) -> None:
+def test_params_module_without_any_marker_still_rebuilds(tmp_path: Path) -> None:
+  # Without the prebuilt marker or the artifact env the source behavior stands.
   result, root, cache, sim = _run_ensure_params_build(tmp_path, prebuilt=False, module=True, stamp=None)
 
   assert result.returncode == 0, result.stdout + result.stderr

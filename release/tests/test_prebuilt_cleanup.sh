@@ -92,38 +92,6 @@ assert_junk_gone "$DEVICE"
 
 echo "device-release cleanup passed"
 
-# --- ci mode: keep the tracked onnx inputs, drop every untracked model artifact ---
-CI="$TMP_DIR/ci"
-make_repo "$CI"
-populate_tracked "$CI"
-populate_untracked_junk "$CI"
-populate_untracked_models "$CI"
-
-bash "$CLEANUP" --mode ci "$CI"
-
-[[ -f "$CI/prebuilt" ]]
-[[ -f "$CI/prebuilt.json" ]]
-grep -Fq '"builder":"ci"' "$CI/prebuilt.json"
-grep -Fq '"models":"device"' "$CI/prebuilt.json"
-SOURCE_COMMIT="$(git -C "$CI" rev-parse HEAD)"
-grep -Fq "\"source_commit\":\"$SOURCE_COMMIT\"" "$CI/prebuilt.json"
-EXPECTED_INPUTS="$(git -C "$CI" rev-parse HEAD:openpilot/selfdrive/modeld HEAD:tinygrad_repo HEAD:openpilot/common/file_chunker.py | tr '\n' ':')"
-grep -Fq "\"model_inputs\":\"$EXPECTED_INPUTS\"" "$CI/prebuilt.json"
-# The tracked onnx inputs and libraries stay.
-[[ -f "$CI/openpilot/selfdrive/modeld/models/driving_supercombo.onnx" ]]
-[[ -f "$CI/third_party/raylib/larch64/libraylib.a" ]]
-[[ -f "$CI/openpilot/selfdrive/modeld/models/README.md" ]]
-# Every untracked model artifact is gone.
-[[ ! -e "$CI/openpilot/selfdrive/modeld/models/driving_tinygrad.pkl" ]]
-[[ ! -e "$CI/openpilot/selfdrive/modeld/models/driving_tinygrad.pkl.chunkmanifest" ]]
-[[ ! -e "$CI/openpilot/selfdrive/modeld/models/tg_input_devices.json" ]]
-[[ ! -e "$CI/openpilot/selfdrive/modeld/models/.build_stamp" && ! -e "$CI/openpilot/selfdrive/modeld/models/.big_model_build_stamp" ]]
-[[ ! -e "$CI/openpilot/selfdrive/modeld/models/extra.onnx" ]]
-[[ ! -e "$CI/Jenkinsfile" && ! -e "$CI/release" ]]
-assert_junk_gone "$CI"
-
-echo "ci cleanup passed"
-
 # --- a file above GitHub's 95 MiB limit is rejected after the marker is written ---
 BIG="$TMP_DIR/big"
 make_repo "$BIG"

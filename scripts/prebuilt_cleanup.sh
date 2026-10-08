@@ -1,26 +1,21 @@
 #!/usr/bin/env bash
-# Shared prebuilt-tree cleanup. Used by release/build_carrot.sh (on-device
-# release, --mode device-release) and by the carrot-wip-prebuilt CI workflow
-# (--mode ci) so the rules never diverge.
+# Shared prebuilt-tree cleanup for on-device release builds.
+# Used by release/build_carrot.sh (--mode device-release).
 #
 # Only git-untracked files are ever deleted, so tracked build inputs such as
 # third_party/raylib/*/libraylib.a survive the cleanup. The intentional
-# tracked deletions are models/*.onnx in device-release mode and the
-# release-only Jenkinsfile and release/ directory, which are dropped from
-# every published tree. Rejects files above GitHub's size limit and, in ci
-# mode, writes prebuilt.json next to the `prebuilt` marker.
+# tracked deletions are models/*.onnx and the release-only Jenkinsfile and
+# release/ directory, which are dropped from the published tree. Rejects files
+# above GitHub's size limit.
 set -Eeuo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/prebuilt_cleanup.sh --mode {ci|device-release} [TREE]
+Usage: scripts/prebuilt_cleanup.sh --mode device-release [TREE]
 
   --mode device-release  On-device release semantics: drop untracked build
                          junk, models/*.onnx and device-local stamps; keep the
                          device-built model pickles.
-  --mode ci              CI prebuilt semantics: keep the tracked .onnx inputs,
-                         drop every untracked model artifact and build junk,
-                         then write prebuilt and prebuilt.json.
 EOF
 }
 
@@ -49,7 +44,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$MODE" == "ci" || "$MODE" == "device-release" ]] || { usage >&2; exit 2; }
+[[ "$MODE" == "device-release" ]] || { usage >&2; exit 2; }
 TARGET_DIR="${TARGET_DIR:-$PWD}"
 cd -- "$TARGET_DIR"
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
@@ -108,50 +103,21 @@ delete_root_sconsign() {
   fi
 }
 
-# Every untracked file under the model tree is build output: the onnx inputs
-# and the python glue are tracked, the pkl/chunk/stamp/backend files are not.
-delete_untracked_model_artifacts() {
-  local rel
-  while IFS= read -r rel; do
-    [ -n "$rel" ] || continue
-    case "$rel" in
-      openpilot/selfdrive/modeld/models/*) rm -f -- "$rel" ;;
-    esac
-  done < "$UNTRACKED"
-}
-
 delete_untracked_build_junk
 delete_untracked_cache_dirs
 delete_root_sconsign
 
-if [[ "$MODE" == "ci" ]]; then
-  delete_untracked_model_artifacts
-else
-  # On-device release keeps the compiled model pickles but the historical
-  # semantics always dropped the .onnx inputs, the device-local stamps and any
-  # stale CI manifest that would make the launcher expect a device rebuild.
-  rm -f -- openpilot/selfdrive/modeld/models/*.onnx
-  rm -f -- openpilot/selfdrive/modeld/models/.build_stamp \
-           openpilot/selfdrive/modeld/models/.big_model_build_stamp
-  rm -f -- prebuilt.json
-fi
+# On-device release keeps the compiled model pickles but the historical
+# semantics always dropped the .onnx inputs, the device-local stamps and any
+# stale CI manifest that would make the launcher expect a device rebuild.
+rm -f -- openpilot/selfdrive/modeld/models/*.onnx
+rm -f -- openpilot/selfdrive/modeld/models/.build_stamp \
+         openpilot/selfdrive/modeld/models/.big_model_build_stamp
+rm -f -- prebuilt.json
 
 # Release-only files are dropped from every published tree.
 rm -rf -- Jenkinsfile release/
 touch prebuilt
-
-if [[ "$MODE" == "ci" ]]; then
-  # The manifest records the source commit and the exact model input hash the
-  # launcher computes, so the device builds its own QCOM model artifacts on
-  # the first boot and never trusts host-built CPU ones.
-  SOURCE_COMMIT="$(git rev-parse HEAD)"
-  MODEL_INPUTS="$(git rev-parse HEAD:openpilot/selfdrive/modeld HEAD:tinygrad_repo HEAD:openpilot/common/file_chunker.py 2>/dev/null | tr '\n' ':')"
-  if [[ -z "$MODEL_INPUTS" ]]; then
-    MODEL_INPUTS="$(git rev-parse HEAD)"
-  fi
-  printf '{"builder":"ci","models":"device","source_commit":"%s","model_inputs":"%s"}\n' \
-    "$SOURCE_COMMIT" "$MODEL_INPUTS" > prebuilt.json
-fi
 
 BIG_FILES="$(find . -type f -not -path './.git/*' -size +95M -print)"
 if [[ -n "$BIG_FILES" ]]; then

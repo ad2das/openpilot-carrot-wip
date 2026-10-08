@@ -7,6 +7,7 @@ import subprocess
 import time
 
 from openpilot.common.async_process import prepare_repo, run_locked_thread, run_process
+from openpilot.common.build_artifact_fetch import FETCH_NOT_PUBLISHED, fetch_build_artifact
 from openpilot.common.repo_update import RepoBusyError, repo_lock
 from .git_config import prepare_git_pull
 from .git_state import read_auto_update_state, write_auto_update_event, write_git_pull_time
@@ -27,6 +28,11 @@ RESET_TIMEOUT = 120.0
 PULL_TIMEOUT = 180.0
 GIT_INFO_TIMEOUT = 10.0    # cheap rev-parse/log/diff lookups
 NOTIFY_TIMEOUT = 4.0       # CWP push POST (fire-and-forget)
+# A just-pushed commit whose CI build artifact is not published yet is worth a
+# short wait: retrying shortly lets the reboot happen with the artifact ready
+# instead of compiling on the device. Older commits update as before, so no
+# update can be blocked forever by a missing artifact.
+ARTIFACT_POSTPONE_MAX_AGE = 45 * 60.0
 AUTO_UPDATE_ERROR_ALERT = "Offroad_CarrotAutoUpdateFailed"
 AUTO_UPDATE_ERROR_DETAIL_LIMIT = 2000
 
@@ -215,6 +221,39 @@ class ManagerMonitor:
       await asyncio.sleep(1.0)
 
 
+async def _postpone_for_missing_artifact(target_head: str) -> bool:
+  """Warm the artifact cache for the update target; briefly postpone if CI has
+  not published its artifact yet, so the reboot normally happens with it ready.
+
+  Never blocks an update forever: a commit older than the postpone window, an
+  unreachable fetch or a fetch error proceeds exactly like today.
+  """
+  try:
+    rc = await asyncio.to_thread(fetch_build_artifact, REPO_DIR, target_head)
+  except Exception as exc:
+    print(f"[auto_update] artifact fetch skipped: {exc}", flush=True)
+    return False
+  if rc != FETCH_NOT_PUBLISHED:
+    return False
+  commit_rc, commit_time = await _git(["show", "-s", "--format=%ct", target_head], GIT_INFO_TIMEOUT)
+  if commit_rc:
+    return False
+  try:
+    age = time.time() - int(commit_time.strip())
+  except (TypeError, ValueError):
+    return False
+  if age >= ARTIFACT_POSTPONE_MAX_AGE:
+    return False
+  write_auto_update_event(
+    "waiting",
+    error_code="artifact_not_ready",
+    error=f"CI build artifact for {target_head[:12]} is not published yet; retrying",
+    target_head=target_head,
+  )
+  print(f"[auto_update] waiting: artifact for {target_head[:12]} is not published yet (age {int(age)}s)", flush=True)
+  return True
+
+
 async def _attempt_update(monitor) -> tuple[bool, bool, str]:
   """Do not hold the checkout lock while waiting for manager initialization."""
   global _last_pull_at
@@ -223,6 +262,8 @@ async def _attempt_update(monitor) -> tuple[bool, bool, str]:
   status = await get_git_status()
   behind, target_head = _verified_update_target(status)
   if not behind or time.monotonic() - _last_pull_at < AUTO_UPDATE_COOLDOWN:
+    return False, False, ""
+  if await _postpone_for_missing_artifact(target_head):
     return False, False, ""
   try:
     with repo_lock():

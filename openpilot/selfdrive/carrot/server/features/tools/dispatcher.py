@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from aiohttp import web
 
 from openpilot.common.async_process import prepare_repo, run_locked_thread
+from openpilot.common.build_artifact_fetch import fetch_build_artifact_async
 from openpilot.common.reboot import spawn_reboot
 from openpilot.common.repo_update import RepoBusyError, child_lock_kwargs, repo_lock
 from openpilot.system.hardware import HARDWARE
@@ -300,6 +301,10 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
       if rc_config:
         jobs.finish(job, ok=False, result=jobs.result_from_log(job, rc_config))
         return
+      # Warm the build-artifact cache for the target commit so the next boot
+      # can install it; best effort, a missing artifact never blocks the pull.
+      if await fetch_build_artifact_async(repo_dir, target_head) == 0:
+        jobs.append(job, "build artifact fetched for the update target\n")
       jobs.progress(job, message="git reset --hard", current=1, total=2)
       jobs.append(job, "$ git reset --hard\n")
       rc_reset = await jobs.stream_exec(job, ["git", "reset", "--hard"], cwd=repo_dir, timeout=120)
@@ -899,6 +904,8 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       clear_git_status_cache()
       if rc_config != 0:
         return web.json_response({"ok": False, "rc": rc_config, "out": out_config})
+      # Best-effort warm of the build-artifact cache for the target commit.
+      await fetch_build_artifact_async(REPO_DIR, target_head)
       rc_before, before_out = run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR)
       before_head = before_out.strip() if rc_before == 0 else ""
       rc, out = run(["git", "merge", "--ff-only", target_head], cwd=REPO_DIR)

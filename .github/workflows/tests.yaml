@@ -39,7 +39,8 @@ jobs:
             openpilot/selfdrive/modeld/tests/test_big_model_delivery.py \
             openpilot/selfdrive/modeld/tests/test_helpers.py::test_usbgpu_compiled_path_waits_for_selected_model_instead_of_previous \
             openpilot/system/tests/test_model_build_cache.py \
-            openpilot/system/tests/test_prebuilt_boot.py \
+            openpilot/system/tests/test_boot_build_artifacts.py \
+            openpilot/system/tests/test_carrot_build_artifact.py \
             openpilot/system/tests/test_model_backend_check.py \
             openpilot/system/tests/test_build_targets.py \
             openpilot/system/tests/test_launch_order.py
@@ -90,9 +91,9 @@ jobs:
       - name: Check startup, locking, recovery and subprocess cleanup
         run: |
           bash -n launch_chffrplus.sh
-          python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/common/tests openpilot/common/tests/test_repo_update.py
+          python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/common/tests openpilot/common/tests/test_repo_update.py openpilot/common/tests/test_build_artifact_fetch.py
           python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/selfdrive/carrot/server/tests openpilot/selfdrive/carrot/server/tests/test_auto_update.py openpilot/selfdrive/carrot/server/tests/test_git_config.py
-          python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/system/tests openpilot/system/tests/test_launch_order.py
+          python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/system/tests openpilot/system/tests/test_launch_order.py openpilot/system/tests/test_startup_recovery.py
           python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/system/updated/tests openpilot/system/updated/tests/test_process.py
 
   build_release:

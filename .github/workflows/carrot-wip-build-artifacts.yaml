@@ -1,35 +1,50 @@
-# Build the comma 3 / 3X (AGNOS) prebuilt tree for carrot-wip and publish it to
-# the append-only `carrot-wip-prebuilt` branch, so a device that switches to
-# that branch can skip the on-device SCons build after an update.
+# Build the comma 3 / 3X (AGNOS 19.8-carrot-bt1) device outputs for every
+# carrot-wip commit and publish them as a downloadable artifact, so the device
+# can install the update target at boot instead of compiling.
 #
 # The build runs inside the device's own AGNOS system image (the "system"
 # partition from openpilot/system/hardware/tici/agnos.json) at the device path
 # /data/openpilot, using the same steps as launch_chffrplus.sh:
 #   bootstrap_runtime_dependencies -> scripts/ensure_params_build.sh -> build.py
-# then validates the result, applies the shared release cleanup
-# (scripts/prebuilt_cleanup.sh --mode ci) and writes the `prebuilt` marker plus
-# a `prebuilt.json` manifest.
 #
-# Device parity is enforced before publishing (scripts/ci_prebuilt_parity_gate.py):
-#   G1 every source-tracked path survives byte-identical (allowlist in
-#      scripts/prebuilt_allowed_changes.txt)
-#   G2 no untracked file under openpilot/selfdrive/modeld/models/
-#   G3 camerad and visionipc_pyx.so use the ION backend, not /dev/shm
-#   G4 every non-panda C/C++ compile carries -D__TICI__
-#   G5 every untracked ELF is AArch64
-#   G6 prebuilt.json matches the source commit's model inputs
-# and G7 simulates the device's first boot inside the chroot. The publish step
-# is skipped when any gate fails, and the published commit is re-fetched and
-# checked again afterwards.
+# Artifact content (scripts/ci_build_artifact_gate.py):
+#   every git-untracked file left by the build, minus model artifacts, pydeps,
+#   python caches, untracked *.o/*.os/*.a, .sconsign.dblite, moc_* and test
+#   caches, plus the tracked files the build regenerates (allowlist in
+#   scripts/build_artifact_tracked_outputs.txt). Any other tracked modification
+#   fails the run. Packed as <sha>.tar.xz with a <sha>.json manifest of file
+#   hashes, modes and gate evidence.
+#
+# Gates before publishing (fail = no publish):
+#   - tracked files: only the allowlisted regenerated outputs differ
+#   - ION strings in camerad and visionipc_pyx.so (no /dev/shm fallback)
+#   - every non-panda compile carries -D__TICI__ (scons verbose dry run)
+#   - every ELF in the artifact is AArch64 (panda/board firmware exempt)
+#   - no model artifacts in the artifact
+#   - manifest hashes match the packed tarball
+#   - device-install simulation (scripts/ci_artifact_boot_simulation.sh):
+#     (a) clean checkout + artifact installs and needs only the model build,
+#     (b) stub QCOM models + matching stamp need no build,
+#     (c) no artifact -> full build,
+#     (d) unmatched /dev/ion or AGNOS_VERSION -> rejected -> full build,
+#     (e) tampered tarball file -> rejected -> full build,
+#     (f) tracked status stays within the allowlist.
+#
+# Publishing uses ONE rolling GitHub Release (tag carrot-wip-builds, prerelease)
+# with the workflow GITHUB_TOKEN; assets are pruned so only the newest 30
+# commits remain. The device fetches from
+# https://github.com/ad2das/openpilot-carrot-wip/releases/download/carrot-wip-builds/.
+#
+# Models (tinygrad pkls) are never shipped: they are compiled on the device
+# only when model inputs change. The artifact otherwise leaves the checkout
+# equivalent to a successful on-device build, except build intermediates
+# (.o/.os/.a, .sconsign.dblite, the SCons cache).
 #
 # /dev/ion: the chroot's /dev is an rbind of the runner's /dev, so the build
 # step creates a placeholder /dev/ion immediately before SCons (msgq selects
 # visionbuf_ion.cc only when it exists) and removes it again as soon as the
-# build finishes, before any in-chroot test runs. Nothing opens it at runtime.
-#
-# Models are built on the device, never shipped: the CI tree keeps only the
-# tracked .onnx inputs, and the launcher builds
-# `openpilot/selfdrive/modeld/models` with QCOM on the first boot.
+# build finishes. The device-install simulation creates its own placeholder
+# only for its duration. Nothing opens it at runtime.
 #
 # /AGNOS is hidden inside the build chroot: build.py's device-only power/IRQ
 # setup (Tici.set_power_save) cannot run on a server VM (no Qualcomm CPUs, no
@@ -37,17 +52,8 @@
 # same build() call is reproduced with minimal=True explicitly, so the built
 # tree matches a device build. SConstruct still sees /TICI, so the tree is
 # built for larch64 exactly like the device.
-#
-# Publishing is append-only: the new commit's parent is the current remote head
-# and the ref update is server-side fast-forward checked (GitHub API
-# force=false). New blobs are seeded through a force-pushed scratch branch in
-# bounded batches so no single push is huge; the real branch only fast-forwards.
-#
-# A push to carrot-wip triggers the workflow; workflow_dispatch is available for
-# manual runs (e.g. from a development branch). Only a fully green dispatched
-# publish re-enabled this trigger after the device-parity work landed.
 
-name: carrot-wip prebuilt
+name: carrot-wip build artifacts
 
 on:
   push:
@@ -55,7 +61,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: carrot-wip-prebuilt
+  group: carrot-wip-build-artifacts
   cancel-in-progress: true
 
 permissions:
@@ -65,11 +71,11 @@ env:
   AGNOS_IMAGE_URL: https://github.com/ajouatom/agnos-builder/releases/download/agnos-19.8-carrot-bt1/system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz
   AGNOS_IMAGE_SHA256: 077d42186def98025ffad9723774c96f45da10c87cc6fedbc58d0cf4fa65ffd4
   AGNOS_IMAGE_NAME: system-375c5d22335770ac08750660bb5b29a3331c550d6a9875b35f36b88af792ea44.img.xz
-  PREBUILT_BRANCH: carrot-wip-prebuilt
-  UPLOAD_BRANCH: carrot-wip-prebuilt-upload
+  AGNOS_VERSION: 19.8-carrot-bt1
+  ARTIFACT_RELEASE_TAG: carrot-wip-builds
 
 jobs:
-  build-prebuilt:
+  build-artifacts:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 350
     steps:
@@ -88,13 +94,13 @@ jobs:
       - name: Setup working directories
         run: |
           set -euo pipefail
-          CACHE_ROOT="$RUNNER_TEMP/carrot-prebuilt"
-          mkdir -p "$CACHE_ROOT/agnos-image" "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/params"
+          CACHE_ROOT="$RUNNER_TEMP/carrot-build-artifacts"
+          mkdir -p "$CACHE_ROOT/agnos-image" "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/params" "$CACHE_ROOT/artifact"
           # Put the multi-gigabyte raw disk image on the filesystem with the
           # most free space (the ephemeral /mnt when it is larger).
           WORK_ROOT="$CACHE_ROOT"
           if [ -d /mnt ] && [ "$(df -Pk --output=avail /mnt | tail -1)" -gt "$(df -Pk --output=avail / | tail -1)" ]; then
-            WORK_ROOT=/mnt/carrot-prebuilt
+            WORK_ROOT=/mnt/carrot-build-artifacts
           fi
           sudo mkdir -p "$WORK_ROOT"
           sudo chown "$(id -u):$(id -g)" "$WORK_ROOT"
@@ -108,7 +114,7 @@ jobs:
         id: agnos-cache
         uses: actions/cache/restore@v4
         with:
-          path: ${{ runner.temp }}/carrot-prebuilt/agnos-image
+          path: ${{ runner.temp }}/carrot-build-artifacts/agnos-image
           key: agnos-system-${{ env.AGNOS_IMAGE_SHA256 }}
           fail-on-cache-miss: false
 
@@ -132,16 +138,16 @@ jobs:
         if: steps.agnos-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v4
         with:
-          path: ${{ runner.temp }}/carrot-prebuilt/agnos-image
+          path: ${{ runner.temp }}/carrot-build-artifacts/agnos-image
           key: agnos-system-${{ env.AGNOS_IMAGE_SHA256 }}
 
       - name: Restore SCons cache
         uses: actions/cache@v4
         with:
-          path: ${{ runner.temp }}/carrot-prebuilt/scons_cache
-          key: scons-cache-v1-${{ github.run_id }}
+          path: ${{ runner.temp }}/carrot-build-artifacts/scons_cache
+          key: scons-cache-v2-${{ github.run_id }}
           restore-keys: |
-            scons-cache-v1-
+            scons-cache-v2-
 
       - name: Convert AGNOS sparse image to raw
         run: |
@@ -291,7 +297,7 @@ jobs:
           echo "=== scripts/ensure_params_build.sh ==="
           bash /data/openpilot/scripts/ensure_params_build.sh
 
-          echo "=== scons verbose dry run (gate G4 evidence) ==="
+          echo "=== scons verbose dry run (gate evidence) ==="
           # The real build reads cached objects and prints abbreviated actions,
           # so a verbose dry run records the full compile command lines for the
           # -D__TICI__ parity gate. The restored SCons cache would let SCons
@@ -299,7 +305,7 @@ jobs:
           # every compile the build would perform.
           if ! ( cd /data/openpilot && SCONS_PROGRESS=1 PYTHONUNBUFFERED=1 \
                   scons -n -j4 --cache-disable --minimal --verbose ) > /data/ci_scons_dryrun.log 2>&1; then
-            echo "::warning::the scons dry run exited nonzero; gate G4 will judge the log"
+            echo "::warning::the scons dry run exited nonzero; the gate will judge the log"
           fi
           wc -l /data/ci_scons_dryrun.log || true
           tail -n 3 /data/ci_scons_dryrun.log || true
@@ -414,7 +420,8 @@ jobs:
           python3 -m pytest -o addopts='' -q -c /dev/null --rootdir=/data/openpilot \
             openpilot/system/tests/test_launch_order.py \
             openpilot/system/tests/test_model_build_cache.py \
-            openpilot/system/tests/test_prebuilt_boot.py \
+            openpilot/system/tests/test_boot_build_artifacts.py \
+            openpilot/system/tests/test_carrot_build_artifact.py \
             openpilot/system/tests/test_model_backend_check.py \
             openpilot/system/tests/test_build_targets.py \
             openpilot/system/tests/test_c3_agnos_manifest.py \
@@ -427,306 +434,123 @@ jobs:
         run: |
           set -euo pipefail
           # The chroot runs as root, so give the workspace and caches back to
-          # the runner user before the host-side cleanup and publish steps.
+          # the runner user before packing and publishing.
           sudo chown -R "$(id -u):$(id -g)" "$GITHUB_WORKSPACE" "$CACHE_ROOT" "$WORK_ROOT" 2>/dev/null || true
           du -sh "$CACHE_ROOT/scons_cache" "$CACHE_ROOT/agnos-image" 2>/dev/null || true
 
-      - name: Clean the tree with the shared release rules
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          echo "--- before cleanup ---"
-          du -sh . 2>/dev/null || true
-          bash scripts/prebuilt_cleanup.sh --mode ci "$GITHUB_WORKSPACE"
-          echo "--- prebuilt manifest ---"
-          cat prebuilt.json
-          echo "--- after cleanup ---"
-          du -sh . 2>/dev/null || true
-          echo "changed/untracked entries:"
-          git status --porcelain | wc -l
-
-      - name: Device-parity gates (G1-G6)
+      - name: Pack and gate the build artifact
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
           SRC_SHA="$(git rev-parse HEAD)"
           echo "SRC_SHA=$SRC_SHA" >> "$GITHUB_ENV"
           echo "source commit: $SRC_SHA"
-          if ! command -v readelf >/dev/null 2>&1; then
-            sudo apt-get install -y -qq binutils
-          fi
-          # Any failing gate exits nonzero here, so the publish step is skipped.
-          python3 scripts/ci_prebuilt_parity_gate.py \
-            --mode worktree --tree "$GITHUB_WORKSPACE" \
+          python3 scripts/ci_build_artifact_gate.py pack \
+            --tree "$GITHUB_WORKSPACE" \
             --source-sha "$SRC_SHA" \
-            --allowlist "$GITHUB_WORKSPACE/scripts/prebuilt_allowed_changes.txt" \
+            --allowlist "$GITHUB_WORKSPACE/scripts/build_artifact_tracked_outputs.txt" \
             --scons-log "${SCONS_DRY_RUN_LOG}" \
-            --gates G1,G2,G3,G4,G5,G6
+            --out-dir "$CACHE_ROOT/artifact" \
+            --agnos-version "$AGNOS_VERSION" \
+            --arch larch64
 
-      - name: First-boot simulation on the published tree (G7)
-        run: |
-          set -euo pipefail
-          sudo tee /mnt/agnos/tmp/ci_first_boot_sim.sh >/dev/null <<'SIM_EOF'
-          #!/bin/bash
-          # G7: simulate the device's first boot on the cleaned, prebuilt tree.
-          # No set -u: the launcher functions rely on optional variables unset.
-          set -Eeo pipefail
-          export HOME=/root
-          cd /data/openpilot
-          if [ -d /usr/local/venv/bin ]; then
-            export PATH="/usr/local/venv/bin:$PATH"
-          fi
-          export PYDEPS=/data/openpilot/pydeps
-          export PYTHONPATH="$PYDEPS:/data/openpilot"
-          git config --global --add safe.directory /data/openpilot
-
-          SIM=/tmp/first_boot_sim
-          rm -rf "$SIM"
-          mkdir -p "$SIM/scons_cache"
-          LOG="$SIM/invocations.log"
-          MODELS=/data/openpilot/openpilot/selfdrive/modeld/models
-          MODEL_INPUTS="$(python3 -c 'import json; print(json.load(open("/data/openpilot/prebuilt.json"))["model_inputs"])')"
-
-          source /data/openpilot/launch_env.sh
-          source /data/openpilot/launch_chffrplus.sh
-
-          # The device's fresh /data/scons_cache has no Params stamp; give the
-          # simulation its own cache instead of touching the mounted one.
-          export SCONS_CACHE_DIR="$SIM/scons_cache"
-
-          # The scons/build shim: every startup command the launcher would
-          # execute is recorded here and reports success, so the decision logic
-          # is what gets tested.
-          run_startup_command() {
-            printf 'STARTUP %s\n' "$*" >> "$LOG"
-            return 0
-          }
-
-          fast_boot=0
-
-          reset_models() {
-            rm -f "$MODELS/tg_input_devices.json" \
-                  "$MODELS/driving_tinygrad.pkl" \
-                  "$MODELS/dmonitoring_model_tinygrad.pkl" \
-                  "$MODELS/dmonitoring_model_metadata.pkl" \
-                  "$MODELS/.build_stamp" "$MODELS/.big_model_build_stamp"
-          }
-
-          run_decision() {
-            FORCE_REBUILD=0
-            MODEL_REBUILD=0
-            invalidate_modeld_build_if_needed
-            invalidate_native_build_if_needed
-            carrot_build_if_needed
-          }
-
-          build_calls() {
-            grep -c '^STARTUP ./build.py' "$LOG" || true
-          }
-
-          expect_model_build() {
-            local label="$1" calls
-            calls="$(build_calls)"
-            [ "$calls" = "1" ] || { echo "::error::${label}: expected exactly one build invocation, got $calls"; cat "$LOG"; exit 1; }
-            grep -Fxq 'STARTUP ./build.py --targets openpilot/selfdrive/modeld/models' "$LOG" || {
-              echo "::error::${label}: the invocation was not the model-only target"; cat "$LOG"; exit 1; }
-            [ "$FORCE_REBUILD" = "0" ] || { echo "::error::${label}: FORCE_REBUILD=$FORCE_REBUILD"; exit 1; }
-            [ "$MODEL_REBUILD" = "1" ] || { echo "::error::${label}: MODEL_REBUILD=$MODEL_REBUILD"; exit 1; }
-            [ "$(cat "$MODELS/.build_stamp" 2>/dev/null)" = "$MODEL_INPUTS" ] || {
-              echo "::error::${label}: the model stamp was not refreshed"; exit 1; }
-          }
-
-          expect_no_build() {
-            local label="$1" calls
-            calls="$(build_calls)"
-            [ "$calls" = "0" ] || { echo "::error::${label}: expected no build invocation, got $calls"; cat "$LOG"; exit 1; }
-            [ "$FORCE_REBUILD" = "0" ] || { echo "::error::${label}: FORCE_REBUILD=$FORCE_REBUILD"; exit 1; }
-            [ "$MODEL_REBUILD" = "0" ] || { echo "::error::${label}: MODEL_REBUILD=$MODEL_REBUILD"; exit 1; }
-          }
-
-          echo "G7 prebuilt.json model_inputs=$MODEL_INPUTS"
-          echo "G7 /TICI present: $(test -f /TICI && echo yes || echo no)"
-
-          # (a) The published tree ships no compiled models: the first boot
-          # builds only the model targets.
-          reset_models
-          : > "$LOG"
-          run_decision
-          echo "G7(a): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
-          expect_model_build "G7(a)"
-          echo "G7(a) pass: exactly one model-only build, FORCE_REBUILD=0"
-
-          # (b) Already-built QCOM artifacts with the manifest stamp: nothing
-          # to rebuild.
-          reset_models
-          : > "$LOG"
-          printf '%s' '{"openpilot.selfdrive.modeld.modeld": {"default": {"WARP_DEV": "QCOM", "QUEUE_DEV": "QCOM"}, "usbgpu": {"WARP_DEV": "QCOM", "QUEUE_DEV": "AMD"}}, "openpilot.selfdrive.modeld.dmonitoringmodeld": {"default": {"DEV": "QCOM"}}}' > "$MODELS/tg_input_devices.json"
-          printf '%s' "$MODEL_INPUTS" > "$MODELS/.build_stamp"
-          touch "$MODELS/driving_tinygrad.pkl" "$MODELS/dmonitoring_model_tinygrad.pkl" "$MODELS/dmonitoring_model_metadata.pkl"
-          run_decision
-          echo "G7(b): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
-          expect_no_build "G7(b)"
-          echo "G7(b) pass: QCOM artifacts with the matching stamp trigger nothing"
-
-          # (c) CPU-backend artifacts (the defect being fixed): the model-only
-          # rebuild runs.
-          reset_models
-          : > "$LOG"
-          printf '%s' '{"openpilot.selfdrive.modeld.modeld": {"default": {"WARP_DEV": "CPU", "QUEUE_DEV": "CPU"}, "usbgpu": {"WARP_DEV": "CPU", "QUEUE_DEV": "AMD"}}, "openpilot.selfdrive.modeld.dmonitoringmodeld": {"default": {"DEV": "CPU"}}}' > "$MODELS/tg_input_devices.json"
-          printf '%s' "$MODEL_INPUTS" > "$MODELS/.build_stamp"
-          touch "$MODELS/driving_tinygrad.pkl" "$MODELS/dmonitoring_model_tinygrad.pkl" "$MODELS/dmonitoring_model_metadata.pkl"
-          run_decision
-          echo "G7(c): FORCE_REBUILD=$FORCE_REBUILD MODEL_REBUILD=$MODEL_REBUILD"
-          expect_model_build "G7(c)"
-          echo "G7(c) pass: a CPU backend triggers the model-only rebuild"
-
-          # Leave the published tree exactly as it was.
-          reset_models
-          git status --porcelain -- openpilot/selfdrive/modeld/models > "$SIM/status.txt"
-          if [ -s "$SIM/status.txt" ]; then
-            echo "::error::the first-boot simulation left files behind:"
-            cat "$SIM/status.txt"
-            exit 1
-          fi
-          echo "G7 pass: tree clean after the simulation"
-          SIM_EOF
-          sudo chmod +x /mnt/agnos/tmp/ci_first_boot_sim.sh
-          sudo chroot /mnt/agnos /bin/bash /tmp/ci_first_boot_sim.sh
-
-      - name: Publish append-only to carrot-wip-prebuilt
+      - name: Reproducibility report against an already published manifest
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-
-          SRC_SHA="$(git rev-parse HEAD)"
-          echo "source commit: $SRC_SHA"
-
-          # The workflow GITHUB_TOKEN may not push commits that create or update
-          # .github/workflows files, and a device tree has no use for them.
-          # Drop them from the published tree (they remain on the source branch).
-          rm -rf "$GITHUB_WORKSPACE/.github/workflows"
-
-          export GIT_AUTHOR_NAME=ad2das GIT_AUTHOR_EMAIL=ad2das@gmail.com
-          export GIT_COMMITTER_NAME=ad2das GIT_COMMITTER_EMAIL=ad2das@gmail.com
-
-          # Seed the new blobs through a force-pushable scratch branch in
-          # bounded batches; carrot-wip-prebuilt itself only fast-forwards.
-          export GIT_INDEX_FILE="$RUNNER_TEMP/prebuilt-publish.index"
-          rm -f "$GIT_INDEX_FILE"
-          git read-tree "$SRC_SHA"
-
-          BATCH_BYTES=$((32 * 1024 * 1024))
-          batch_paths=()
-          batch_bytes=0
-          batch_index=0
-
-          push_scratch() {
-            git push --quiet --force origin "$1:refs/heads/$UPLOAD_BRANCH"
-          }
-
-          mapfile -d '' -t ALL_PATHS < <(
-            {
-              git diff --name-only -z
-              git ls-files --others -z
-            } | sort -zu
-          )
-          echo "changed/untracked entries: ${#ALL_PATHS[@]}"
-
-          for path in "${ALL_PATHS[@]}"; do
-            size=0
-            if [ -e "$path" ] || [ -L "$path" ]; then
-              size="$(stat -c '%s' -- "$path")"
-            fi
-            if [ "${#batch_paths[@]}" -gt 0 ] && [ $((batch_bytes + size)) -gt "$BATCH_BYTES" ]; then
-              git add -f -A -- "${batch_paths[@]}"
-              tree="$(git write-tree)"
-              batch_index=$((batch_index + 1))
-              commit="$(git commit-tree "$tree" -p "$SRC_SHA" -m "prebuilt upload batch $batch_index")"
-              push_scratch "$commit"
-              echo "batch $batch_index pushed"
-              batch_paths=()
-              batch_bytes=0
-            fi
-            batch_paths+=("$path")
-            batch_bytes=$((batch_bytes + size))
-          done
-          if [ "${#batch_paths[@]}" -gt 0 ]; then
-            git add -f -A -- "${batch_paths[@]}"
-            tree="$(git write-tree)"
-            batch_index=$((batch_index + 1))
-            commit="$(git commit-tree "$tree" -p "$SRC_SHA" -m "prebuilt upload batch $batch_index")"
-            push_scratch "$commit"
-            echo "batch $batch_index pushed"
+          PREV="$RUNNER_TEMP/previous-manifest"
+          mkdir -p "$PREV"
+          if gh release download "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+               --pattern "$SRC_SHA.json" -D "$PREV" 2>/dev/null && [ -f "$PREV/$SRC_SHA.json" ]; then
+            python3 scripts/ci_build_artifact_gate.py repro \
+              --previous "$PREV/$SRC_SHA.json" --current "$CACHE_ROOT/artifact/$SRC_SHA.json"
+          else
+            echo "reproducibility: no previously published artifact for $SRC_SHA; first build of this commit"
           fi
 
-          # Final full stage (catches files created while batching).
-          git add -f -A
-          T_FULL="$(git write-tree)"
-          C_FULL="$(git commit-tree "$T_FULL" -p "$SRC_SHA" -m "prebuilt upload complete")"
-          push_scratch "$C_FULL"
-          echo "tree $T_FULL seeded"
+      - name: Device-install simulation on the built artifact
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          ARTIFACT_DIR="$CACHE_ROOT/artifact"
+          # The artifact lives OUTSIDE the simulation work dir, which the
+          # simulation clears and rebuilds for every case.
+          sudo mkdir -p /mnt/agnos/data/ci_boot_artifact
+          sudo cp "$ARTIFACT_DIR/$SRC_SHA.json" "$ARTIFACT_DIR/$SRC_SHA.tar.xz" /mnt/agnos/data/ci_boot_artifact/
+          printf '%s\n' "$SRC_SHA" | sudo tee /mnt/agnos/data/ci_boot_artifact/sha >/dev/null
+          sudo chmod -R a+rX /mnt/agnos/data/ci_boot_artifact
+          sudo tee /mnt/agnos/tmp/ci_artifact_sim.sh >/dev/null <<'SIM_WRAPPER_EOF'
+          #!/bin/bash
+          set -Eeo pipefail
+          export HOME=/root
+          if [ -d /usr/local/venv/bin ]; then
+            export PATH="/usr/local/venv/bin:$PATH"
+          fi
+          export PYDEPS=/data/openpilot/pydeps
+          export AGNOS_VERSION="19.8-carrot-bt1"
+          cd /data/openpilot
+          bash /data/openpilot/scripts/ci_artifact_boot_simulation.sh \
+            --repo /data/openpilot \
+            --sha "$(cat /data/ci_boot_artifact/sha)" \
+            --artifact-dir /data/ci_boot_artifact \
+            --work /data/ci_boot_sim 2>&1 | tee /data/ci_boot_sim/simulation.log
+          SIM_WRAPPER_EOF
+          sudo chmod +x /mnt/agnos/tmp/ci_artifact_sim.sh
+          sudo chroot /mnt/agnos /bin/bash /tmp/ci_artifact_sim.sh
+          echo "simulation log: $(wc -l < /mnt/agnos/data/ci_boot_sim/simulation.log) lines"
 
-          TREE_BYTES="$(git ls-tree -r -l "$T_FULL" | awk '{s += $4} END {print s + 0}')"
-          TREE_FILES="$(git ls-tree -r "$T_FULL" | wc -l)"
-          echo "published tree: $TREE_FILES files, $TREE_BYTES bytes of blobs"
+      - name: Attest the simulation gate in the manifest
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          python3 scripts/ci_build_artifact_gate.py attest \
+            --manifest "$CACHE_ROOT/artifact/$SRC_SHA.json" \
+            --key device_install_simulation \
+            --value '"pass (a-f)"'
 
-          MSG="prebuilt build of $SRC_SHA
+      - name: Publish to the rolling ${{ env.ARTIFACT_RELEASE_TAG }} release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          ARTIFACT_DIR="$CACHE_ROOT/artifact"
+          if ! gh release view "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" --prerelease \
+              --title "carrot-wip device build artifacts" \
+              --notes "Rolling device build artifacts for carrot-wip commits. Each commit publishes <sha>.json and <sha>.tar.xz; only the newest 30 commits are kept. The device fetches these automatically for the update target."
+          fi
+          gh release upload "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" --clobber \
+            "$ARTIFACT_DIR/$SRC_SHA.json" "$ARTIFACT_DIR/$SRC_SHA.tar.xz"
 
-          Source-Commit: $SRC_SHA
-          Workflow-Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}
-          Workflow-Ref: ${GITHUB_REF}
-          Tree-Bytes: $TREE_BYTES
-
-          Docs-Not-Needed: CI-generated device build artifacts for the append-only carrot-wip-prebuilt branch; the source commits carry their own documentation.
-          Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
-
-          published=0
-          for attempt in 1 2 3 4 5 6; do
-            PREV="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha 2>/dev/null || true)"
-            # gh api prints the 404 error JSON to stdout; only accept a SHA.
-            if [[ "$PREV" =~ ^[0-9a-f]{40}$ ]]; then
-              BODY="$(jq -n --arg msg "$MSG" --arg tree "$T_FULL" --arg prev "$PREV" \
-                '{message: $msg, tree: $tree, parents: [$prev],
-                  author: {name: "ad2das", email: "ad2das@gmail.com"},
-                  committer: {name: "ad2das", email: "ad2das@gmail.com"}}')"
-              NEW="$(printf '%s' "$BODY" | gh api --method POST "repos/${GITHUB_REPOSITORY}/git/commits" --input - --jq .sha)"
-              if gh api --method PATCH "repos/${GITHUB_REPOSITORY}/git/refs/heads/${PREBUILT_BRANCH}" \
-                   -f "sha=$NEW" -F force=false >/dev/null 2>&1; then
-                echo "carrot-wip-prebuilt: $PREV -> $NEW (fast-forward)"
-                published=1
-                break
-              fi
-              echo "ref update rejected (a newer head appeared); retrying"
-            else
-              BODY="$(jq -n --arg msg "$MSG" --arg tree "$T_FULL" \
-                '{message: $msg, tree: $tree,
-                  author: {name: "ad2das", email: "ad2das@gmail.com"},
-                  committer: {name: "ad2das", email: "ad2das@gmail.com"}}')"
-              NEW="$(printf '%s' "$BODY" | gh api --method POST "repos/${GITHUB_REPOSITORY}/git/commits" --input - --jq .sha)"
-              if gh api --method POST "repos/${GITHUB_REPOSITORY}/git/refs" \
-                   -f "ref=refs/heads/${PREBUILT_BRANCH}" -f "sha=$NEW" >/dev/null 2>&1; then
-                echo "carrot-wip-prebuilt created at $NEW"
-                published=1
-                break
-              fi
-              echo "branch creation raced; retrying"
-            fi
-            sleep 3
-          done
-          [ "$published" = 1 ] || { echo "::error::failed to publish $PREBUILT_BRANCH"; exit 1; }
-
-          HEAD_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
-          [ "$HEAD_SHA" = "$NEW" ] || { echo "::error::published ref does not match"; exit 1; }
-          echo "carrot-wip-prebuilt head: $HEAD_SHA"
-          echo "PUBLISHED_SHA=$HEAD_SHA" >> "$GITHUB_ENV"
-
-          # The scratch branch existed only to seed blobs for this commit; the
-          # published commit now references them, so drop it. Cleanup failure
-          # must not fail an otherwise successful publish.
-          git push --quiet origin --delete "$UPLOAD_BRANCH" || \
-            echo "::warning::could not delete scratch branch $UPLOAD_BRANCH"
+          # Prune assets so only the newest 30 commits (by upload time) remain.
+          ASSETS_JSON="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ARTIFACT_RELEASE_TAG}" --jq '.assets')"
+          DELETE_LIST="$(printf '%s' "$ASSETS_JSON" | python3 - <<'PRUNE_EOF'
+          import collections, json, re, sys
+          assets = json.load(sys.stdin)
+          by_sha = collections.defaultdict(str)
+          for asset in assets:
+            sha = asset["name"][:40]
+            if re.fullmatch(r"[0-9a-f]{40}", sha):
+              by_sha[sha] = max(by_sha[sha], asset["updatedAt"])
+          keep = {sha for sha, _ in sorted(by_sha.items(), key=lambda kv: kv[1], reverse=True)[:30]}
+          for asset in assets:
+            sha = asset["name"][:40]
+            if re.fullmatch(r"[0-9a-f]{40}", sha) and sha not in keep:
+              print(asset["name"])
+          PRUNE_EOF
+          )"
+          if [ -n "$DELETE_LIST" ]; then
+            while IFS= read -r name; do
+              [ -n "$name" ] || continue
+              gh release delete-asset "$ARTIFACT_RELEASE_TAG" "$name" -R "$GITHUB_REPOSITORY" --yes
+            done <<< "$DELETE_LIST"
+          fi
+          echo "release assets:"
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ARTIFACT_RELEASE_TAG}" \
+            --jq '.assets[] | "\(.name) \(.size) \(.updatedAt)"'
 
       - name: Post-publish verification
         env:
@@ -734,22 +558,27 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE"
-          PUB_SHA="$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq .object.sha)"
-          if [ -z "${PUBLISHED_SHA:-}" ] || [ "$PUB_SHA" != "$PUBLISHED_SHA" ]; then
-            echo "::error::published ref is $PUB_SHA but this run published ${PUBLISHED_SHA:-nothing}"
-            exit 1
-          fi
-          git fetch --no-tags origin "refs/heads/${PREBUILT_BRANCH}"
-          FETCHED="$(git rev-parse FETCH_HEAD)"
-          [ "$FETCHED" = "$PUB_SHA" ] || { echo "::error::fetched $FETCHED but published $PUB_SHA"; exit 1; }
-          # Re-run the parity gates G1-G3+G6 against the fetched published
-          # commit; fail loudly if it differs from the verified tree.
-          python3 scripts/ci_prebuilt_parity_gate.py \
-            --mode commit --tree "$GITHUB_WORKSPACE" \
-            --source-sha "$SRC_SHA" --published-sha "$PUB_SHA" \
-            --allowlist "$GITHUB_WORKSPACE/scripts/prebuilt_allowed_changes.txt" \
-            --gates G1,G2,G3,G6
-          echo "post-publish verification OK: $PUB_SHA (parent $(git rev-parse "$PUB_SHA^"))"
+          VERIFY="$RUNNER_TEMP/artifact-verify"
+          rm -rf "$VERIFY"; mkdir -p "$VERIFY"
+          gh release download "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --pattern "$SRC_SHA.json" --pattern "$SRC_SHA.tar.xz" -D "$VERIFY"
+          python3 scripts/ci_build_artifact_gate.py verify \
+            --manifest "$VERIFY/$SRC_SHA.json" --tarball "$VERIFY/$SRC_SHA.tar.xz"
+          echo "local  tarball: $(sha256sum "$CACHE_ROOT/artifact/$SRC_SHA.tar.xz" | awk '{print $1}')"
+          echo "remote tarball: $(sha256sum "$VERIFY/$SRC_SHA.tar.xz" | awk '{print $1}')"
+          cmp "$CACHE_ROOT/artifact/$SRC_SHA.tar.xz" "$VERIFY/$SRC_SHA.tar.xz"
+          echo "post-publish verification OK: $SRC_SHA"
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifact-evidence-${{ github.run_id }}
+          retention-days: 14
+          if-no-files-found: ignore
+          path: |
+            /mnt/agnos/data/ci_boot_sim/simulation.log
+            ${{ runner.temp }}/carrot-build-artifacts/artifact/*.json
 
       - name: Report
         if: always()
@@ -758,5 +587,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          gh api "repos/${GITHUB_REPOSITORY}/git/ref/heads/${PREBUILT_BRANCH}" --jq '"branch head: " + .object.sha' 2>/dev/null || echo "no prebuilt branch yet"
+          gh release view "$ARTIFACT_RELEASE_TAG" -R "$GITHUB_REPOSITORY" \
+            --json tagName,isPrerelease,assets --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[] | "\(.name) \(.size)"]}' 2>/dev/null || echo "no artifact release yet"
           df -h / /mnt 2>/dev/null || df -h /

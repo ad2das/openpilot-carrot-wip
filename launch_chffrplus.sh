@@ -419,6 +419,47 @@ function carrot_model_backend_guard {
     --tici-marker "${CARROT_TICI_MARKER:-/TICI}"
 }
 
+function carrot_prepare_build_artifact {
+  # Fetch and install the CI build artifact for this exact checkout, so the
+  # first boot after an update does not compile. Every failure (not published
+  # yet, no network, rejected for a changed environment) simply leaves
+  # ARTIFACT_OK=0 and the boot continues with the on-device build.
+  local sha tool data_root cache_dir
+  ARTIFACT_OK=0
+  unset CARROT_BUILD_ARTIFACT
+
+  sha="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  tool="$DIR/scripts/carrot_build_artifact.py"
+  if [ -z "$sha" ] || [ ! -f "$tool" ]; then
+    return 0
+  fi
+  data_root="$(carrot_data_dir)"
+
+  if python3 "$tool" --root "$data_root" check --repo "$DIR" >/dev/null 2>&1; then
+    boot_timing artifact_check=installed
+    ARTIFACT_OK=1
+  else
+    cache_dir="$data_root/carrot_build_cache/$sha"
+    if { [ -f "$cache_dir/$sha.tar.xz" ] && [ -f "$cache_dir/$sha.json" ]; } || \
+       python3 "$tool" --root "$data_root" fetch "$sha" --timeout 120; then
+      boot_timing artifact_fetch=ready
+      if python3 "$tool" --root "$data_root" install "$sha" --repo "$DIR"; then
+        boot_timing artifact_install=ok
+        ARTIFACT_OK=1
+      else
+        boot_timing artifact_install=rejected
+      fi
+    else
+      boot_timing artifact_fetch=unavailable
+    fi
+  fi
+
+  if [ "$ARTIFACT_OK" = "1" ]; then
+    export CARROT_BUILD_ARTIFACT=1
+  fi
+  return 0
+}
+
 function invalidate_modeld_build_if_needed {
   local stamp_path="$DIR/openpilot/selfdrive/modeld/models/.build_stamp"
   local big_stamp_path="$DIR/openpilot/selfdrive/modeld/models/.big_model_build_stamp"
@@ -426,11 +467,8 @@ function invalidate_modeld_build_if_needed {
   local driving_pkl_path="$DIR/openpilot/selfdrive/modeld/models/driving_tinygrad.pkl"
   local dm_pkl_path="$DIR/openpilot/selfdrive/modeld/models/dmonitoring_model_tinygrad.pkl"
   local dm_metadata_path="$DIR/openpilot/selfdrive/modeld/models/dmonitoring_model_metadata.pkl"
-  local prebuilt_json="$DIR/prebuilt.json"
   local old_stamp
   local old_big_stamp
-  local prebuilt_models=""
-  local prebuilt_model_inputs=""
 
   MODEL_REBUILD=0
 
@@ -439,34 +477,8 @@ function invalidate_modeld_build_if_needed {
     MODEL_BUILD_STAMP_VALUE="$(git rev-parse HEAD 2>/dev/null || true)"
   fi
 
-  if [ -f "$prebuilt_json" ]; then
-    prebuilt_models="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("models", ""))' "$prebuilt_json" 2>/dev/null || true)"
-    prebuilt_model_inputs="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model_inputs", ""))' "$prebuilt_json" 2>/dev/null || true)"
-  fi
-
   old_stamp="$(cat "$stamp_path" 2>/dev/null || true)"
-  if [ "$prebuilt_models" = "device" ]; then
-    # CI prebuilt tree: it intentionally ships no compiled model artifacts, so
-    # the first boot builds the model targets for this device. The manifest's
-    # model inputs are the stamp value a matching source checkout writes.
-    MODEL_BUILD_STAMP_VALUE="$prebuilt_model_inputs"
-    if [ ! -f "$tg_devices_path" ] || \
-       { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; } || \
-       { [ ! -f "$dm_pkl_path" ] && [ ! -f "$dm_pkl_path.chunkmanifest" ]; } || \
-       [ ! -f "$dm_metadata_path" ]; then
-      echo "CI prebuilt model artifacts are missing; scheduling the device model build."
-      MODEL_REBUILD=1
-    elif [ -z "$prebuilt_model_inputs" ]; then
-      echo "CI prebuilt manifest has no model inputs; scheduling the device model build."
-      MODEL_REBUILD=1
-    elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
-      echo "CI prebuilt model stamp is not for this checkout; scheduling the device model build."
-      MODEL_REBUILD=1
-    elif ! carrot_model_backend_guard; then
-      echo "CI prebuilt models are not QCOM-compiled; scheduling the device model build."
-      MODEL_REBUILD=1
-    fi
-  elif [ -f "$DIR/prebuilt" ]; then
+  if [ -f "$DIR/prebuilt" ]; then
     # Legacy on-device prebuilt tree: trust the shipped artifacts, which were
     # compiled on a device, but never trust a host-built CPU backend.
     if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
@@ -493,6 +505,22 @@ function invalidate_modeld_build_if_needed {
       echo "Prebuilt models are not QCOM-compiled; revalidating with SCons."
       FORCE_REBUILD=1
     fi
+  elif [ "${ARTIFACT_OK:-0}" = "1" ]; then
+    # Installed CI build artifact: it never ships compiled model artifacts, so
+    # a first boot after an update only ever schedules the device model build.
+    if [ ! -f "$tg_devices_path" ] || \
+       { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; } || \
+       { [ ! -f "$dm_pkl_path" ] && [ ! -f "$dm_pkl_path.chunkmanifest" ]; } || \
+       [ ! -f "$dm_metadata_path" ]; then
+      echo "Model artifacts are missing; scheduling the device model build."
+      MODEL_REBUILD=1
+    elif [ "$MODEL_BUILD_STAMP_VALUE" != "$old_stamp" ]; then
+      echo "Model inputs changed; scheduling the device model build."
+      MODEL_REBUILD=1
+    elif ! carrot_model_backend_guard; then
+      echo "Model artifacts are not QCOM-compiled; scheduling the device model build."
+      MODEL_REBUILD=1
+    fi
   else
     # Source checkout: unchanged behaviour.
     if [ ! -f "$tg_devices_path" ] || { [ ! -f "$driving_pkl_path" ] && [ ! -f "$driving_pkl_path.chunkmanifest" ]; }; then
@@ -511,7 +539,11 @@ function invalidate_modeld_build_if_needed {
     old_big_stamp="$(cat "$big_stamp_path" 2>/dev/null || true)"
     if [ "$BIG_MODEL_SHA" != "$old_big_stamp" ] || ! big_model_artifact_ready; then
       echo "USB eGPU big model changed or needs compilation."
-      FORCE_REBUILD=1
+      if [ "${ARTIFACT_OK:-0}" = "1" ] && [ ! -f "$DIR/prebuilt" ]; then
+        MODEL_REBUILD=1
+      else
+        FORCE_REBUILD=1
+      fi
     fi
   fi
 }
@@ -617,7 +649,8 @@ function run_model_build {
 }
 
 function carrot_build_if_needed {
-  if [ "$fast_boot" = "0" ] && { [ "$FORCE_REBUILD" = "1" ] || [ ! -f "$DIR/prebuilt" ]; }; then
+  local artifact_ok="${ARTIFACT_OK:-0}"
+  if [ "$fast_boot" = "0" ] && { [ "$FORCE_REBUILD" = "1" ] || { [ "$artifact_ok" != "1" ] && [ ! -f "$DIR/prebuilt" ]; }; }; then
     run_full_build
   elif [ "$fast_boot" = "0" ] && [ "$MODEL_REBUILD" = "1" ]; then
     run_model_build
@@ -788,6 +821,14 @@ function launch {
     show_startup_failure "Runtime dependency installation failed"
   fi
 
+  # Install the CI build artifact for this exact checkout, when one exists, so
+  # the first boot after an update does not compile. The result gates the
+  # Params trust in ensure_params_build.sh and the model/native invalidation.
+  if [ "$fast_boot" = "0" ]; then
+    boot_timing artifact_prepare
+    carrot_prepare_build_artifact
+  fi
+
   # Build Params before any long-running carrot service imports it.
   if ! run_startup_command bash "$DIR/scripts/ensure_params_build.sh"; then
     echo "Params registry build failed, not starting openpilot."
@@ -808,6 +849,7 @@ function launch {
 
   FORCE_REBUILD=0
   MODEL_REBUILD=0
+  ARTIFACT_OK="${ARTIFACT_OK:-0}"
   if [ "$fast_boot" = "0" ]; then
     boot_timing big_model_probe
     prepare_big_model_if_needed

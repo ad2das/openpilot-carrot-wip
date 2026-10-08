@@ -47,6 +47,31 @@ def test_update_current_branch_then_request_reboot(checkouts):
   assert git(device, 'branch', '--show-current') == 'main'
 
 
+def test_build_artifact_fetch_failure_never_blocks_the_update(checkouts, monkeypatch):
+  device, target = checkouts
+  calls = []
+
+  def broken_fetch(*args, **kwargs):
+    raise RuntimeError('artifact server down')
+
+  monkeypatch.setattr(startup_recovery, 'fetch_build_artifact', broken_fetch)
+  update = startup_recovery.RecoveryUpdate(device, reboot=lambda: calls.append(git(device, 'rev-parse', 'HEAD')))
+  update._run()
+  assert calls == [target] and update.state == ('rebooting', target[:10])
+  assert (device / 'source.txt').read_text() == 'fixed\n'
+
+
+def test_build_artifact_fetch_is_requested_for_the_update_target(checkouts, monkeypatch):
+  device, target = checkouts
+  fetched = []
+
+  monkeypatch.setattr(startup_recovery, 'fetch_build_artifact',
+                      lambda repo, sha, timeout=None: fetched.append((Path(repo), sha, timeout)))
+  update = startup_recovery.RecoveryUpdate(device, reboot=lambda: None)
+  update._run()
+  assert fetched == [(device, target, startup_recovery.UPDATE_FETCH_TIMEOUT)]
+
+
 @pytest.mark.parametrize('reason', ['dirty', 'diverged', 'network', 'busy', 'reboot'])
 def test_failure_preserves_checkout_and_allows_retry(checkouts, monkeypatch, reason):
   device, _ = checkouts
