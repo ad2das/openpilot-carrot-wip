@@ -43,13 +43,15 @@
 # force=false). New blobs are seeded through a force-pushed scratch branch in
 # bounded batches so no single push is huge; the real branch only fast-forwards.
 #
-# The push trigger is intentionally disabled while the device-parity work lands:
-# every publish in this window must be a deliberate workflow_dispatch run, and
-# only a fully green dispatched publish may re-enable the push trigger.
+# A push to carrot-wip triggers the workflow; workflow_dispatch is available for
+# manual runs (e.g. from a development branch). Only a fully green dispatched
+# publish re-enabled this trigger after the device-parity work landed.
 
 name: carrot-wip prebuilt
 
 on:
+  push:
+    branches: [carrot-wip]
   workflow_dispatch:
 
 concurrency:
