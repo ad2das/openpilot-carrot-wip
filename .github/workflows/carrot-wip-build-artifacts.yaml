@@ -539,7 +539,7 @@ jobs:
           for asset in assets:
             sha = asset["name"][:40]
             if re.fullmatch(r"[0-9a-f]{40}", sha):
-              by_sha[sha] = max(by_sha[sha], asset["updatedAt"])
+              by_sha[sha] = max(by_sha[sha], asset["updated_at"])
           keep = {sha for sha, _ in sorted(by_sha.items(), key=lambda kv: kv[1], reverse=True)[:30]}
           for asset in assets:
             sha = asset["name"][:40]
@@ -555,7 +555,7 @@ jobs:
           fi
           echo "release assets:"
           gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${ARTIFACT_RELEASE_TAG}" \
-            --jq '.assets[] | "\(.name) \(.size) \(.updatedAt)"'
+            --jq '.assets[] | "\(.name) \(.size) \(.updated_at)"'
 
       - name: Post-publish verification
         env:
