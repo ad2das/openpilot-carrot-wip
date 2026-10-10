@@ -48,6 +48,24 @@ def _param_text(params, key: str, default: str = "") -> str:
   return value if value else default
 
 
+def _host_is_tici() -> bool:
+  try:
+    from openpilot.system.hardware import TICI
+    return bool(TICI)
+  except Exception:
+    return False
+
+
+def resolve_backend_name(value: str, is_tici: bool) -> str:
+  """Resolve CarrotTlvBackend. The param default 'onnx' means the onnxruntime
+  CPU backend on PC, but tinygrad on TICI where onnxruntime is not a device
+  dependency. 'null'/'dsp' and any explicit other name are untouched."""
+  name = (value or "").strip()
+  if name in ("", "onnx"):
+    return "tinygrad" if is_tici else "onnx"
+  return name
+
+
 def apply_cpu_policy() -> list[str]:
   """Cores 1-3 + SCHED_IDLE + nice19 on POSIX; silently skipped on Windows."""
   applied: list[str] = []
@@ -83,7 +101,7 @@ class TlvRunner:
     self.decoder = None
     self.backend_error = ""
     if _param_int(params, "CarrotTlvMode") >= 1:
-      name = _param_text(params, "CarrotTlvBackend", "onnx")
+      name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
       model_path = _param_text(params, "CarrotTlvModelPath", "")
       try:
         self.backend, self.decoder = backends.make_backend(name, model_path)

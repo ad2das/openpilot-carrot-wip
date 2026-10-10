@@ -172,6 +172,8 @@ def make_serv(mode: int) -> CarrotServ:
   serv.traffic_light_count = -1
   serv.traffic_state = 0
   serv.traffic_state_src = 0
+  serv.tlv_mode = mode
+  serv.tlv_mode_poll = 0.0
   serv.params = SimpleNamespace(get_int=lambda key, _mode=mode: _mode if key == "CarrotTlvMode" else 0)
   return serv
 
@@ -217,9 +219,97 @@ def test_mode2_left_arrow_uses_left_turn_path():
   serv = make_serv(2)
   serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft"),
+                                 carState=SimpleNamespace(leftBlinker=True)))
   assert serv.traffic_state == 3
   assert serv.traffic_state_src == 1
+
+
+def test_tlv_state_color_maps_every_state_and_intent():
+  from openpilot.selfdrive.carrot.carrot_serv import tlv_state_color
+  cases = {
+    (0, False): None, (0, True): None,
+    (1, False): "Red Light", (1, True): "Red Light",
+    (2, False): "Yellow Light", (2, True): "Yellow Light",
+    (3, False): "Green Light", (3, True): "Green Light",
+    (4, False): "Red Light", (4, True): "Left turn",
+    (5, False): "Red Light", (5, True): "Left turn",
+    (6, False): "Green Light", (6, True): "Left turn",
+  }
+  for (state, intent), color in cases.items():
+    assert tlv_state_color(state, intent) == color, (state, intent)
+
+
+def test_mode2_left_phase_intent_from_carstate_and_atctype():
+  # redLeft + left blinker -> Left turn -> left path (state 3)
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLeft"),
+                                 carState=SimpleNamespace(leftBlinker=True)))
+  assert serv.traffic_state == 3
+  # greenLeft + carrotMan atcType intent (same definition tlvd uses)
+  serv2 = make_serv(2)
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft"),
+                                  carrotMan=SimpleNamespace(atcType="atc left")))
+  assert serv2.traffic_state == 3
+  # "turn left" atcType also counts
+  serv3 = make_serv(2)
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("left"),
+                                  carrotMan=SimpleNamespace(atcType="turn left")))
+  assert serv3.traffic_state == 3
+
+
+def test_mode2_left_phases_without_intent_are_straight_phases():
+  # redLeft without intent -> Red Light: stays red
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLeft")))
+  assert serv.traffic_state == 1
+  # greenLeft without intent -> Green Light: the red->green edge fires
+  serv2 = make_serv(2)
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft")))
+  assert serv2.traffic_state == 2
+  # bare left arrow without intent -> Red Light (straight is not allowed)
+  serv3 = make_serv(2)
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("left")))
+  assert serv3.traffic_state == 1
+
+
+def test_tlv_mode_is_cached_and_refreshed_at_most_once_per_second(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  calls = []
+
+  def fake_get_int(key):
+    calls.append(key)
+    return 0
+
+  serv = CarrotServ.__new__(CarrotServ)
+  serv.traffic_light_q = collections.deque(maxlen=20)
+  serv.traffic_light_count = -1
+  serv.traffic_state = 0
+  serv.traffic_state_src = 0
+  serv.tlv_mode = 2
+  serv.tlv_mode_poll = 0.0
+  serv.params = SimpleNamespace(get_int=fake_get_int)
+  clock = [200.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  sm = FakeSM(carrotTlv=tlv_message("green"))
+  serv._update_tlv_fusion(sm)
+  serv._update_tlv_fusion(sm)
+  assert calls == ["CarrotTlvMode"]
+  clock[0] += 2.0
+  serv._update_tlv_fusion(sm)
+  assert calls == ["CarrotTlvMode", "CarrotTlvMode"]
 
 
 def test_mode2_ignores_bad_or_inactive_tlv_messages():
@@ -266,8 +356,8 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   return planner
 
 
-def gate_sm(carrot_man):
-  return FakeSM(carrotMan=carrot_man, carState=SimpleNamespace(leftBlinker=False))
+def gate_sm(carrot_man, left=False):
+  return FakeSM(carrotMan=carrot_man, carState=SimpleNamespace(leftBlinker=left))
 
 
 def test_tlv_green_holds_start_while_model_signals_stop():
@@ -293,6 +383,31 @@ def test_navi_green_trigger_is_unchanged_even_with_model_stop():
   assert planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=0)), 20.0, 60.0) == (60.0, False)
   assert planner.xState == XState.e2eCruise
   assert planner.trafficState_carrot == 2
+
+
+def test_tlv_left_holds_start_while_model_signals_stop():
+  planner = planner_for_gate(stop_sign=True)
+  assert planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 1  # held so the edge can fire later
+
+
+def test_tlv_left_starts_once_both_cues_agree():
+  planner = planner_for_gate(stop_sign=True)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0)
+  planner.last_model_stop_sign = False
+  assert planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 3
+
+
+def test_navi_left_trigger_is_unchanged_even_with_model_stop():
+  # src == 0 keeps the pre-existing red->left trigger byte-identical.
+  planner = planner_for_gate(stop_sign=True)
+  assert planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=0), left=True), 20.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eCruise
+  assert planner.trafficState_carrot == 3
 
 
 def test_tlv_green_decay_leaves_normal_behavior():

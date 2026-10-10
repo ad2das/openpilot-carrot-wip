@@ -20,6 +20,7 @@ from openpilot.selfdrive.navd.helpers import Coordinate
 from openpilot.common.constants import CV
 from openpilot.common.gps import get_gps_location_service
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
+from openpilot.selfdrive.carrot.tlv.tlvd import LEFT_INTENT_ATCTYPES
 
 nav_type_mapping = {
   12: ("turn", "left", 1),
@@ -86,15 +87,31 @@ TLV_CONF_MIN = 0.5
 TLV_FRAME_W = 1928.0  # C3X road camera native size (CONTRACT.md)
 TLV_FRAME_H = 1208.0
 # carrotTlv State ordinals -> the color strings traffic_light() already uses.
-# red/redLeft=stop, yellow, green, greenLeft/left=left-arrow ("Left turn").
-TLV_STATE_COLORS = {
-  1: "Red Light",
-  5: "Red Light",
-  2: "Yellow Light",
-  3: "Green Light",
-  6: "Left turn",
-  4: "Left turn",
-}
+# Korean left phases depend on turn intent: a left arrow means "Left turn"
+# only when the driver/navi intends to go left; otherwise the same lamp is the
+# straight phase (redLeft -> Red Light, greenLeft -> Green Light) and a bare
+# left arrow without intent means straight is not allowed (Red Light).
+TLV_COLOR_RED = "Red Light"
+TLV_COLOR_YELLOW = "Yellow Light"
+TLV_COLOR_GREEN = "Green Light"
+TLV_COLOR_LEFT = "Left turn"
+
+
+def tlv_state_color(state_raw: int, left_intent: bool) -> str | None:
+  """Map a carrotTlv State ordinal to a traffic_light() color, or None to ignore."""
+  if state_raw == 5:  # redLeft: red + left arrow (normal Korean left phase)
+    return TLV_COLOR_LEFT if left_intent else TLV_COLOR_RED
+  if state_raw == 6:  # greenLeft: green + left arrow
+    return TLV_COLOR_LEFT if left_intent else TLV_COLOR_GREEN
+  if state_raw == 4:  # left arrow only: straight is not allowed
+    return TLV_COLOR_LEFT if left_intent else TLV_COLOR_RED
+  if state_raw == 1:
+    return TLV_COLOR_RED
+  if state_raw == 2:
+    return TLV_COLOR_YELLOW
+  if state_raw == 3:
+    return TLV_COLOR_GREEN
+  return None
 
 
 class CarrotServ:
@@ -196,6 +213,8 @@ class CarrotServ:
     self.traffic_light_count = -1
     self.traffic_state = 0
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
+    self.tlv_mode = 0           # CarrotTlvMode cached; refreshed at most 1/s
+    self.tlv_mode_poll = 0.0
 
     self.left_spd_sec = 100
     self.left_tbt_sec = 100
@@ -369,11 +388,14 @@ class CarrotServ:
     """Feed the confirmed carrotTlv relevant track into the existing traffic_light()
     path (only when CarrotTlvMode == 2). The tlvd process publishes the relevant
     track's current detection as dets[0]; coordinates are full-frame pixels."""
-    try:
-      mode = self.params.get_int("CarrotTlvMode")
-    except Exception:
-      return
-    if mode != 2:
+    now = time.monotonic()
+    if now - self.tlv_mode_poll >= 1.0:
+      self.tlv_mode_poll = now
+      try:
+        self.tlv_mode = self.params.get_int("CarrotTlvMode")
+      except Exception:
+        self.tlv_mode = 0
+    if self.tlv_mode != 2:
       return
     if not (sm.seen['carrotTlv'] and sm.alive['carrotTlv'] and sm.valid['carrotTlv']):
       return
@@ -382,7 +404,7 @@ class CarrotServ:
     msg = sm['carrotTlv']
     if int(msg.status.raw) != 1 or len(msg.dets) == 0:  # Status.running only
       return
-    color = TLV_STATE_COLORS.get(int(msg.state.raw))
+    color = tlv_state_color(int(msg.state.raw), self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
       return
     det = msg.dets[0]
@@ -390,6 +412,19 @@ class CarrotServ:
     y = 0.5 * (float(det.y1) + float(det.y2)) / TLV_FRAME_H
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.traffic_light_count = int(0.5 / 0.1)
+
+  def _tlv_left_intent(self, sm) -> bool:
+    """Left-turn intent, same definition tlvd uses (LEFT_INTENT_ATCTYPES):
+    carState.leftBlinker or carrotMan.atcType in ("turn left", "atc left")."""
+    try:
+      if bool(sm['carState'].leftBlinker):
+        return True
+    except Exception:
+      pass
+    try:
+      return str(sm['carrotMan'].atcType) in LEFT_INTENT_ATCTYPES
+    except Exception:
+      return False
 
 
   def calculate_current_speed(self, left_dist, safe_speed_kph, safe_time, safe_decel_rate):

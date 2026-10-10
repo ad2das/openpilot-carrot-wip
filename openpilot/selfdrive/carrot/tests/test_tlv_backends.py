@@ -1,4 +1,8 @@
 """Tests for TLV inference backends: CPU-only refusal guards and ONNX stub model."""
+import shutil
+import sys
+import time
+
 import numpy as np
 import pytest
 
@@ -106,3 +110,109 @@ def test_placeholder_decoder_contract():
   assert decoder.decode((np.zeros((2, 5)), scores, classes), "near") == []
   bad = decoder.decode((np.array([[30.0, 20.0, 10.0, 60.0]]), np.array([0.9]), np.array([2])), "far")
   assert bad == []
+
+
+def _tiny_conv_onnx_model(onnx, tmp_path):
+  """A tiny Conv+ReLU ONNX (1,3,8,8) for CPU parity checks."""
+  from onnx import TensorProto, helper
+  x = helper.make_tensor_value_info("input", TensorProto.FLOAT, [1, 3, 8, 8])
+  y = helper.make_tensor_value_info("output", TensorProto.FLOAT, [1, 3, 8, 8])
+  rng = np.random.default_rng(1)
+  w = helper.make_tensor("w", TensorProto.FLOAT, [3, 3, 3, 3],
+                         rng.standard_normal(81).astype(np.float32).tobytes(), raw=True)
+  b = helper.make_tensor("b", TensorProto.FLOAT, [3],
+                         np.array([0.5, -1.0, 2.0], np.float32).tobytes(), raw=True)
+  nodes = [
+    helper.make_node("Conv", ["input", "w", "b"], ["c"], kernel_shape=[3, 3], pads=[1, 1, 1, 1]),
+    helper.make_node("Relu", ["c"], ["output"]),
+  ]
+  graph = helper.make_graph(nodes, "tlv_conv", [x], [y], [w, b])
+  model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+  model.ir_version = 10  # onnxruntime 1.30 refuses the onnx-default IR 14
+  path = tmp_path / "conv.onnx"
+  onnx.save(model, str(path))
+  return path
+
+
+def _ensure_cc(monkeypatch, tmp_path) -> bool:
+  """tinygrad compiles CPU kernels with clang (CC env). Use a ziglang wrapper
+  when clang is not on PATH; return False when no clang-compatible driver exists."""
+  if shutil.which("clang"):
+    return True
+  try:
+    import ziglang  # noqa: F401
+  except ImportError:
+    return False
+  driver = tmp_path / "zigcc_driver.py"
+  driver.write_text(
+    "\n".join([
+      "import subprocess, sys",
+      "args = [a.replace('-none-unknown-elf', '-linux-gnu') for a in sys.argv[1:]]",
+      "args.append('-g0')",
+      "sys.exit(subprocess.run([sys.executable, '-m', 'ziglang', 'cc', *args],",
+      "                        input=sys.stdin.buffer.read()).returncode)",
+    ]) + "\n",
+    encoding="utf-8",
+  )
+  wrapper = tmp_path / "zigcc.cmd"
+  wrapper.write_text(f'@"{sys.executable}" "{driver}" %*\n', encoding="ascii")
+  monkeypatch.setenv("CC", str(wrapper))
+  return True
+
+
+def test_tinygrad_backend_refuses_bad_configuration():
+  with pytest.raises(backends.BackendError, match="not set"):
+    backends.make_backend("tinygrad", "")
+  with pytest.raises(backends.BackendError, match="model not found"):
+    backends.make_backend("tinygrad", "Z:/definitely/missing.onnx")
+
+
+def test_tinygrad_backend_refuses_gpu_environment(tmp_path, monkeypatch):
+  onnx = pytest.importorskip("onnx")
+  path = _tiny_conv_onnx_model(onnx, tmp_path)
+  monkeypatch.setenv("QCOM", "1")
+  with pytest.raises(backends.BackendError, match="GPU-capable"):
+    backends.make_backend("tinygrad", str(path))
+
+
+def test_resolve_backend_name_defaults():
+  from openpilot.selfdrive.carrot.tlv import tlvd
+  assert tlvd.resolve_backend_name("", False) == "onnx"
+  assert tlvd.resolve_backend_name("onnx", False) == "onnx"
+  assert tlvd.resolve_backend_name("", True) == "tinygrad"
+  assert tlvd.resolve_backend_name("onnx", True) == "tinygrad"
+  assert tlvd.resolve_backend_name("null", True) == "null"
+  assert tlvd.resolve_backend_name("dsp", False) == "dsp"
+
+
+def test_tinygrad_cpu_backend_matches_onnxruntime(tmp_path, monkeypatch):
+  onnx = pytest.importorskip("onnx")
+  ort = pytest.importorskip("onnxruntime")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  path = _tiny_conv_onnx_model(onnx, tmp_path)
+  x = np.random.default_rng(3).standard_normal((1, 3, 8, 8)).astype(np.float32)
+
+  so = ort.SessionOptions()
+  so.intra_op_num_threads = 1
+  sess = ort.InferenceSession(str(path), sess_options=so, providers=["CPUExecutionProvider"])
+  ref = sess.run(None, {"input": x})[0]
+
+  backend, decoder = backends.make_backend("tinygrad", str(path))
+  assert backend.name == "tinygrad"
+  assert backend.device_name in backends.TINYGRAD_CPU_DEVICES
+  assert backend.max_threads == 2
+
+  got = backend.infer(x)[0]
+  assert got.shape == ref.shape
+  max_diff = float(np.max(np.abs(got - ref)))
+  assert max_diff < 1e-4, f"tinygrad vs onnxruntime max abs diff {max_diff}"
+
+  times = []
+  for _ in range(20):
+    t0 = time.perf_counter()
+    backend.infer(x)
+    times.append((time.perf_counter() - t0) * 1000.0)
+  mean_ms, p95_ms, min_ms = float(np.mean(times)), float(np.percentile(times, 95)), float(np.min(times))
+  print(f"\ntinygrad-cpu: max_diff={max_diff:.2e} per-inference mean={mean_ms:.2f}ms p95={p95_ms:.2f}ms min={min_ms:.2f}ms")
+  backend.close()
