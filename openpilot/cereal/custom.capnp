@@ -45,6 +45,8 @@ struct CarrotMan @0x81c2f05a394cf4af {
 	vehicleNaviSpeed @30 : Int32;
 	vehicleNaviSectionActive @31 : Bool;
 	vehicleNaviAvailable @32 : Bool;
+	# 0 = external navi DETECT, 1 = carrotTlv device detector.
+	trafficStateSrc @33 : Int32;
 }
 
 struct CarrotNaviState @0xaedffd8f31e7b55d {
@@ -267,5 +269,48 @@ struct CustomReserved17 @0xa30662f84033036c {
 struct CustomReserved18 @0xc86a3d38d13eb3ef {
 }
 
-struct CustomReserved19 @0xa4f1eb3323f5f582 {
+struct CarrotTlv @0xa4f1eb3323f5f582 {
+	status @0 : Status;
+	suspendReason @1 : Text;
+	view @2 : View;
+	inferMs @3 : Float32;
+	procMs @4 : Float32;
+	droppedFrames @5 : UInt32;
+	# Full-frame pixel boxes. When relevantTrackId >= 0, dets[0] is the
+	# relevant track's detection for the current frame whenever it exists.
+	dets @6 : List(Det);
+	state @7 : State;
+	stateConf @8 : Float32;
+	relevantTrackId @9 : Int32;
+
+	enum Status {
+		off @0;
+		running @1;
+		suspended @2;
+		error @3;
+	}
+
+	enum View {
+		far @0;
+		near @1;
+	}
+
+	enum State {
+		none @0;
+		red @1;
+		yellow @2;
+		green @3;
+		left @4;
+		redLeft @5;
+		greenLeft @6;
+	}
+
+	struct Det {
+		cls @0 : UInt8;
+		score @1 : Float32;
+		x1 @2 : Float32;
+		y1 @3 : Float32;
+		x2 @4 : Float32;
+		y2 @5 : Float32;
+	}
 }

@@ -82,6 +82,20 @@ import collections
 COUNTDOWN_NEW_TARGET_MIN_JUMP_M = 20.0
 SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
 
+TLV_CONF_MIN = 0.5
+TLV_FRAME_W = 1928.0  # C3X road camera native size (CONTRACT.md)
+TLV_FRAME_H = 1208.0
+# carrotTlv State ordinals -> the color strings traffic_light() already uses.
+# red/redLeft=stop, yellow, green, greenLeft/left=left-arrow ("Left turn").
+TLV_STATE_COLORS = {
+  1: "Red Light",
+  5: "Red Light",
+  2: "Yellow Light",
+  3: "Green Light",
+  6: "Left turn",
+  4: "Left turn",
+}
+
 
 class CarrotServ:
   def __init__(self):
@@ -181,6 +195,7 @@ class CarrotServ:
     self.traffic_light_q = collections.deque(maxlen=int(2.0/0.1))  # 2 secnods
     self.traffic_light_count = -1
     self.traffic_state = 0
+    self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
 
     self.left_spd_sec = 100
     self.left_tbt_sec = 100
@@ -281,6 +296,7 @@ class CarrotServ:
     if self.traffic_light_count < 0:
       self.traffic_light_count = -1
       self.traffic_state = 0
+      self.traffic_state_src = 0
 
   def _handle_detect_command(self, xArg):
     elements = [e.strip() for e in xArg.split(',')]
@@ -295,7 +311,7 @@ class CarrotServ:
       except ValueError:
         pass
 
-  def traffic_light(self, x, y, color, cnf):
+  def traffic_light(self, x, y, color, cnf, src=0):
     traffic_red = 0
     traffic_green = 0
     traffic_left = 0
@@ -344,7 +360,36 @@ class CarrotServ:
       self.traffic_state = 0
       #print("TrafficLight none")
 
+    self.traffic_state_src = src if self.traffic_state != 0 else 0
+
     self.traffic_light_q.append((x,y,color,cnf))
+
+
+  def _update_tlv_fusion(self, sm):
+    """Feed the confirmed carrotTlv relevant track into the existing traffic_light()
+    path (only when CarrotTlvMode == 2). The tlvd process publishes the relevant
+    track's current detection as dets[0]; coordinates are full-frame pixels."""
+    try:
+      mode = self.params.get_int("CarrotTlvMode")
+    except Exception:
+      return
+    if mode != 2:
+      return
+    if not (sm.seen['carrotTlv'] and sm.alive['carrotTlv'] and sm.valid['carrotTlv']):
+      return
+    if not sm.updated['carrotTlv']:
+      return
+    msg = sm['carrotTlv']
+    if int(msg.status.raw) != 1 or len(msg.dets) == 0:  # Status.running only
+      return
+    color = TLV_STATE_COLORS.get(int(msg.state.raw))
+    if color is None or float(msg.stateConf) < TLV_CONF_MIN:
+      return
+    det = msg.dets[0]
+    x = 0.5 * (float(det.x1) + float(det.x2)) / TLV_FRAME_W
+    y = 0.5 * (float(det.y1) + float(det.y2)) / TLV_FRAME_H
+    self.traffic_light(x, y, color, float(msg.stateConf), src=1)
+    self.traffic_light_count = int(0.5 / 0.1)
 
 
   def calculate_current_speed(self, left_dist, safe_speed_kph, safe_time, safe_decel_rate):
@@ -1518,6 +1563,7 @@ class CarrotServ:
     self._update_countdown_alert(left_sec, source, v_ego_kph)
 
     self._update_cmd()
+    self._update_tlv_fusion(sm)
     msg = messaging.new_message('carrotMan')
     msg.valid = True
     msg.carrotMan.activeCarrot = self.active_carrot
@@ -1545,6 +1591,7 @@ class CarrotServ:
     msg.carrotMan.carrotCmd = self.carrotCmd
     msg.carrotMan.carrotArg = self.carrotArg
     msg.carrotMan.trafficState = self.traffic_state
+    msg.carrotMan.trafficStateSrc = int(self.traffic_state_src)
 
     msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)

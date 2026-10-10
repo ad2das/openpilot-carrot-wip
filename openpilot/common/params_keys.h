@@ -386,6 +386,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DriverMonitoringSessionDisabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}},
     {"DriverMonitoringMode", {PERSISTENT, INT, "0"}},
     {"CarrotVisionEnabled", {PERSISTENT, BOOL, "0"}},
+    {"CarrotTlvMode", {PERSISTENT, INT, "0"}},  // 0=off, 1=shadow (detect+publish only), 2=active control fusion
+    {"CarrotTlvBackend", {PERSISTENT, STRING, "onnx"}},
+    {"CarrotTlvModelPath", {PERSISTENT, STRING}},
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 

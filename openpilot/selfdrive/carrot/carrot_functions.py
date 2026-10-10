@@ -74,6 +74,7 @@ class CarrotPlanner:
     #self.v_ego_prev = 0.0
 
     self.trafficState = TrafficState.off
+    self.last_model_stop_sign = False
     self.xStopFilter = MyMovingAverage(3)
     self.xStopFilter2 = MyMovingAverage(15)
     self.vFilter = MyMovingAverage(10)
@@ -337,6 +338,8 @@ class CarrotPlanner:
     else:
       stopSign = False
 
+    self.last_model_stop_sign = bool(stopSign)
+
     # self.stopSignCount = (
     #   self.stopSignCount + 1
     #   if (
@@ -367,6 +370,14 @@ class CarrotPlanner:
     carrot_man = get_carrot_man(sm)
     if carrot_man is not None:
       atc_turn_left = carrot_man.atcType in ["turn left", "atc left"]
+      # A green trigger produced by the on-device carrotTlv detector may start
+      # the car only while the supercombo model is not signalling a stop, i.e.
+      # both cues agree (ONE extra gate for tlv-originated greens).
+      tlv_green_disagrees = (
+        int(getattr(carrot_man, 'trafficStateSrc', 0)) == 1
+        and carrot_man.trafficState == 2
+        and getattr(self, 'last_model_stop_sign', False)
+      )
       trigger_start = self.carrot_stay_stop = False
       if atc_turn_left or sm['carState'].leftBlinker:
         if self.trafficState_carrot == 1 and carrot_man.trafficState == 3: # red -> left triggered
@@ -374,10 +385,14 @@ class CarrotPlanner:
         elif carrot_man.trafficState in [1, 2]:
           self.carrot_stay_stop = True
       elif self.trafficState_carrot == 1 and carrot_man.trafficState == 2:  # red -> green triggered
-        trigger_start = True
+        trigger_start = not tlv_green_disagrees
       else:
         trigger_start = False
-      self.trafficState_carrot = carrot_man.trafficState
+      if not tlv_green_disagrees:
+        self.trafficState_carrot = carrot_man.trafficState
+      # else: hold trafficState_carrot at 1 so the red->green edge can fire
+      # once the model's stop cue clears; a tlv green that decays away first
+      # leaves normal (non-tlv) behavior untouched.
 
       if trigger_start:
         if self.soft_hold_active > 0:

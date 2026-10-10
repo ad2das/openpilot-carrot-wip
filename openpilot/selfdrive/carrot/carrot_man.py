@@ -317,7 +317,7 @@ class CarrotMan:
     self.sm = messaging.SubMaster([
       'deviceState', 'carState', 'controlsState', 'radarState', 'longitudinalPlan', 'modelV2',
       'selfdriveState', 'carControl', 'navRouteNavd', self.gps_location_service,
-      'navInstruction', 'carrotNavi',
+      'navInstruction', 'carrotNavi', 'carrotTlv',
     ])
     self.pm = messaging.PubMaster(['carrotMan', "navRoute", "navInstructionCarrot"])
 

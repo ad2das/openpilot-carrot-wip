@@ -132,6 +132,13 @@ def enable_youtube_wide_encoder(started, params, CP: car.CarParams) -> bool:
 def enable_cluster_hud(started, params, CP: car.CarParams) -> bool:
   return cluster_hud_active(params)
 
+def enable_tlvd(started, params, CP: car.CarParams) -> bool:
+  # On-device traffic-light detector: onroad only and off by default.
+  try:
+    return started and params.get_int("CarrotTlvMode") >= 1
+  except Exception:
+    return False
+
 procs = [
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
 
@@ -212,6 +219,9 @@ procs = [
   # Starts after onroad readiness, when manager already has live IPC mappings.
   # Launch a fresh interpreter instead of forking that running manager state.
   PythonProcess("xiaoge_data", "openpilot.selfdrive.carrot.xiaoge_data", enable_xiaoge_data, spawn=True),
+
+  # On-device traffic light detector (CarrotTlvMode 1=shadow, 2=active). Cores 1-3, SCHED_IDLE.
+  PythonProcess("tlvd", "openpilot.selfdrive.carrot.tlv.tlvd", enable_tlvd, restart_if_crash=True),
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
   PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),
