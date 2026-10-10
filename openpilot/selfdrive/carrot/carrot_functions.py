@@ -397,10 +397,13 @@ class CarrotPlanner:
         trigger_start = not tlv_start_disagrees
       else:
         trigger_start = False
-      if not tlv_start_disagrees:
+      # Graded redLikely (4) must never overwrite the last confirmed state:
+      # 1 -> 4 -> 2/3 would otherwise lose the red->green / red->left edge.
+      # 4 is not red here, and it is not in (2, 3) for tlv_start_disagrees.
+      if not tlv_start_disagrees and carrot_man.trafficState != 4:
         self.trafficState_carrot = carrot_man.trafficState
-      # else: hold trafficState_carrot at 1 so the start edge can fire later
-      # once the model's stop cue clears; a tlv trigger that decays away first
+      # else: hold the previous value so the start edge can fire later once
+      # the model's stop cue clears; a tlv trigger that decays away first
       # leaves normal (non-tlv) behavior untouched.
 
       if trigger_start:

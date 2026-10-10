@@ -441,6 +441,58 @@ def test_tlv_green_decay_leaves_normal_behavior():
   assert planner.xState == XState.e2eStopped
 
 
+def test_red_likely_grade_holds_start_edge_for_green():
+  # Confirmed red (1) -> graded redLikely (4) -> green (2): the grade must
+  # hold 1 so the red->green edge still fires.
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=4, src=1)), 20.0, 60.0)
+  assert planner.trafficState_carrot == 1  # grade held, not stored
+  assert planner.carrot_stay_stop is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 2
+
+
+def test_red_likely_to_green_without_confirmed_red_does_not_start():
+  # 0 -> 4 -> 2: the grade is not a confirmed red, so no start edge.
+  planner = planner_for_gate(stop_sign=False)
+  planner.trafficState_carrot = 0
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=4, src=1)), 20.0, 60.0)
+  assert planner.trafficState_carrot == 0
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 2
+
+
+def test_red_likely_grade_holds_start_edge_for_left():
+  # 1 -> 4 -> 3 with left intent: same hold for the red->left edge; 4 is not
+  # in [1, 2], so the left-blinker stay-stop branch is untouched.
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=4, src=1), left=True), 20.0, 60.0)
+  assert planner.trafficState_carrot == 1
+  assert planner.carrot_stay_stop is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 3
+
+
+def test_red_likely_grade_never_overwrites_confirmed_state():
+  # 0 -> 4 alone leaves the confirmed state untouched (the grade is not red).
+  planner = planner_for_gate(stop_sign=False)
+  planner.trafficState_carrot = 0
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=4, src=1)), 20.0, 60.0)
+  assert planner.trafficState_carrot == 0
+  assert planner.xState == XState.e2eStopped
+  # 4 is not in (2, 3): the grade alone cannot create tlv_start_disagrees
+  # (src 1 + model stop sign) either.
+  stopped = planner_for_gate(stop_sign=True)
+  stopped._update_carrot_man(gate_sm(carrot_man_message(state=4, src=1)), 20.0, 60.0)
+  assert stopped.trafficState_carrot == 1  # held, no store, no start
+  assert stopped.xState == XState.e2eStopped
+
+
 # ---------------------------------------------------------------------------
 # Graded redLikely -> coast (mode 2 only)
 # ---------------------------------------------------------------------------
