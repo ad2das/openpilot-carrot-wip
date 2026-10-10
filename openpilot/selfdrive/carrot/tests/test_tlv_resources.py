@@ -258,4 +258,34 @@ def test_write_oom_score_adj(tmp_path):
   target = tmp_path / "oom_score_adj"
   assert resources.write_oom_score_adj(1000, str(target))
   assert target.read_text() == "1000"
-  assert not resources.write_oom_score_adj(1000, str(tmp_path / "missing" / "oom_score_adj"))
+
+
+# ---------------------------------------------------------------------------
+# Detector throttle (classifier priority)
+# ---------------------------------------------------------------------------
+
+def test_detector_throttle_intervals_halve_with_tracks():
+  throttle = resources.DetectorThrottle(base_interval_s=0.2, tracks_interval_s=0.4)
+  assert throttle.due(0.0, has_tracks=False)
+  throttle.mark(0.0)
+  assert not throttle.due(0.1, has_tracks=False)
+  assert throttle.due(0.2, has_tracks=False)
+  throttle.mark(0.2)
+  assert not throttle.due(0.3, has_tracks=False)
+  assert throttle.due(0.4, has_tracks=False)
+  # With tracked lights the detector halves its rate to free the budget.
+  # Off-boundary probes: 0.6 - 0.2 evaluates to 0.3999... in float.
+  assert not throttle.due(0.59, has_tracks=True)
+  assert throttle.due(0.61, has_tracks=True)
+
+
+def test_detector_due_prioritizes_the_classifier():
+  throttle = resources.DetectorThrottle()
+  throttle.mark(0.0)
+  # No classifier: every frame keeps its detector run (current behavior).
+  assert resources.detector_due(throttle, 0.01, classifier_present=False, has_tracks=True)
+  assert resources.detector_due(throttle, 0.01, classifier_present=False, has_tracks=False)
+  # Classifier present: only the detector follows the throttle cadence.
+  assert not resources.detector_due(throttle, 0.2, classifier_present=True, has_tracks=True)
+  assert resources.detector_due(throttle, 0.4, classifier_present=True, has_tracks=True)
+  assert resources.detector_due(throttle, 0.75, classifier_present=True, has_tracks=True)

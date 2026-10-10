@@ -95,6 +95,11 @@ TLV_COLOR_RED = "Red Light"
 TLV_COLOR_YELLOW = "Yellow Light"
 TLV_COLOR_GREEN = "Green Light"
 TLV_COLOR_LEFT = "Left turn"
+# carrotTlv State ordinal 7 = graded redLikely (custom.capnp, appended last).
+# carrotMan trafficState carries the internal graded ordinal 4; the existing
+# 0 none / 1 red / 2 green / 3 left ordinals stay unchanged for every consumer.
+TLV_RED_LIKELY_STATE = 7
+TLV_GRADED_TRAFFIC_STATE = 4
 
 
 def tlv_state_color(state_raw: int, left_intent: bool) -> str | None:
@@ -404,7 +409,15 @@ class CarrotServ:
     msg = sm['carrotTlv']
     if int(msg.status.raw) != 1 or len(msg.dets) == 0:  # Status.running only
       return
-    color = tlv_state_color(int(msg.state.raw), self._tlv_left_intent(sm))
+    state_raw = int(msg.state.raw)
+    if state_raw == TLV_RED_LIKELY_STATE:  # graded redLikely: no confirmed color
+      if float(msg.stateConf) < TLV_CONF_MIN:
+        return
+      self.traffic_state = TLV_GRADED_TRAFFIC_STATE
+      self.traffic_state_src = 1
+      self.traffic_light_count = int(0.5 / 0.1)
+      return
+    color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
       return
     det = msg.dets[0]

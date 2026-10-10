@@ -215,3 +215,54 @@ def test_proc_sampler_with_fake_proc_root(tmp_path):
   sampler._last_scan = -1e9
   assert sampler.sample(7.0)["procs"]["tlvd"]["cpu_s"] == pytest.approx(0.02)
   assert sampler.pid_changes["tlvd"] == 1
+
+
+def test_classify_episodes_rate_per_track():
+  states = [
+    (0.0, "none", -1),
+    (0.1, "redLikely", 7), (0.2, "redLikely", 7), (0.3, "red", 7),
+    (0.5, "red", 9),
+    (0.6, "none", -1),
+  ]
+  episodes, rates = bench.classify_episodes(states)
+  assert episodes == [(7, 0.1, 0.3, 3), (9, 0.5, 0.5, 1)]
+  # 2 intervals / 0.2 s = 10 Hz; the single-sample episode contributes no rate.
+  assert rates == [pytest.approx(10.0)]
+  assert bench.classify_episodes([]) == ([], [])
+  assert bench.classify_episodes([(0.0, "none", -1)]) == ([], [])
+
+
+def test_time_to_confirm_measures_redlikely_to_red():
+  states = [
+    (0.0, "redLikely", 5), (0.2, "redLikely", 5), (0.4, "red", 5),
+    (1.0, "none", -1),
+    (2.0, "redLikely", 5), (2.5, "green", 5),  # ended without a red
+    (3.0, "redLikely", 5), (3.1, "red", 5),
+    (4.0, "redLikely", 5), (4.1, "red", 5),  # two runs
+  ]
+  deltas = bench.time_to_confirm(states)
+  assert deltas == [pytest.approx(0.4), pytest.approx(0.1), pytest.approx(0.1)]
+  assert bench.time_to_confirm([]) == []
+
+
+def test_summarize_phase_includes_classifier_stats():
+  report = {
+    "seconds": 10.0,
+    "tlv_states": [
+      (0.0, "none", -1),
+      (0.2, "redLikely", 3), (0.4, "redLikely", 3), (0.6, "red", 3),
+      (0.8, "red", 3), (1.0, "none", -1),
+    ],
+    "proc_samples": [],
+  }
+  summary = bench.summarize_phase(report)
+  assert summary["tlv_classify_episodes"] == 1
+  assert summary["tlv_classify_rate_hz_median"] == pytest.approx(5.0)
+  assert summary["tlv_classify_rate_hz_max"] == pytest.approx(5.0)
+  assert summary["tlv_redlikely_episodes"] == 1
+  assert summary["tlv_time_to_confirm_s_median"] == pytest.approx(0.4)
+  assert summary["tlv_time_to_confirm_s_max"] == pytest.approx(0.4)
+  # No tlv states at all -> explicit None instead of an exception.
+  empty = bench.summarize_phase({"seconds": 1.0, "proc_samples": []})
+  assert empty["tlv_classify_rate_hz_median"] is None
+  assert empty["tlv_time_to_confirm_s_median"] is None

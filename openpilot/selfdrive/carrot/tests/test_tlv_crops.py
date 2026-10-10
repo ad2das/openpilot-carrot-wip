@@ -156,3 +156,64 @@ def test_frame_preprocessor_rejects_mismatched_geometry():
   geom = crops.ViewGeometry(view="far", x0=0, y0=0, w=64, h=32, scale=1, focal_px=100.0)
   with pytest.raises(ValueError):
     pre.model_input_from_frame(b"\x00" * (64 * 32 * 3 // 2), 64, 32, 64, 64 * 32, geom)
+
+
+def test_standstill_near_geometry_raises_horizon_to_90_percent():
+  geom = crops.near_geometry(600.0, W, H, 2648.0, horizon_fraction=crops.STANDSTILL_HORIZON_CROP_FRACTION)
+  assert geom.view == "near"
+  assert (geom.w, geom.h) == (1280, 640)
+  assert geom.y0 == 24 and geom.y0 % 2 == 0
+  assert geom.y0 + crops.STANDSTILL_HORIZON_CROP_FRACTION * geom.h == pytest.approx(600.0)
+  # The raised crop starts higher (smaller y0) than the normal 75% horizon crop.
+  normal = crops.near_geometry(600.0, W, H, 2648.0)
+  assert geom.y0 < normal.y0
+
+
+def test_standstill_near_geometry_clamps_to_image():
+  top = crops.near_geometry(60.0, W, H, 2648.0, horizon_fraction=crops.STANDSTILL_HORIZON_CROP_FRACTION)
+  assert top.y0 == 0
+  bottom = crops.near_geometry(1200.0, W, H, 2648.0, horizon_fraction=crops.STANDSTILL_HORIZON_CROP_FRACTION)
+  assert bottom.y0 == H - bottom.h
+  side = crops.near_geometry(600.0, 1000, H, 2648.0, horizon_fraction=crops.STANDSTILL_HORIZON_CROP_FRACTION)
+  assert side.w <= 1000 and side.x0 >= 0
+
+
+def _horizontal_gradient_model_input():
+  img = np.zeros((1, 3, crops.MODEL_H, crops.MODEL_W), dtype=np.uint8)
+  column = np.arange(crops.MODEL_W, dtype=np.uint8)[None, None, :]
+  img[0, :, :, :] = column
+  return img
+
+
+def test_lamp_crop_buffer_builds_padded_nearest_crops():
+  img = _horizontal_gradient_model_input()
+  buf = crops.LampCropBuffer()
+  geom = crops.far_geometry(600.0, W, H, 2648.0)
+  box_full = (geom.x0 + 100.0, geom.y0 + 50.0, geom.x0 + 140.0, geom.y0 + 90.0)
+  batch, count = buf.build(img, geom, [box_full])
+  assert count == 1
+  assert batch.shape == (crops.MAX_LAMP_CROPS, 3, crops.LAMP_CROP_H, crops.LAMP_CROP_W)
+  assert batch.dtype == np.uint8
+  # Model box 100..140 padded 25% -> 90..150; nearest samples stay inside and
+  # the horizontal gradient increases across the crop.
+  first_col = int(batch[0, 0, 0, 0])
+  last_col = int(batch[0, 0, 0, -1])
+  assert 90 <= first_col <= 96
+  assert 144 <= last_col <= 150
+  assert last_col > first_col
+  # Workspace reuse and shape validation.
+  empty, count0 = buf.build(img, geom, [])
+  assert count0 == 0 and empty is batch
+  with pytest.raises(ValueError):
+    buf.build(np.zeros((1, 3, 64, 64), dtype=np.uint8), geom, [box_full])
+
+
+def test_lamp_crop_buffer_maps_near_view_and_max_tracks():
+  img = _horizontal_gradient_model_input()
+  buf = crops.LampCropBuffer(max_tracks=2)
+  geom = crops.near_geometry(600.0, W, H, 2648.0)
+  # Full-frame box for a model-space box (300..340, 150..190) under the NEAR view.
+  box_full = (geom.x0 + 600.0, geom.y0 + 300.0, geom.x0 + 680.0, geom.y0 + 380.0)
+  batch, count = buf.build(img, geom, [box_full, box_full, box_full])
+  assert count == 2 and batch.shape[0] == 2
+  assert int(batch[1, 0, 0, 0]) == int(batch[0, 0, 0, 0])

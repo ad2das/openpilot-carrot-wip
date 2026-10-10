@@ -10,6 +10,7 @@ import sys
 import types
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 
@@ -133,9 +134,11 @@ def _install_pc_shims() -> None:
 _install_pc_shims()
 
 from openpilot.cereal import log
+from openpilot.common.filter_simple import MyMovingAverage
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner, XState
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
+from openpilot.selfdrive.carrot.driving_mode import DrivingMode
 
 BOX = (900.0, 400.0, 940.0, 440.0)
 
@@ -192,6 +195,7 @@ def test_mode0_and_mode1_ignore_carrotTlv_and_match_no_tlv_outputs():
     serv = make_serv(mode)
     if with_tlv:
       serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+      serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLikely")))
       serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green")))
     _replay_detect(serv)
     return snapshot(serv)
@@ -200,6 +204,22 @@ def test_mode0_and_mode1_ignore_carrotTlv_and_match_no_tlv_outputs():
   assert replay(0, True) == baseline
   assert replay(1, True) == baseline
   assert baseline[0] == 2  # the DETECT green trigger still works
+
+
+def test_mode2_red_likely_is_graded_not_a_confirmed_color():
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLikely", conf=0.8)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (4, 1)
+  assert serv.traffic_light_count == 5
+  assert list(serv.traffic_light_q) == []  # graded state is not a color latch
+  # A confirmed red message overrides the grade through the existing path.
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", conf=0.75)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", conf=0.75)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  # Weak graded confidence is ignored entirely.
+  weak = make_serv(2)
+  weak._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLikely", conf=0.2)))
+  assert snapshot(weak) == (0, 0, -1, [])
 
 
 def test_mode2_feed_red_then_green_uses_existing_trigger_logic():
@@ -235,6 +255,7 @@ def test_tlv_state_color_maps_every_state_and_intent():
     (4, False): "Red Light", (4, True): "Left turn",
     (5, False): "Red Light", (5, True): "Left turn",
     (6, False): "Green Light", (6, True): "Left turn",
+    (7, False): None, (7, True): None,  # graded redLikely is not a color
   }
   for (state, intent), color in cases.items():
     assert tlv_state_color(state, intent) == color, (state, intent)
@@ -418,3 +439,91 @@ def test_tlv_green_decay_leaves_normal_behavior():
   planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 20.0, 60.0)
   assert planner.trafficState_carrot == 0
   assert planner.xState == XState.e2eStopped
+
+
+# ---------------------------------------------------------------------------
+# Graded redLikely -> coast (mode 2 only)
+# ---------------------------------------------------------------------------
+
+def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
+  planner = CarrotPlanner.__new__(CarrotPlanner)
+  planner.trafficLightDetectMode = detect_mode
+  planner.myDrivingMode = DrivingMode.Normal
+  planner.myHighModeFactor = 1.2
+  planner.mySafeFactor = 1.0
+  for index in range(7):
+    setattr(planner, f"cruiseMaxVals{index}", 1.6)
+  planner.tlv_red_likely = False
+  planner.last_model_start_sign = False
+  planner.coast_cap_active = False
+  return planner
+
+
+def test_red_likely_reader_requires_fresh_tlv_source():
+  planner = CarrotPlanner.__new__(CarrotPlanner)
+  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=4, src=1))) is True
+  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=4, src=0))) is False
+  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=1, src=1))) is False
+  stale = FakeSM(carrotMan=carrot_man_message(state=4, src=1))
+  stale.recv_time['carrotMan'] = 50.0  # frozen clock at 100.0 -> 50 s old
+  assert planner._read_tlv_red_likely(stale) is False
+  assert planner._read_tlv_red_likely(FakeSM()) is False
+
+
+def test_coast_cap_only_mode2_without_model_start():
+  planner = accel_planner(2)
+  planner.tlv_red_likely = True
+  planner.last_model_start_sign = True
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is False  # model is signalling a go
+  planner.last_model_start_sign = False
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is True
+  for mode in (0, 1):
+    legacy = accel_planner(mode)
+    legacy.tlv_red_likely = True
+    legacy.last_model_start_sign = False
+    legacy._update_coast_cap()
+    assert legacy.coast_cap_active is False
+  idle = accel_planner(2)
+  idle._update_coast_cap()
+  assert idle.coast_cap_active is False  # no redLikely
+
+
+def test_coast_cap_zeroes_accel_and_never_adds_braking():
+  planner = accel_planner()
+  base = planner.get_carrot_accel(10.0)
+  assert base > 0.0
+  planner.coast_cap_active = True
+  assert planner.get_carrot_accel(10.0) == 0.0
+  # Only the upper bound moves: no braking request is created here.
+  assert planner.get_carrot_accel(0.0) == 0.0
+  legacy = accel_planner(1)
+  assert legacy.coast_cap_active is False
+  assert legacy.get_carrot_accel(10.0) == pytest.approx(base)
+
+
+def test_check_model_stopping_records_start_sign():
+  def fresh_planner() -> CarrotPlanner:
+    planner = CarrotPlanner.__new__(CarrotPlanner)
+    planner.xStopFilter = MyMovingAverage(3)
+    planner.xStopFilter2 = MyMovingAverage(15)
+    planner.vFilter = MyMovingAverage(10)
+    planner.stopSignCount = 0
+    planner.startSignCount = 0
+    planner.trafficState = None
+    planner.last_model_stop_sign = True
+    planner.last_model_start_sign = False
+    return planner
+
+  go = fresh_planner()
+  v_go = np.zeros(75, dtype=np.float64)
+  v_go[-1] = 10.0  # model velocity implies a start
+  go.check_model_stopping(0.0, v_go, 0.1, 0.0, 15.0, np.zeros_like(v_go), 100.0)
+  assert go.last_model_start_sign is True
+
+  stop = fresh_planner()
+  v_stop = np.zeros(75, dtype=np.float64)
+  stop.check_model_stopping(0.0, v_stop, 0.1, 0.0, 15.0, np.zeros_like(v_stop), 100.0)
+  assert stop.last_model_start_sign is False
+  assert stop.last_model_stop_sign is True

@@ -224,6 +224,60 @@ def camera_gap_stats(frames: list) -> tuple[float | None, int, float | None]:
   return rate, max_skip, max_gap_ms
 
 
+def classify_episodes(states: list) -> tuple[list, list]:
+  """Per-track classification episodes from (t, state, relevant_track_id).
+
+  An episode is a run of consecutive carrotTlv samples carrying the SAME
+  relevant track id (>= 0): the lamp classifier's effective sampling rate for
+  that track. Returns (episodes [(track_id, t0, t1, votes)], rates_hz) where
+  rates_hz = (votes-1)/(t1-t0): intervals per second, not votes per second,
+  so a two-sample 0.2 s episode reports its 5 Hz cadence. Single-sample
+  episodes contribute no rate.
+  """
+  episodes: list[tuple[int, float, float, int]] = []
+  current: list | None = None
+  for t, _state, track_id in states:
+    tid = int(track_id)
+    if tid < 0:
+      if current is not None:
+        episodes.append((current[0], current[1], current[2], current[3]))
+        current = None
+      continue
+    if current is not None and current[0] == tid:
+      current[2] = float(t)
+      current[3] += 1
+    else:
+      if current is not None:
+        episodes.append((current[0], current[1], current[2], current[3]))
+      current = [tid, float(t), float(t), 1]
+  if current is not None:
+    episodes.append((current[0], current[1], current[2], current[3]))
+  rates = [(votes - 1) / (t1 - t0) for _, t0, t1, votes in episodes if t1 > t0]
+  return episodes, rates
+
+
+def time_to_confirm(states: list) -> list:
+  """Seconds from a first redLikely to the following confirmed red, per run.
+
+  Any other state between the two (green/yellow/none/...) ends the run without
+  a measurement.
+  """
+  deltas: list[float] = []
+  red_likely_at: float | None = None
+  for t, state, _track_id in states:
+    name = str(state)
+    if name == "redLikely":
+      if red_likely_at is None:
+        red_likely_at = float(t)
+    elif name == "red":
+      if red_likely_at is not None:
+        deltas.append(float(t) - red_likely_at)
+        red_likely_at = None
+    else:
+      red_likely_at = None
+  return deltas
+
+
 def _proc_summaries(samples: list) -> dict:
   names: set[str] = set()
   for sample in samples:
@@ -279,6 +333,9 @@ def summarize_phase(report: dict) -> dict:
   samples = report.get("proc_samples", [])
   procs = _proc_summaries(samples)
   tlvd_rss_series = procs.get("tlvd", {}).get("rss_series_mb", [])
+  tlv_states = report.get("tlv_states", [])
+  _, classify_rates = classify_episodes(tlv_states)
+  confirm_deltas = time_to_confirm(tlv_states)
   return {
     "seconds": report.get("seconds"),
     "counts": {
@@ -312,6 +369,12 @@ def summarize_phase(report: dict) -> dict:
     "tlv_status_seen": report.get("tlv_status_seen", []),
     "tlv_dropped_final": report.get("tlv_dropped_final"),
     "tlv_rss_growth_mb": _growth_mb(tlvd_rss_series),
+    "tlv_classify_episodes": len(classify_episodes(tlv_states)[0]),
+    "tlv_classify_rate_hz_median": float(np.median(classify_rates)) if classify_rates else None,
+    "tlv_classify_rate_hz_max": max(classify_rates) if classify_rates else None,
+    "tlv_redlikely_episodes": len(time_to_confirm(tlv_states)),
+    "tlv_time_to_confirm_s_median": float(np.median(confirm_deltas)) if confirm_deltas else None,
+    "tlv_time_to_confirm_s_max": max(confirm_deltas) if confirm_deltas else None,
     "pid_changes": report.get("pid_changes", {}),
   }
 
@@ -462,7 +525,7 @@ def _collect(sm, seconds: float, rate_hz: float = 20.0, proc_sample_s: float = P
     "frame_drop": [], "model_exec_ms": [], "controls_mono_ns": [], "cam_frames": [],
     "ui_draw_ms": [], "thermal_status": [], "max_temp_c": [], "gpu_temp_c": [],
     "tlv_infer_ms": [], "tlv_proc_ms": [], "tlv_status_seen": [], "tlv_dropped_final": None,
-    "carrot_tlv_seen": 0, "proc_samples": [], "pid_changes": {},
+    "tlv_states": [], "carrot_tlv_seen": 0, "proc_samples": [], "pid_changes": {},
   }
   rk = Ratekeeper(rate_hz, print_delay_threshold=None)
   next_proc = 0.0
@@ -494,6 +557,7 @@ def _collect(sm, seconds: float, rate_hz: float = 20.0, proc_sample_s: float = P
       report["tlv_infer_ms"].append(float(tlv.inferMs))
       report["tlv_proc_ms"].append(float(tlv.procMs))
       report["tlv_dropped_final"] = int(tlv.droppedFrames)
+      report["tlv_states"].append((now, str(tlv.state), int(tlv.relevantTrackId)))
       status = str(tlv.status)
       if status not in report["tlv_status_seen"]:
         report["tlv_status_seen"].append(status)

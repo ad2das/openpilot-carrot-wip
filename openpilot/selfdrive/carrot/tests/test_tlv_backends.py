@@ -268,3 +268,104 @@ def test_tinygrad_cpu_backend_matches_onnxruntime(tmp_path, monkeypatch):
   mean_ms, p95_ms, min_ms = float(np.mean(times)), float(np.percentile(times, 95)), float(np.min(times))
   print(f"\ntinygrad-cpu: max_diff={max_diff:.2e} per-inference mean={mean_ms:.2f}ms p95={p95_ms:.2f}ms min={min_ms:.2f}ms")
   backend.close()
+
+
+def _tiny_classifier_onnx_model(onnx, tmp_path):
+  """Tiny input-dependent lamp classifier: (4,3,32,64) uint8 -> logits (4,8).
+
+  Same pattern as the real crop model: DequantizeLinear first, then a 1x1 conv
+  and GlobalAveragePool. A zero crop still yields logits[:, 0] == 2.0 (bias),
+  but the non-zero weights keep the graph input-dependent so the tinygrad JIT
+  actually compiles kernels (a Constant-only graph defeats TinyJit capture).
+  """
+  from onnx import TensorProto, helper
+  img = helper.make_tensor_value_info("img", TensorProto.UINT8, [4, 3, 32, 64])
+  logits = helper.make_tensor_value_info("logits", TensorProto.FLOAT, [4, 8])
+  rng = np.random.default_rng(11)
+  w = (rng.standard_normal((8, 3, 1, 1)) * 0.1).astype(np.float32)
+  b = np.zeros(8, np.float32)
+  b[0] = 2.0
+  nodes = [
+    helper.make_node("DequantizeLinear", ["img", "scale", "zp"], ["xf"]),
+    helper.make_node("Conv", ["xf", "w", "b"], ["c"], kernel_shape=[1, 1]),
+    helper.make_node("GlobalAveragePool", ["c"], ["gap"]),
+    helper.make_node("Reshape", ["gap", "lshape"], ["logits"]),
+  ]
+  inits = [
+    helper.make_tensor("scale", TensorProto.FLOAT, [1], np.array([0.5], np.float32).tobytes(), raw=True),
+    helper.make_tensor("zp", TensorProto.UINT8, [1], np.array([0], np.uint8).tobytes(), raw=True),
+    helper.make_tensor("w", TensorProto.FLOAT, w.shape, w.tobytes(), raw=True),
+    helper.make_tensor("b", TensorProto.FLOAT, b.shape, b.tobytes(), raw=True),
+    helper.make_tensor("lshape", TensorProto.INT64, [2], np.array([4, 8], np.int64).tobytes(), raw=True),
+  ]
+  graph = helper.make_graph(nodes, "tlv_classifier", [img], [logits], inits)
+  model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+  model.ir_version = 10  # onnxruntime 1.30 refuses the onnx-default IR 14
+  path = tmp_path / "classifier.onnx"
+  onnx.save(model, str(path))
+  return path
+
+
+def test_make_classifier_falls_back_to_null_without_model():
+  null = backends.make_classifier("", "")
+  assert null.enabled is False
+  assert null.classify(np.zeros(backends.LAMP_INPUT_SHAPE, dtype=np.uint8)) is None
+  assert backends.make_classifier("onnx", "").enabled is False
+  assert backends.make_classifier("tinygrad", "").enabled is False
+
+
+def test_make_classifier_rejects_unknown_and_dsp_model():
+  with pytest.raises(backends.BackendError):
+    backends.make_classifier("banana", "some.onnx")
+  with pytest.raises(NotImplementedError, match="W70"):
+    backends.make_classifier("dsp", "some.onnx")
+
+
+def test_classifier_errors_name_the_lamp_param():
+  with pytest.raises(backends.BackendError, match="CarrotTlvLampModelPath"):
+    backends.OnnxCpuClassifier("")
+  with pytest.raises(backends.BackendError, match="model not found"):
+    backends.make_classifier("onnx", "Z:/definitely/missing.onnx")
+
+
+def test_stub_classifier_votes_requested_class():
+  stub = backends.StubClassifier(cls=2, prob=0.9)
+  assert stub.enabled is True
+  logits = stub.classify(np.zeros((4, 3, 32, 64), dtype=np.uint8))
+  assert logits.shape == (4, 8) and logits.dtype == np.float32
+  probs = np.exp(logits - logits.max(axis=1, keepdims=True))
+  probs /= probs.sum(axis=1, keepdims=True)
+  assert np.argmax(probs, axis=1).tolist() == [2, 2, 2, 2]
+  assert probs[0, 2] == pytest.approx(0.9, abs=0.01)
+
+
+def test_classifier_refuses_gpu_environment(tmp_path, monkeypatch):
+  onnx = pytest.importorskip("onnx")
+  path = _tiny_classifier_onnx_model(onnx, tmp_path)
+  monkeypatch.setenv("QCOM", "1")
+  with pytest.raises(backends.BackendError, match="GPU-capable"):
+    backends.make_classifier("onnx", str(path))
+
+
+def test_onnx_classifier_end_to_end(tmp_path):
+  onnx = pytest.importorskip("onnx")
+  pytest.importorskip("onnxruntime")
+  path = _tiny_classifier_onnx_model(onnx, tmp_path)
+  classifier = backends.make_classifier("onnx", str(path))
+  assert classifier.enabled and classifier.name == "onnx"
+  classifier.warmup()
+  out = classifier.classify(np.zeros(backends.LAMP_INPUT_SHAPE, dtype=np.uint8))
+  assert out.shape == (4, 8)
+  assert float(out[0, 0]) == pytest.approx(2.0)
+  classifier.close()
+
+
+def test_tinygrad_classifier_end_to_end(tmp_path, monkeypatch):
+  onnx = pytest.importorskip("onnx")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  path = _tiny_classifier_onnx_model(onnx, tmp_path)
+  classifier = backends.make_classifier("tinygrad", str(path))
+  out = classifier.classify(np.zeros(backends.LAMP_INPUT_SHAPE, dtype=np.uint8))
+  assert out.shape == (4, 8)
+  classifier.close()

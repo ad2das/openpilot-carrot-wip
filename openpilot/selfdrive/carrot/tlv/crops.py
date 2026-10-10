@@ -25,9 +25,18 @@ FOCAL_REFERENCE_PX = 2648.0
 MODEL_W = 640
 MODEL_H = 320
 HORIZON_CROP_FRACTION = 0.75
+# Standstill/creep (CONTRACT.md): NEAR crop shifted up so the horizon sits at
+# 90% of the crop height, covering overhead lights near the stop line.
+STANDSTILL_HORIZON_CROP_FRACTION = 0.90
 
 FAR_CROP = (640, 320)
 NEAR_CROP = (1280, 640)
+
+# Lamp-classifier crop (CONTRACT.md): housing box padded 25%, resized to 32x64.
+LAMP_CROP_H = 32
+LAMP_CROP_W = 64
+LAMP_PAD_FRACTION = 0.25
+MAX_LAMP_CROPS = 4
 
 
 @dataclass(frozen=True)
@@ -76,21 +85,26 @@ def _clamp_even(value: int, lo: int, hi: int) -> int:
 
 
 def _geometry(view: str, crop: tuple[int, int], horizon_y: float, width: int, height: int,
-              focal_px: float, scale: int) -> ViewGeometry:
+              focal_px: float, scale: int,
+              horizon_fraction: float = HORIZON_CROP_FRACTION) -> ViewGeometry:
   w = min(_even_down(crop[0]), _even_down(width))
   h = min(_even_down(crop[1]), _even_down(height))
   x0 = _clamp_even((width - w) // 2, 0, width - w)
-  y0 = _clamp_even(int(round(horizon_y - HORIZON_CROP_FRACTION * h)), 0, height - h)
+  y0 = _clamp_even(int(round(horizon_y - horizon_fraction * h)), 0, height - h)
   effective_focal = focal_px / scale if scale > 1 else focal_px
   return ViewGeometry(view=view, x0=x0, y0=y0, w=w, h=h, scale=scale, focal_px=float(effective_focal))
 
 
-def far_geometry(horizon_y: float, width: int, height: int, focal_px: float) -> ViewGeometry:
-  return _geometry("far", FAR_CROP, horizon_y, width, height, focal_px, scale=1)
+def far_geometry(horizon_y: float, width: int, height: int, focal_px: float,
+                 horizon_fraction: float = HORIZON_CROP_FRACTION) -> ViewGeometry:
+  return _geometry("far", FAR_CROP, horizon_y, width, height, focal_px, scale=1,
+                   horizon_fraction=horizon_fraction)
 
 
-def near_geometry(horizon_y: float, width: int, height: int, focal_px: float) -> ViewGeometry:
-  return _geometry("near", NEAR_CROP, horizon_y, width, height, focal_px, scale=2)
+def near_geometry(horizon_y: float, width: int, height: int, focal_px: float,
+                  horizon_fraction: float = HORIZON_CROP_FRACTION) -> ViewGeometry:
+  return _geometry("near", NEAR_CROP, horizon_y, width, height, focal_px, scale=2,
+                   horizon_fraction=horizon_fraction)
 
 
 def nv12_planes(data, width: int, height: int, stride: int, uv_offset: int):
@@ -220,6 +234,56 @@ class FramePreprocessor:
     np.copyto(self.model_input[0, 0], rf, casting="unsafe")
     np.copyto(self.model_input[0, 1], gf, casting="unsafe")
     np.copyto(self.model_input[0, 2], bf, casting="unsafe")
+
+
+class LampCropBuffer:
+  """Preallocated [MAX_LAMP_CROPS, 3, 32, 64] uint8 builder for the classifier.
+
+  Each crop is the track box padded by 25% and resized nearest into 32x64, in
+  the CURRENT view's model space (640x320). Buffers are allocated once; build()
+  only writes into them (np.take with out=).
+  """
+
+  def __init__(self, max_tracks: int = MAX_LAMP_CROPS) -> None:
+    self.max_tracks = int(max_tracks)
+    self.crops = np.zeros((self.max_tracks, 3, LAMP_CROP_H, LAMP_CROP_W), dtype=np.uint8)
+    self._rows = np.empty((3, LAMP_CROP_H, MODEL_W), dtype=np.uint8)
+    self._ys = np.empty(LAMP_CROP_H, dtype=np.intp)
+    self._xs = np.empty(LAMP_CROP_W, dtype=np.intp)
+
+  def build(self, model_input: np.ndarray, geom: ViewGeometry,
+            boxes) -> tuple[np.ndarray, int]:
+    """Write up to max_tracks lamp crops; returns (crops [4,3,32,64], count)."""
+    if model_input.shape != (1, 3, MODEL_H, MODEL_W):
+      raise ValueError(f"unexpected model input shape {model_input.shape}")
+    count = 0
+    for box in boxes:
+      if count >= self.max_tracks:
+        break
+      if self._fill_crop(model_input[0], geom, box, count):
+        count += 1
+    return self.crops, count
+
+  def _fill_crop(self, image: np.ndarray, geom: ViewGeometry, box, slot: int) -> bool:
+    x1 = (box[0] - geom.x0) / geom.scale
+    y1 = (box[1] - geom.y0) / geom.scale
+    x2 = (box[2] - geom.x0) / geom.scale
+    y2 = (box[3] - geom.y0) / geom.scale
+    pad_x = LAMP_PAD_FRACTION * max(0.0, x2 - x1)
+    pad_y = LAMP_PAD_FRACTION * max(0.0, y2 - y1)
+    x1, x2 = x1 - pad_x, x2 + pad_x
+    y1, y2 = y1 - pad_y, y2 + pad_y
+    x1 = min(max(x1, 0.0), MODEL_W - 1.0)
+    y1 = min(max(y1, 0.0), MODEL_H - 1.0)
+    x2 = min(max(x2, x1 + 1.0), MODEL_W - 1.0)
+    y2 = min(max(y2, y1 + 1.0), MODEL_H - 1.0)
+    for i in range(LAMP_CROP_H):
+      self._ys[i] = int(y1 + (i + 0.5) * (y2 - y1) / LAMP_CROP_H)
+    for j in range(LAMP_CROP_W):
+      self._xs[j] = int(x1 + (j + 0.5) * (x2 - x1) / LAMP_CROP_W)
+    np.take(image, self._ys, axis=1, out=self._rows)
+    np.take(self._rows, self._xs, axis=2, out=self.crops[slot])
+    return True
 
 
 def model_input_from_frame(data, width: int, height: int, stride: int, uv_offset: int,

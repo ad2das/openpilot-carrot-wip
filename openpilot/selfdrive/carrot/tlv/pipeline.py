@@ -17,6 +17,43 @@ import numpy as np
 
 from openpilot.selfdrive.carrot.tlv import crops, tracker
 
+# CONTRACT.md "High-speed approach" view scheduling thresholds (km/h).
+FAR_RATE_V_KPH = 50.0
+NEAR_RATE_V_KPH = 20.0
+STANDSTILL_V_KPH = 5.0
+MAX_CLASSIFY_TRACKS = crops.MAX_LAMP_CROPS
+
+
+class ViewScheduler:
+  """Speed-aware FAR/NEAR pattern (CONTRACT.md High-speed approach).
+
+  v >= 50: FAR on 3 of 4 inferences; v < 20: NEAR on 3 of 4; standstill
+  (v < 5): NEAR every inference (the crop itself is raised, see geometry());
+  otherwise the historical 1:1 alternation.
+  """
+
+  def __init__(self) -> None:
+    self._frame = 0
+
+  def next_view(self, v_ego_kph: float) -> str:
+    idx = self._frame % 4
+    self._frame += 1
+    if v_ego_kph >= FAR_RATE_V_KPH:
+      return "near" if idx == 3 else "far"
+    if v_ego_kph < NEAR_RATE_V_KPH:
+      if v_ego_kph < STANDSTILL_V_KPH:
+        return "near"
+      return "far" if idx == 3 else "near"
+    return "far" if idx % 2 == 0 else "near"
+
+
+def _softmax_rows_into(out: np.ndarray, logits) -> None:
+  """Row softmax of `logits` (n, 8) into the preallocated `out`."""
+  out[...] = logits
+  out -= out.max(axis=1, keepdims=True)
+  np.exp(out, out=out)
+  out /= out.sum(axis=1, keepdims=True)
+
 
 @dataclass
 class FrameOutput:
@@ -28,15 +65,19 @@ class FrameOutput:
   track_id: int
   infer_ms: float
   proc_ms: float
+  red_likely: bool = False
 
 
 class FramePipeline:
-  def __init__(self, backend, decoder) -> None:
+  def __init__(self, backend, decoder, classifier=None) -> None:
     self.backend = backend
     self.decoder = decoder
+    self.classifier = classifier
     self.preprocess = crops.FramePreprocessor()
+    self.lamp_crops = crops.LampCropBuffer()
     self.tracker = tracker.TrafficLightTracker()
     self.machine = tracker.SignalStateMachine()
+    self.scheduler = ViewScheduler()
     self.frame_idx = 0
     self.infer_ms = 0.0
     self.proc_ms = 0.0
@@ -44,15 +85,22 @@ class FramePipeline:
     self.last_state = tracker.SignalState.none
     self.last_conf = 0.0
     self.last_track_id = -1
+    self.last_red_likely = False
+    self._classifier_probs = np.empty((MAX_CLASSIFY_TRACKS, 8), dtype=np.float32)
 
   @staticmethod
-  def geometry(view: str, horizon_y: float, width: int, height: int, focal_px: float) -> crops.ViewGeometry:
-    build = crops.far_geometry if view == "far" else crops.near_geometry
-    return build(horizon_y, width, height, focal_px)
+  def geometry(view: str, horizon_y: float, width: int, height: int, focal_px: float,
+               raised: bool = False) -> crops.ViewGeometry:
+    if view == "far":
+      return crops.far_geometry(horizon_y, width, height, focal_px)
+    fraction = crops.STANDSTILL_HORIZON_CROP_FRACTION if raised else crops.HORIZON_CROP_FRACTION
+    return crops.near_geometry(horizon_y, width, height, focal_px, horizon_fraction=fraction)
 
-  def next_view(self) -> str:
-    """Views alternate per processed frame: FAR, NEAR, FAR, ..."""
-    return "far" if self.frame_idx % 2 == 0 else "near"
+  def next_view(self, v_ego_kph: float | None = None) -> str:
+    """Speed-aware scheduler when vEgo is given; legacy alternation otherwise."""
+    if v_ego_kph is None:
+      return "far" if self.frame_idx % 2 == 0 else "near"
+    return self.scheduler.next_view(v_ego_kph)
 
   def prepare(self, data, width: int, height: int, stride: int, uv_offset: int, geom: crops.ViewGeometry) -> np.ndarray:
     """Copy the ROI into the preallocated workspace.
@@ -62,39 +110,107 @@ class FramePipeline:
     """
     return self.preprocess.model_input_from_frame(data, width, height, stride, uv_offset, geom)
 
+  @property
+  def has_tracks(self) -> bool:
+    return bool(self.tracker.tracks)
+
+  def _confirmed(self, now: float) -> list[tuple[tracker.Track, int, float]]:
+    """Per-track confirmation: classifier votes OR the detector M-of-N belt."""
+    if self.classifier is None:
+      return self.tracker.confirmed(self.frame_idx)
+    out: list[tuple[tracker.Track, int, float]] = []
+    for track in self.tracker.tracks:
+      result = self.tracker.confirm_track(track, self.frame_idx, now, use_classifier=True)
+      if result is not None:
+        out.append((track, result[0], result[1]))
+    return out
+
+  def _classify_order(self) -> list[tracker.Track]:
+    """Relevant track first, then the most recently detected, max 4."""
+    relevant: list[tracker.Track] = []
+    rest: list[tracker.Track] = []
+    for track in self.tracker.tracks:
+      (relevant if track.track_id == self.last_track_id else rest).append(track)
+    rest.sort(key=lambda t: t.last_frame, reverse=True)
+    return (relevant + rest)[:MAX_CLASSIFY_TRACKS]
+
+  def _classify_tracks(self, now: float, geom: crops.ViewGeometry) -> None:
+    """Re-classify up to 4 tracked lights from THIS frame, any view."""
+    classifier = self.classifier
+    if classifier is None or not self.tracker.tracks:
+      return
+    ordered = self._classify_order()
+    batch, count = self.lamp_crops.build(self.preprocess.model_input, geom, [t.box for t in ordered])
+    if count == 0:
+      return
+    logits = classifier.classify(batch)
+    if logits is None:
+      return
+    _softmax_rows_into(self._classifier_probs, logits)
+    votes: list[tuple[int, int, float]] = []
+    for i in range(min(count, len(ordered))):
+      row = self._classifier_probs[i]
+      cls = int(np.argmax(row))
+      votes.append((ordered[i].track_id, cls, float(row[cls])))
+    self.tracker.record_votes(now, votes)
+
   def infer(self, view: str, geom: crops.ViewGeometry, *, image_width: int, path_x=(), path_y=(),
-            left_intent: bool = False, now: float | None = None) -> FrameOutput:
+            left_intent: bool = False, now: float | None = None, detect: bool = True) -> FrameOutput:
     started = time.perf_counter()
     infer_started = time.perf_counter()
-    raw = self.backend.infer(self.preprocess.model_input)
+    raw = self.backend.infer(self.preprocess.model_input) if detect else []
     infer_ms = (time.perf_counter() - infer_started) * 1000.0
 
-    decoded = self.decoder.decode(raw, view)
     dets: list[tracker.Detection] = []
-    for det in decoded:
-      x1, y1, x2, y2 = crops.map_model_box_to_full((det.x1, det.y1, det.x2, det.y2), geom)
-      dets.append(tracker.Detection(cls=det.cls, score=det.score, x1=x1, y1=y1, x2=x2, y2=y2))
+    if detect:
+      decoded = self.decoder.decode(raw, view)
+      for det in decoded:
+        x1, y1, x2, y2 = crops.map_model_box_to_full((det.x1, det.y1, det.x2, det.y2), geom)
+        dets.append(tracker.Detection(cls=det.cls, score=det.score, x1=x1, y1=y1, x2=x2, y2=y2))
 
     if now is None:
       now = time.monotonic()
-    self.tracker.update(self.frame_idx, dets, view, geom.focal_px)
-    confirmed = self.tracker.confirmed(self.frame_idx)
-    relevant = tracker.select_relevant(
-      confirmed, self.frame_idx, image_width=image_width,
+    if detect:
+      self.tracker.update(self.frame_idx, dets, view, geom.focal_px, now=now)
+    self._classify_tracks(now, geom)
+
+    confirmed_relevant = tracker.select_relevant(
+      self._confirmed(now), self.frame_idx, image_width=image_width,
       path_x=path_x, path_y=path_y, left_intent=left_intent,
     )
-    lamp_state = tracker.lamp_state_for(relevant[1]) if relevant is not None else None
-    state, conf = self.machine.update(now, lamp_state, relevant[2] if relevant is not None else 0.0)
+    relevant = confirmed_relevant
+    lamp_state = tracker.lamp_state_for(confirmed_relevant[1]) if confirmed_relevant is not None else None
+    machine_conf = confirmed_relevant[2] if confirmed_relevant is not None else 0.0
+    red_likely = False
+    if self.classifier is not None:
+      if confirmed_relevant is not None:
+        red_likely = (int(confirmed_relevant[1]) not in tracker.RED_FAMILY
+                      and confirmed_relevant[0].classifier_red_likely(now))
+      else:
+        # Candidate-only frame: relevant selection for crop ordering and the
+        # graded redLikely state; the state machine stays on confirmed input.
+        candidates = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks
+                      if int(t.cls) != int(tracker.LampClass.OFF)]
+        candidate = tracker.select_relevant(
+          candidates, self.frame_idx, image_width=image_width,
+          path_x=path_x, path_y=path_y, left_intent=left_intent,
+        )
+        if candidate is not None:
+          relevant = candidate
+          red_likely = candidate[0].classifier_red_likely(now)
+    state, conf = self.machine.update(now, lamp_state, machine_conf)
 
-    self.last_dets = dets
+    if detect:
+      self.last_dets = dets
     self.last_track_id = relevant[0].track_id if relevant is not None else -1
     self.last_state, self.last_conf = state, conf
+    self.last_red_likely = red_likely
     self.frame_idx += 1
     self.infer_ms = infer_ms
     self.proc_ms = (time.perf_counter() - started) * 1000.0
     return FrameOutput(
       view=view, dets=dets, matches=self.tracker.last_matches, state=state, state_conf=conf,
-      track_id=self.last_track_id, infer_ms=infer_ms, proc_ms=self.proc_ms,
+      track_id=self.last_track_id, infer_ms=infer_ms, proc_ms=self.proc_ms, red_likely=red_likely,
     )
 
   def process(self, data, width: int, height: int, stride: int, uv_offset: int, geom: crops.ViewGeometry, **infer_kwargs) -> FrameOutput:

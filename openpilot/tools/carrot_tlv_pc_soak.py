@@ -105,6 +105,7 @@ def main(argv=None) -> int:
   parser.add_argument("--sample-s", type=float, default=10.0)
   parser.add_argument("--backend", default="tinygrad", choices=("tinygrad", "null"))
   parser.add_argument("--model", default=None, help="ONNX model path; a tiny stub conv is generated when omitted")
+  parser.add_argument("--classifier-model", default=None, help="lamp classifier ONNX; runs every frame when set")
   parser.add_argument("--warmup-frames", type=int, default=2000, help="pipeline warm-up before the measured soak")
   args = parser.parse_args(argv)
 
@@ -121,7 +122,8 @@ def main(argv=None) -> int:
       del _stub_onnx_import
       _stub_conv_onnx(model_path)
   backend, decoder = backends.make_backend(args.backend, model_path or "")
-  pipe = pipeline.FramePipeline(backend, decoder)
+  classifier = backends.make_classifier(args.backend, args.classifier_model or "") if args.classifier_model else None
+  pipe = pipeline.FramePipeline(backend, decoder, classifier=classifier)
   data, stride, uv_offset = _synthetic_frame()
   far = crops.far_geometry(600.0, W, H, 2648.0)
   near = crops.near_geometry(600.0, W, H, 2648.0)

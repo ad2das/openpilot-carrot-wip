@@ -167,3 +167,97 @@ def test_select_relevant_left_intent_prefers_arrow():
   )
   assert with_intent is not None
   assert with_intent[1] == int(LampClass.GREEN_LEFT)
+
+
+def _track_with_votes(votes, cls=LampClass.RED, box=BOX):
+  t = TrafficLightTracker()
+  t.update(0, [det(cls, box=box)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  for when, vote_cls, prob in votes:
+    t.record_votes(when, [(track.track_id, int(vote_cls), prob)])
+  return t, track
+
+
+def test_classifier_votes_confirm_red_by_time():
+  t, track = _track_with_votes([(0.0, LampClass.RED, 0.9), (0.2, LampClass.RED, 0.9)])
+  assert track.classifier_confirmed(0.2) is None  # only 2 votes inside 0.6 s
+  t.record_votes(0.4, [(track.track_id, int(LampClass.RED), 0.9)])
+  assert track.classifier_confirmed(0.4) == (int(LampClass.RED), 1.0)
+  # Votes age out of the red window: no fresh votes, no confirmation.
+  assert track.classifier_confirmed(1.2) is None
+
+
+def test_classifier_green_vote_blocks_red_confirmation():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.RED)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  red, green = int(LampClass.RED), int(LampClass.GREEN)
+  t.record_votes(0.0, [(track.track_id, red, 0.9)])
+  t.record_votes(0.2, [(track.track_id, red, 0.9)])
+  t.record_votes(0.4, [(track.track_id, green, 0.8)])
+  assert track.classifier_confirmed(0.4) is None
+  # Once the green ages out of the red window, three fresh reds confirm; two
+  # fresh reds are not enough.
+  t.record_votes(1.0, [(track.track_id, red, 0.9)])
+  t.record_votes(1.2, [(track.track_id, red, 0.9)])
+  assert track.classifier_confirmed(1.2) is None
+  t.record_votes(1.4, [(track.track_id, red, 0.9)])
+  assert track.classifier_confirmed(1.4) == (red, 1.0)
+
+
+def test_classifier_green_needs_six_votes_in_1_2s():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  green = int(LampClass.GREEN)
+  for i in range(5):
+    t.record_votes(i * 0.2, [(track.track_id, green, 0.8)])
+  assert track.classifier_confirmed(0.8) is None
+  t.record_votes(1.0, [(track.track_id, green, 0.8)])
+  assert track.classifier_confirmed(1.0) == (green, 1.0)
+
+
+def test_classifier_red_likely_uses_latest_strong_vote():
+  t, track = _track_with_votes([(0.0, LampClass.RED, 0.9)])
+  assert track.classifier_red_likely(0.2) is True
+  assert track.classifier_red_likely(0.7) is False  # vote older than the window
+  t.record_votes(1.0, [(track.track_id, int(LampClass.RED), 0.5)])  # weak vote
+  assert track.classifier_red_likely(1.0) is False
+  t.record_votes(1.2, [(track.track_id, int(LampClass.GREEN), 0.9)])  # latest is green
+  assert track.classifier_red_likely(1.2) is False
+
+
+def test_votes_keep_a_track_alive_beyond_misses():
+  plain = TrafficLightTracker(max_misses=2)
+  plain.update(0, [det()], "far", 2648.0, now=0.0)
+  for frame in range(1, 6):
+    plain.update(frame, [], "far", 2648.0, now=0.05 * frame)
+  assert plain.tracks == []  # no votes: the plain miss budget applies
+
+  voted = TrafficLightTracker(max_misses=2)
+  voted.update(0, [det()], "far", 2648.0, now=0.0)
+  track_id = voted.tracks[0].track_id
+  for frame in range(1, 6):
+    voted.update(frame, [], "far", 2648.0, now=0.05 * frame)
+    voted.record_votes(0.05 * frame, [(track_id, int(LampClass.RED), 0.9)])
+  assert len(voted.tracks) == 1 and voted.tracks[0].track_id == track_id
+  # Vote expiry eventually drops a stale track that the detector lost.
+  for frame in range(6, 30):
+    voted.update(frame, [], "far", 2648.0, now=0.05 * frame)
+  assert voted.tracks == []
+
+
+def test_confirm_track_prefers_red_and_keeps_the_detector_belt():
+  t = TrafficLightTracker()
+  for frame in range(6):
+    t.update(frame, [det(LampClass.GREEN)], "far", 2648.0, now=0.1 * frame)
+  track = t.tracks[0]
+  # No classifier votes: the detector M-of-N belt behaves like today.
+  result = t.confirm_track(track, 5, 0.5, use_classifier=True)
+  assert result is not None and result[0] == int(LampClass.GREEN)
+  # Three red votes override a green detector history (safety first).
+  for i in range(3):
+    t.record_votes(1.0 + 0.2 * i, [(track.track_id, int(LampClass.RED), 0.9)])
+  assert t.confirm_track(track, 5, 1.4, use_classifier=True) == (int(LampClass.RED), 1.0)
+  # The classifier-less path is byte-identical to the detector belt.
+  assert t.confirm_track(track, 5, 1.4, use_classifier=False) == (int(LampClass.GREEN), 0.75)

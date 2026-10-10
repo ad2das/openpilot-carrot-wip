@@ -389,6 +389,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotTlvMode", {PERSISTENT, INT, "0"}},  // 0=off, 1=shadow (detect+publish only), 2=active control fusion
     {"CarrotTlvBackend", {PERSISTENT, STRING, "onnx"}},
     {"CarrotTlvModelPath", {PERSISTENT, STRING}},
+    {"CarrotTlvLampModelPath", {PERSISTENT, STRING}},  // lamp classifier (detect-then-track)
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 

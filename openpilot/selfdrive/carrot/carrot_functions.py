@@ -7,7 +7,7 @@ import numpy as np
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import MyMovingAverage
-from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.carrot.carrot_man_input import CARROT_MAN_TIMEOUT, get_carrot_man
 from openpilot.selfdrive.carrot.t_follow import (
   get_t_follow_mode_factor, get_t_follow_mode_max, get_speed_t_follow_factor, get_lead_response_for_gap, ramp_t_follow,
   ramp_mode_t_follow_factor,
@@ -163,6 +163,9 @@ class CarrotPlanner:
     self._traffic_stop_model_lead_matcher = TrafficStopModelLeadMatcher()
     self.trafficStopModelLeadOffset = 0.0
     self.last_event_time = 0.0
+    self.last_model_start_sign = False
+    self.tlv_red_likely = False
+    self.coast_cap_active = False
 
   def _params_update(self):
     self.frame += 1
@@ -213,7 +216,11 @@ class CarrotPlanner:
   def get_carrot_accel(self, v_ego):
     cruiseMaxVals = [self.cruiseMaxVals0, self.cruiseMaxVals1, self.cruiseMaxVals2, self.cruiseMaxVals3, self.cruiseMaxVals4, self.cruiseMaxVals5, self.cruiseMaxVals6]
     factor = self.myHighModeFactor if self.myDrivingMode == DrivingMode.High else self.mySafeFactor
-    return np.interp(v_ego, A_CRUISE_MAX_BP_CARROT, cruiseMaxVals) * factor
+    accel = np.interp(v_ego, A_CRUISE_MAX_BP_CARROT, cruiseMaxVals) * factor
+    if getattr(self, 'coast_cap_active', False):
+      # Graded redLikely (mode 2, model not signalling a go): coast only, never brake.
+      accel = min(accel, 0.0)
+    return accel
 
   def _get_base_t_follow(self, personality, v_ego):
     if personality == log.LongitudinalPersonality.moreRelaxed:
@@ -339,6 +346,7 @@ class CarrotPlanner:
       stopSign = False
 
     self.last_model_stop_sign = bool(stopSign)
+    self.last_model_start_sign = bool(startSign)
 
     # self.stopSignCount = (
     #   self.stopSignCount + 1
@@ -416,6 +424,31 @@ class CarrotPlanner:
       self.atcType = ""
 
     return v_cruise_kph, atc_active
+
+  def _read_tlv_red_likely(self, sm) -> bool:
+    """Graded redLikely from carrotMan: fresh TLV-sourced trafficState 4.
+
+    Read directly (not via get_carrot_man, which needs an active navigation
+    speed) so the grade also works at a red light with no route set.
+    """
+    try:
+      service = 'carrotMan'
+      if not (sm.seen[service] and sm.alive[service] and sm.valid[service]):
+        return False
+      if time.monotonic() - sm.recv_time[service] > CARROT_MAN_TIMEOUT:
+        return False
+      carrot_man = sm[service]
+      return (int(getattr(carrot_man, 'trafficStateSrc', 0)) == 1
+              and int(getattr(carrot_man, 'trafficState', 0)) == 4)
+    except Exception:
+      return False
+
+  def _update_coast_cap(self) -> None:
+    """Graded redLikely -> coast (accel cap 0): mode 2 only, model must not
+    signal a go. Never adds braking; mode 0/1 keep the pre-W74C behavior."""
+    self.coast_cap_active = (
+      self.trafficLightDetectMode == 2 and self.tlv_red_likely and not self.last_model_start_sign
+    )
 
   def cruise_eco_control(self, v_ego_kph, v_cruise_kph):
     v_cruise_kph_apply = v_cruise_kph
@@ -522,6 +555,11 @@ class CarrotPlanner:
 
     if self.myDrivingMode == DrivingMode.High or self.trafficLightDetectMode == 0:
       self.trafficState = TrafficState.off
+
+    # Graded redLikely (CONTRACT.md High-speed approach): mode 2 only, coast
+    # (accel cap 0) while the supercombo model is not signalling a go.
+    self.tlv_red_likely = self._read_tlv_red_likely(sm)
+    self._update_coast_cap()
 
     #self.update_user_control()
     if carstate.gasPressed or carstate.brakePressed:

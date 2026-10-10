@@ -153,6 +153,42 @@ class DutyCycleGovernor:
 
 
 # ---------------------------------------------------------------------------
+# Detector throttle (classifier priority)
+# ---------------------------------------------------------------------------
+
+class DetectorThrottle:
+  """Detector cadence while the lamp classifier carries the confirmation load.
+
+  Base interval 0.2 s (5 Hz); halved to 0.4 s while tracked lights exist, so
+  the governor budget goes to the classifier first and the detector runs at a
+  lower rate instead of classification being dropped (CONTRACT.md).
+  """
+
+  def __init__(self, *, base_interval_s: float = 0.2, tracks_interval_s: float = 0.4) -> None:
+    self.base_interval_s = float(base_interval_s)
+    self.tracks_interval_s = float(tracks_interval_s)
+    self._last = -float("inf")
+
+  def due(self, now: float, *, has_tracks: bool = False) -> bool:
+    interval = self.tracks_interval_s if has_tracks else self.base_interval_s
+    return now - self._last >= interval
+
+  def mark(self, now: float) -> None:
+    self._last = float(now)
+
+
+def detector_due(throttle: DetectorThrottle, now: float, *, classifier_present: bool,
+                 has_tracks: bool) -> bool:
+  """Classifier first: with a classifier only the detector is throttled.
+
+  Without a classifier every frame keeps its detector run (current behavior).
+  """
+  if not classifier_present:
+    return True
+  return throttle.due(now, has_tracks=has_tracks)
+
+
+# ---------------------------------------------------------------------------
 # /proc/stat cores guard
 # ---------------------------------------------------------------------------
 

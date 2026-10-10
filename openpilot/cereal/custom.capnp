@@ -303,6 +303,9 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 		left @4;
 		redLeft @5;
 		greenLeft @6;
+		# Graded state (CONTRACT.md High-speed approach): one strong red
+		# detection (score >= 0.6) on the relevant track, not yet confirmed.
+		redLikely @7;
 	}
 
 	struct Det {

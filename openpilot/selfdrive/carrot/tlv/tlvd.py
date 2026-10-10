@@ -125,6 +125,9 @@ class TlvRunner:
     self.backend = None
     self.decoder = None
     self.backend_error = ""
+    self.classifier = backends.NullClassifier()
+    self.classifier_error = ""
+    self.detector_throttle = resources.DetectorThrottle()
     if _param_int(params, "CarrotTlvMode") >= 1:
       name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
       model_path = _param_text(params, "CarrotTlvModelPath", "")
@@ -134,7 +137,17 @@ class TlvRunner:
         self.backend_error = str(exc)
       except backends.BackendError as exc:
         self.backend_error = str(exc)
-    self.pipeline = pipeline.FramePipeline(self.backend, self.decoder)
+      if self.backend is not None:
+        # Lamp classifier: a bad/missing lamp model must never kill tlvd; fall
+        # back to the detector-only behavior (CONTRACT.md detect-then-track).
+        lamp_path = _param_text(params, "CarrotTlvLampModelPath", "")
+        try:
+          self.classifier = backends.make_classifier(name, lamp_path)
+          self.classifier.warmup()
+        except Exception as exc:
+          self.classifier_error = str(exc)
+          self.classifier = backends.NullClassifier()
+    self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
     self.governor = resources.DutyCycleGovernor()
     self.cpu_guard = resources.CpuContentionGuard()
@@ -218,12 +231,13 @@ class TlvRunner:
             and self._cpu_reason is None
             and self._mem.suspend_reason is None)
 
-  def _process_frame(self, frame) -> None:
+  def _process_frame(self, frame, *, detect: bool, v_ego_kph: float) -> None:
     width, height = frame.width, frame.height
     focal = crops.focal_px_for_width(width)
     horizon = self._update_horizon()
-    view = self.pipeline.next_view()
-    geom = pipeline.FramePipeline.geometry(view, horizon, width, height, focal)
+    view = self.pipeline.next_view(v_ego_kph)
+    raised = view == "near" and v_ego_kph < pipeline.STANDSTILL_V_KPH
+    geom = pipeline.FramePipeline.geometry(view, horizon, width, height, focal, raised=raised)
 
     data = frame.data
     # VisionIPC: copy the ROI into the preallocated workspace NOW and drop the
@@ -236,7 +250,7 @@ class TlvRunner:
 
     out = self.pipeline.infer(
       view, geom, image_width=width, path_x=self._path_x(), path_y=self._path_y(),
-      left_intent=self._left_intent(), now=time.monotonic(),
+      left_intent=self._left_intent(), now=time.monotonic(), detect=detect,
     )
     self.last_view = out.view
     self.processed += 1
@@ -262,6 +276,11 @@ class TlvRunner:
     if self.sm.seen["carrotMan"] and str(self.sm["carrotMan"].atcType) in LEFT_INTENT_ATCTYPES:
       return True
     return False
+
+  def _v_ego_kph(self) -> float:
+    if self.sm is not None and self.sm.seen["carState"]:
+      return float(self.sm["carState"].vEgo) * 3.6
+    return 0.0
 
   # -- system guards --------------------------------------------------------
 
@@ -345,7 +364,7 @@ class TlvRunner:
       d.y1 = float(det.y1)
       d.x2 = float(det.x2)
       d.y2 = float(det.y2)
-    out.state = self.pipeline.last_state.name
+    out.state = "redLikely" if self.pipeline.last_red_likely else self.pipeline.last_state.name
     out.stateConf = float(self.pipeline.last_conf)
     out.relevantTrackId = int(self.pipeline.last_track_id)
     self.pub.send("carrotTlv", msg)
@@ -412,6 +431,10 @@ class TlvRunner:
 
     self.sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "carState", "carrotMan", "liveCalibration"])
     self.pub = messaging.PubMaster(["carrotTlv"])
+    if self.classifier_error:
+      print(f"tlvd: lamp classifier disabled: {self.classifier_error}", flush=True)
+    elif self.classifier.enabled:
+      print("tlvd: lamp classifier ready", flush=True)
     from openpilot.common.realtime import Ratekeeper
     rk = Ratekeeper(PUBLISH_HZ, print_delay_threshold=None)
 
@@ -431,9 +454,18 @@ class TlvRunner:
         if frame is not None:
           self.last_frame_mono = now
           if self._can_infer() and self.governor.ready(now):
+            # Classifier first: with the lamp classifier present only the
+            # detector is throttled; classification still runs every frame.
+            detect = resources.detector_due(
+              self.detector_throttle, now,
+              classifier_present=self.classifier.enabled,
+              has_tracks=self.pipeline.has_tracks,
+            )
             self.governor.begin_frame(now)
             try:
-              self._process_frame(frame)
+              if detect:
+                self.detector_throttle.mark(now)
+              self._process_frame(frame, detect=detect, v_ego_kph=self._v_ego_kph())
             except Exception as exc:
               self._log_error(f"tlvd: frame processing error: {exc!r}", now)
             finally:

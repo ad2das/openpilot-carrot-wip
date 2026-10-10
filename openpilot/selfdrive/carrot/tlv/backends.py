@@ -62,12 +62,13 @@ class OnnxCpuBackend:
 
   name = "onnx"
 
-  def __init__(self, model_path: str, intra_op_threads: int = 2, inter_op_threads: int = 1) -> None:
+  def __init__(self, model_path: str, intra_op_threads: int = 2, inter_op_threads: int = 1,
+               param_name: str = "CarrotTlvModelPath") -> None:
     reason = gpu_env_reason()
     if reason is not None:
       raise BackendError(f"refusing GPU-capable environment: {reason}")
     if not model_path:
-      raise BackendError("CarrotTlvModelPath is not set")
+      raise BackendError(f"{param_name} is not set")
     if not os.path.isfile(model_path):
       raise BackendError(f"model not found: {model_path}")
     try:
@@ -98,6 +99,22 @@ TINYGRAD_GPU_DEVICES = ("QCOM", "GPU", "CL", "CUDA", "METAL", "AMD", "NV", "HIP"
 # (tinygrad_repo/tinygrad/device.py:25 allow-list).
 TINYGRAD_HOST_DEVICES = ("NPY", "DISK", "TINYFS", "PYTHON")
 TINYGRAD_THREAD_CAP = 2
+# tinygrad DTypes have no numpy accessor (dtypes.uchar.np does not exist), so
+# map the ONNX input dtype names onto numpy for the input cast.
+TINYGRAD_NP_DTYPES = {
+  "bool": np.bool_,
+  "uchar": np.uint8,
+  "char": np.int8,
+  "ushort": np.uint16,
+  "short": np.int16,
+  "uint": np.uint32,
+  "int": np.int32,
+  "ulong": np.uint64,
+  "long": np.int64,
+  "half": np.float16,
+  "float": np.float32,
+  "double": np.float64,
+}
 
 
 def _tinygrad_repo_path() -> str:
@@ -165,7 +182,8 @@ class TinygradCpuBackend:
 
   name = "tinygrad"
 
-  def __init__(self, model_path: str, max_threads: int = TINYGRAD_THREAD_CAP) -> None:
+  def __init__(self, model_path: str, max_threads: int = TINYGRAD_THREAD_CAP,
+               param_name: str = "CarrotTlvModelPath") -> None:
     # CPU default FIRST: OnnxRunner loads weights on Device.DEFAULT, which with
     # DEV unset (or inherited QCOM/CUDA) auto-opens and writes the first
     # available device (tinygrad_repo/tinygrad/device.py:14,45-51).
@@ -174,7 +192,7 @@ class TinygradCpuBackend:
     if reason is not None:
       raise BackendError(f"refusing GPU-capable environment: {reason}")
     if not model_path:
-      raise BackendError("CarrotTlvModelPath is not set")
+      raise BackendError(f"{param_name} is not set")
     if not os.path.isfile(model_path):
       raise BackendError(f"model not found: {model_path}")
     Device, Tensor, TinyJit, OnnxRunner = _import_tinygrad()
@@ -233,11 +251,8 @@ class TinygradCpuBackend:
     return tuple(outs[name] for name in self._output_names)
 
   def _make_tensor(self, model_input):
-    dtype = None
-    try:
-      dtype = self._input_spec.dtype.np
-    except Exception:
-      dtype = None
+    spec_dtype = getattr(self._input_spec, "dtype", None)
+    dtype = TINYGRAD_NP_DTYPES.get(str(spec_dtype).rsplit(".", 1)[-1]) if spec_dtype is not None else None
     data = np.asarray(model_input)
     if dtype is not None:
       data = data.astype(dtype, copy=False)
@@ -283,6 +298,92 @@ class DspBackend:
 
   def __init__(self, model_path: str = "") -> None:
     raise NotImplementedError("DSP backend is not implemented yet; W70 decides the Hexagon runtime")
+
+
+# ---------------------------------------------------------------------------
+# Lamp classifier (CONTRACT.md High-speed approach detect-then-track)
+# ---------------------------------------------------------------------------
+
+# Fixed batch so the tinygrad JIT compiles once at startup; the pipeline pads
+# unused slots and consumes only the first `count` rows.
+LAMP_INPUT_SHAPE = (4, 3, 32, 64)
+
+
+class NullClassifier:
+  """No classifier model configured: pipeline keeps the detector-only behavior."""
+
+  name = "null"
+  enabled = False
+
+  def classify(self, crops_input):
+    return None
+
+  def warmup(self) -> None:
+    pass
+
+  def close(self) -> None:
+    pass
+
+
+class StubClassifier:
+  """Deterministic classifier for tests and the PC soak: fixed class vote."""
+
+  name = "stub"
+  enabled = True
+
+  def __init__(self, cls: int = 0, prob: float = 0.9) -> None:
+    import math
+    self.cls = int(cls)
+    self.prob = float(min(max(prob, 1e-3), 1.0 - 1e-6))
+    self._logit = math.log(7.0 * self.prob / (1.0 - self.prob))
+
+  def classify(self, crops_input):
+    n = int(np.asarray(crops_input).shape[0])
+    logits = np.zeros((n, 8), dtype=np.float32)
+    logits[:, self.cls] = self._logit
+    return logits
+
+  def warmup(self) -> None:
+    pass
+
+  def close(self) -> None:
+    pass
+
+
+class OnnxCpuClassifier(OnnxCpuBackend):
+  """onnxruntime CPU lamp classifier: same guards/threads, logits output."""
+
+  name = "onnx"
+  enabled = True
+
+  def __init__(self, model_path: str) -> None:
+    super().__init__(model_path, param_name="CarrotTlvLampModelPath")
+
+  def classify(self, crops_input):
+    outs = self.infer(crops_input)
+    return outs[0] if outs else None
+
+  def warmup(self) -> None:
+    self.classify(np.zeros(LAMP_INPUT_SHAPE, dtype=np.uint8))
+
+
+class TinygradCpuClassifier(TinygradCpuBackend):
+  """tinygrad CPU lamp classifier (fixed batch 4, compiled once at startup)."""
+
+  name = "tinygrad"
+  enabled = True
+
+  def __init__(self, model_path: str) -> None:
+    super().__init__(model_path, param_name="CarrotTlvLampModelPath")
+
+  def classify(self, crops_input):
+    outs = self.infer(crops_input)
+    return outs[0] if outs else None
+
+  def warmup(self) -> None:
+    self.classify(np.zeros(LAMP_INPUT_SHAPE, dtype=np.uint8))
+
+
 def make_backend(name: str, model_path: str = "", decoder: Decoder | None = None):
   key = (name or "").strip().lower()
   if key in ("", "null", "none"):
@@ -294,3 +395,17 @@ def make_backend(name: str, model_path: str = "", decoder: Decoder | None = None
   if key == "dsp":
     return DspBackend(model_path), decoder or PlaceholderDecoder()
   raise BackendError(f"unknown backend: {name!r}")
+
+
+def make_classifier(name: str, model_path: str = ""):
+  """Lamp-classifier factory. No/empty path -> NullClassifier (detector-only)."""
+  key = (name or "").strip().lower()
+  if key in ("", "null", "none") or not model_path:
+    return NullClassifier()
+  if key == "onnx":
+    return OnnxCpuClassifier(model_path)
+  if key == "tinygrad":
+    return TinygradCpuClassifier(model_path)
+  if key == "dsp":
+    raise NotImplementedError("DSP lamp classifier is not implemented yet; W70 decides the Hexagon runtime")
+  raise BackendError(f"unknown classifier backend: {name!r}")

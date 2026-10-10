@@ -36,11 +36,28 @@ class SignalState(IntEnum):
   left = 4
   redLeft = 5
   greenLeft = 6
+  # Graded state (CONTRACT.md High-speed approach): one strong red detection on
+  # the relevant track, not yet confirmed. Advisory only; never a lamp class.
+  redLikely = 7
 
 
 RED_FAMILY = (LampClass.RED, LampClass.RED_LEFT, LampClass.RED_YELLOW)
 GREEN_FAMILY = (LampClass.GREEN, LampClass.GREEN_LEFT)
 ARROW_CLASSES = (LampClass.RED_LEFT, LampClass.GREEN_LEFT, LampClass.LEFT)
+SLOW_CLASSES = (LampClass.YELLOW, LampClass.GREEN, LampClass.GREEN_LEFT, LampClass.LEFT)
+
+# Lamp-classifier confirmation counts VOTES BY TIME, not frames (CONTRACT.md).
+# Red is confirmed fast but must not override a conflicting green vote in the
+# same window; green/yellow/left keep the stricter 6-in-1.2 s rule.
+CLASSIFIER_RED_WINDOW_S = 0.6
+CLASSIFIER_RED_VOTES = 3
+CLASSIFIER_SLOW_WINDOW_S = 1.2
+CLASSIFIER_SLOW_VOTES = 6
+# Graded redLikely: one strong red vote (probability >= 0.6) is enough.
+RED_LIKELY_MIN_PROB = 0.6
+# Classifier votes keep a track alive this long after the last detection, so a
+# slow detector cadence cannot drop a light the fast classifier still sees.
+VOTE_TRACK_KEEP_S = 0.75
 
 # (window frames, required hits). Asymmetric on purpose: red is confirmed fast
 # (safety stop), green is confirmed slowly (never start on a flicker).
@@ -151,6 +168,8 @@ class Track:
   hits: int = 1
   misses: int = 0
   history: deque[tuple[int, int]] = field(default_factory=lambda: deque(maxlen=64))
+  # Lamp-classifier votes: (monotonic time, class, probability), bounded deque.
+  votes: deque[tuple[float, int, float]] = field(default_factory=lambda: deque(maxlen=32))
 
   @property
   def cx(self) -> float:
@@ -178,6 +197,42 @@ class Track:
           best = (int(cls), conf)
     return best
 
+  def classifier_confirmed(self, now: float) -> tuple[int, float] | None:
+    """(cls, confidence) from classifier votes counted by TIME, else None.
+
+    Red family: >= 3 votes within the last 0.6 s and no green-family vote in
+    that window. Yellow/green/left: the stricter >= 6 votes in 1.2 s. Red is
+    evaluated first so a stale green cannot delay a safety stop.
+    """
+    red_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_WINDOW_S and c in RED_FAMILY]
+    green_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_WINDOW_S and c in GREEN_FAMILY]
+    if len(red_votes) >= CLASSIFIER_RED_VOTES and not green_votes:
+      return int(_most_common(red_votes)), min(1.0, len(red_votes) / CLASSIFIER_RED_VOTES)
+    best: tuple[int, float] | None = None
+    for cls in SLOW_CLASSES:
+      hits = sum(1 for t, c, _ in self.votes if t > now - CLASSIFIER_SLOW_WINDOW_S and c == cls)
+      if hits >= CLASSIFIER_SLOW_VOTES:
+        conf = min(1.0, hits / CLASSIFIER_SLOW_VOTES)
+        if best is None or conf > best[1]:
+          best = (int(cls), conf)
+    return best
+
+  def classifier_red_likely(self, now: float) -> bool:
+    """True when the LATEST vote is a strong red vote inside the red window."""
+    if not self.votes:
+      return False
+    t, cls, prob = self.votes[-1]
+    if t <= now - CLASSIFIER_RED_WINDOW_S:
+      return False
+    return cls in RED_FAMILY and prob >= RED_LIKELY_MIN_PROB
+
+
+def _most_common(values: list[int]) -> int:
+  counts: dict[int, int] = {}
+  for value in values:
+    counts[value] = counts.get(value, 0) + 1
+  return max(counts, key=lambda value: (counts[value], value))
+
 
 class TrafficLightTracker:
   """IoU + centre tracker across views, in full-frame coordinates."""
@@ -189,7 +244,8 @@ class TrafficLightTracker:
     self.last_matches: list[tuple[Detection, int]] = []
     self._next_id = 1
 
-  def update(self, frame_idx: int, detections: list[Detection], view: str, focal_px: float) -> list[tuple[Detection, int]]:
+  def update(self, frame_idx: int, detections: list[Detection], view: str, focal_px: float,
+             now: float | None = None) -> list[tuple[Detection, int]]:
     pairs: list[tuple[float, int, int]] = []
     for di, det in enumerate(detections):
       for ti, track in enumerate(self.tracks):
@@ -236,8 +292,13 @@ class TrafficLightTracker:
     for track in self.tracks:
       if track.track_id not in matched_track_ids:
         track.misses += 1
-    self.tracks = [t for t in self.tracks if frame_idx - t.last_frame <= self.max_misses]
+    self.tracks = [t for t in self.tracks if self._alive(t, frame_idx, now)]
     return self.last_matches
+
+  def _alive(self, track: Track, frame_idx: int, now: float | None) -> bool:
+    if frame_idx - track.last_frame <= self.max_misses:
+      return True
+    return now is not None and bool(track.votes) and now - track.votes[-1][0] <= VOTE_TRACK_KEEP_S
 
   def confirmed(self, frame_idx: int) -> list[tuple[Track, int, float]]:
     out: list[tuple[Track, int, float]] = []
@@ -247,6 +308,36 @@ class TrafficLightTracker:
         cls, conf = result
         out.append((track, cls, conf))
     return out
+
+  def record_votes(self, now: float, votes: list[tuple[int, int, float]]) -> None:
+    """Append lamp-classifier votes: (track_id, class, probability)."""
+    by_id = {track.track_id: track for track in self.tracks}
+    for track_id, cls, prob in votes:
+      track = by_id.get(int(track_id))
+      if track is not None:
+        track.votes.append((float(now), int(cls), float(prob)))
+
+  def confirm_track(self, track: Track, frame_idx: int, now: float,
+                    use_classifier: bool) -> tuple[int, float] | None:
+    """Best confirmation for one track: classifier votes OR the detector belt.
+
+    Red-family results win over non-red ones (safety), otherwise the higher
+    confidence wins. With no classifier this is exactly track.confirmed().
+    """
+    vote = track.classifier_confirmed(now) if use_classifier else None
+    det = track.confirmed(frame_idx)
+    candidates = [c for c in (vote, det) if c is not None]
+    if not candidates:
+      return None
+    red = [c for c in candidates if int(c[0]) in RED_FAMILY]
+    pool = red if red else candidates
+    return max(pool, key=lambda c: float(c[1]))
+
+  def track_by_id(self, track_id: int) -> Track | None:
+    for track in self.tracks:
+      if track.track_id == track_id:
+        return track
+    return None
 
 
 def estimate_distance_m(box_height_px: float, focal_px: float, housing_m: float = HOUSING_HEIGHT_M) -> float:
