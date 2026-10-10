@@ -94,6 +94,9 @@ class OnnxCpuBackend:
 
 TINYGRAD_CPU_DEVICES = ("CPU", "CLANG", "LLVM")
 TINYGRAD_GPU_DEVICES = ("QCOM", "GPU", "CL", "CUDA", "METAL", "AMD", "NV", "HIP", "DSP", "WEBGPU", "REMOTE")
+# Host-side plumbing devices tinygrad may open without an accelerator
+# (tinygrad_repo/tinygrad/device.py:25 allow-list).
+TINYGRAD_HOST_DEVICES = ("NPY", "DISK", "TINYFS", "PYTHON")
 TINYGRAD_THREAD_CAP = 2
 
 
@@ -111,10 +114,45 @@ def _import_tinygrad():
     if repo not in sys.path:
       sys.path.append(repo)
     __import__("tinygrad")
+  # The submodules below can read Device.DEFAULT at import time; an unset or
+  # stale-empty DEV would probe and open the first available device
+  # (device.py:42,45-51). Pin the context before importing them.
+  _force_cpu_dev_context()
   from tinygrad import Device, Tensor
   from tinygrad.engine.jit import TinyJit
   from tinygrad.nn.onnx import OnnxRunner
   return Device, Tensor, TinyJit, OnnxRunner
+
+
+def _force_cpu_dev_env() -> None:
+  """Set DEV=CPU in the environment before tinygrad (re)imports it.
+
+  device.py:42 falls back to _select_device when DEV is empty; that probe walks
+  ALL_DEVICES (device.py:14: CUDA/QCOM before CPU), opens the first device that
+  exists and writes it into os.environ (device.py:51) - on TICI the QCOM GPU
+  next to modeld. Unconditional: an inherited QCOM/CUDA value must never reach
+  tinygrad device selection."""
+  os.environ["DEV"] = "CPU"
+
+
+def _force_cpu_dev_context() -> None:
+  """Pin DEV=CPU for an already-imported tinygrad (env is only read at import)."""
+  try:
+    from tinygrad.helpers import DEV as tinygrad_dev
+    tinygrad_dev.value = "CPU"
+  except Exception as exc:
+    raise BackendError(f"cannot pin tinygrad DEV to CPU: {exc}") from exc
+
+
+def _assert_only_cpu_devices_opened(Device) -> None:
+  """Raise unless every device opened so far is a CPU renderer or host staging.
+
+  tinygrad records each instantiated device in _opened_devices
+  (tinygrad_repo/tinygrad/device.py:18,34)."""
+  for dev in getattr(Device, "_opened_devices", ()):
+    base = str(dev).split(":")[0]
+    if base in TINYGRAD_GPU_DEVICES or (base not in TINYGRAD_CPU_DEVICES and base not in TINYGRAD_HOST_DEVICES):
+      raise BackendError(f"tinygrad opened a non-CPU device: {dev}")
 
 
 class TinygradCpuBackend:
@@ -128,6 +166,10 @@ class TinygradCpuBackend:
   name = "tinygrad"
 
   def __init__(self, model_path: str, max_threads: int = TINYGRAD_THREAD_CAP) -> None:
+    # CPU default FIRST: OnnxRunner loads weights on Device.DEFAULT, which with
+    # DEV unset (or inherited QCOM/CUDA) auto-opens and writes the first
+    # available device (tinygrad_repo/tinygrad/device.py:14,45-51).
+    _force_cpu_dev_env()
     reason = gpu_env_reason()
     if reason is not None:
       raise BackendError(f"refusing GPU-capable environment: {reason}")
@@ -136,6 +178,12 @@ class TinygradCpuBackend:
     if not os.path.isfile(model_path):
       raise BackendError(f"model not found: {model_path}")
     Device, Tensor, TinyJit, OnnxRunner = _import_tinygrad()
+    # A tinygrad imported earlier in the process does not re-read the env:
+    # pin its DEV context and verify the resolution before any weight tensor.
+    _force_cpu_dev_context()
+    default = str(Device.DEFAULT).split(":")[0]
+    if default not in TINYGRAD_CPU_DEVICES:
+      raise BackendError(f"tinygrad default device resolved to {default!r}, not CPU")
     self.max_threads = max(1, min(int(max_threads), TINYGRAD_THREAD_CAP))
     # CPU_COUNT must be lowered before the CPU device is created: the renderers
     # capture it as a class attribute at import time
@@ -144,6 +192,8 @@ class TinygradCpuBackend:
     self.device_name = self._pick_cpu_device(Device)
     runner = OnnxRunner(model_path)
     runner.to(self.device_name)
+    # Weight streaming above runs on Device.DEFAULT; no GPU may have opened.
+    _assert_only_cpu_devices_opened(Device)
     self._runner = runner
     self._Tensor = Tensor
     self._TinyJit = TinyJit
@@ -153,6 +203,7 @@ class TinygradCpuBackend:
     self._jits: dict[tuple, object] = {}
     self.model_path = model_path
     self._warmup()
+    _assert_only_cpu_devices_opened(Device)
 
   @staticmethod
   def _cap_tinygrad_threads() -> None:

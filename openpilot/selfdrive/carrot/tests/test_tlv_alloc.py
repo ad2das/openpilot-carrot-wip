@@ -136,9 +136,8 @@ def test_tinygrad_cpu_backend_no_allocation_growth(tmp_path, monkeypatch):
   onnx = pytest.importorskip("onnx")
   if not _ensure_cc(monkeypatch, tmp_path):
     pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
-  # tinygrad writes its resolved device into DEV; an earlier test in the same
-  # process may have left DEV=CUDA there. tlvd itself runs as a fresh process;
-  # this test only wants the allocation behaviour of the CPU backend.
+  # The backend pins DEV to CPU itself (backends.py); delenv is defence in
+  # depth so no inherited value can reach this allocation-only test.
   monkeypatch.delenv("DEV", raising=False)
   path = _stub_conv_onnx(onnx, tmp_path)
   backend, decoder = backends.make_backend("tinygrad", str(path))

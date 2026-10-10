@@ -33,6 +33,12 @@ os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 
+# Pin tinygrad's default device to CPU before ANY tinygrad import. With DEV
+# unset, Device.DEFAULT probes ALL_DEVICES in order (CUDA/QCOM ahead of CPU,
+# tinygrad_repo/tinygrad/device.py:14,45-51) and opens the first that exists -
+# on TICI the QCOM GPU next to modeld. Overrides any inherited QCOM/CUDA value.
+os.environ["DEV"] = "CPU"
+
 from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, resources, tracker
 from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNNING, STATUS_SUSPENDED, SuspendWatchdog
 

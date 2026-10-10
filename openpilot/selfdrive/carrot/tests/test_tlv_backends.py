@@ -1,4 +1,5 @@
 """Tests for TLV inference backends: CPU-only refusal guards and ONNX stub model."""
+import os
 import shutil
 import sys
 import time
@@ -173,6 +174,57 @@ def test_tinygrad_backend_refuses_gpu_environment(tmp_path, monkeypatch):
   monkeypatch.setenv("QCOM", "1")
   with pytest.raises(backends.BackendError, match="GPU-capable"):
     backends.make_backend("tinygrad", str(path))
+
+
+def test_tinygrad_backend_pins_cpu_with_dev_unset(tmp_path, monkeypatch):
+  """DEV unset + a GPU that would win Device.DEFAULT auto-selection: the
+  backend must not probe at all and must never open a non-CPU device."""
+  onnx = pytest.importorskip("onnx")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  from tinygrad import device as tgdevice
+  from tinygrad.helpers import DEV as tg_dev
+  path = _tiny_conv_onnx_model(onnx, tmp_path)
+
+  monkeypatch.delenv("DEV", raising=False)
+  tg_dev.value = ""  # fresh-process state: no DEV env, no resolved target
+  probes = []
+
+  def fake_available_devices():
+    probes.append(1)
+    yield "CUDA"  # first in ALL_DEVICES on this class of machine (device.py:14)
+
+  monkeypatch.setattr(tgdevice.Device, "get_available_devices", fake_available_devices)
+  monkeypatch.delitem(tgdevice.Device.__dict__, "_select_device", raising=False)
+  opened_before = set(map(str, tgdevice.Device._opened_devices))
+
+  backend, decoder = backends.make_backend("tinygrad", str(path))
+  assert backend.device_name in backends.TINYGRAD_CPU_DEVICES
+  assert probes == []  # Device.DEFAULT probing never ran
+  assert os.environ.get("DEV") == "CPU"
+  assert str(tgdevice.Device.DEFAULT).split(":")[0] in backends.TINYGRAD_CPU_DEVICES
+  for dev in set(map(str, tgdevice.Device._opened_devices)) - opened_before:
+    base = str(dev).split(":")[0]
+    assert base in backends.TINYGRAD_CPU_DEVICES or base in backends.TINYGRAD_HOST_DEVICES, dev
+  backend.close()
+
+
+def test_tinygrad_backend_overrides_inherited_gpu_dev(tmp_path, monkeypatch):
+  """An inherited DEV=QCOM (parent env / earlier import) must be overridden,
+  not obeyed, and must never reach tinygrad device selection."""
+  onnx = pytest.importorskip("onnx")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  from tinygrad.helpers import DEV as tg_dev
+  path = _tiny_conv_onnx_model(onnx, tmp_path)
+
+  monkeypatch.setenv("DEV", "QCOM")
+  tg_dev.value = "QCOM"
+  backend, decoder = backends.make_backend("tinygrad", str(path))
+  assert backend.device_name in backends.TINYGRAD_CPU_DEVICES
+  assert os.environ.get("DEV") == "CPU"
+  assert str(tg_dev.device).split(":")[0] in backends.TINYGRAD_CPU_DEVICES
+  backend.close()
 
 
 def test_resolve_backend_name_defaults():
