@@ -89,3 +89,58 @@ def test_backoff_resets_after_long_run():
   t = feed(wd, t, 70.0, frame_drop=BASE_FD, exec_time=BASE_EXEC, thermal=0)
   wd.update(t + DT, thermal=1)
   assert wd.clean_required_s == 30.0
+
+
+def armed_with_controls(controls_interval: float = 0.010, camera_step: int = 2, ticks: int = 90):
+  wd = SuspendWatchdog(baseline_min_s=0.5, baseline_min_samples=50, clean_resume_s=30.0,
+                       camera_min_span_s=1.0, camera_window_s=2.0)
+  t = 100.0
+  fid = 0
+  for _ in range(ticks):
+    t += DT
+    fid += camera_step
+    wd.update(t, frame_drop=BASE_FD, exec_time=BASE_EXEC, thermal=0,
+              controls_interval=controls_interval, camera_frame_id=fid)
+  return wd, t, fid
+
+
+def feed_live(wd, t, fid, ticks, *, controls_interval=0.010, camera_step=2):
+  for _ in range(ticks):
+    t += DT
+    fid += camera_step
+    wd.update(t, controls_interval=controls_interval, camera_frame_id=fid)
+  return t, fid
+
+
+def test_controls_jitter_suspends():
+  wd, t, fid = armed_with_controls(controls_interval=0.010)
+  assert wd.inferring
+  t, fid = feed_live(wd, t, fid, 40, controls_interval=0.013)
+  assert not wd.inferring
+  assert wd.reason == "controls_jitter"
+
+
+def test_controls_steady_interval_does_not_suspend():
+  wd, t, fid = armed_with_controls(controls_interval=0.010)
+  t, fid = feed_live(wd, t, fid, 60, controls_interval=0.010)
+  assert wd.inferring
+
+
+def test_camera_gap_rate_suspends():
+  wd, t, fid = armed_with_controls(camera_step=2)
+  assert wd.inferring
+  t, fid = feed_live(wd, t, fid, 60, camera_step=2)
+  assert wd.inferring  # steady stream (same as baseline) must not suspend
+  # now add real skips: every 5th observation skips an extra frameId -> 24/s vs 20/s
+  for i in range(60):
+    t += DT
+    fid += 3 if i % 5 == 0 else 2
+    wd.update(t, camera_frame_id=fid)
+  assert not wd.inferring
+  assert wd.reason == "camera_gaps"
+
+
+def test_camera_steady_stream_does_not_suspend():
+  wd, t, fid = armed_with_controls(camera_step=2)
+  t, fid = feed_live(wd, t, fid, 80, camera_step=2)
+  assert wd.inferring

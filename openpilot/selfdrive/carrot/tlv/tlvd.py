@@ -7,17 +7,33 @@ Pipeline per processed frame:
   -> full-frame detections -> tracker (IoU+centre, M-of-N) -> relevant-light
   selection -> Korean signal state machine -> carrotTlv @10 Hz.
 
-Zero-stutter policy: cores 1-3, SCHED_IDLE, nice 19, never config_realtime_process,
-newest frame only (no queueing; busy frames counted as droppedFrames), and a
-self-throttle watchdog that suspends inference when modeld/deviceState suffer.
+Zero-stutter policy (RESOURCE_BUDGET.md, enforced here, not by the scheduler):
+  cores 1-3, SCHED_IDLE, nice 19, never config_realtime_process; newest frame
+  only (no queueing; busy frames counted as droppedFrames); thread caps in the
+  environment before numpy loads; duty-cycle governor at <= 40% of one core over
+  a 2 s window with a 1..10 Hz adaptive rate; /proc/stat cores 1-3 idle guard;
+  RSS soft/hard caps with a clean non-restart-looping exit; MemAvailable floor;
+  oom_score_adj=1000; copy-then-release for VisionIPC frames; no per-frame
+  prints; <= 16 dets published.
 
 Messaging imports are lazy so this module stays importable (and lintable) on a PC.
 """
 from __future__ import annotations
 
+import gc
+import os
 import time
 
-from openpilot.selfdrive.carrot.tlv import backends, crops, tracker
+# Thread caps must be in the environment BEFORE numpy/OpenBLAS/MKL load (numpy
+# arrives through the tlv imports below). One thread for BLAS, and the tinygrad
+# backend additionally caps its own CPU pool at 2 (TinygradCpuBackend).
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, resources, tracker
 from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNNING, STATUS_SUSPENDED, SuspendWatchdog
 
 CONNECT_RETRY_S = 0.5
@@ -25,6 +41,14 @@ FRAME_STALE_S = 1.2
 PUBLISH_HZ = 10.0
 MODEL_FRESH_S = 0.5
 LEFT_INTENT_ATCTYPES = ("turn left", "atc left")
+PROC_POLL_S = 1.0
+STATS_INTERVAL_S = 10.0
+ERROR_LOG_INTERVAL_S = 10.0
+MAX_PUBLISHED_DETS = 16
+
+PROC_STAT = "/proc/stat"
+PROC_MEMINFO = "/proc/meminfo"
+PROC_SELF_STATM = "/proc/self/statm"
 
 
 def _param_int(params, key: str, default: int = 0) -> int:
@@ -70,19 +94,16 @@ def apply_cpu_policy() -> list[str]:
   """Cores 1-3 + SCHED_IDLE + nice19 on POSIX; silently skipped on Windows."""
   applied: list[str] = []
   try:
-    import os
     os.sched_setaffinity(0, {1, 2, 3})
     applied.append("affinity=1,2,3")
   except (AttributeError, OSError, ValueError):
     pass
   try:
-    import os
     os.sched_setscheduler(0, os.SCHED_IDLE, os.sched_param(0))
     applied.append("sched=SCHED_IDLE")
   except (AttributeError, OSError, ValueError):
     pass
   try:
-    import os
     os.nice(19)
     applied.append("nice=19")
   except (AttributeError, OSError, ValueError):
@@ -94,8 +115,6 @@ class TlvRunner:
   def __init__(self, params) -> None:
     self.params = params
     self.watchdog = SuspendWatchdog()
-    self.tracker = tracker.TrafficLightTracker()
-    self.machine = tracker.SignalStateMachine()
 
     self.backend = None
     self.decoder = None
@@ -109,6 +128,19 @@ class TlvRunner:
         self.backend_error = str(exc)
       except backends.BackendError as exc:
         self.backend_error = str(exc)
+    self.pipeline = pipeline.FramePipeline(self.backend, self.decoder)
+
+    self.governor = resources.DutyCycleGovernor()
+    self.cpu_guard = resources.CpuContentionGuard()
+    self.mem_guard = resources.MemoryGuard()
+    self.page_size = resources.default_page_size()
+    self._cpu_reason: str | None = None
+    self._mem = resources.MemoryDecision()
+    self._hard_exit_reason: str | None = None
+    self._rss_bytes = 0
+    self._last_proc_poll = 0.0
+    self._last_stats = 0.0
+    self._last_error_log = 0.0
 
     self.sm = None
     self.pub = None
@@ -116,17 +148,10 @@ class TlvRunner:
     self.last_connect_try = 0.0
     self.last_frame_mono = 0.0
 
-    self.frame_idx = 0
-    self.inferring_frames = 0
     self.dropped = 0
-    self.infer_ms = 0.0
-    self.proc_ms = 0.0
+    self.processed = 0
     self.last_view = "far"
-    self.last_dets: list[tracker.Detection] = []
-    self.last_matches: list[tuple[tracker.Detection, int]] = []
-    self.last_state = tracker.SignalState.none
-    self.last_conf = 0.0
-    self.last_track_id = -1
+    self._prev_controls_mono: int | None = None
     self._horizon_y: float | None = None
     self._calib_rpy = None
 
@@ -163,7 +188,7 @@ class TlvRunner:
       if newest is not None:
         skipped += 1
       newest = frame
-    if newest is not None and self.watchdog.inferring:
+    if newest is not None and self._can_infer():
       self.dropped += skipped
     return newest
 
@@ -181,40 +206,34 @@ class TlvRunner:
 
   # -- inference ------------------------------------------------------------
 
+  def _can_infer(self) -> bool:
+    return (self.backend is not None
+            and self.watchdog.inferring
+            and self._cpu_reason is None
+            and self._mem.suspend_reason is None)
+
   def _process_frame(self, frame) -> None:
     width, height = frame.width, frame.height
     focal = crops.focal_px_for_width(width)
     horizon = self._update_horizon()
-    view = "far" if self.inferring_frames % 2 == 0 else "near"
-    geom = (crops.far_geometry if view == "far" else crops.near_geometry)(horizon, width, height, focal)
+    view = self.pipeline.next_view()
+    geom = pipeline.FramePipeline.geometry(view, horizon, width, height, focal)
 
-    started = time.perf_counter()
-    model_input = crops.model_input_from_frame(frame.data, width, height, frame.stride, frame.uv_offset, geom)
-    infer_started = time.perf_counter()
-    raw = self.backend.infer(model_input)
-    self.infer_ms = (time.perf_counter() - infer_started) * 1000.0
-    decoded = self.decoder.decode(raw, view)
-    dets = []
-    for det in decoded:
-      x1, y1, x2, y2 = crops.map_model_box_to_full((det.x1, det.y1, det.x2, det.y2), geom)
-      dets.append(tracker.Detection(cls=det.cls, score=det.score, x1=x1, y1=y1, x2=x2, y2=y2))
+    data = frame.data
+    # VisionIPC: copy the ROI into the preallocated workspace NOW and drop the
+    # frame before inference. The VisionBuf only borrows a client-owned buffer
+    # (msgq/visionipc/visionipc_client.cc:108) that camerad can reuse as soon as
+    # we recv again (msgq/visionipc/visionipc_pyx.pyx:153), so it must never be
+    # held across the model call.
+    self.pipeline.prepare(data, width, height, frame.stride, frame.uv_offset, geom)
+    del frame, data
 
-    now = time.monotonic()
-    self.last_matches = self.tracker.update(self.frame_idx, dets, view, focal)
-    confirmed = self.tracker.confirmed(self.frame_idx)
-    relevant = tracker.select_relevant(
-      confirmed, self.frame_idx, image_width=width,
-      path_x=self._path_x(), path_y=self._path_y(), left_intent=self._left_intent(),
+    out = self.pipeline.infer(
+      view, geom, image_width=width, path_x=self._path_x(), path_y=self._path_y(),
+      left_intent=self._left_intent(), now=time.monotonic(),
     )
-    lamp_state = tracker.lamp_state_for(relevant[1]) if relevant is not None else None
-    self.last_state, self.last_conf = self.machine.update(now, lamp_state, relevant[2] if relevant is not None else 0.0)
-    self.last_track_id = relevant[0].track_id if relevant is not None else -1
-
-    self.last_dets = dets
-    self.last_view = view
-    self.frame_idx += 1
-    self.inferring_frames += 1
-    self.proc_ms = (time.perf_counter() - started) * 1000.0
+    self.last_view = out.view
+    self.processed += 1
 
   def _path_x(self):
     if self.sm is not None and self.sm.seen["modelV2"] and self._model_fresh():
@@ -238,12 +257,47 @@ class TlvRunner:
       return True
     return False
 
+  # -- system guards --------------------------------------------------------
+
+  def _poll_system(self, now: float) -> None:
+    """1 Hz: /proc/stat cores guard, RSS soft/hard, MemAvailable floor."""
+    if now - self._last_proc_poll < PROC_POLL_S:
+      return
+    self._last_proc_poll = now
+    self._cpu_reason = self.cpu_guard.update(now, resources.read_text(PROC_STAT))
+    rss_bytes = resources.read_rss_bytes(PROC_SELF_STATM, self.page_size)
+    mem_available = resources.read_mem_available_bytes(PROC_MEMINFO)
+    if rss_bytes is None:
+      return
+    self._rss_bytes = rss_bytes
+    self._mem = self.mem_guard.update(now, rss_bytes, mem_available)
+    if self._mem.run_gc:
+      gc.collect()
+    if self._mem.drop_caches:
+      resources.drop_caches()
+    if self._mem.exit_reason is not None:
+      self._hard_exit_reason = self._mem.exit_reason
+
+  def _handle_hard_exit(self) -> None:
+    """Hard RSS limit: publish status=error and clear CarrotTlvMode so the
+    manager's enable_tlvd() goes False and tlvd is not restarted (restart_if_crash
+    alone would start the process again regardless of exit code)."""
+    reason = self._hard_exit_reason or "rss_hard"
+    self._publish("error", reason)
+    try:
+      self.params.put("CarrotTlvMode", b"0")
+    except Exception as exc:
+      print(f"tlvd: failed to clear CarrotTlvMode on {reason}: {exc!r}", flush=True)
+    print(f"tlvd: hard memory limit ({reason}); exiting without restart", flush=True)
+
   # -- watchdog -------------------------------------------------------------
 
   def _feed_watchdog(self, now: float) -> None:
     frame_drop = None
     exec_time = None
     thermal = None
+    controls_interval = None
+    camera_frame_id = None
     if self.sm.updated["modelV2"]:
       model = self.sm["modelV2"]
       frame_drop = float(model.frameDropPerc)
@@ -251,7 +305,17 @@ class TlvRunner:
         exec_time = max(float(v) for v in model.modelExecutionTime)
     if self.sm.updated["deviceState"]:
       thermal = int(self.sm["deviceState"].thermalStatus)
-    self.watchdog.update(now, frame_drop=frame_drop, exec_time=exec_time, thermal=thermal)
+    if self.sm.seen["controlsState"] and self.sm.updated["controlsState"]:
+      mono_ns = int(self.sm.logMonoTime["controlsState"])
+      if self._prev_controls_mono is not None and mono_ns > self._prev_controls_mono:
+        controls_interval = (mono_ns - self._prev_controls_mono) / 1e9
+      self._prev_controls_mono = mono_ns
+    if self.sm.seen["roadCameraState"] and self.sm.updated["roadCameraState"]:
+      camera_frame_id = int(self.sm["roadCameraState"].frameId)
+    self.watchdog.update(
+      now, frame_drop=frame_drop, exec_time=exec_time, thermal=thermal,
+      controls_interval=controls_interval, camera_frame_id=camera_frame_id,
+    )
 
   # -- publish --------------------------------------------------------------
 
@@ -262,10 +326,10 @@ class TlvRunner:
     out.status = status
     out.suspendReason = reason
     out.view = self.last_view
-    out.inferMs = float(self.infer_ms)
-    out.procMs = float(self.proc_ms)
+    out.inferMs = float(self.pipeline.infer_ms)
+    out.procMs = float(self.pipeline.proc_ms)
     out.droppedFrames = int(self.dropped)
-    ordered = self._ordered_dets()
+    ordered = self._ordered_dets()[:MAX_PUBLISHED_DETS]
     out.init("dets", len(ordered))
     for i, det in enumerate(ordered):
       d = out.dets[i]
@@ -275,40 +339,72 @@ class TlvRunner:
       d.y1 = float(det.y1)
       d.x2 = float(det.x2)
       d.y2 = float(det.y2)
-    out.state = self.last_state.name
-    out.stateConf = float(self.last_conf)
-    out.relevantTrackId = int(self.last_track_id)
+    out.state = self.pipeline.last_state.name
+    out.stateConf = float(self.pipeline.last_conf)
+    out.relevantTrackId = int(self.pipeline.last_track_id)
     self.pub.send("carrotTlv", msg)
 
   def _ordered_dets(self) -> list[tracker.Detection]:
-    if self.last_track_id < 0 or not self.last_matches:
-      return self.last_dets
+    last_track_id = self.pipeline.last_track_id
+    if last_track_id < 0 or not self.pipeline.tracker.last_matches:
+      return self.pipeline.last_dets
     relevant = None
     rest: list[tracker.Detection] = []
-    for det, track_id in self.last_matches:
-      if track_id == self.last_track_id and relevant is None:
+    for det, track_id in self.pipeline.tracker.last_matches:
+      if track_id == last_track_id and relevant is None:
         relevant = det
       else:
         rest.append(det)
     if relevant is None:
-      return self.last_dets
+      return self.pipeline.last_dets
     return [relevant, *rest]
 
   def _status(self) -> tuple[str, str]:
     if self.backend_error:
       return "error", self.backend_error
+    if self._cpu_reason is not None:
+      return "suspended", self._cpu_reason
+    if self._mem.suspend_reason is not None:
+      return "suspended", self._mem.suspend_reason
     if self.watchdog.status == STATUS_BASELINE:
       return "suspended", STATUS_BASELINE
     if self.watchdog.status == STATUS_SUSPENDED:
       return "suspended", self.watchdog.reason or STATUS_SUSPENDED
     return STATUS_RUNNING, ""
 
+  # -- logging --------------------------------------------------------------
+
+  def _log_error(self, text: str, now: float) -> None:
+    if now - self._last_error_log >= ERROR_LOG_INTERVAL_S:
+      self._last_error_log = now
+      print(text, flush=True)
+
+  def _maybe_log_stats(self, now: float) -> None:
+    if now - self._last_stats < STATS_INTERVAL_S:
+      return
+    self._last_stats = now
+    duty = self.governor.window_duty
+    duty_text = "n/a" if duty is None else f"{duty * 100.0:.0f}%"
+    status, _ = self._status()
+    rss_mb = self._rss_bytes / resources.MB
+    parts = (
+      f"frames={self.processed}",
+      f"dropped={self.dropped}",
+      f"rate={self.governor.rate_hz:.1f}Hz",
+      f"duty={duty_text}",
+      f"rss={rss_mb:.0f}MB",
+      f"infer={self.pipeline.infer_ms:.0f}ms",
+      f"proc={self.pipeline.proc_ms:.0f}ms",
+      status,
+    )
+    print("tlvd: stats " + " ".join(parts), flush=True)
+
   # -- main loop ------------------------------------------------------------
 
   def run(self) -> None:
     from openpilot.cereal import messaging
 
-    self.sm = messaging.SubMaster(["modelV2", "deviceState", "carState", "carrotMan", "liveCalibration"])
+    self.sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "carState", "carrotMan", "liveCalibration"])
     self.pub = messaging.PubMaster(["carrotTlv"])
     from openpilot.common.realtime import Ratekeeper
     rk = Ratekeeper(PUBLISH_HZ, print_delay_threshold=None)
@@ -317,6 +413,10 @@ class TlvRunner:
       now = time.monotonic()
       self.sm.update(0)
       self._feed_watchdog(now)
+      self._poll_system(now)
+      if self._hard_exit_reason is not None:
+        self._handle_hard_exit()
+        return  # exit code 0; CarrotTlvMode=0 keeps the manager from restarting tlvd
 
       if self.client is None or not self.client.is_connected():
         self._connect()
@@ -324,16 +424,20 @@ class TlvRunner:
         frame = self._drain_newest_frame()
         if frame is not None:
           self.last_frame_mono = now
-          if self.backend is not None and self.watchdog.inferring:
+          if self._can_infer() and self.governor.ready(now):
+            self.governor.begin_frame(now)
             try:
               self._process_frame(frame)
             except Exception as exc:
-              print(f"tlvd: frame processing error: {exc!r}", flush=True)
+              self._log_error(f"tlvd: frame processing error: {exc!r}", now)
+            finally:
+              self.governor.end_frame()
         elif self.last_frame_mono > 0.0 and now - self.last_frame_mono > FRAME_STALE_S:
           self._disconnect()
 
       status, reason = self._status()
       self._publish(status, reason)
+      self._maybe_log_stats(now)
       rk.keep_time()
 
 
@@ -344,6 +448,8 @@ def main() -> None:
     print("tlvd: disabled (CarrotTlvMode off)", flush=True)
     return
   print(f"tlvd: start cpu-policy={apply_cpu_policy()}", flush=True)
+  if not resources.write_oom_score_adj(1000):
+    print("tlvd: oom_score_adj not writable (non-Linux or missing /proc)", flush=True)
   TlvRunner(params).run()
 
 

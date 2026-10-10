@@ -136,13 +136,12 @@ class TinygradCpuBackend:
     if not os.path.isfile(model_path):
       raise BackendError(f"model not found: {model_path}")
     Device, Tensor, TinyJit, OnnxRunner = _import_tinygrad()
-    self.device_name = self._pick_cpu_device(Device)
     self.max_threads = max(1, min(int(max_threads), TINYGRAD_THREAD_CAP))
-    try:
-      from tinygrad.helpers import CPU_COUNT
-      CPU_COUNT.value = self.max_threads
-    except Exception:
-      pass
+    # CPU_COUNT must be lowered before the CPU device is created: the renderers
+    # capture it as a class attribute at import time
+    # (tinygrad_repo/tinygrad/renderer/cstyle.py:252 global_max = (CPU_COUNT.value, 0, 0)).
+    self._cap_tinygrad_threads()
+    self.device_name = self._pick_cpu_device(Device)
     runner = OnnxRunner(model_path)
     runner.to(self.device_name)
     self._runner = runner
@@ -154,6 +153,14 @@ class TinygradCpuBackend:
     self._jits: dict[tuple, object] = {}
     self.model_path = model_path
     self._warmup()
+
+  @staticmethod
+  def _cap_tinygrad_threads() -> None:
+    try:
+      from tinygrad.helpers import CPU_COUNT
+      CPU_COUNT.value = TINYGRAD_THREAD_CAP
+    except Exception:
+      pass
 
   @staticmethod
   def _pick_cpu_device(Device) -> str:

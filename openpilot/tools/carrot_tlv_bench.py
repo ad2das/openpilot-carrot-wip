@@ -1,165 +1,493 @@
 #!/usr/bin/env python3
-"""carrotTlv bench: 60 s baseline (tlvd off) then 60 s shadow (tlvd on).
+"""carrotTlv bench, per RESOURCE_BUDGET.md.
 
-Paste into the Carrot web terminal on the C3X:
+Runs on the C3X (Carrot web terminal):
 
   python3 openpilot/tools/carrot_tlv_bench.py --backend null
-  python3 openpilot/tools/carrot_tlv_bench.py --backend onnx --model-path /data/models/tlv/model.onnx
+  python3 openpilot/tools/carrot_tlv_bench.py --backend tinygrad --model-path /data/models/tlv/model.onnx
 
-Collects modelV2 executionTime/frameDropPerc, UI draw times (uiDebug, if
-published), camerad roadCameraState timings, deviceState temps/thermalStatus and
-tlvd inferMs/procMs/droppedFrames, then prints ONE JSON summary with pass/fail
-per "no difference beyond noise" gate. Restores the original CarrotTlvMode (and
-backend/model path) on exit, including Ctrl+C.
+Phases: baseline (CarrotTlvMode=0), tlvd (mode 1), then a soak (default 20 min,
+`--soak-min`). Every phase samples modelV2 / controlsState / roadCameraState /
+uiDebug / deviceState messages plus, from /proc: per-process CPU and RSS for
+tlvd, modeld, controlsd, ui and camerad, MemAvailable, and the cores 1-3
+/proc/stat totals.
 
-The gate evaluation (`summarize`) is a pure function, unit-tested on a PC; the
-openpilot messaging imports happen lazily so this file stays importable anywhere.
+It prints ONE JSON document with pass/fail for each of the eight budget gates
+and the raw numbers, restores CarrotTlvMode (and backend/model path) on exit
+including Ctrl+C, and exits 0 only when every gate passes. A difference larger
+than the noise is a FAIL.
+
+Gate math (`summarize_phase`, `evaluate_gates`, the /proc parsers) is pure and
+unit-tested on a PC; openpilot messaging imports stay lazy so the module is
+importable anywhere.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import signal
 import sys
 import time
 
 import numpy as np
 
-FRAME_DROP_DELTA = 1.0      # allowed frameDropPerc mean/p95 increase
-EXEC_P95_RATIO = 1.10       # allowed model execution p95 increase
-UI_P95_RATIO = 1.10
-UI_P95_ABS_SLACK_MS = 1.0
-CAM_PT_RATIO = 1.20
-CAM_SOF_SLACK_MS = 5.0
+from openpilot.selfdrive.carrot.tlv import resources
+
+# Gate tolerances ("beyond noise").
+FRAME_DROP_DELTA = 1.0            # allowed frameDropPerc mean/p95 increase
+EXEC_P95_RATIO = 1.10             # allowed model execution p95 increase
+EXEC_P50_RATIO = 1.10             # allowed model execution p50 increase
+CONTROL_P99_SLACK_MS = 2.0        # controlsState interval p99 increase
+CONTROL_MAX_SLACK_MS = 5.0        # controlsState interval max increase
+CAMERA_GAP_RATE_SLACK_S = 0.5     # extra skipped roadCameraState frameIds per second
+CAMERA_GAP_MAX_SKIP_SLACK = 1     # extra frames in the worst single gap
+UI_DRAW_P95_RATIO = 1.10
+UI_DRAW_P95_SLACK_MS = 1.0
+UI_CPU_SLACK_PCT = 5.0            # ui process CPU% increase
+TLVD_CPU_BUDGET_PCT = 40.0        # of one core, max over any 2 s window
+CORES13_CPU_SLACK_PCT = 5.0       # cores 1-3 total increase beyond tlvd's own CPU
+TLVD_RSS_MAX_MB = 220.0
+TLVD_RSS_GROWTH_MAX_MB = 5.0      # during the soak
+MEM_AVAILABLE_FLOOR_MB = 600.0
+MEM_AVAILABLE_DROP_MAX_MB = 300.0
 TEMP_SLACK_C = 3.0
-TLV_INFER_P95_BUDGET_MS = 100.0   # 10 Hz service budget
-TLV_PROC_P95_BUDGET_MS = 150.0
+THERMAL_YELLOW = 1
+
+PROC_SAMPLE_S = 1.0
+PID_REFRESH_S = 5.0
+DEFAULT_PROCESSES = {
+  "tlvd": "openpilot.selfdrive.carrot.tlv.tlvd",
+  "modeld": "openpilot.selfdrive.modeld.modeld",
+  "controlsd": "openpilot.selfdrive.controls.controlsd",
+  "ui": "openpilot.selfdrive.ui.ui",
+  "camerad": "openpilot.system.camerad.camerad",
+}
 
 
-def _p95(values: list[float]) -> float:
-  return float(np.percentile(values, 95.0)) if values else 0.0
+# ---------------------------------------------------------------------------
+# /proc parsing (pure)
+# ---------------------------------------------------------------------------
+
+def parse_pid_stat(text: str) -> tuple[float, float]:
+  """(utime, stime) in clock ticks from /proc/<pid>/stat fields 14/15."""
+  close = text.rfind(")")
+  if close < 0:
+    raise ValueError(f"bad /proc/<pid>/stat: {text[:80]!r}")
+  fields = text[close + 2:].split()
+  if len(fields) < 13:
+    raise ValueError(f"short /proc/<pid>/stat: {len(fields)} fields")
+  return float(fields[11]), float(fields[12])
 
 
-def _mean(values: list[float]) -> float:
+def parse_pid_statm_pages(text: str) -> int:
+  fields = text.split()
+  if len(fields) < 2:
+    raise ValueError(f"short /proc/<pid>/statm: {text!r}")
+  return int(fields[1])
+
+
+def clk_tck() -> float:
+  try:
+    return float(os.sysconf("SC_CLK_TCK"))
+  except (AttributeError, ValueError, OSError):
+    return 100.0
+
+
+class ProcSampler:
+  """Per-process CPU/RSS plus MemAvailable and cores 1-3 from /proc."""
+
+  def __init__(self, processes: dict[str, str] | None = None, proc_root: str = "/proc",
+               ticks_per_s: float | None = None, pid_refresh_s: float = PID_REFRESH_S) -> None:
+    self.processes = dict(processes or DEFAULT_PROCESSES)
+    self.proc_root = proc_root
+    self.ticks_per_s = float(ticks_per_s if ticks_per_s is not None else clk_tck())
+    self.pid_refresh_s = float(pid_refresh_s)
+    self.page_size = resources.default_page_size()
+    self.pids: dict[str, int | None] = dict.fromkeys(self.processes)
+    self.pid_changes: dict[str, int] = dict.fromkeys(self.processes, 0)
+    self._last_pid_seen: dict[str, int | None] = dict.fromkeys(self.processes)
+    self._last_scan = -1e9
+
+  def _scan(self, now: float) -> None:
+    if now - self._last_scan < self.pid_refresh_s:
+      return
+    self._last_scan = now
+    found: dict[str, int | None] = dict.fromkeys(self.processes)
+    try:
+      entries = os.listdir(self.proc_root)
+    except OSError:
+      entries = []
+    for entry in entries:
+      if not entry.isdigit():
+        continue
+      try:
+        with open(os.path.join(self.proc_root, entry, "cmdline"), "rb") as f:
+          cmdline = f.read().decode("utf-8", "replace").replace("\x00", " ")
+      except OSError:
+        continue
+      for name, token in self.processes.items():
+        if found[name] is None and token in cmdline:
+          found[name] = int(entry)
+    for name, pid in found.items():
+      self.pids[name] = pid
+      if pid is not None:
+        last = self._last_pid_seen[name]
+        if last is not None and pid != last:
+          self.pid_changes[name] += 1
+        self._last_pid_seen[name] = pid
+
+  def sample(self, now: float) -> dict:
+    self._scan(now)
+    procs: dict[str, dict] = {}
+    for name, pid in self.pids.items():
+      if pid is None:
+        continue
+      try:
+        with open(os.path.join(self.proc_root, str(pid), "stat")) as f:
+          stat_text = f.read()
+        with open(os.path.join(self.proc_root, str(pid), "statm")) as f:
+          statm_text = f.read()
+      except OSError:
+        continue
+      try:
+        utime, stime = parse_pid_stat(stat_text)
+        rss_bytes = parse_pid_statm_pages(statm_text) * self.page_size
+      except ValueError:
+        continue
+      procs[name] = {"cpu_s": (utime + stime) / self.ticks_per_s, "rss_mb": rss_bytes / resources.MB}
+    meminfo = resources.read_text(os.path.join(self.proc_root, "meminfo"))
+    stat = resources.read_text(os.path.join(self.proc_root, "stat"))
+    mem_available = resources.parse_meminfo_available_bytes(meminfo) if meminfo else None
+    return {
+      "t": float(now),
+      "procs": procs,
+      "mem_available_mb": None if mem_available is None else mem_available / resources.MB,
+      "cores13": resources.parse_proc_stat_totals(stat, (1, 2, 3)) if stat else None,
+    }
+
+
+# ---------------------------------------------------------------------------
+# phase statistics (pure)
+# ---------------------------------------------------------------------------
+
+def _mean(values) -> float:
   return float(np.mean(values)) if values else 0.0
 
 
-def _max(values: list[float]) -> float:
-  return float(np.max(values)) if values else 0.0
+def _p50(values) -> float:
+  return float(np.percentile(values, 50.0)) if values else 0.0
 
 
-def summarize(baseline: dict, tlv: dict) -> dict:
-  """Pure gate evaluation over two collection reports."""
-  base_fd, tlv_fd = baseline.get("frame_drop", []), tlv.get("frame_drop", [])
-  base_exec, tlv_exec = baseline.get("model_exec_ms", []), tlv.get("model_exec_ms", [])
+def _p95(values) -> float:
+  return float(np.percentile(values, 95.0)) if values else 0.0
 
-  fd_pass = (
-    _mean(tlv_fd) <= _mean(base_fd) + FRAME_DROP_DELTA
-    and _p95(tlv_fd) <= _p95(base_fd) + FRAME_DROP_DELTA
-  ) if base_fd and tlv_fd else False
 
-  exec_pass = (_p95(tlv_exec) <= _p95(base_exec) * EXEC_P95_RATIO) if base_exec and tlv_exec else False
+def _p99(values) -> float:
+  return float(np.percentile(values, 99.0)) if values else 0.0
 
-  ui_base, ui_tlv = baseline.get("ui_draw_ms", []), tlv.get("ui_draw_ms", [])
-  if ui_base and ui_tlv:
-    ui_pass = _p95(ui_tlv) <= _p95(ui_base) * UI_P95_RATIO + UI_P95_ABS_SLACK_MS
-    ui_available = True
-  else:
-    ui_pass, ui_available = True, False
 
-  cam_base_pt, cam_tlv_pt = baseline.get("cam_processing_ms", []), tlv.get("cam_processing_ms", [])
-  cam_base_sof, cam_tlv_sof = baseline.get("cam_sof_gap_ms", []), tlv.get("cam_sof_gap_ms", [])
-  if cam_base_pt and cam_tlv_pt and cam_base_sof and cam_tlv_sof:
-    cam_pass = (
-      _p95(cam_tlv_pt) <= _p95(cam_base_pt) * CAM_PT_RATIO
-      and _max(cam_tlv_sof) <= _max(cam_base_sof) * CAM_PT_RATIO + CAM_SOF_SLACK_MS
-    )
-    cam_available = True
-  else:
-    cam_pass, cam_available = True, False
+def _max_or_none(values):
+  return float(np.max(values)) if values else None
 
-  base_thermal = baseline.get("thermal_status", [])
-  tlv_thermal = tlv.get("thermal_status", [])
-  base_temp = baseline.get("max_temp_c", [])
-  tlv_temp = tlv.get("max_temp_c", [])
-  if base_thermal and tlv_thermal and base_temp and tlv_temp:
-    thermal_pass = _max(tlv_thermal) <= _max(base_thermal) and _max(tlv_temp) <= _max(base_temp) + TEMP_SLACK_C
-    thermal_available = True
-  else:
-    thermal_pass, thermal_available = False, False
 
-  infer = tlv.get("tlv_infer_ms", [])
-  proc = tlv.get("tlv_proc_ms", [])
-  if infer and proc:
-    tlv_budget_pass = _p95(infer) <= TLV_INFER_P95_BUDGET_MS and _p95(proc) <= TLV_PROC_P95_BUDGET_MS
-  else:
-    tlv_budget_pass = False
+def _min_or_none(values):
+  present = [v for v in values if v is not None]
+  return float(np.min(present)) if present else None
 
-  gates = {
-    "model_frame_drop_unchanged": {"pass": bool(fd_pass), "available": True},
-    "model_exec_p95_unchanged": {"pass": bool(exec_pass), "available": True},
-    "ui_frame_time_unchanged": {"pass": bool(ui_pass), "available": ui_available},
-    "camerad_timing_unchanged": {"pass": bool(cam_pass), "available": cam_available},
-    "thermal_no_regression": {"pass": bool(thermal_pass), "available": thermal_available},
-    "tlvd_within_budget": {"pass": bool(tlv_budget_pass), "available": bool(infer and proc)},
-  }
-  verdict = all(gate["pass"] for gate in gates.values())
+
+def _growth_mb(series) -> float | None:
+  """Robust RSS growth: median of the last 5 samples minus median of the first 5."""
+  values = [v for _, v in series if v is not None]
+  if len(values) < 2:
+    return None
+  k = min(5, max(1, len(values) // 2))
+  return float(np.median(values[-k:]) - np.median(values[:k]))
+
+
+def camera_gap_stats(frames: list) -> tuple[float | None, int, float | None]:
+  """(skipped frameIds per second, worst single skip, worst gap ms)."""
+  if len(frames) < 2:
+    return None, 0, None
+  span = frames[-1][0] - frames[0][0]
+  skipped = 0
+  max_skip = 0
+  max_gap_ms = None
+  for i in range(1, len(frames)):
+    dfid = frames[i][1] - frames[i - 1][1]
+    if dfid > 1:
+      skipped += dfid - 1
+      max_skip = max(max_skip, dfid - 1)
+      gap_ms = (frames[i][0] - frames[i - 1][0]) * 1000.0
+      max_gap_ms = gap_ms if max_gap_ms is None else max(max_gap_ms, gap_ms)
+  rate = skipped / span if span > 0.0 else None
+  return rate, max_skip, max_gap_ms
+
+
+def _proc_summaries(samples: list) -> dict:
+  names: set[str] = set()
+  for sample in samples:
+    names.update(sample.get("procs", {}).keys())
+  out: dict[str, dict] = {}
+  for name in sorted(names):
+    points = [(s["t"], s["procs"][name]["cpu_s"], s["procs"][name].get("rss_mb"))
+              for s in samples if name in s.get("procs", {})]
+    if not points:
+      continue
+    cpu_pct_avg = None
+    span = points[-1][0] - points[0][0]
+    if len(points) >= 2 and span > 0.0 and points[-1][1] >= points[0][1]:
+      cpu_pct_avg = 100.0 * (points[-1][1] - points[0][1]) / span
+    windows = []
+    for i in range(1, len(points) - 1):
+      window = points[i + 1][0] - points[i - 1][0]
+      if window < 1.0 or window > 3.0:
+        continue
+      delta = points[i + 1][1] - points[i - 1][1]
+      if delta >= 0.0:
+        windows.append(100.0 * delta / window)
+    rss = [r for _, _, r in points if r is not None]
+    out[name] = {
+      "cpu_pct_avg": cpu_pct_avg,
+      "cpu_pct_max_2s": max(windows) if windows else None,
+      "rss_max_mb": max(rss) if rss else None,
+      "rss_end_mb": rss[-1] if rss else None,
+      "rss_series_mb": [[round(t, 3), round(r, 2)] for t, _, r in points if r is not None],
+      "samples": len(points),
+    }
+  return out
+
+
+def _cores13_busy_pct(samples: list) -> float | None:
+  pairs = [(s["t"], s["cores13"]) for s in samples if s.get("cores13") is not None]
+  if len(pairs) < 2:
+    return None
+  t0, (idle0, total0) = pairs[0]
+  t1, (idle1, total1) = pairs[-1]
+  del t0, t1
+  d_total = total1 - total0
+  if d_total <= 0.0:
+    return None
+  return 100.0 * (1.0 - (idle1 - idle0) / d_total)
+
+
+def summarize_phase(report: dict) -> dict:
+  """Derived statistics for one collection phase."""
+  controls_ns = report.get("controls_mono_ns", [])
+  controls_ms = [(controls_ns[i] - controls_ns[i - 1]) / 1e6 for i in range(1, len(controls_ns)) if controls_ns[i] > controls_ns[i - 1]]
+  gap_rate, max_skip, max_gap_ms = camera_gap_stats(report.get("cam_frames", []))
+  samples = report.get("proc_samples", [])
+  procs = _proc_summaries(samples)
+  tlvd_rss_series = procs.get("tlvd", {}).get("rss_series_mb", [])
   return {
-    "verdict": "pass" if verdict else "fail",
-    "gates": gates,
-    "baseline": {
-      "frame_drop_mean": _mean(base_fd), "frame_drop_p95": _p95(base_fd),
-      "model_exec_p95_ms": _p95(base_exec), "ui_draw_p95_ms": _p95(ui_base),
-      "cam_processing_p95_ms": _p95(cam_base_pt), "cam_sof_gap_max_ms": _max(cam_base_sof),
-      "thermal_status_max": int(_max(base_thermal)) if base_thermal else None,
-      "max_temp_c_max": _max(base_temp) if base_temp else None,
+    "seconds": report.get("seconds"),
+    "counts": {
+      "frame_drop": len(report.get("frame_drop", [])),
+      "model_exec": len(report.get("model_exec_ms", [])),
+      "controls": len(controls_ms),
+      "camera": len(report.get("cam_frames", [])),
+      "ui_draw": len(report.get("ui_draw_ms", [])),
+      "thermal": len(report.get("thermal_status", [])),
+      "tlv_msgs": report.get("carrot_tlv_seen", 0),
+      "proc_samples": len(samples),
     },
-    "tlv": {
-      "frame_drop_mean": _mean(tlv_fd), "frame_drop_p95": _p95(tlv_fd),
-      "model_exec_p95_ms": _p95(tlv_exec), "ui_draw_p95_ms": _p95(ui_tlv),
-      "cam_processing_p95_ms": _p95(cam_tlv_pt), "cam_sof_gap_max_ms": _max(cam_tlv_sof),
-      "thermal_status_max": int(_max(tlv_thermal)) if tlv_thermal else None,
-      "max_temp_c_max": _max(tlv_temp) if tlv_temp else None,
-      "infer_p95_ms": _p95(infer), "proc_p95_ms": _p95(proc),
-      "infer_msgs": len(infer), "dropped_frames_final": tlv.get("tlv_dropped_final"),
-      "status_seen": tlv.get("tlv_status_seen", []),
-    },
-    "baseline_clean": not baseline.get("carrot_tlv_seen", 0),
+    "frame_drop_mean": _mean(report.get("frame_drop", [])),
+    "frame_drop_p95": _p95(report.get("frame_drop", [])),
+    "model_exec_p50_ms": _p50(report.get("model_exec_ms", [])),
+    "model_exec_p95_ms": _p95(report.get("model_exec_ms", [])),
+    "controls_p99_ms": _p99(controls_ms),
+    "controls_max_ms": _max_or_none(controls_ms) or 0.0,
+    "camera_gap_rate_s": gap_rate,
+    "camera_gap_max_skip": max_skip,
+    "camera_gap_max_ms": max_gap_ms,
+    "ui_draw_p95_ms": _p95(report.get("ui_draw_ms", [])),
+    "procs": procs,
+    "cores13_busy_pct_avg": _cores13_busy_pct(samples),
+    "mem_available_min_mb": _min_or_none([s.get("mem_available_mb") for s in samples]),
+    "thermal_status_max": _max_or_none(report.get("thermal_status", [])),
+    "max_temp_c_max": _max_or_none(report.get("max_temp_c", [])),
+    "gpu_temp_c_max": _max_or_none(report.get("gpu_temp_c", [])),
+    "tlv_infer_p95_ms": _p95(report.get("tlv_infer_ms", [])),
+    "tlv_proc_p95_ms": _p95(report.get("tlv_proc_ms", [])),
+    "tlv_status_seen": report.get("tlv_status_seen", []),
+    "tlv_dropped_final": report.get("tlv_dropped_final"),
+    "tlv_rss_growth_mb": _growth_mb(tlvd_rss_series),
+    "pid_changes": report.get("pid_changes", {}),
   }
 
 
-def _collect(sm, seconds: float, rate_hz: float = 20.0) -> dict:
-  """Collect one phase; openpilot services must already be wired by the caller."""
+# ---------------------------------------------------------------------------
+# gate evaluation (pure)
+# ---------------------------------------------------------------------------
+
+def _join(*parts: str) -> str:
+  return " ".join(parts)
+
+
+def evaluate_gates(baseline: dict, tlv: dict, soak: dict | None) -> dict:
+  """Evaluate all eight RESOURCE_BUDGET.md bench gates."""
+  soak = soak or {}
+  gates: dict[str, dict] = {}
+
+  def gate(name: str, ok: bool, detail: str, **raw) -> None:
+    gates[name] = {"pass": bool(ok), "detail": detail, "raw": raw}
+
+  # 1. modeld executionTime p50/p99 and frameDropPerc.
+  have_model = baseline["counts"]["model_exec"] > 0 and tlv["counts"]["model_exec"] > 0
+  p50_ok = have_model and tlv["model_exec_p50_ms"] <= baseline["model_exec_p50_ms"] * EXEC_P50_RATIO
+  p99_ok = have_model and tlv["model_exec_p95_ms"] <= baseline["model_exec_p95_ms"] * EXEC_P95_RATIO
+  fd_ok = (baseline["counts"]["frame_drop"] > 0 and tlv["counts"]["frame_drop"] > 0
+           and tlv["frame_drop_mean"] <= baseline["frame_drop_mean"] + FRAME_DROP_DELTA
+           and tlv["frame_drop_p95"] <= baseline["frame_drop_p95"] + FRAME_DROP_DELTA)
+  gate("modeld_exec_frame_drop", have_model and p50_ok and p99_ok and fd_ok,
+       _join(
+         f"exec p50 {tlv['model_exec_p50_ms']:.1f} vs {baseline['model_exec_p50_ms']:.1f} ms,",
+         f"p99 {tlv['model_exec_p95_ms']:.1f} vs {baseline['model_exec_p95_ms']:.1f} ms,",
+         f"frame_drop mean {tlv['frame_drop_mean']:.2f} vs {baseline['frame_drop_mean']:.2f}",
+       ),
+       p50_ok=p50_ok, p99_ok=p99_ok, frame_drop_ok=fd_ok)
+
+  # 2. controlsState interval p99 and max.
+  have_ctl = baseline["counts"]["controls"] > 0 and tlv["counts"]["controls"] > 0
+  ctl_p99_ok = have_ctl and tlv["controls_p99_ms"] <= baseline["controls_p99_ms"] + CONTROL_P99_SLACK_MS
+  ctl_max_ok = have_ctl and tlv["controls_max_ms"] <= baseline["controls_max_ms"] + CONTROL_MAX_SLACK_MS
+  gate("controlsd_interval_p99_max", ctl_p99_ok and ctl_max_ok,
+       _join(
+         f"interval p99 {tlv['controls_p99_ms']:.2f} vs {baseline['controls_p99_ms']:.2f} ms,",
+         f"max {tlv['controls_max_ms']:.2f} vs {baseline['controls_max_ms']:.2f} ms",
+       ),
+       p99_ok=ctl_p99_ok, max_ok=ctl_max_ok)
+
+  # 3. roadCameraState frame gaps.
+  have_cam = baseline["counts"]["camera"] > 1 and tlv["counts"]["camera"] > 1
+  have_rates = baseline["camera_gap_rate_s"] is not None and tlv["camera_gap_rate_s"] is not None
+  cam_rate_ok = have_cam and have_rates and tlv["camera_gap_rate_s"] <= baseline["camera_gap_rate_s"] + CAMERA_GAP_RATE_SLACK_S
+  cam_skip_ok = have_cam and tlv["camera_gap_max_skip"] <= baseline["camera_gap_max_skip"] + CAMERA_GAP_MAX_SKIP_SLACK
+  gate("camera_frame_gaps", cam_rate_ok and cam_skip_ok,
+       _join(
+         f"skip rate {tlv['camera_gap_rate_s']} vs {baseline['camera_gap_rate_s']} per s,",
+         f"worst skip {tlv['camera_gap_max_skip']} vs {baseline['camera_gap_max_skip']} frames",
+       ),
+       rate_ok=cam_rate_ok, worst_skip_ok=cam_skip_ok)
+
+  # 4. UI frame time p99 if published, else ui process CPU%.
+  ui_base = baseline["procs"].get("ui", {})
+  ui_tlv = tlv["procs"].get("ui", {})
+  have_draw = baseline["counts"]["ui_draw"] > 0 and tlv["counts"]["ui_draw"] > 0
+  draw_ok = None
+  if have_draw:
+    draw_ok = tlv["ui_draw_p95_ms"] <= baseline["ui_draw_p95_ms"] * UI_DRAW_P95_RATIO + UI_DRAW_P95_SLACK_MS
+  cpu_ok = None
+  if ui_base.get("cpu_pct_avg") is not None and ui_tlv.get("cpu_pct_avg") is not None:
+    cpu_ok = ui_tlv["cpu_pct_avg"] <= ui_base["cpu_pct_avg"] + UI_CPU_SLACK_PCT
+  checks = [v for v in (draw_ok, cpu_ok) if v is not None]
+  draw_text = "n/a" if draw_ok is None else f"{tlv['ui_draw_p95_ms']:.2f} vs {baseline['ui_draw_p95_ms']:.2f} ms"
+  cpu_text = "n/a" if cpu_ok is None else f"{ui_tlv.get('cpu_pct_avg', 0.0):.1f}% vs {ui_base.get('cpu_pct_avg', 0.0):.1f}%"
+  gate("ui_frame_time", all(checks) if checks else True,
+       f"draw p95 {draw_text}, ui CPU {cpu_text}",
+       draw_ok=draw_ok, cpu_ok=cpu_ok, available=bool(checks))
+
+  # 5. tlvd CPU% and cores 1-3 total.
+  tlvd_t = tlv["procs"].get("tlvd", {})
+  tlvd_s = soak.get("procs", {}).get("tlvd", {})
+  windows = [v for v in (tlvd_t.get("cpu_pct_max_2s"), tlvd_s.get("cpu_pct_max_2s")) if v is not None]
+  cpu_budget_ok = bool(windows) and max(windows) <= TLVD_CPU_BUDGET_PCT
+  base_cores = baseline["cores13_busy_pct_avg"]
+  deltas = []
+  for phase in (tlv, soak):
+    if base_cores is not None and phase.get("cores13_busy_pct_avg") is not None:
+      deltas.append(phase["cores13_busy_pct_avg"] - base_cores)
+  tlvd_cpu_avg = tlvd_t.get("cpu_pct_avg") or 0.0
+  cores_ok = bool(deltas) and max(deltas) <= tlvd_cpu_avg + CORES13_CPU_SLACK_PCT
+  gate("tlvd_cpu_budget", cpu_budget_ok and cores_ok,
+       _join(
+         f"tlvd CPU max 2s window {max(windows) if windows else 'n/a'} <= {TLVD_CPU_BUDGET_PCT}%,",
+         f"cores1-3 delta {max(deltas) if deltas else 'n/a'} vs tlvd avg {tlvd_cpu_avg:.1f}%",
+       ),
+       cpu_budget_ok=cpu_budget_ok, cores13_ok=cores_ok)
+
+  # 6. tlvd RSS max and soak growth.
+  rss_maxes = [v for v in (tlvd_t.get("rss_max_mb"), tlvd_s.get("rss_max_mb")) if v is not None]
+  rss_max_ok = bool(rss_maxes) and max(rss_maxes) <= TLVD_RSS_MAX_MB
+  growth = soak.get("tlv_rss_growth_mb") if soak else tlv.get("tlv_rss_growth_mb")
+  growth_ok = growth is not None and growth < TLVD_RSS_GROWTH_MAX_MB
+  gate("tlvd_rss", rss_max_ok and growth_ok,
+       _join(
+         f"RSS max {max(rss_maxes) if rss_maxes else 'n/a'} <= {TLVD_RSS_MAX_MB} MB,",
+         f"growth {growth if growth is not None else 'n/a'} < {TLVD_RSS_GROWTH_MAX_MB} MB",
+       ),
+       rss_max_ok=rss_max_ok, growth_ok=growth_ok)
+
+  # 7. MemAvailable min vs baseline and the 600 MB floor.
+  mem_mins = [v for v in (tlv["mem_available_min_mb"], soak.get("mem_available_min_mb")) if v is not None]
+  mem_floor_ok = bool(mem_mins) and min(mem_mins) >= MEM_AVAILABLE_FLOOR_MB
+  mem_drop_ok = (baseline["mem_available_min_mb"] is not None and bool(mem_mins)
+                 and min(mem_mins) >= baseline["mem_available_min_mb"] - MEM_AVAILABLE_DROP_MAX_MB)
+  gate("mem_available", mem_floor_ok and mem_drop_ok,
+       f"min {min(mem_mins) if mem_mins else 'n/a'} MB vs baseline {baseline['mem_available_min_mb']} MB",
+       floor_ok=mem_floor_ok, drop_ok=mem_drop_ok)
+
+  # 8. thermalStatus and CPU/GPU max temp; no new throttling.
+  base_status = baseline["thermal_status_max"]
+  status_values = [v for v in (tlv["thermal_status_max"], soak.get("thermal_status_max")) if v is not None]
+  status_ok = base_status is not None and bool(status_values) and max(status_values) <= base_status
+  temp_values = [v for v in (tlv["max_temp_c_max"], soak.get("max_temp_c_max")) if v is not None]
+  temp_ok = (baseline["max_temp_c_max"] is not None and bool(temp_values)
+             and max(temp_values) <= baseline["max_temp_c_max"] + TEMP_SLACK_C)
+  gpu_values = [v for v in (tlv["gpu_temp_c_max"], soak.get("gpu_temp_c_max")) if v is not None]
+  gpu_ok = True
+  if baseline["gpu_temp_c_max"] is not None and gpu_values:
+    gpu_ok = max(gpu_values) <= baseline["gpu_temp_c_max"] + TEMP_SLACK_C
+  throttled = bool(status_values) and max(status_values) >= THERMAL_YELLOW and (base_status is None or max(status_values) > base_status)
+  gate("thermal", status_ok and temp_ok and gpu_ok and not throttled,
+       _join(
+         f"status {max(status_values) if status_values else 'n/a'} vs baseline {base_status},",
+         f"temp {max(temp_values) if temp_values else 'n/a'} vs {baseline['max_temp_c_max']} C",
+       ),
+       status_ok=status_ok, temp_ok=temp_ok, gpu_ok=gpu_ok, throttled=throttled)
+
+  verdict = all(g["pass"] for g in gates.values())
+  return {"verdict": "pass" if verdict else "fail", "gates": gates}
+
+
+# ---------------------------------------------------------------------------
+# collection (device only; messaging wired by main)
+# ---------------------------------------------------------------------------
+
+def _collect(sm, seconds: float, rate_hz: float = 20.0, proc_sample_s: float = PROC_SAMPLE_S) -> dict:
   from openpilot.common.realtime import Ratekeeper
+  sampler = ProcSampler()
   report: dict = {
-    "frame_drop": [], "model_exec_ms": [], "ui_draw_ms": [], "cam_processing_ms": [],
-    "cam_sof_gap_ms": [], "thermal_status": [], "max_temp_c": [],
-    "tlv_infer_ms": [], "tlv_proc_ms": [], "carrot_tlv_seen": 0,
-    "tlv_dropped_final": None, "tlv_status_seen": [],
+    "seconds": float(seconds),
+    "frame_drop": [], "model_exec_ms": [], "controls_mono_ns": [], "cam_frames": [],
+    "ui_draw_ms": [], "thermal_status": [], "max_temp_c": [], "gpu_temp_c": [],
+    "tlv_infer_ms": [], "tlv_proc_ms": [], "tlv_status_seen": [], "tlv_dropped_final": None,
+    "carrot_tlv_seen": 0, "proc_samples": [], "pid_changes": {},
   }
   rk = Ratekeeper(rate_hz, print_delay_threshold=None)
-  last_sof = None
-  end = time.monotonic() + seconds
+  next_proc = 0.0
+  end = time.monotonic() + float(seconds)
   while time.monotonic() < end:
+    now = time.monotonic()
     sm.update(0)
     if sm.updated.get("modelV2") and sm.valid["modelV2"]:
       model = sm["modelV2"]
       report["frame_drop"].append(float(model.frameDropPerc))
       if len(model.modelExecutionTime) > 0:
         report["model_exec_ms"].append(1000.0 * max(float(v) for v in model.modelExecutionTime))
+    if sm.seen.get("controlsState") and sm.updated.get("controlsState") and sm.valid["controlsState"]:
+      report["controls_mono_ns"].append(int(sm.logMonoTime["controlsState"]))
+    if sm.seen.get("roadCameraState") and sm.updated.get("roadCameraState") and sm.valid["roadCameraState"]:
+      report["cam_frames"].append((now, int(sm["roadCameraState"].frameId)))
     if sm.seen.get("uiDebug") and sm.updated.get("uiDebug") and sm.valid["uiDebug"]:
       report["ui_draw_ms"].append(float(sm["uiDebug"].drawTimeMillis))
-    if sm.seen.get("roadCameraState") and sm.updated.get("roadCameraState") and sm.valid["roadCameraState"]:
-      cam = sm["roadCameraState"]
-      report["cam_processing_ms"].append(float(cam.processingTime))
-      if last_sof is not None and cam.timestampSof > last_sof:
-        report["cam_sof_gap_ms"].append((cam.timestampSof - last_sof) / 1e6)
-      last_sof = cam.timestampSof
     if sm.seen.get("deviceState") and sm.updated.get("deviceState") and sm.valid["deviceState"]:
       state = sm["deviceState"]
       report["thermal_status"].append(float(state.thermalStatus.raw))
       if state.maxTempC > 0.0:
         report["max_temp_c"].append(float(state.maxTempC))
+      if len(state.gpuTempC) > 0:
+        report["gpu_temp_c"].append(float(max(state.gpuTempC)))
     if sm.seen.get("carrotTlv") and sm.updated.get("carrotTlv") and sm.valid["carrotTlv"]:
       report["carrot_tlv_seen"] += 1
       tlv = sm["carrotTlv"]
@@ -169,16 +497,23 @@ def _collect(sm, seconds: float, rate_hz: float = 20.0) -> dict:
       status = str(tlv.status)
       if status not in report["tlv_status_seen"]:
         report["tlv_status_seen"].append(status)
+    if now >= next_proc:
+      next_proc = now + proc_sample_s
+      report["proc_samples"].append(sampler.sample(now))
     rk.keep_time()
+  report["pid_changes"] = dict(sampler.pid_changes)
   return report
 
 
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
 def _param_bytes(params, key: str):
   try:
-    value = params.get(key)
+    return params.get(key)
   except Exception:
     return None
-  return value
 
 
 def _put_raw(params, key: str, value) -> None:
@@ -189,10 +524,11 @@ def _put_raw(params, key: str, value) -> None:
 
 
 def main(argv=None) -> int:
-  parser = argparse.ArgumentParser(description="carrotTlv A/B bench (baseline vs shadow)")
+  parser = argparse.ArgumentParser(description="carrotTlv bench (baseline vs tlvd vs soak), per RESOURCE_BUDGET.md")
   parser.add_argument("--baseline-s", type=float, default=60.0)
   parser.add_argument("--tlv-s", type=float, default=60.0)
-  parser.add_argument("--backend", default="null", help="null/onnx (tlvd CarrotTlvBackend)")
+  parser.add_argument("--soak-min", type=float, default=20.0, help="soak phase minutes; 0 skips the soak")
+  parser.add_argument("--backend", default="null", help="null/onnx/tinygrad (tlvd CarrotTlvBackend)")
   parser.add_argument("--model-path", default=None, help="CarrotTlvModelPath override")
   parser.add_argument("--startup-wait-s", type=float, default=20.0)
   args = parser.parse_args(argv)
@@ -219,15 +555,16 @@ def main(argv=None) -> int:
   if hasattr(signal, "SIGTERM"):
     signal.signal(signal.SIGTERM, on_signal)
 
-  sm = messaging.SubMaster(["modelV2", "deviceState", "roadCameraState", "uiDebug", "carrotTlv"],
+  sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "uiDebug", "carrotTlv"],
                            ignore_avg_freq=["uiDebug", "carrotTlv"])
+  baseline_report = tlv_report = soak_report = None
   try:
     print("carrot_tlv_bench: baseline phase (tlvd off) ...", file=sys.stderr)
     _put_raw(params, "CarrotTlvMode", b"0")
     time.sleep(3.0)
-    baseline = _collect(sm, args.baseline_s)
+    baseline_report = _collect(sm, args.baseline_s)
 
-    print("carrot_tlv_bench: shadow phase (tlvd on) ...", file=sys.stderr)
+    print("carrot_tlv_bench: tlvd phase (mode 1) ...", file=sys.stderr)
     _put_raw(params, "CarrotTlvBackend", args.backend.encode())
     if args.model_path is not None:
       _put_raw(params, "CarrotTlvModelPath", args.model_path.encode())
@@ -235,20 +572,30 @@ def main(argv=None) -> int:
     deadline = time.monotonic() + args.startup_wait_s
     while time.monotonic() < deadline and not sm.seen.get("carrotTlv"):
       sm.update(100)
-    tlv = _collect(sm, args.tlv_s)
+    tlv_report = _collect(sm, args.tlv_s)
+
+    if args.soak_min > 0.0:
+      print(f"carrot_tlv_bench: soak phase {args.soak_min:.1f} min ...", file=sys.stderr)
+      soak_report = _collect(sm, args.soak_min * 60.0)
   except KeyboardInterrupt:
     print("carrot_tlv_bench: interrupted", file=sys.stderr)
-    restore()
     return 130
+  finally:
+    restore()
 
-  restore()
-  summary = summarize(baseline, tlv)
-  summary["parameters"] = {
-    "baseline_s": args.baseline_s, "tlv_s": args.tlv_s, "backend": args.backend,
-    "model_path": args.model_path, "original_mode": None if original_mode is None else original_mode.decode("utf-8", "replace"),
+  baseline = summarize_phase(baseline_report)
+  tlv = summarize_phase(tlv_report)
+  soak = summarize_phase(soak_report) if soak_report is not None else None
+  result = evaluate_gates(baseline, tlv, soak)
+  result["raw"] = {"baseline": baseline, "tlv": tlv, "soak": soak}
+  result["baseline_clean"] = baseline["counts"]["tlv_msgs"] == 0
+  result["parameters"] = {
+    "baseline_s": args.baseline_s, "tlv_s": args.tlv_s, "soak_min": args.soak_min,
+    "backend": args.backend, "model_path": args.model_path,
+    "original_mode": None if original_mode is None else original_mode.decode("utf-8", "replace"),
   }
-  print(json.dumps(summary, indent=2))
-  return 0 if summary["verdict"] == "pass" else 1
+  print(json.dumps(result, indent=2))
+  return 0 if result["verdict"] == "pass" else 1
 
 
 if __name__ == "__main__":

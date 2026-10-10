@@ -137,13 +137,102 @@ def nv12_to_rgb(y: np.ndarray, uv: np.ndarray) -> np.ndarray:
   return np.clip(rgb, 0.0, 255.0).astype(np.uint8)
 
 
+class FramePreprocessor:
+  """Preallocated workspace for crop + NV12->RGB + NCHW packing.
+
+  RESOURCE_BUDGET.md: every per-frame buffer is allocated once here; the hot
+  path only writes into these arrays (ufunc out=, slice copies), so no per-frame
+  numpy allocation happens. Instantiate once per process and reuse.
+
+  Layout: the model input is MODEL_H x MODEL_W (320x640) for both views - FAR is
+  a native crop, NEAR is a x2 decimation.
+  """
+
+  def __init__(self, model_h: int = MODEL_H, model_w: int = MODEL_W) -> None:
+    self.model_h = int(model_h)
+    self.model_w = int(model_w)
+    h, w = self.model_h, self.model_w
+    self.y_crop = np.empty((h, w), dtype=np.uint8)
+    self.uv_pairs = np.empty((h // 2, w // 2, 2), dtype=np.uint8)
+    self.model_input = np.empty((1, 3, h, w), dtype=np.uint8)
+    self._yf = np.empty((h, w), dtype=np.float32)
+    self._uf = np.empty((h, w), dtype=np.float32)
+    self._vf = np.empty((h, w), dtype=np.float32)
+    self._cf = np.empty((h, w), dtype=np.float32)
+    self._rf = np.empty((h, w), dtype=np.float32)
+    self._gf = np.empty((h, w), dtype=np.float32)
+    self._bf = np.empty((h, w), dtype=np.float32)
+    self._tf = np.empty((h, w), dtype=np.float32)
+
+  def model_input_from_frame(self, data, width: int, height: int, stride: int, uv_offset: int,
+                             geom: ViewGeometry) -> np.ndarray:
+    """Copy the crop out of `data` and write the NCHW input into the workspace.
+
+    The returned array never references `data`, so the caller can release the
+    VisionIPC buffer as soon as this returns (RESOURCE_BUDGET.md: VisionIPC).
+    """
+    if geom.model_h != self.model_h or geom.model_w != self.model_w:
+      raise ValueError(f"geometry {geom.model_w}x{geom.model_h} does not fit workspace {self.model_w}x{self.model_h}")
+    y, uv = nv12_planes(data, width, height, stride, uv_offset)
+    self._crop_into(y, uv, geom)
+    self._nv12_to_nchw_into()
+    return self.model_input
+
+  def _crop_into(self, y: np.ndarray, uv: np.ndarray, geom: ViewGeometry) -> None:
+    h, w = geom.h, geom.w
+    y_roi = y[geom.y0:geom.y0 + h, geom.x0:geom.x0 + w]
+    if geom.scale == 1:
+      np.copyto(self.y_crop, y_roi)
+    else:
+      np.copyto(self.y_crop, y_roi[::2, ::2])
+    uv3 = uv.reshape(uv.shape[0], uv.shape[1] // 2, 2)
+    p0y, p0x = geom.y0 // 2, geom.x0 // 2
+    ph, pw = h // 2, w // 2
+    if geom.scale == 1:
+      np.copyto(self.uv_pairs, uv3[p0y:p0y + ph, p0x:p0x + pw, :])
+    else:
+      np.copyto(self.uv_pairs, uv3[p0y:p0y + ph:2, p0x:p0x + pw:2, :])
+
+  def _nv12_to_nchw_into(self) -> None:
+    yf, uf, vf, cf = self._yf, self._uf, self._vf, self._cf
+    np.copyto(yf, self.y_crop, casting="unsafe")
+    yf -= 16.0
+    np.maximum(yf, 0.0, out=yf)
+    np.multiply(yf, 1.164383, out=cf)
+    for buf, src in ((uf, self.uv_pairs[:, :, 0]), (vf, self.uv_pairs[:, :, 1])):
+      np.copyto(buf[0::2, 0::2], src, casting="unsafe")
+      np.copyto(buf[0::2, 1::2], src, casting="unsafe")
+      np.copyto(buf[1::2, 0::2], src, casting="unsafe")
+      np.copyto(buf[1::2, 1::2], src, casting="unsafe")
+      buf -= 128.0
+    rf, gf, bf, tf = self._rf, self._gf, self._bf, self._tf
+    np.multiply(vf, 1.596027, out=rf)
+    np.add(rf, cf, out=rf)
+    np.multiply(uf, -0.391762, out=gf)
+    np.multiply(vf, -0.812968, out=tf)
+    np.add(gf, tf, out=gf)
+    np.add(gf, cf, out=gf)
+    np.multiply(uf, 2.017232, out=bf)
+    np.add(bf, cf, out=bf)
+    np.clip(rf, 0.0, 255.0, out=rf)
+    np.clip(gf, 0.0, 255.0, out=gf)
+    np.clip(bf, 0.0, 255.0, out=bf)
+    np.copyto(self.model_input[0, 0], rf, casting="unsafe")
+    np.copyto(self.model_input[0, 1], gf, casting="unsafe")
+    np.copyto(self.model_input[0, 2], bf, casting="unsafe")
+
+
 def model_input_from_frame(data, width: int, height: int, stride: int, uv_offset: int,
-                           geom: ViewGeometry) -> np.ndarray:
-  """Crop + convert one NV12 frame into the [1, 3, 320, 640] uint8 NCHW input."""
-  y, uv = nv12_planes(data, width, height, stride, uv_offset)
-  y_small, uv_small = nv12_crop(y, uv, geom)
-  rgb = nv12_to_rgb(y_small, uv_small)
-  return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
+                           geom: ViewGeometry, workspace: FramePreprocessor | None = None) -> np.ndarray:
+  """Crop + convert one NV12 frame into the [1, 3, 320, 640] uint8 NCHW input.
+
+  With `workspace` the result is written into its preallocated arrays (no
+  per-frame allocation); without one a fresh workspace is allocated per call
+  (PC convenience only - never do that in the tlvd hot path).
+  """
+  if workspace is None:
+    workspace = FramePreprocessor()
+  return workspace.model_input_from_frame(data, width, height, stride, uv_offset, geom)
 
 
 def map_model_box_to_full(box: tuple[float, float, float, float], geom: ViewGeometry) -> tuple[float, float, float, float]:

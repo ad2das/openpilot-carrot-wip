@@ -116,3 +116,43 @@ def test_map_model_box_to_full():
   assert crops.map_model_box_to_full((10.0, 20.0, 30.0, 60.0), far) == (654.0, 380.0, 674.0, 420.0)
   near = crops.near_geometry(600.0, W, H, 2648.0)
   assert crops.map_model_box_to_full((10.0, 20.0, 30.0, 60.0), near) == (344.0, 160.0, 384.0, 240.0)
+
+
+def _allocating_reference(buf, stride, uv_offset, geom):
+  """The pre-FramePreprocessor path: allocate the whole chain per call."""
+  y, uv = crops.nv12_planes(buf, W, H, stride, uv_offset)
+  y_small, uv_small = crops.nv12_crop(y, uv, geom)
+  rgb = crops.nv12_to_rgb(y_small, uv_small)
+  return np.ascontiguousarray(rgb.transpose(2, 0, 1)[None])
+
+
+def test_frame_preprocessor_matches_allocating_path():
+  buf, stride, uv_offset = _synthetic_frame(stride_pad=64)
+  pre = crops.FramePreprocessor()
+  for geom in (crops.far_geometry(600.0, W, H, 2648.0), crops.near_geometry(600.0, W, H, 2648.0)):
+    ref = _allocating_reference(buf, stride, uv_offset, geom)
+    got = pre.model_input_from_frame(buf, W, H, stride, uv_offset, geom)
+    assert got is pre.model_input
+    assert np.array_equal(got, ref), f"view {geom.view} differs from the allocating path"
+    # Workspace reuse must not change the result.
+    got2 = pre.model_input_from_frame(buf, W, H, stride, uv_offset, geom)
+    assert got2 is got and np.array_equal(got2, ref)
+
+
+def test_frame_preprocessor_output_does_not_alias_frame_data():
+  buf, stride, uv_offset = _synthetic_frame()
+  pre = crops.FramePreprocessor()
+  geom = crops.far_geometry(600.0, W, H, 2648.0)
+  out = pre.model_input_from_frame(buf, W, H, stride, uv_offset, geom).copy()
+  mutated = bytearray(buf)
+  mutated[:] = b"\x00" * len(mutated)
+  again = pre.model_input_from_frame(bytes(mutated), W, H, stride, uv_offset, geom)
+  assert not np.array_equal(out, again)
+  assert np.array_equal(out, pre.model_input_from_frame(buf, W, H, stride, uv_offset, geom))
+
+
+def test_frame_preprocessor_rejects_mismatched_geometry():
+  pre = crops.FramePreprocessor()
+  geom = crops.ViewGeometry(view="far", x0=0, y0=0, w=64, h=32, scale=1, focal_px=100.0)
+  with pytest.raises(ValueError):
+    pre.model_input_from_frame(b"\x00" * (64 * 32 * 3 // 2), 64, 32, 64, 64 * 32, geom)
