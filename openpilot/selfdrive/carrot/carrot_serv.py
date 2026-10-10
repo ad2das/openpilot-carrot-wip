@@ -420,6 +420,13 @@ class CarrotServ:
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
       return
+    # Same-track green (W74D): a TLV green/left may only feed the confirmed
+    # color path when it comes from the light that was red-confirmed within
+    # 120 s (goAfterRed). Otherwise keep the PREVIOUS traffic_state: storing 0
+    # would erase a confirmed red and kill the later red->green/left edge,
+    # while holding the previous value can never create a start edge.
+    if color in (TLV_COLOR_GREEN, TLV_COLOR_LEFT) and not bool(msg.goAfterRed):
+      return
     det = msg.dets[0]
     x = 0.5 * (float(det.x1) + float(det.x2)) / TLV_FRAME_W
     y = 0.5 * (float(det.y1) + float(det.y2)) / TLV_FRAME_H

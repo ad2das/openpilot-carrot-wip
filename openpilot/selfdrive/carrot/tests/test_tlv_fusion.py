@@ -136,7 +136,13 @@ _install_pc_shims()
 from openpilot.cereal import log
 from openpilot.common.filter_simple import MyMovingAverage
 from openpilot.common.realtime import DT_MDL
-from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner, XState
+from openpilot.selfdrive.carrot.carrot_functions import (
+  CarrotPlanner,
+  TLV_A4_APPROACH_WINDOW_FRAMES,
+  TLV_GAS_COOLDOWN_FRAMES,
+  TLV_RED_HOLD_FRAMES,
+  XState,
+)
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 from openpilot.selfdrive.carrot.driving_mode import DrivingMode
 
@@ -153,7 +159,8 @@ class FakeSM(dict):
     self.recv_time = dict.fromkeys(services, 100.0)
 
 
-def tlv_message(state: str = "green", conf: float = 0.75, status: str = "running", box=BOX):
+def tlv_message(state: str = "green", conf: float = 0.75, status: str = "running", box=BOX,
+                go_after_red: bool = False):
   msg = log.Event.new_message()
   msg.init("carrotTlv")
   t = msg.carrotTlv
@@ -161,6 +168,7 @@ def tlv_message(state: str = "green", conf: float = 0.75, status: str = "running
   t.state = state
   t.stateConf = conf
   t.relevantTrackId = 1
+  t.goAfterRed = go_after_red
   t.init("dets", 1)
   d = t.dets[0]
   d.cls = 2
@@ -230,16 +238,35 @@ def test_mode2_feed_red_then_green_uses_existing_trigger_logic():
   assert serv.traffic_state == 1
   assert serv.traffic_state_src == 1
   assert serv.traffic_light_count == 5
-  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.75)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.75, go_after_red=True)))
   assert serv.traffic_state == 2
   assert serv.traffic_state_src == 1
+
+
+def test_mode2_green_without_go_after_red_keeps_previous_and_fresh_stays_off():
+  # Same-track green (W74D B2): a green from a light NOT confirmed red within
+  # 120 s must not feed the confirmed-colour path.
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", conf=0.75)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", conf=0.75)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  # goAfterRed False keeps the previous red: a stored 0 would kill the edge.
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.75)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  # goAfterRed True still fires the existing red->green trigger.
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.75, go_after_red=True)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  # A fresh serv with no prior red stays off for a gated green.
+  fresh = make_serv(2)
+  fresh._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.75)))
+  assert snapshot(fresh) == (0, 0, -1, [])
 
 
 def test_mode2_left_arrow_uses_left_turn_path():
   serv = make_serv(2)
   serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft"),
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft", go_after_red=True),
                                  carState=SimpleNamespace(leftBlinker=True)))
   assert serv.traffic_state == 3
   assert serv.traffic_state_src == 1
@@ -265,22 +292,21 @@ def test_mode2_left_phase_intent_from_carstate_and_atctype():
   # redLeft + left blinker -> Left turn -> left path (state 3)
   serv = make_serv(2)
   serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLeft"),
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("redLeft", go_after_red=True),
                                  carState=SimpleNamespace(leftBlinker=True)))
   assert serv.traffic_state == 3
   # greenLeft + carrotMan atcType intent (same definition tlvd uses)
   serv2 = make_serv(2)
   serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft"),
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft", go_after_red=True),
                                   carrotMan=SimpleNamespace(atcType="atc left")))
   assert serv2.traffic_state == 3
   # "turn left" atcType also counts
   serv3 = make_serv(2)
   serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("left"),
+  serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("left", go_after_red=True),
                                   carrotMan=SimpleNamespace(atcType="turn left")))
   assert serv3.traffic_state == 3
 
@@ -296,7 +322,7 @@ def test_mode2_left_phases_without_intent_are_straight_phases():
   serv2 = make_serv(2)
   serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
-  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft")))
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("greenLeft", go_after_red=True)))
   assert serv2.traffic_state == 2
   # bare left arrow without intent -> Red Light (straight is not allowed)
   serv3 = make_serv(2)
@@ -354,31 +380,48 @@ def frozen_clock(monkeypatch):
   monkeypatch.setattr(carrot_man_input.time, "monotonic", lambda: 100.0)
 
 
-def carrot_man_message(state: int = 2, src: int = 1, speed: int = 60):
+def carrot_man_message(state: int = 2, src: int = 1, speed: int = 60,
+                       atc_type: str = "", x_dist: int = 0):
   msg = log.Event.new_message()
   msg.init("carrotMan")
   msg.carrotMan.desiredSpeed = speed
   msg.carrotMan.trafficState = state
   msg.carrotMan.trafficStateSrc = src
-  msg.carrotMan.atcType = ""
+  msg.carrotMan.atcType = atc_type
   msg.carrotMan.activeCarrot = 0
-  msg.carrotMan.xDistToTurn = 0
+  msg.carrotMan.xDistToTurn = x_dist
   return msg.carrotMan
 
 
 def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   planner = CarrotPlanner.__new__(CarrotPlanner)
   planner.trafficState_carrot = 1
+  planner.trafficState_carrot_src = 1
   planner.soft_hold_active = 0
   planner.xState = XState.e2eStopped
   planner.carrot_stay_stop = False
   planner.last_model_stop_sign = stop_sign
   planner.traffic_starting_count = 0
+  planner.tlv_standstill_hold_frames = 0
+  planner.tlv_hold_run = False
+  planner.tlv_gas_cooldown_frames = 0
+  planner.coast_cap_active = False
+  planner.left_blinker_pre_stop = False
+  planner.left_blinker_off_frames = 0
+  planner.a4_frame = 0
+  planner.a4_approach = collections.deque(maxlen=TLV_A4_APPROACH_WINDOW_FRAMES + 5)
+  planner.a4_stop_frame = None
+  planner.a4_approach_median = None
+  planner.a4_standstill_dists = collections.deque(maxlen=200)
+  planner.a4_standstill_ok_frames = 0
+  planner.a4_lane_ok = False
   return planner
 
 
-def gate_sm(carrot_man, left=False):
-  return FakeSM(carrotMan=carrot_man, carState=SimpleNamespace(leftBlinker=left))
+def gate_sm(carrot_man, left=False, right=False, gas=False, enabled=True):
+  return FakeSM(carrotMan=carrot_man,
+                carState=SimpleNamespace(leftBlinker=left, rightBlinker=right, gasPressed=gas),
+                selfdriveState=SimpleNamespace(enabled=enabled))
 
 
 def test_tlv_green_holds_start_while_model_signals_stop():
@@ -508,6 +551,11 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
   planner.tlv_red_likely = False
   planner.last_model_start_sign = False
   planner.coast_cap_active = False
+  planner.tlv_gas_cooldown_frames = 0
+  planner.tlv_standstill_hold_frames = 0
+  planner.trafficState_carrot = 0
+  planner.trafficState_carrot_src = 0
+  planner.carrot_stay_stop = False
   return planner
 
 
@@ -579,3 +627,262 @@ def test_check_model_stopping_records_start_sign():
   stop.check_model_stopping(0.0, v_stop, 0.1, 0.0, 15.0, np.zeros_like(v_stop), 100.0)
   assert stop.last_model_start_sign is False
   assert stop.last_model_stop_sign is True
+
+
+# ---------------------------------------------------------------------------
+# W74D (A): TLV red->left start policy
+# ---------------------------------------------------------------------------
+
+def test_tlv_left_route_near_allows_start_without_blinker():
+  planner = planner_for_gate(stop_sign=False)
+  sm = gate_sm(carrot_man_message(state=3, src=1, atc_type="turn left", x_dist=50))
+  assert planner._update_carrot_man(sm, 0.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 3
+
+
+def test_tlv_left_route_far_away_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  sm = gate_sm(carrot_man_message(state=3, src=1, atc_type="turn left", x_dist=200))
+  assert planner._update_carrot_man(sm, 0.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_tlv_left_blinker_before_stop_allows_start():
+  planner = planner_for_gate(stop_sign=False)
+  # Blinker already on while moving primes the pre-stop condition.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1), left=True), 20.0, 60.0)
+  assert planner.left_blinker_pre_stop is True
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.trafficState_carrot == 3
+
+
+def test_tlv_left_blinker_after_stop_without_lane_signal_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 20.0, 60.0)
+  assert planner.left_blinker_pre_stop is False
+  sm = gate_sm(carrot_man_message(state=3, src=1), left=True)  # blinker on only after the stop
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_tlv_left_blinker_off_gap_over_half_second_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1), left=True), 20.0, 60.0)
+  assert planner.left_blinker_pre_stop is True
+  for _ in range(11):  # 11 * 0.05 s = 0.55 s > 0.5 s off-gap while stopped
+    planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 0.0, 60.0)
+  assert planner.left_blinker_pre_stop is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_tlv_left_right_blinker_vetoes_route_left():
+  planner = planner_for_gate(stop_sign=False)
+  sm = gate_sm(carrot_man_message(state=3, src=1, atc_type="turn left", x_dist=50), right=True)
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+# ---------------------------------------------------------------------------
+# W74D (B1): standstill red hold survives unknown
+# ---------------------------------------------------------------------------
+
+def test_tlv_red_hold_survives_unknown_then_green_starts():
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 0.0, 60.0)
+  assert (planner.trafficState_carrot, planner.trafficState_carrot_src) == (1, 1)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.trafficState_carrot == 1  # held through the unknown
+  assert planner.tlv_standstill_hold_frames == TLV_RED_HOLD_FRAMES
+  for _ in range(100):
+    planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.trafficState_carrot == 1
+  assert planner.tlv_standstill_hold_frames == TLV_RED_HOLD_FRAMES - 100
+  # A (same-track) green still fires the red->green start edge.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 2
+
+
+def test_tlv_red_hold_expires_after_120s_and_no_late_start():
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 0.0, 60.0)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)  # armed
+  for _ in range(TLV_RED_HOLD_FRAMES - 1):
+    planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.trafficState_carrot == 1  # still held at 2400 state-0 frames
+  assert planner.tlv_standstill_hold_frames == 1
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.tlv_standstill_hold_frames == 0
+  assert planner.trafficState_carrot == 0  # 120 s elapsed: hold ends, no re-arm
+  # A green now cannot create a start edge: the red has been dropped.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 2
+
+
+def test_tlv_red_hold_gas_clears_and_does_not_rearm():
+  planner = planner_for_gate(stop_sign=False)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 0.0, 60.0)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.tlv_standstill_hold_frames == TLV_RED_HOLD_FRAMES
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0), gas=True), 0.0, 60.0)
+  assert planner.tlv_standstill_hold_frames == 0
+  assert planner.trafficState_carrot == 0
+  # Still unknown and stopped: this run does not re-arm after the gas.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.tlv_standstill_hold_frames == 0
+  assert planner.trafficState_carrot == 0
+
+
+# ---------------------------------------------------------------------------
+# W74D (B3): gas override cooldown
+# ---------------------------------------------------------------------------
+
+def test_gas_cooldown_suppresses_and_rearms_the_red_likely_cap():
+  planner = accel_planner(2)
+  planner.coast_cap_active = True
+  planner.tlv_red_likely = True
+  planner.last_model_start_sign = False
+  planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
+  assert planner.tlv_gas_cooldown_frames == TLV_GAS_COOLDOWN_FRAMES
+  assert planner.coast_cap_active is False
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is False  # suppressed during the cooldown
+  for _ in range(TLV_GAS_COOLDOWN_FRAMES - 1):
+    planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
+    planner._update_coast_cap()
+  assert planner.tlv_gas_cooldown_frames == 1
+  assert planner.coast_cap_active is False
+  planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
+  planner._update_coast_cap()
+  assert planner.tlv_gas_cooldown_frames == 0
+  assert planner.coast_cap_active is True  # rearmed 10 s after release
+
+
+def test_gas_during_tlv_red_suppresses_edges_for_10s():
+  planner = planner_for_gate(stop_sign=False)
+  # TLV red with left intent arms the src-1 stay-stop (a TLV control effect).
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1), left=True), 0.0, 60.0)
+  assert planner.carrot_stay_stop is True
+  planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
+  assert planner.tlv_gas_cooldown_frames == TLV_GAS_COOLDOWN_FRAMES
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1), left=True), 0.0, 60.0)
+  assert planner.carrot_stay_stop is False  # suppressed during the cooldown
+  # A green edge inside the cooldown is consumed (stored) but must not start.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 2
+  for _ in range(TLV_GAS_COOLDOWN_FRAMES):
+    planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
+  assert planner.tlv_gas_cooldown_frames == 0
+  # The consumed edge cannot start later.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 2
+
+
+# ---------------------------------------------------------------------------
+# W74D: non-TLV (src 0) regression table
+# ---------------------------------------------------------------------------
+
+def test_non_tlv_src0_transitions_unchanged():
+  cases = [
+    # (state, left, right, exp_state, exp_started, exp_stay_stop)
+    (1, True, False, 1, False, True),
+    (2, False, False, 2, True, False),
+    (3, True, True, 3, True, False),   # src 0 never used the right-blinker veto
+    (2, True, False, 2, False, True),  # left intent: stay-stop, no green start
+    (0, False, False, 0, False, False),
+  ]
+  for state, left, right, exp_state, exp_started, exp_stay_stop in cases:
+    planner = planner_for_gate(stop_sign=False)
+    planner.trafficState_carrot_src = 0  # the confirmed red came from navi (src 0)
+    sm = gate_sm(carrot_man_message(state=state, src=0), left=left, right=right)
+    planner._update_carrot_man(sm, 0.0, 60.0)
+    assert planner.trafficState_carrot == exp_state, (state, left, right)
+    assert (planner.xState == XState.e2eCruise) is exp_started, (state, left, right)
+    assert planner.carrot_stay_stop is exp_stay_stop, (state, left, right)
+
+
+# ---------------------------------------------------------------------------
+# W74D (A4): left blinker turned on after stopping, leftmost two lanes
+# ---------------------------------------------------------------------------
+
+def _a4_model(edge_y: float, std: float = 0.3):
+  edge = SimpleNamespace(x=np.array([0.0, 5.0, 10.0]), y=np.array([0.0, edge_y, 0.0]))
+  return SimpleNamespace(roadEdges=[edge], roadEdgeStds=np.array([std, 0.5]))
+
+
+def _run_a4_stop(planner: CarrotPlanner, approach_y: float, stop_y: float, std: float = 0.3,
+                 approach_frames: int = 65, stop_frames: int = 25) -> None:
+  for _ in range(approach_frames):
+    planner._update_a4_lane_tracking(_a4_model(approach_y, std), 20.0)
+  for _ in range(stop_frames):
+    planner._update_a4_lane_tracking(_a4_model(stop_y, std), 0.0)
+
+
+def test_a4_blinker_after_stop_starts_in_leftmost_lane():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 1.7, 1.7)
+  assert planner.a4_lane_ok is True
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.traffic_starting_count == 10.0 / DT_MDL
+  assert planner.trafficState_carrot == 3
+
+
+def test_a4_blinker_after_stop_starts_in_the_second_lane():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 5.1, 5.1)
+  assert planner.a4_lane_ok is True
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+
+
+def test_a4_third_lane_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 8.5, 8.5)
+  assert planner.a4_lane_ok is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_a4_high_edge_std_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 1.7, 1.7, std=0.9)
+  assert planner.a4_lane_ok is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_a4_approach_standstill_disagreement_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 1.7, 5.3)
+  assert planner.a4_lane_ok is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_a4_missing_model_does_not_start():
+  planner = planner_for_gate(stop_sign=False)
+  for _ in range(65):
+    planner._update_a4_lane_tracking(None, 20.0)
+  for _ in range(25):
+    planner._update_a4_lane_tracking(SimpleNamespace(), 0.0)
+  assert planner.a4_lane_ok is False
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_a4_right_blinker_still_blocks():
+  planner = planner_for_gate(stop_sign=False)
+  _run_a4_stop(planner, 1.7, 1.7)
+  assert planner.a4_lane_ok is True
+  sm = gate_sm(carrot_man_message(state=3, src=1), left=True, right=True)
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert planner.xState == XState.e2eStopped

@@ -282,6 +282,10 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	state @7 : State;
 	stateConf @8 : Float32;
 	relevantTrackId @9 : Int32;
+	# Same-track green (W74D): the relevant track was confirmed red/redLeft
+	# within the last 120 s and is now confirmed green/greenLeft/left. A TLV
+	# green/left start edge is only valid from the same tracked light.
+	goAfterRed @10 :Bool;
 
 	enum Status {
 		off @0;

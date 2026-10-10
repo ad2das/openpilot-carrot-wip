@@ -117,12 +117,15 @@ class FramePipeline:
   def _confirmed(self, now: float) -> list[tuple[tracker.Track, int, float]]:
     """Per-track confirmation: classifier votes OR the detector M-of-N belt."""
     if self.classifier is None:
-      return self.tracker.confirmed(self.frame_idx)
-    out: list[tuple[tracker.Track, int, float]] = []
-    for track in self.tracker.tracks:
-      result = self.tracker.confirm_track(track, self.frame_idx, now, use_classifier=True)
-      if result is not None:
-        out.append((track, result[0], result[1]))
+      out = self.tracker.confirmed(self.frame_idx)
+    else:
+      out: list[tuple[tracker.Track, int, float]] = []
+      for track in self.tracker.tracks:
+        result = self.tracker.confirm_track(track, self.frame_idx, now, use_classifier=True)
+        if result is not None:
+          out.append((track, result[0], result[1]))
+    # Same-track green (W74D): remember red-family confirmations per track.
+    self.tracker.note_red_confirmations(now, out)
     return out
 
   def _classify_order(self) -> list[tracker.Track]:

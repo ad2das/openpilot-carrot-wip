@@ -367,6 +367,12 @@ class TlvRunner:
     out.state = "redLikely" if self.pipeline.last_red_likely else self.pipeline.last_state.name
     out.stateConf = float(self.pipeline.last_conf)
     out.relevantTrackId = int(self.pipeline.last_track_id)
+    # Same-track green (W74D): only the light that was confirmed red/redLeft
+    # within the last 120 s may release a TLV green/left start downstream.
+    out.goAfterRed = bool(
+      self.pipeline.last_state in (tracker.SignalState.green, tracker.SignalState.greenLeft, tracker.SignalState.left)
+      and self.pipeline.tracker.go_after_red(self.pipeline.last_track_id, time.monotonic())
+    )
     self.pub.send("carrotTlv", msg)
 
   def _ordered_dets(self) -> list[tracker.Detection]:

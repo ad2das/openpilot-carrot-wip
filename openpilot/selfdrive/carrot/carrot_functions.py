@@ -1,4 +1,5 @@
 import time
+from collections import deque
 from enum import Enum
 
 from openpilot.cereal import log
@@ -55,6 +56,21 @@ class TrafficState(Enum):
     return self.name
 
 A_CRUISE_MAX_BP_CARROT = [0., 10 * CV.KPH_TO_MS, 40 * CV.KPH_TO_MS, 60 * CV.KPH_TO_MS, 80 * CV.KPH_TO_MS, 110 * CV.KPH_TO_MS, 140 * CV.KPH_TO_MS]
+
+# W74D TLV-sourced policies (CONTRACT.md High-speed approach follow-ups).
+TLV_STANDSTILL_MPS = 0.3
+TLV_MOVE_END_MPS = 1.0
+TLV_RED_HOLD_FRAMES = int(120.0 / DT_MDL)
+TLV_GAS_COOLDOWN_FRAMES = int(10.0 / DT_MDL)
+TLV_ROUTE_LEFT_NEAR_M = 150.0
+TLV_BLINKER_STOP_GAP_S = 0.5
+# W74D (A4): a left blinker turned on only after stopping is allowed only in
+# the leftmost two lanes, judged by the modelV2 left road edge near the car.
+TLV_A4_LEFT_EDGE_MAX_M = 5.6
+TLV_A4_EDGE_STD_MAX_M = 0.6
+TLV_A4_APPROACH_WINDOW_FRAMES = int(3.0 / DT_MDL)
+TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
+TLV_A4_MEDIAN_DISAGREE_M = 1.0
 
 class CarrotPlanner:
   def __init__(self):
@@ -143,7 +159,20 @@ class CarrotPlanner:
 
     self.trafficLightDetectMode = 2 # 0: None, 1:Stop, 2:Stop&Go
     self.trafficState_carrot = 0
+    self.trafficState_carrot_src = 0
     self.carrot_stay_stop = False
+    self.tlv_standstill_hold_frames = 0
+    self.tlv_hold_run = False  # W74D B1: at most one 120 s hold per unknown run
+    self.tlv_gas_cooldown_frames = 0
+    self.left_blinker_pre_stop = False
+    self.left_blinker_off_frames = 0
+    self.a4_frame = 0
+    self.a4_approach = deque(maxlen=TLV_A4_APPROACH_WINDOW_FRAMES + 5)
+    self.a4_stop_frame = None
+    self.a4_approach_median = None
+    self.a4_standstill_dists = deque(maxlen=200)
+    self.a4_standstill_ok_frames = 0
+    self.a4_lane_ok = False
 
     self.eco_over_speed = 2
     self.eco_target_speed = 0
@@ -373,35 +402,201 @@ class CarrotPlanner:
     else:
       self.trafficState = TrafficState.off
 
+  def _update_left_blinker_pre_stop(self, carstate, v_ego_kph: float) -> None:
+    """W74D (A): a left blinker already on when the car came to a stop and
+    stayed on since (>0.5 s off-gap disqualifies) may authorize a TLV red->left
+    start. While moving, the current blinker state primes the next stop."""
+    left_on = bool(carstate.leftBlinker)
+    if v_ego_kph >= TLV_STANDSTILL_MPS * CV.MS_TO_KPH:
+      self.left_blinker_pre_stop = left_on
+      self.left_blinker_off_frames = 0
+      return
+    if left_on:
+      self.left_blinker_off_frames = 0
+    else:
+      self.left_blinker_off_frames += 1
+      if self.left_blinker_off_frames * DT_MDL > TLV_BLINKER_STOP_GAP_S:
+        self.left_blinker_pre_stop = False
+
+  @staticmethod
+  def _engaged(sm) -> bool:
+    try:
+      return bool(sm['selfdriveState'].enabled)
+    except Exception:
+      return False
+
+  def _update_tlv_gas_cooldown(self, carstate) -> None:
+    """B3 gas override: gas pressed while a TLV effect is active (redLikely
+    coast cap, standstill red hold, src-1 stay-stop) suppresses every TLV
+    control effect for 10 s after release, in frame/DT_MDL timing. Ordinary
+    non-TLV behavior continues."""
+    effect_active = (
+      self.coast_cap_active
+      or self.tlv_standstill_hold_frames > 0
+      or (self.carrot_stay_stop and self.trafficState_carrot_src == 1)
+    )
+    if carstate.gasPressed and (effect_active or self.tlv_gas_cooldown_frames > 0):
+      self.tlv_gas_cooldown_frames = TLV_GAS_COOLDOWN_FRAMES
+    elif not carstate.gasPressed and self.tlv_gas_cooldown_frames > 0:
+      self.tlv_gas_cooldown_frames -= 1
+    if self.tlv_gas_cooldown_frames > 0:
+      self.coast_cap_active = False
+      self.tlv_standstill_hold_frames = 0
+
+  @staticmethod
+  def _a4_left_edge_sample(model) -> tuple[float, float] | None:
+    """W74D (A4): (|lateral y|, std) of the modelV2 left road edge near the car.
+
+    No existing Carrot helper estimates the left edge (the only roadEdges
+    consumer is the web vision overlay), so read modelV2 directly:
+    roadEdges[0] (left edge), the point with x in 0-10 m nearest to 5 m, and
+    roadEdgeStds[0] - one scalar per edge (modeld/fill_model_msg.py:156).
+    """
+    try:
+      edge = model.roadEdges[0]
+      xs = edge.x
+      ys = edge.y
+      best_idx = None
+      best_dx = None
+      for i, xv in enumerate(xs):
+        x = float(xv)
+        if 0.0 <= x <= 10.0:
+          dx = abs(x - 5.0)
+          if best_dx is None or dx < best_dx:
+            best_dx = dx
+            best_idx = i
+      if best_idx is None or best_idx >= len(ys):
+        return None
+      dist = abs(float(ys[best_idx]))
+      std = abs(float(model.roadEdgeStds[0]))
+      if not (np.isfinite(dist) and np.isfinite(std)):
+        return None
+      return dist, std
+    except Exception:
+      return None
+
+  def _update_a4_lane_tracking(self, model, v_ego_kph: float) -> None:
+    """W74D (A4): the fresh-blinker (turned on after the stop) start way-in
+    requires the left road edge (<= 5.6 m, std <= 0.6 m) to pass the median of
+    the last 3 s before the stop and to keep passing for >= 1.0 s continuously
+    at standstill; approach and standstill medians must agree within 1.0 m.
+    Missing samples or a too-high std keep the condition False."""
+    self.a4_frame += 1
+    stopped = v_ego_kph < TLV_STANDSTILL_MPS * CV.MS_TO_KPH
+    sample = self._a4_left_edge_sample(model) if model is not None else None
+    if not stopped:
+      self.a4_approach.append((self.a4_frame, sample))
+      self.a4_stop_frame = None
+      self.a4_approach_median = None
+      self.a4_standstill_dists.clear()
+      self.a4_standstill_ok_frames = 0
+      self.a4_lane_ok = False
+      return
+    if self.a4_stop_frame is None:
+      self.a4_stop_frame = self.a4_frame
+      window = [s for f, s in self.a4_approach if f > self.a4_frame - TLV_A4_APPROACH_WINDOW_FRAMES]
+      if window and all(s is not None for s in window) and max(s[1] for s in window) <= TLV_A4_EDGE_STD_MAX_M:
+        self.a4_approach_median = float(np.median([s[0] for s in window]))
+    if sample is not None:
+      self.a4_standstill_dists.append(sample[0])
+      if sample[1] <= TLV_A4_EDGE_STD_MAX_M and sample[0] <= TLV_A4_LEFT_EDGE_MAX_M:
+        self.a4_standstill_ok_frames += 1
+      else:
+        self.a4_standstill_ok_frames = 0
+    else:
+      self.a4_standstill_ok_frames = 0
+    if self.a4_approach_median is not None and self.a4_standstill_dists:
+      stand_median = float(np.median(self.a4_standstill_dists))
+      self.a4_lane_ok = (
+        self.a4_approach_median <= TLV_A4_LEFT_EDGE_MAX_M
+        and self.a4_standstill_ok_frames >= TLV_A4_STANDSTILL_MIN_FRAMES
+        and abs(stand_median - self.a4_approach_median) <= TLV_A4_MEDIAN_DISAGREE_M
+      )
+    else:
+      self.a4_lane_ok = False
+
   def _update_carrot_man(self, sm, v_ego_kph, v_cruise_kph):
     atc_active = False
+    carstate = sm['carState']
+    self._update_left_blinker_pre_stop(carstate, v_ego_kph)
     carrot_man = get_carrot_man(sm)
     if carrot_man is not None:
+      state_in = int(carrot_man.trafficState)
+      src_in = int(getattr(carrot_man, 'trafficStateSrc', 0))
+      tlv_src = src_in == 1
       atc_turn_left = carrot_man.atcType in ["turn left", "atc left"]
+      gas = bool(carstate.gasPressed)
+      engaged = self._engaged(sm)
+      v_stopped = v_ego_kph < TLV_STANDSTILL_MPS * CV.MS_TO_KPH
+      v_moving_end = v_ego_kph > TLV_MOVE_END_MPS * CV.MS_TO_KPH
+      cooldown = self.tlv_gas_cooldown_frames > 0
       # A start trigger produced by the on-device carrotTlv detector may start
       # the car only while the supercombo model is not signalling a stop, i.e.
       # both cues agree (ONE extra gate for tlv-originated red->green AND
       # red->left edges).
       tlv_start_disagrees = (
-        int(getattr(carrot_man, 'trafficStateSrc', 0)) == 1
-        and carrot_man.trafficState in (2, 3)
+        tlv_src
+        and state_in in (2, 3)
         and getattr(self, 'last_model_stop_sign', False)
       )
+      # W74D (A): a TLV red->left start also needs a nearby routed left
+      # (carrotMan.atcType; carrotMan.xDistToTurn <= 150 m, int metres from
+      # navInstruction.maneuverDistance) or a left blinker already on before
+      # the stop; the right blinker vetoes it.
+      route_left_near = atc_turn_left and carrot_man.xDistToTurn <= TLV_ROUTE_LEFT_NEAR_M
+      # A4: a left blinker turned on only after the stop is allowed in the
+      # leftmost two lanes (model-confident left edge) instead of pre-stop on.
+      fresh_blinker_lane_ok = bool(carstate.leftBlinker) and self.a4_lane_ok
+      left_start_allowed = (
+        route_left_near or self.left_blinker_pre_stop or fresh_blinker_lane_ok
+      ) and not bool(carstate.rightBlinker)
       trigger_start = self.carrot_stay_stop = False
-      if atc_turn_left or sm['carState'].leftBlinker:
-        if self.trafficState_carrot == 1 and carrot_man.trafficState == 3: # red -> left triggered
+      if atc_turn_left or carstate.leftBlinker:
+        if self.trafficState_carrot == 1 and state_in == 3:  # red -> left triggered
+          if tlv_src:
+            trigger_start = (not tlv_start_disagrees) and left_start_allowed and not cooldown
+          else:
+            trigger_start = not tlv_start_disagrees
+        elif state_in in [1, 2]:
+          # TLV red/left keeps the stop only outside the gas cooldown;
+          # non-TLV sources stay byte-identical to the pre-W74D behavior.
+          self.carrot_stay_stop = not (tlv_src and cooldown)
+      elif self.trafficState_carrot == 1 and state_in == 2:  # red -> green triggered
+        if tlv_src:
+          trigger_start = (not tlv_start_disagrees) and not cooldown
+        else:
           trigger_start = not tlv_start_disagrees
-        elif carrot_man.trafficState in [1, 2]:
-          self.carrot_stay_stop = True
-      elif self.trafficState_carrot == 1 and carrot_man.trafficState == 2:  # red -> green triggered
-        trigger_start = not tlv_start_disagrees
       else:
         trigger_start = False
+      # B1: a confirmed TLV red at standstill survives an unknown (0) for up
+      # to 120 s so a later green/left edge can still fire; unknown never
+      # counts as go. Gas, disengage, > 1 m/s or expiry end the hold.
+      if self.tlv_standstill_hold_frames > 0:
+        if state_in != 0 or gas or not engaged or v_moving_end:
+          self.tlv_standstill_hold_frames = 0
+        else:
+          self.tlv_standstill_hold_frames -= 1
+      hold_armed = (
+        self.trafficState_carrot == 1 and self.trafficState_carrot_src == 1
+        and v_stopped and engaged and not gas and not cooldown
+      )
+      if state_in != 0:
+        # Any non-zero TLV state ends the current unknown run.
+        self.tlv_hold_run = False
+      elif not self.tlv_hold_run:
+        # First unknown frame of this run: arm at most one full 120 s hold.
+        # The run never re-arms after the hold expires (spec: the hold ends
+        # when 120 s elapsed) until a non-zero state starts a new run.
+        self.tlv_hold_run = True
+        if hold_armed and self.tlv_standstill_hold_frames == 0:
+          self.tlv_standstill_hold_frames = TLV_RED_HOLD_FRAMES
+      hold_skip_store = state_in == 0 and self.tlv_standstill_hold_frames > 0
       # Graded redLikely (4) must never overwrite the last confirmed state:
       # 1 -> 4 -> 2/3 would otherwise lose the red->green / red->left edge.
       # 4 is not red here, and it is not in (2, 3) for tlv_start_disagrees.
-      if not tlv_start_disagrees and carrot_man.trafficState != 4:
-        self.trafficState_carrot = carrot_man.trafficState
+      if not tlv_start_disagrees and state_in != 4 and not hold_skip_store:
+        self.trafficState_carrot = state_in
+        self.trafficState_carrot_src = src_in
       # else: hold the previous value so the start edge can fire later once
       # the model's stop cue clears; a tlv trigger that decays away first
       # leaves normal (non-tlv) behavior untouched.
@@ -421,6 +616,9 @@ class CarrotPlanner:
       v_cruise_kph = min(v_cruise_kph, carrot_man.desiredSpeed)
     else:
       self.trafficState_carrot = 0
+      self.trafficState_carrot_src = 0
+      self.tlv_standstill_hold_frames = 0
+      self.tlv_hold_run = False
       self.carrot_stay_stop = False
       self.activeCarrot = 0
       self.xDistToTurn = 0
@@ -451,6 +649,7 @@ class CarrotPlanner:
     signal a go. Never adds braking; mode 0/1 keep the pre-W74C behavior."""
     self.coast_cap_active = (
       self.trafficLightDetectMode == 2 and self.tlv_red_likely and not self.last_model_start_sign
+      and self.tlv_gas_cooldown_frames == 0
     )
 
   def cruise_eco_control(self, v_ego_kph, v_cruise_kph):
@@ -520,6 +719,12 @@ class CarrotPlanner:
 
 
     v_cruise_kph = self.cruise_eco_control(v_ego_cluster_kph, v_cruise_kph)
+    self._update_tlv_gas_cooldown(carstate)
+    try:
+      model_v2 = sm['modelV2']
+    except Exception:
+      model_v2 = None
+    self._update_a4_lane_tracking(model_v2, v_ego_kph)
     v_cruise_kph, atc_active = self._update_carrot_man(sm, v_ego_kph, v_cruise_kph)
     
     #if atc_active and not self.atc_active and self.xState not in [XState.e2eStop, XState.e2eStopped, XState.lead]:

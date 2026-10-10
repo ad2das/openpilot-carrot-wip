@@ -58,6 +58,9 @@ RED_LIKELY_MIN_PROB = 0.6
 # Classifier votes keep a track alive this long after the last detection, so a
 # slow detector cadence cannot drop a light the fast classifier still sees.
 VOTE_TRACK_KEEP_S = 0.75
+# Same-track green (W74D): a TLV green/left start edge is only valid from the
+# tracked light that was confirmed red/redLeft within this window.
+GO_AFTER_RED_WINDOW_S = 120.0
 
 # (window frames, required hits). Asymmetric on purpose: red is confirmed fast
 # (safety stop), green is confirmed slowly (never start on a flicker).
@@ -170,6 +173,9 @@ class Track:
   history: deque[tuple[int, int]] = field(default_factory=lambda: deque(maxlen=64))
   # Lamp-classifier votes: (monotonic time, class, probability), bounded deque.
   votes: deque[tuple[float, int, float]] = field(default_factory=lambda: deque(maxlen=32))
+  # Last red-family confirmation time (monotonic); the W74D same-track green
+  # window. None until this track was ever confirmed red/redLeft.
+  red_confirmed_s: float | None = None
 
   @property
   def cx(self) -> float:
@@ -338,6 +344,19 @@ class TrafficLightTracker:
       if track.track_id == track_id:
         return track
     return None
+
+  def note_red_confirmations(self, now: float, confirmed: list[tuple[Track, int, float]]) -> None:
+    """Record red-family confirmations for the same-track goAfterRed window."""
+    for track, cls, _conf in confirmed:
+      if int(cls) in RED_FAMILY:
+        track.red_confirmed_s = float(now)
+
+  def go_after_red(self, track_id: int, now: float) -> bool:
+    """True when this track was confirmed red/redLeft within 120 s."""
+    track = self.track_by_id(track_id)
+    if track is None or track.red_confirmed_s is None:
+      return False
+    return 0.0 <= now - track.red_confirmed_s <= GO_AFTER_RED_WINDOW_S
 
 
 def estimate_distance_m(box_height_px: float, focal_px: float, housing_m: float = HOUSING_HEIGHT_M) -> float:

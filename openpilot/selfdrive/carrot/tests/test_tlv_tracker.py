@@ -261,3 +261,47 @@ def test_confirm_track_prefers_red_and_keeps_the_detector_belt():
   assert t.confirm_track(track, 5, 1.4, use_classifier=True) == (int(LampClass.RED), 1.0)
   # The classifier-less path is byte-identical to the detector belt.
   assert t.confirm_track(track, 5, 1.4, use_classifier=False) == (int(LampClass.GREEN), 0.75)
+
+
+# ---------------------------------------------------------------------------
+# W74D (B2): same-track goAfterRed window
+# ---------------------------------------------------------------------------
+
+OTHER_BOX = (600.0, 300.0, 640.0, 340.0)
+
+
+def test_go_after_red_same_track_red_confirmed_then_green():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.RED)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  t.note_red_confirmations(0.0, [(track, int(LampClass.RED), 1.0)])
+  assert t.go_after_red(track.track_id, 0.5) is True
+
+
+def test_go_after_red_other_tracks_green_is_false():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.RED)], "far", 2648.0, now=0.0)
+  t.update(1, [det(LampClass.GREEN, box=OTHER_BOX)], "far", 2648.0, now=0.05)
+  assert len(t.tracks) == 2
+  red_track = next(track for track in t.tracks if track.cx < 500.0)
+  green_track = next(track for track in t.tracks if track.cx >= 500.0)
+  t.note_red_confirmations(0.05, [(red_track, int(LampClass.RED), 1.0)])
+  assert t.go_after_red(red_track.track_id, 1.0) is True
+  assert t.go_after_red(green_track.track_id, 1.0) is False
+
+
+def test_go_after_red_without_prior_red_is_false():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  assert t.go_after_red(t.tracks[0].track_id, 0.0) is False
+  assert t.go_after_red(123456, 0.0) is False  # unknown track id
+
+
+def test_go_after_red_window_is_120s():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.RED)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  # redLeft is red-family: it also refreshes the window (Korean left phase).
+  t.note_red_confirmations(10.0, [(track, int(LampClass.RED_LEFT), 1.0)])
+  assert t.go_after_red(track.track_id, 130.0) is True    # exactly 120 s
+  assert t.go_after_red(track.track_id, 130.001) is False  # beyond the window
