@@ -136,9 +136,12 @@ _install_pc_shims()
 from openpilot.cereal import log
 from openpilot.common.filter_simple import MyMovingAverage
 from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.carrot import carrot_functions
 from openpilot.selfdrive.carrot.carrot_functions import (
   CarrotPlanner,
   TLV_A4_APPROACH_WINDOW_FRAMES,
+  TLV_COAST_MAX_MOVING_FRAMES,
+  TLV_COAST_MAX_MOVING_S,
   TLV_GAS_COOLDOWN_FRAMES,
   TLV_RED_HOLD_FRAMES,
   XState,
@@ -415,13 +418,29 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   planner.a4_standstill_dists = collections.deque(maxlen=200)
   planner.a4_standstill_ok_frames = 0
   planner.a4_lane_ok = False
+  planner.tlv_coast_moving_frames = 0
+  planner.tlv_coast_stop_sign_seen = False
+  planner.tlv_coast_released = False
+  planner.tlv_veto_active = False
+  planner.tlv_veto_started = 0.0
+  planner.tlv_red_confirmed_at = None
+  planner.tlv_log_veto_t = -1e9
+  planner.tlv_log_clear_t = -1e9
+  planner.tlv_log_coast_t = -1e9
   return planner
 
 
-def gate_sm(carrot_man, left=False, right=False, gas=False, enabled=True):
-  return FakeSM(carrotMan=carrot_man,
-                carState=SimpleNamespace(leftBlinker=left, rightBlinker=right, gasPressed=gas),
-                selfdriveState=SimpleNamespace(enabled=enabled))
+def gate_sm(carrot_man, left=False, right=False, gas=False, enabled=True, model=None, radar=None):
+  services = {
+    'carrotMan': carrot_man,
+    'carState': SimpleNamespace(leftBlinker=left, rightBlinker=right, gasPressed=gas),
+    'selfdriveState': SimpleNamespace(enabled=enabled),
+  }
+  if model is not None:
+    services['modelV2'] = model
+  if radar is not None:
+    services['radarState'] = radar
+  return FakeSM(**services)
 
 
 def test_tlv_green_holds_start_while_model_signals_stop():
@@ -550,12 +569,22 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
     setattr(planner, f"cruiseMaxVals{index}", 1.6)
   planner.tlv_red_active = False
   planner.last_model_start_sign = False
+  planner.last_model_stop_sign = False
   planner.coast_cap_active = False
   planner.tlv_gas_cooldown_frames = 0
   planner.tlv_standstill_hold_frames = 0
   planner.trafficState_carrot = 0
   planner.trafficState_carrot_src = 0
   planner.carrot_stay_stop = False
+  planner.tlv_coast_moving_frames = 0
+  planner.tlv_coast_stop_sign_seen = False
+  planner.tlv_coast_released = False
+  planner.tlv_veto_active = False
+  planner.tlv_veto_started = 0.0
+  planner.tlv_red_confirmed_at = None
+  planner.tlv_log_veto_t = -1e9
+  planner.tlv_log_clear_t = -1e9
+  planner.tlv_log_coast_t = -1e9
   return planner
 
 
@@ -574,24 +603,36 @@ def test_red_active_reader_requires_fresh_tlv_source():
   assert planner._read_tlv_red_active(FakeSM()) is False
 
 
-def test_coast_cap_only_mode2_without_model_start():
+def test_coast_cap_ignores_model_start_sign_and_requires_mode2():
+  # W74D follow-up: startSign is True while cruising toward a red the model has
+  # not noticed (model_v ~ 17-22 m/s), so it must not release the cap.
   planner = accel_planner(2)
   planner.tlv_red_active = True
   planner.last_model_start_sign = True
-  planner._update_coast_cap()
-  assert planner.coast_cap_active is False  # model is signalling a go
+  planner._update_coast_cap(22.2)
+  assert planner.coast_cap_active is True
   planner.last_model_start_sign = False
-  planner._update_coast_cap()
+  planner._update_coast_cap(22.2)
   assert planner.coast_cap_active is True
   for mode in (0, 1):
     legacy = accel_planner(mode)
     legacy.tlv_red_active = True
-    legacy.last_model_start_sign = False
-    legacy._update_coast_cap()
+    legacy._update_coast_cap(22.2)
     assert legacy.coast_cap_active is False
   idle = accel_planner(2)
-  idle._update_coast_cap()
+  idle._update_coast_cap(22.2)
   assert idle.coast_cap_active is False  # no red active
+
+
+def test_highway_red_with_model_start_sign_keeps_cap_on():
+  # Regression for the Claude-found defect: 80 km/h, model_v ~ 22 m/s makes
+  # startSign True; the cap must still engage toward a TLV-confirmed red.
+  planner = accel_planner(2)
+  planner.tlv_red_active = planner._read_tlv_red_active(
+    FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
+  planner.last_model_start_sign = True
+  planner._update_coast_cap(80.0 / 3.6)
+  assert planner.coast_cap_active is True
 
 
 def test_coast_cap_survives_promotion_from_graded_to_confirmed_red():
@@ -601,19 +642,19 @@ def test_coast_cap_survives_promotion_from_graded_to_confirmed_red():
   for state in (4, 1):
     planner.tlv_red_active = planner._read_tlv_red_active(
       FakeSM(carrotMan=carrot_man_message(state=state, src=1)))
-    planner._update_coast_cap()
+    planner._update_coast_cap(22.2)
     assert planner.tlv_red_active is True
     assert planner.coast_cap_active is True
 
 
-def test_confirmed_red_cap_drops_when_model_signals_go():
+def test_confirmed_red_cap_stays_on_at_standstill_with_model_start_sign():
   planner = accel_planner(2)
   planner.tlv_red_active = planner._read_tlv_red_active(
     FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
   assert planner.tlv_red_active is True
   planner.last_model_start_sign = True
-  planner._update_coast_cap()
-  assert planner.coast_cap_active is False
+  planner._update_coast_cap(0.0)
+  assert planner.coast_cap_active is True  # no creeping into the red
 
 
 def test_confirmed_red_cap_only_mode2():
@@ -622,7 +663,7 @@ def test_confirmed_red_cap_only_mode2():
     planner.tlv_red_active = planner._read_tlv_red_active(
       FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
     assert planner.tlv_red_active is True
-    planner._update_coast_cap()
+    planner._update_coast_cap(22.2)
     assert planner.coast_cap_active is False
 
 
@@ -631,7 +672,7 @@ def test_non_tlv_confirmed_red_keeps_cap_off():
   planner.tlv_red_active = planner._read_tlv_red_active(
     FakeSM(carrotMan=carrot_man_message(state=1, src=0)))
   assert planner.tlv_red_active is False
-  planner._update_coast_cap()
+  planner._update_coast_cap(22.2)
   assert planner.coast_cap_active is False
 
 
@@ -639,16 +680,76 @@ def test_confirmed_red_cap_gas_cooldown_and_rearm():
   planner = accel_planner(2)
   planner.tlv_red_active = planner._read_tlv_red_active(
     FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
-  planner._update_coast_cap()
+  planner._update_coast_cap(0.0)
   assert planner.coast_cap_active is True
   planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
-  planner._update_coast_cap()
+  planner._update_coast_cap(0.0)
   assert planner.coast_cap_active is False  # suppressed during the cooldown
   for _ in range(TLV_GAS_COOLDOWN_FRAMES):
     planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
-    planner._update_coast_cap()
+    planner._update_coast_cap(0.0)
   assert planner.tlv_gas_cooldown_frames == 0
   assert planner.coast_cap_active is True  # re-armed while still confirmed red
+
+
+def test_coast_timeout_releases_after_12s_moving_without_stop_sign(monkeypatch):
+  events = []
+  monkeypatch.setattr(carrot_functions, 'cloudlog',
+                      SimpleNamespace(event=lambda name, **kw: events.append((name, kw))))
+  planner = accel_planner(2)
+  planner.tlv_red_active = True
+  planner.tlv_red_confirmed_at = 90.0  # frozen clock at 100.0 -> 10 s old
+  for _ in range(TLV_COAST_MAX_MOVING_FRAMES):
+    planner._update_coast_cap(22.2)
+    assert planner.coast_cap_active is True
+  planner._update_coast_cap(22.2)
+  assert planner.tlv_coast_released is True
+  assert planner.coast_cap_active is False
+  timeouts = [e for e in events if e[0] == 'tlv_coast_timeout']
+  assert len(timeouts) == 1
+  assert timeouts[0][1]['v_ego'] == 22.2
+  assert timeouts[0][1]['moving_s'] >= TLV_COAST_MAX_MOVING_S
+  assert timeouts[0][1]['red_age_s'] == pytest.approx(10.0)
+  # Latched: stays released while the red persists, no repeated events.
+  for _ in range(50):
+    planner._update_coast_cap(22.2)
+    assert planner.coast_cap_active is False
+  assert len([e for e in events if e[0] == 'tlv_coast_timeout']) == 1
+  # Leaving (1, 4) and coming back re-arms a fresh window.
+  planner.tlv_red_active = False
+  planner._update_coast_cap(22.2)
+  assert planner.tlv_coast_released is False
+  planner.tlv_red_active = True
+  planner._update_coast_cap(22.2)
+  assert planner.coast_cap_active is True
+
+
+def test_coast_timeout_never_releases_when_stop_sign_seen(monkeypatch):
+  events = []
+  monkeypatch.setattr(carrot_functions, 'cloudlog',
+                      SimpleNamespace(event=lambda name, **kw: events.append((name, kw))))
+  planner = accel_planner(2)
+  planner.tlv_red_active = True
+  for i in range(TLV_COAST_MAX_MOVING_FRAMES + 80):
+    planner.last_model_stop_sign = (i == 5)  # stopSign arms within the window
+    planner._update_coast_cap(22.2)
+    assert planner.coast_cap_active is True
+  assert planner.tlv_coast_released is False
+  assert [e for e in events if e[0] == 'tlv_coast_timeout'] == []
+
+
+def test_coast_cap_standstill_holds_indefinitely(monkeypatch):
+  events = []
+  monkeypatch.setattr(carrot_functions, 'cloudlog',
+                      SimpleNamespace(event=lambda name, **kw: events.append((name, kw))))
+  planner = accel_planner(2)
+  planner.tlv_red_active = True
+  planner.last_model_start_sign = True
+  for _ in range(TLV_COAST_MAX_MOVING_FRAMES + 60):
+    planner._update_coast_cap(0.0)
+    assert planner.coast_cap_active is True
+  assert planner.tlv_coast_released is False
+  assert [e for e in events if e[0] == 'tlv_coast_timeout'] == []
 
 
 def test_coast_cap_zeroes_accel_and_never_adds_braking():
@@ -812,15 +913,15 @@ def test_gas_cooldown_suppresses_and_rearms_the_red_active_cap():
   planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
   assert planner.tlv_gas_cooldown_frames == TLV_GAS_COOLDOWN_FRAMES
   assert planner.coast_cap_active is False
-  planner._update_coast_cap()
+  planner._update_coast_cap(0.0)
   assert planner.coast_cap_active is False  # suppressed during the cooldown
   for _ in range(TLV_GAS_COOLDOWN_FRAMES - 1):
     planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
-    planner._update_coast_cap()
+    planner._update_coast_cap(0.0)
   assert planner.tlv_gas_cooldown_frames == 1
   assert planner.coast_cap_active is False
   planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
-  planner._update_coast_cap()
+  planner._update_coast_cap(0.0)
   assert planner.tlv_gas_cooldown_frames == 0
   assert planner.coast_cap_active is True  # rearmed 10 s after release
 
@@ -947,3 +1048,74 @@ def test_a4_right_blinker_still_blocks():
   sm = gate_sm(carrot_man_message(state=3, src=1), left=True, right=True)
   planner._update_carrot_man(sm, 0.0, 60.0)
   assert planner.xState == XState.e2eStopped
+
+
+# ---------------------------------------------------------------------------
+# W74D follow-up (Claude review): start-veto measurement events
+# ---------------------------------------------------------------------------
+
+def _record_events(monkeypatch):
+  events = []
+  monkeypatch.setattr(carrot_functions, 'cloudlog',
+                      SimpleNamespace(event=lambda name, **kw: events.append((name, kw))))
+  return events
+
+
+def test_tlv_start_veto_logs_one_event_per_blocked_edge(monkeypatch):
+  events = _record_events(monkeypatch)
+  planner = planner_for_gate(stop_sign=True)
+  planner.tlv_red_confirmed_at = 97.0  # frozen clock at 100.0 -> 3 s old
+  model = SimpleNamespace(position=SimpleNamespace(x=np.array([0.0, 5.0, 42.0])),
+                          velocity=SimpleNamespace(x=np.array([12.0, 15.0, 22.0])))
+  radar = SimpleNamespace(leadOne=SimpleNamespace(status=True, dRel=30.5))
+  sm = gate_sm(carrot_man_message(state=2, src=1), model=model, radar=radar)
+  for _ in range(3):
+    planner._update_carrot_man(sm, 0.0, 60.0)
+  vetoes = [e for e in events if e[0] == 'tlv_start_veto']
+  assert len(vetoes) == 1  # one per blocked edge, not per frame
+  fields = vetoes[0][1]
+  assert fields['state_in'] == 2
+  assert fields['v_ego'] == 0.0
+  assert fields['model_x'] == 42.0
+  assert fields['model_v'] == 22.0
+  assert fields['lead_d_rel'] == 30.5
+  assert fields['left_intent'] is False
+  assert fields['red_age_s'] == pytest.approx(3.0)
+  assert planner.xState == XState.e2eStopped  # the start is still vetoed
+  # The model stop cue clears: the held start fires once and is logged.
+  planner.last_model_stop_sign = False
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  cleared = [e for e in events if e[0] == 'tlv_start_veto_cleared']
+  assert len(cleared) == 1
+  assert cleared[0][1]['delay_s'] >= 0.0
+  assert planner.xState == XState.e2eCruise
+
+
+def test_tlv_start_veto_logs_left_edge_once(monkeypatch):
+  events = _record_events(monkeypatch)
+  planner = planner_for_gate(stop_sign=True)
+  sm = gate_sm(carrot_man_message(state=3, src=1, atc_type="turn left", x_dist=50))
+  for _ in range(2):
+    planner._update_carrot_man(sm, 0.0, 60.0)
+  vetoes = [e for e in events if e[0] == 'tlv_start_veto']
+  assert len(vetoes) == 1
+  assert vetoes[0][1]['state_in'] == 3
+  assert vetoes[0][1]['left_intent'] is True
+  planner.last_model_stop_sign = False
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert len([e for e in events if e[0] == 'tlv_start_veto_cleared']) == 1
+
+
+def test_tlv_start_veto_rate_limited_within_2s(monkeypatch):
+  events = _record_events(monkeypatch)
+  planner = planner_for_gate(stop_sign=True)
+  sm = gate_sm(carrot_man_message(state=2, src=1))
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert [e[0] for e in events] == ['tlv_start_veto']
+  # The edge decays, then a new blocked edge appears inside the 2 s window.
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
+  assert planner.tlv_veto_active is False
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert planner.tlv_veto_active is True
+  assert [e[0] for e in events] == ['tlv_start_veto']  # second event suppressed

@@ -8,6 +8,16 @@ import numpy as np
 from openpilot.common.realtime import DT_MDL
 from openpilot.common.constants import CV
 from openpilot.common.filter_simple import MyMovingAverage
+
+try:
+  from openpilot.common.swaglog import cloudlog
+except ImportError:  # PC test environment has no zmq; the vehicle always imports it.
+  class _NullCloudlog:
+    @staticmethod
+    def event(name, **kwargs):
+      pass
+
+  cloudlog = _NullCloudlog()
 from openpilot.selfdrive.carrot.carrot_man_input import CARROT_MAN_TIMEOUT, get_carrot_man
 from openpilot.selfdrive.carrot.t_follow import (
   get_t_follow_mode_factor, get_t_follow_mode_max, get_speed_t_follow_factor, get_lead_response_for_gap, ramp_t_follow,
@@ -62,6 +72,13 @@ TLV_STANDSTILL_MPS = 0.3
 TLV_MOVE_END_MPS = 1.0
 TLV_RED_HOLD_FRAMES = int(120.0 / DT_MDL)
 TLV_GAS_COOLDOWN_FRAMES = int(10.0 / DT_MDL)
+# W74D follow-up (Claude review): the model start sign must not release the
+# coast cap; a moving run without any model stopSign is bounded by this limit
+# so a stuck false red only coasts. TLV_LOG_MIN_INTERVAL_S rate-limits the TLV
+# measurement events (at most one per kind).
+TLV_COAST_MAX_MOVING_S = 12.0
+TLV_COAST_MAX_MOVING_FRAMES = int(TLV_COAST_MAX_MOVING_S / DT_MDL)
+TLV_LOG_MIN_INTERVAL_S = 2.0
 TLV_ROUTE_LEFT_NEAR_M = 150.0
 TLV_BLINKER_STOP_GAP_S = 0.5
 # W74D (A4): a left blinker turned on only after stopping is allowed only in
@@ -195,6 +212,16 @@ class CarrotPlanner:
     self.last_model_start_sign = False
     self.tlv_red_active = False
     self.coast_cap_active = False
+    # W74D follow-up: moving-timeout and veto instrumentation state.
+    self.tlv_coast_moving_frames = 0
+    self.tlv_coast_stop_sign_seen = False
+    self.tlv_coast_released = False
+    self.tlv_veto_active = False
+    self.tlv_veto_started = 0.0
+    self.tlv_red_confirmed_at = None
+    self.tlv_log_veto_t = -1e9
+    self.tlv_log_clear_t = -1e9
+    self.tlv_log_coast_t = -1e9
 
   def _params_update(self):
     self.frame += 1
@@ -568,6 +595,25 @@ class CarrotPlanner:
           trigger_start = not tlv_start_disagrees
       else:
         trigger_start = False
+      # W74D instrument: exactly one cloudlog event per blocked TLV start edge
+      # (rate-limited 2 s per kind). The episode ends when the held start fires
+      # (cleared event, delay_s) or the edge decays (state leaves 2/3 or the
+      # confirmed red ends).
+      left_intent = bool(atc_turn_left or carstate.leftBlinker)
+      blocked_edge = (
+        tlv_start_disagrees and self.trafficState_carrot == 1
+        and ((state_in == 3 and left_intent) or (state_in == 2 and not left_intent))
+      )
+      if self.tlv_veto_active:
+        if trigger_start:
+          self._log_tlv_start_veto_cleared()
+          self.tlv_veto_active = False
+        elif not blocked_edge:
+          self.tlv_veto_active = False
+      elif blocked_edge:
+        self.tlv_veto_active = True
+        self.tlv_veto_started = time.monotonic()
+        self._log_tlv_start_veto(sm, state_in, v_ego_kph * CV.KPH_TO_MS, left_intent)
       # B1: a confirmed TLV red at standstill survives an unknown (0) for up
       # to 120 s so a later green/left edge can still fire; unknown never
       # counts as go. Gas, disengage, > 1 m/s or expiry end the hold.
@@ -600,6 +646,11 @@ class CarrotPlanner:
       # else: hold the previous value so the start edge can fire later once
       # the model's stop cue clears; a tlv trigger that decays away first
       # leaves normal (non-tlv) behavior untouched.
+      if self.trafficState_carrot == 1 and self.trafficState_carrot_src == 1:
+        if self.tlv_red_confirmed_at is None:
+          self.tlv_red_confirmed_at = time.monotonic()
+      else:
+        self.tlv_red_confirmed_at = None
 
       if trigger_start:
         if self.soft_hold_active > 0:
@@ -620,6 +671,8 @@ class CarrotPlanner:
       self.tlv_standstill_hold_frames = 0
       self.tlv_hold_run = False
       self.carrot_stay_stop = False
+      self.tlv_red_confirmed_at = None
+      self.tlv_veto_active = False
       self.activeCarrot = 0
       self.xDistToTurn = 0
       self.atcType = ""
@@ -648,14 +701,80 @@ class CarrotPlanner:
     except Exception:
       return False
 
-  def _update_coast_cap(self) -> None:
+  def _update_coast_cap(self, v_ego: float) -> None:
     """TLV red active (confirmed 1 or graded 4) -> coast (accel cap 0): mode 2
-    only, model must not signal a go. Never adds braking; mode 0/1 keep the
-    pre-W74C behavior."""
-    self.coast_cap_active = (
-      self.trafficLightDetectMode == 2 and self.tlv_red_active and not self.last_model_start_sign
-      and self.tlv_gas_cooldown_frames == 0
-    )
+    only, gas cooldown respected. Never adds braking; mode 0/1 keep the pre-W74C
+    behavior. The model start sign does NOT release the cap (it stays True while
+    cruising toward a red the model has not noticed). A moving run longer than
+    TLV_COAST_MAX_MOVING_S without any model stopSign releases the cap, latched
+    until the TLV state leaves (1, 4); standstill keeps the cap so the car
+    cannot creep into the red."""
+    if not self.tlv_red_active:
+      self.tlv_coast_moving_frames = 0
+      self.tlv_coast_stop_sign_seen = False
+      self.tlv_coast_released = False
+    cap = (self.trafficLightDetectMode == 2 and self.tlv_red_active
+           and self.tlv_gas_cooldown_frames == 0)
+    if cap:
+      if self.last_model_stop_sign:
+        self.tlv_coast_stop_sign_seen = True
+      if v_ego > TLV_MOVE_END_MPS:
+        self.tlv_coast_moving_frames += 1
+        if (self.tlv_coast_moving_frames > TLV_COAST_MAX_MOVING_FRAMES
+            and not self.tlv_coast_stop_sign_seen):
+          if not self.tlv_coast_released:
+            self._log_tlv_coast_timeout(v_ego)
+          self.tlv_coast_released = True
+      else:
+        self.tlv_coast_moving_frames = 0
+        self.tlv_coast_stop_sign_seen = False
+    else:
+      self.tlv_coast_moving_frames = 0
+      self.tlv_coast_stop_sign_seen = False
+    self.coast_cap_active = cap and not self.tlv_coast_released
+
+  def _tlv_red_age_s(self, now: float):
+    if self.tlv_red_confirmed_at is None:
+      return None
+    return max(0.0, now - self.tlv_red_confirmed_at)
+
+  def _log_tlv_start_veto(self, sm, state_in: int, v_ego: float, left_intent: bool) -> None:
+    """W74D instrument: one event per blocked TLV start edge, rate-limited."""
+    now = time.monotonic()
+    if now - self.tlv_log_veto_t < TLV_LOG_MIN_INTERVAL_S:
+      return
+    self.tlv_log_veto_t = now
+    model_x = model_v = lead_d_rel = None
+    try:
+      model = sm['modelV2']
+      model_x = float(model.position.x[-1])
+      model_v = float(model.velocity.x[-1])
+    except Exception:
+      pass
+    try:
+      lead = sm['radarState'].leadOne
+      lead_d_rel = float(lead.dRel) if lead.status else None
+    except Exception:
+      pass
+    cloudlog.event("tlv_start_veto", state_in=int(state_in), v_ego=float(v_ego),
+                   model_x=model_x, model_v=model_v, lead_d_rel=lead_d_rel,
+                   left_intent=bool(left_intent), red_age_s=self._tlv_red_age_s(now))
+
+  def _log_tlv_start_veto_cleared(self) -> None:
+    now = time.monotonic()
+    if now - self.tlv_log_clear_t < TLV_LOG_MIN_INTERVAL_S:
+      return
+    self.tlv_log_clear_t = now
+    cloudlog.event("tlv_start_veto_cleared", delay_s=max(0.0, now - self.tlv_veto_started))
+
+  def _log_tlv_coast_timeout(self, v_ego: float) -> None:
+    now = time.monotonic()
+    if now - self.tlv_log_coast_t < TLV_LOG_MIN_INTERVAL_S:
+      return
+    self.tlv_log_coast_t = now
+    cloudlog.event("tlv_coast_timeout", v_ego=float(v_ego),
+                   moving_s=float(self.tlv_coast_moving_frames * DT_MDL),
+                   red_age_s=self._tlv_red_age_s(now))
 
   def cruise_eco_control(self, v_ego_kph, v_cruise_kph):
     v_cruise_kph_apply = v_cruise_kph
@@ -769,11 +888,12 @@ class CarrotPlanner:
     if self.myDrivingMode == DrivingMode.High or self.trafficLightDetectMode == 0:
       self.trafficState = TrafficState.off
 
-    # TLV red active (W74D fix: graded redLikely 4 or confirmed red 1,
-    # CONTRACT.md High-speed approach): mode 2 only, coast (accel cap 0) while
-    # the supercombo model is not signalling a go.
+    # TLV red active (W74D: graded redLikely 4 or confirmed red 1, CONTRACT.md
+    # High-speed approach): mode 2 only, coast (accel cap 0). The model start
+    # sign does not release the cap; a stuck false red is bounded by the moving
+    # time limit inside _update_coast_cap.
     self.tlv_red_active = self._read_tlv_red_active(sm)
-    self._update_coast_cap()
+    self._update_coast_cap(v_ego)
 
     #self.update_user_control()
     if carstate.gasPressed or carstate.brakePressed:
