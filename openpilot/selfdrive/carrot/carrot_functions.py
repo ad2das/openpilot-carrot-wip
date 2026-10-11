@@ -193,7 +193,7 @@ class CarrotPlanner:
     self.trafficStopModelLeadOffset = 0.0
     self.last_event_time = 0.0
     self.last_model_start_sign = False
-    self.tlv_red_likely = False
+    self.tlv_red_active = False
     self.coast_cap_active = False
 
   def _params_update(self):
@@ -626,11 +626,15 @@ class CarrotPlanner:
 
     return v_cruise_kph, atc_active
 
-  def _read_tlv_red_likely(self, sm) -> bool:
-    """Graded redLikely from carrotMan: fresh TLV-sourced trafficState 4.
+  def _read_tlv_red_active(self, sm) -> bool:
+    """TLV red active from carrotMan: fresh TLV-sourced trafficState 1 or 4.
 
-    Read directly (not via get_carrot_man, which needs an active navigation
-    speed) so the grade also works at a red light with no route set.
+    State 4 is the graded redLikely, state 1 the confirmed red. The left-intent
+    exception is already applied upstream by carrot_serv: redLeft/left with an
+    active turn intent maps to "Left turn" (state 3), so state 1 here is a
+    straight red for our path and needs no extra check. Read directly (not via
+    get_carrot_man, which needs an active navigation speed) so the grade also
+    works at a red light with no route set.
     """
     try:
       service = 'carrotMan'
@@ -640,15 +644,16 @@ class CarrotPlanner:
         return False
       carrot_man = sm[service]
       return (int(getattr(carrot_man, 'trafficStateSrc', 0)) == 1
-              and int(getattr(carrot_man, 'trafficState', 0)) == 4)
+              and int(getattr(carrot_man, 'trafficState', 0)) in (1, 4))
     except Exception:
       return False
 
   def _update_coast_cap(self) -> None:
-    """Graded redLikely -> coast (accel cap 0): mode 2 only, model must not
-    signal a go. Never adds braking; mode 0/1 keep the pre-W74C behavior."""
+    """TLV red active (confirmed 1 or graded 4) -> coast (accel cap 0): mode 2
+    only, model must not signal a go. Never adds braking; mode 0/1 keep the
+    pre-W74C behavior."""
     self.coast_cap_active = (
-      self.trafficLightDetectMode == 2 and self.tlv_red_likely and not self.last_model_start_sign
+      self.trafficLightDetectMode == 2 and self.tlv_red_active and not self.last_model_start_sign
       and self.tlv_gas_cooldown_frames == 0
     )
 
@@ -764,9 +769,10 @@ class CarrotPlanner:
     if self.myDrivingMode == DrivingMode.High or self.trafficLightDetectMode == 0:
       self.trafficState = TrafficState.off
 
-    # Graded redLikely (CONTRACT.md High-speed approach): mode 2 only, coast
-    # (accel cap 0) while the supercombo model is not signalling a go.
-    self.tlv_red_likely = self._read_tlv_red_likely(sm)
+    # TLV red active (W74D fix: graded redLikely 4 or confirmed red 1,
+    # CONTRACT.md High-speed approach): mode 2 only, coast (accel cap 0) while
+    # the supercombo model is not signalling a go.
+    self.tlv_red_active = self._read_tlv_red_active(sm)
     self._update_coast_cap()
 
     #self.update_user_control()

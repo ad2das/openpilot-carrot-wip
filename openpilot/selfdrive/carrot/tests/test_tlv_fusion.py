@@ -548,7 +548,7 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
   planner.mySafeFactor = 1.0
   for index in range(7):
     setattr(planner, f"cruiseMaxVals{index}", 1.6)
-  planner.tlv_red_likely = False
+  planner.tlv_red_active = False
   planner.last_model_start_sign = False
   planner.coast_cap_active = False
   planner.tlv_gas_cooldown_frames = 0
@@ -559,20 +559,24 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
   return planner
 
 
-def test_red_likely_reader_requires_fresh_tlv_source():
+def test_red_active_reader_requires_fresh_tlv_source():
   planner = CarrotPlanner.__new__(CarrotPlanner)
-  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=4, src=1))) is True
-  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=4, src=0))) is False
-  assert planner._read_tlv_red_likely(FakeSM(carrotMan=carrot_man_message(state=1, src=1))) is False
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=4, src=1))) is True
+  # W74D fix: a confirmed red (state 1, src 1) must also read as active.
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=1, src=1))) is True
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=4, src=0))) is False
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=1, src=0))) is False
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=2, src=1))) is False
+  assert planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=3, src=1))) is False
   stale = FakeSM(carrotMan=carrot_man_message(state=4, src=1))
   stale.recv_time['carrotMan'] = 50.0  # frozen clock at 100.0 -> 50 s old
-  assert planner._read_tlv_red_likely(stale) is False
-  assert planner._read_tlv_red_likely(FakeSM()) is False
+  assert planner._read_tlv_red_active(stale) is False
+  assert planner._read_tlv_red_active(FakeSM()) is False
 
 
 def test_coast_cap_only_mode2_without_model_start():
   planner = accel_planner(2)
-  planner.tlv_red_likely = True
+  planner.tlv_red_active = True
   planner.last_model_start_sign = True
   planner._update_coast_cap()
   assert planner.coast_cap_active is False  # model is signalling a go
@@ -581,13 +585,70 @@ def test_coast_cap_only_mode2_without_model_start():
   assert planner.coast_cap_active is True
   for mode in (0, 1):
     legacy = accel_planner(mode)
-    legacy.tlv_red_likely = True
+    legacy.tlv_red_active = True
     legacy.last_model_start_sign = False
     legacy._update_coast_cap()
     assert legacy.coast_cap_active is False
   idle = accel_planner(2)
   idle._update_coast_cap()
-  assert idle.coast_cap_active is False  # no redLikely
+  assert idle.coast_cap_active is False  # no red active
+
+
+def test_coast_cap_survives_promotion_from_graded_to_confirmed_red():
+  # W74D fix scenario: 80 km/h, red confirmed about 110 m out before
+  # supercombo arms its stopSign. 4 -> 1 must not open a cap-off gap frame.
+  planner = accel_planner(2)
+  for state in (4, 1):
+    planner.tlv_red_active = planner._read_tlv_red_active(
+      FakeSM(carrotMan=carrot_man_message(state=state, src=1)))
+    planner._update_coast_cap()
+    assert planner.tlv_red_active is True
+    assert planner.coast_cap_active is True
+
+
+def test_confirmed_red_cap_drops_when_model_signals_go():
+  planner = accel_planner(2)
+  planner.tlv_red_active = planner._read_tlv_red_active(
+    FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
+  assert planner.tlv_red_active is True
+  planner.last_model_start_sign = True
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is False
+
+
+def test_confirmed_red_cap_only_mode2():
+  for mode in (0, 1):
+    planner = accel_planner(mode)
+    planner.tlv_red_active = planner._read_tlv_red_active(
+      FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
+    assert planner.tlv_red_active is True
+    planner._update_coast_cap()
+    assert planner.coast_cap_active is False
+
+
+def test_non_tlv_confirmed_red_keeps_cap_off():
+  planner = accel_planner(2)
+  planner.tlv_red_active = planner._read_tlv_red_active(
+    FakeSM(carrotMan=carrot_man_message(state=1, src=0)))
+  assert planner.tlv_red_active is False
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is False
+
+
+def test_confirmed_red_cap_gas_cooldown_and_rearm():
+  planner = accel_planner(2)
+  planner.tlv_red_active = planner._read_tlv_red_active(
+    FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is True
+  planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
+  planner._update_coast_cap()
+  assert planner.coast_cap_active is False  # suppressed during the cooldown
+  for _ in range(TLV_GAS_COOLDOWN_FRAMES):
+    planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=False))
+    planner._update_coast_cap()
+  assert planner.tlv_gas_cooldown_frames == 0
+  assert planner.coast_cap_active is True  # re-armed while still confirmed red
 
 
 def test_coast_cap_zeroes_accel_and_never_adds_braking():
@@ -743,10 +804,10 @@ def test_tlv_red_hold_gas_clears_and_does_not_rearm():
 # W74D (B3): gas override cooldown
 # ---------------------------------------------------------------------------
 
-def test_gas_cooldown_suppresses_and_rearms_the_red_likely_cap():
+def test_gas_cooldown_suppresses_and_rearms_the_red_active_cap():
   planner = accel_planner(2)
   planner.coast_cap_active = True
-  planner.tlv_red_likely = True
+  planner.tlv_red_active = True
   planner.last_model_start_sign = False
   planner._update_tlv_gas_cooldown(SimpleNamespace(gasPressed=True))
   assert planner.tlv_gas_cooldown_frames == TLV_GAS_COOLDOWN_FRAMES
