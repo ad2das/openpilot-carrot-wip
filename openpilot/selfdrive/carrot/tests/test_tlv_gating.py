@@ -143,7 +143,18 @@ from openpilot.selfdrive.carrot.tlv import tlvd
 from openpilot.system.manager import process_config
 
 
+_KEY_TYPES = {
+  "CarrotTlvMode": int,
+  "TrafficLightDetectMode": int,
+  "CarrotTlvRecentStarts": str,
+  "CarrotTlvBackend": str,
+  "CarrotTlvModelPath": str,
+}
+
+
 class FakeParams:
+  """Mirrors params_pyx exact-type casting: put() rejects a mismatched type."""
+
   def __init__(self, values=None):
     self.values = dict(values or {})
     self.writes = []
@@ -156,8 +167,18 @@ class FakeParams:
     return 0 if value is None else int(value)
 
   def put(self, key, value, block=True):
+    expected = _KEY_TYPES.get(key)
+    if expected is None:
+      raise KeyError(f"unknown param: {key}")
+    if type(value) is not expected:
+      raise TypeError(f"Type mismatch while writing param {key}: {type(value)!r} != {expected.__name__}")
     self.writes.append((key, value))
     self.values[key] = value
+
+  def put_int(self, key, value, block=True):
+    if type(value) is not int:
+      raise TypeError(f"put_int requires int for {key}: {type(value)!r}")
+    self.put(key, value, block)
 
 
 def _install_fake_params_module(monkeypatch, params):
@@ -207,9 +228,9 @@ def test_crash_loop_guard_five_starts_ok_sixth_clears_mode():
   base = 1000.0
   for i in range(5):
     assert tlvd.crash_loop_guard(params, base + i) is False
-  assert ("CarrotTlvMode", b"0") not in params.writes
+  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
   assert tlvd.crash_loop_guard(params, base + 5) is True
-  assert params.values["CarrotTlvMode"] == b"0"
+  assert params.values["CarrotTlvMode"] == 0
   assert "1005.0" in params.values["CarrotTlvRecentStarts"]
 
 
@@ -244,6 +265,19 @@ def test_crash_loop_guard_survives_recent_starts_write_failure():
       raise RuntimeError("disk full")
 
   assert tlvd.crash_loop_guard(NoPut(), 100.0) is False
+
+
+def test_strict_fake_rejects_the_old_bytes_idiom():
+  params = FakeParams({"CarrotTlvMode": 2, "CarrotTlvRecentStarts": ""})
+  with pytest.raises(TypeError):
+    params.put("CarrotTlvMode", b"0")
+  with pytest.raises(TypeError):
+    params.put("CarrotTlvMode", "0")
+  with pytest.raises(TypeError):
+    params.put("CarrotTlvRecentStarts", b"1.0")
+  params.put("CarrotTlvMode", 0)
+  params.put_int("CarrotTlvMode", 0)
+  assert params.values["CarrotTlvMode"] == 0
 
 
 # -- tlvd.main() -------------------------------------------------------------
@@ -284,4 +318,31 @@ def test_main_crash_loop_clears_mode_and_skips_runner(monkeypatch):
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
   assert started == []
-  assert params.values["CarrotTlvMode"] == b"0"
+  assert params.values["CarrotTlvMode"] == 0
+
+
+def test_handle_hard_exit_clears_mode_with_put_int(monkeypatch):
+  params = FakeParams({"CarrotTlvMode": 2})
+  runner = tlvd.TlvRunner.__new__(tlvd.TlvRunner)
+  runner.params = params
+  runner._hard_exit_reason = "rss_hard"
+  published = []
+  monkeypatch.setattr(runner, "_publish", lambda status, reason: published.append((status, reason)))
+  runner._handle_hard_exit()
+  assert params.values["CarrotTlvMode"] == 0
+  assert published == [("error", "rss_hard")]
+
+
+def test_main_treats_raising_traffic_light_detect_read_as_off(monkeypatch):
+  class RaisingParams(FakeParams):
+    def get_int(self, key, block=False):
+      if key == "TrafficLightDetectMode":
+        raise RuntimeError("param read failed")
+      return super().get_int(key, block)
+
+  params = RaisingParams({"CarrotTlvMode": 2})
+  _install_fake_params_module(monkeypatch, params)
+  started = _install_recording_runner(monkeypatch)
+  tlvd.main()
+  assert started == []
+  assert params.writes == []

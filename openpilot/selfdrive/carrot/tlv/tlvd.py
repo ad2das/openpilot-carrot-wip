@@ -314,7 +314,7 @@ class TlvRunner:
     reason = self._hard_exit_reason or "rss_hard"
     self._publish("error", reason)
     try:
-      self.params.put("CarrotTlvMode", b"0")
+      self.params.put_int("CarrotTlvMode", 0)
     except Exception as exc:
       print(f"tlvd: failed to clear CarrotTlvMode on {reason}: {exc!r}", flush=True)
     print(f"tlvd: hard memory limit ({reason}); exiting without restart", flush=True)
@@ -508,7 +508,7 @@ def crash_loop_guard(params, now: float) -> bool:
   if len(starts) <= CRASH_LOOP_MAX_STARTS:
     return False
   try:
-    params.put("CarrotTlvMode", b"0")
+    params.put_int("CarrotTlvMode", 0)
   except Exception as exc:
     print(f"tlvd: failed to clear CarrotTlvMode on crash loop: {exc!r}", flush=True)
   return True
@@ -520,7 +520,7 @@ def main() -> None:
   if _param_int(params, "CarrotTlvMode") < 1:
     print("tlvd: disabled (CarrotTlvMode off)", flush=True)
     return
-  if _param_int(params, "TrafficLightDetectMode", 2) < 1:
+  if _param_int(params, "TrafficLightDetectMode") < 1:
     print("tlvd: disabled (TrafficLightDetectMode off)", flush=True)
     return
   if crash_loop_guard(params, time.monotonic()):

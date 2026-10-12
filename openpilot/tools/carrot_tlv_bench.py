@@ -580,6 +580,28 @@ def _param_bytes(params, key: str):
     return None
 
 
+def _int_param(params, key: str, default: int = 0) -> int:
+  try:
+    value = params.get_int(key)
+  except Exception:
+    return default
+  return default if value is None else int(value)
+
+
+def _param_text(value):
+  if value is None:
+    return None
+  if isinstance(value, bytes):
+    return value.decode("utf-8", "replace")
+  return str(value)
+
+
+def _tlvd_phase_error(params) -> str | None:
+  """Reason when TrafficLightDetectMode keeps tlvd from starting, else None."""
+  mode = _int_param(params, "TrafficLightDetectMode")
+  return None if mode >= 1 else f"TrafficLightDetectMode={mode}"
+
+
 def _put_raw(params, key: str, value) -> None:
   try:
     params.put(key, value)
@@ -624,15 +646,20 @@ def main(argv=None) -> int:
   baseline_report = tlv_report = soak_report = None
   try:
     print("carrot_tlv_bench: baseline phase (tlvd off) ...", file=sys.stderr)
-    _put_raw(params, "CarrotTlvMode", b"0")
+    _put_raw(params, "CarrotTlvMode", 0)
     time.sleep(3.0)
     baseline_report = _collect(sm, args.baseline_s)
 
+    block = _tlvd_phase_error(params)
+    if block is not None:
+      print(f"carrot_tlv_bench: {block}; tlvd will not start, aborting tlvd/soak phases", file=sys.stderr)
+      return 2
+
     print("carrot_tlv_bench: tlvd phase (mode 1) ...", file=sys.stderr)
-    _put_raw(params, "CarrotTlvBackend", args.backend.encode())
+    _put_raw(params, "CarrotTlvBackend", args.backend)
     if args.model_path is not None:
-      _put_raw(params, "CarrotTlvModelPath", args.model_path.encode())
-    _put_raw(params, "CarrotTlvMode", b"1")
+      _put_raw(params, "CarrotTlvModelPath", args.model_path)
+    _put_raw(params, "CarrotTlvMode", 1)
     deadline = time.monotonic() + args.startup_wait_s
     while time.monotonic() < deadline and not sm.seen.get("carrotTlv"):
       sm.update(100)
@@ -656,7 +683,7 @@ def main(argv=None) -> int:
   result["parameters"] = {
     "baseline_s": args.baseline_s, "tlv_s": args.tlv_s, "soak_min": args.soak_min,
     "backend": args.backend, "model_path": args.model_path,
-    "original_mode": None if original_mode is None else original_mode.decode("utf-8", "replace"),
+    "original_mode": _param_text(original_mode),
   }
   print(json.dumps(result, indent=2))
   return 0 if result["verdict"] == "pass" else 1

@@ -1,5 +1,9 @@
 """Tests for the pure gate evaluation + /proc parsing in tools/carrot_tlv_bench.py."""
+import importlib
 import importlib.util
+import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -266,3 +270,73 @@ def test_summarize_phase_includes_classifier_stats():
   empty = bench.summarize_phase({"seconds": 1.0, "proc_samples": []})
   assert empty["tlv_classify_rate_hz_median"] is None
   assert empty["tlv_time_to_confirm_s_median"] is None
+
+
+class _MainFakeParams:
+  def __init__(self, values=None):
+    self.values = dict(values or {})
+    self.writes = []
+
+  def get(self, key, block=False, return_default=False):
+    return self.values.get(key)
+
+  def get_int(self, key, block=False):
+    value = self.values.get(key, 0)
+    return 0 if value is None else int(value)
+
+  def put(self, key, value, block=True):
+    self.writes.append((key, value))
+    self.values[key] = value
+
+
+def _install_main_stubs(monkeypatch, params, sm=None):
+  params_module = types.ModuleType("openpilot.common.params")
+  params_module.Params = lambda: params
+  monkeypatch.setitem(sys.modules, "openpilot.common.params", params_module)
+  session = sm if sm is not None else types.SimpleNamespace(seen={}, update=lambda *a, **k: None)
+  messaging_module = types.ModuleType("openpilot.cereal.messaging")
+  messaging_module.SubMaster = lambda *a, **k: session
+  monkeypatch.setitem(sys.modules, "openpilot.cereal.messaging", messaging_module)
+  # `import openpilot.cereal.messaging as messaging` follows the parent package
+  # attribute when the real module was already imported by another test.
+  parent = importlib.import_module("openpilot.cereal")
+  monkeypatch.setattr(parent, "messaging", messaging_module, raising=False)
+
+
+def _patch_bench_time(monkeypatch):
+  monkeypatch.setattr(bench, "time", types.SimpleNamespace(sleep=lambda *_: None,
+                                                           monotonic=bench.time.monotonic))
+
+
+def test_main_aborts_tlvd_phases_when_traffic_light_detect_off(monkeypatch, capsys):
+  params = _MainFakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 0, "CarrotTlvBackend": "null"})
+  _install_main_stubs(monkeypatch, params)
+  _patch_bench_time(monkeypatch)
+  calls = []
+  monkeypatch.setattr(bench, "_collect", lambda sm, seconds, **k: calls.append(seconds) or {"seconds": seconds})
+  rc = bench.main(["--baseline-s", "0", "--tlv-s", "0", "--soak-min", "0"])
+  assert rc == 2
+  assert calls == [0.0]  # the baseline ran, the tlvd and soak phases were aborted
+  err = capsys.readouterr().err
+  assert "TrafficLightDetectMode=0" in err
+  assert "tlvd will not start" in err
+  assert ("CarrotTlvMode", 1) not in params.writes
+
+
+def test_main_runs_phases_when_traffic_light_detect_enabled(monkeypatch, capsys):
+  params = _MainFakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 2, "CarrotTlvBackend": "null"})
+  sm = types.SimpleNamespace(seen={"carrotTlv": True}, update=lambda *a, **k: None)
+  _install_main_stubs(monkeypatch, params, sm=sm)
+  _patch_bench_time(monkeypatch)
+  calls = []
+  monkeypatch.setattr(bench, "_collect", lambda sm, seconds, **k: calls.append(seconds) or {"seconds": seconds})
+  monkeypatch.setattr(bench, "summarize_phase", lambda report: {"counts": {"tlv_msgs": 0}})
+  monkeypatch.setattr(bench, "evaluate_gates", lambda baseline, tlv, soak: {"verdict": "pass"})
+  rc = bench.main(["--baseline-s", "5", "--tlv-s", "6", "--soak-min", "0"])
+  assert rc == 0
+  assert calls == [5.0, 6.0]
+  payload = json.loads(capsys.readouterr().out)
+  assert payload["verdict"] == "pass"
+  assert payload["parameters"]["original_mode"] == "2"
+  assert ("CarrotTlvMode", 1) in params.writes
+  assert params.values["CarrotTlvMode"] == 2  # restore wrote the original back
