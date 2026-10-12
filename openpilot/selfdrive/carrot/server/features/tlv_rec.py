@@ -16,6 +16,8 @@ traversal cannot reach the filesystem.
 from __future__ import annotations
 
 import asyncio
+import html
+import json
 import os
 import re
 import shutil
@@ -26,6 +28,7 @@ from datetime import datetime
 from aiohttp import web
 
 REC_ROOT = "/data/media/0/carrot_tlv_rec"
+DSP_PROBE_ROOT = "/data/media/0/carrot_tlv_rec/dsp_probe"
 SESSION_NAME_RE = re.compile(r"^\d{8}-\d{6}$")
 ZIP_CHUNK_BYTES = 256 * 1024
 STREAM_QUEUE_MAX = 8
@@ -80,6 +83,36 @@ def list_sessions(root: str | None = None) -> list[dict]:
   return sessions
 
 
+def latest_dsp_probe(root: str | None = None) -> dict | None:
+  """Newest dsp_probe result (openpilot/selfdrive/carrot/tlv/dsp_probe.py), best-effort."""
+  root = root if root is not None else DSP_PROBE_ROOT
+  try:
+    names = [name for name in os.listdir(root) if name.endswith(".json")]
+  except OSError:
+    return None
+  newest_path = None
+  newest_mtime = -1.0
+  for name in names:
+    path = os.path.join(root, name)
+    try:
+      mtime = os.path.getmtime(path)
+    except OSError:
+      continue
+    if mtime > newest_mtime:
+      newest_path, newest_mtime = path, mtime
+  if newest_path is None:
+    return None
+  try:
+    with open(newest_path, encoding="utf-8") as f:
+      payload = json.load(f)
+  except (OSError, ValueError):
+    return None
+  if not isinstance(payload, dict):
+    return None
+  payload["file"] = os.path.basename(newest_path)
+  return payload
+
+
 class _ChunkSink:
   """Unseekable zipfile sink; drain() hands the buffered bytes out as chunks."""
 
@@ -125,6 +158,11 @@ def iter_zip_chunks(session_dir: str, chunk_size: int = ZIP_CHUNK_BYTES):
 async def api_tlv_rec_sessions(_request: web.Request) -> web.Response:
   sessions = await asyncio.to_thread(list_sessions)
   return web.json_response(sessions)
+
+
+async def api_tlv_rec_dsp_probe(_request: web.Request) -> web.Response:
+  probe = await asyncio.to_thread(latest_dsp_probe)
+  return web.json_response({"ok": True, "probe": probe})
 
 
 async def api_tlv_rec_download(request: web.Request) -> web.StreamResponse:
@@ -203,6 +241,8 @@ th{color:#aaa;font-weight:normal}
 a.btn,button.btn{display:inline-block;background:#2a6df4;color:#fff;border:0;border-radius:4px;
 padding:5px 10px;font-size:13px;text-decoration:none;cursor:pointer;margin-right:6px}
 button.del{background:#a33}
+td.ok{color:#6f6}
+td.bad{color:#f77}
 tr.empty td{color:#888;text-align:center;padding:24px}
 """
 
@@ -217,7 +257,49 @@ document.querySelectorAll('button.del').forEach(function(btn){
 """
 
 
-def _page_html(sessions: list[dict]) -> str:
+_PROBE_STEP_LABELS = {
+  "presence": "DSP \uc5f0\uacb0/\ud234\uccb4\uc778",
+  "smoke": "tinygrad DSP \uc2a4\ubaa8\ud06c",
+  "detector": "\uac80\ucd9c\uae30 ONNX",
+}
+_PROBE_STATUS_LABELS = {"pass": "\ud1b5\uacfc", "fail": "\uc2e4\ud328", "timeout": "\uc2dc\uac04 \ucd08\uacfc", "skipped": "\uac74\ub108\ub700"}
+
+
+def _probe_detail(step: dict) -> str:
+  name = step.get("name")
+  if step.get("status") != "pass":
+    return html.escape(str(step.get("error") or ""))[:160]
+  if name == "smoke":
+    return f"\uccab \uc2e4\ud589 {step.get('first_ms', '?')} ms / \uc911\uc559\uac12 {step.get('steady_median_ms', '?')} ms"
+  if name == "detector":
+    return (f"\ucef4\ud30c\uc77c {step.get('compile_s', '?')} s / \uc911\uc559\uac12 {step.get('steady_median_ms', '?')} ms / "
+            f"p90 {step.get('steady_p90_ms', '?')} ms / CPU \ub300\ube44 \ucd5c\ub300\ucc28\uc774 {step.get('max_abs_diff', '?')}")
+  if name == "presence":
+    clang = step.get("clang") or {}
+    return f"clang {clang.get('status', '?')}"
+  return ""
+
+
+def _probe_section(probe: dict | None) -> str:
+  section = "<h2>DSP \uc2dc\ud5d8 \uacb0\uacfc</h2>"
+  if not probe:
+    return section + '<p class="hint">\uc544\uc9c1 \uacb0\uacfc\uac00 \uc5c6\uc2b5\ub2c8\ub2e4. \uc8fc\ucc28(\uc2dc\ub3d9 \uafb8\uc9d0) \uc0c1\ud0dc\uc5d0\uc11c \uc790\ub3d9\uc73c\ub85c \uac80\uc0ac\ud569\ub2c8\ub2e4.</p>'
+  steps = probe.get("steps") or {}
+  rows = []
+  for name in ("presence", "smoke", "detector"):
+    step = steps.get(name) or {"status": "skipped"}
+    status = _PROBE_STATUS_LABELS.get(str(step.get("status")), str(step.get("status", "?")))
+    css = "ok" if step.get("status") == "pass" else "bad"
+    detail = _probe_detail(step)
+    rows.append(f'<tr><td>{_PROBE_STEP_LABELS[name]}</td><td class="{css}">{status}</td><td>{detail}</td></tr>')
+  overall = "\ud1b5\uacfc" if probe.get("ok") else "\uc2e4\ud328"
+  meta = f"commit {html.escape(str(probe.get('commit', '?')))} / {html.escape(str(probe.get('timestamp', '?')))} / \uc885\ud569 {overall}"
+  return (section + f'<p class="hint">{meta}</p>'
+          + "<table><thead><tr><th>\ub2e8\uacc4</th><th>\uacb0\uacfc</th><th>\uc2dc\uac04/\uc624\ub958</th></tr></thead><tbody>"
+          + "".join(rows) + "</tbody></table>")
+
+
+def _page_html(sessions: list[dict], probe: dict | None = None) -> str:
   rows = []
   for session in sessions:
     size_mb = session["bytes"] / (1024 * 1024)
@@ -246,17 +328,19 @@ def _page_html(sessions: list[dict]) -> str:
     "<table><thead><tr><th>\uc138\uc158</th><th>\ud06c\uae30</th><th>\ud30c\uc77c</th>"
     "<th>\ucc98\uc74c</th><th>\ub9c8\uc9c0\ub9c9</th><th></th></tr></thead><tbody>"
     + "".join(rows) +
-    f"</tbody></table><script>{_PAGE_JS}</script></body></html>"
+    f"</tbody></table>{_probe_section(probe)}<script>{_PAGE_JS}</script></body></html>"
   )
 
 
 async def tlv_rec_page(_request: web.Request) -> web.Response:
   sessions = await asyncio.to_thread(list_sessions)
-  return web.Response(text=_page_html(sessions), content_type="text/html", charset="utf-8")
+  probe = await asyncio.to_thread(latest_dsp_probe)
+  return web.Response(text=_page_html(sessions, probe), content_type="text/html", charset="utf-8")
 
 
 def register(app: web.Application) -> None:
   app.router.add_get("/api/tlv_rec/sessions", api_tlv_rec_sessions)
   app.router.add_get("/api/tlv_rec/sessions/{name}.zip", api_tlv_rec_download)
   app.router.add_delete("/api/tlv_rec/sessions/{name}", api_tlv_rec_delete)
+  app.router.add_get("/api/tlv_rec/dsp_probe", api_tlv_rec_dsp_probe)
   app.router.add_get("/tlv_rec", tlv_rec_page)

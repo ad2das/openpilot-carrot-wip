@@ -142,6 +142,15 @@ def enable_tlvd(started, params, CP: car.CarParams) -> bool:
   except Exception:
     return False
 
+def enable_tlv_dsp_probe(started, params, CP: car.CarParams) -> bool:
+  # Offroad one-time Hexagon DSP probe (W70 decision data). The result file for
+  # the current commit latches it off; see .../tlv/dsp_probe.py should_run().
+  try:
+    from openpilot.selfdrive.carrot.tlv import dsp_probe
+    return dsp_probe.should_run(started, params)
+  except Exception:
+    return False
+
 procs = [
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
 

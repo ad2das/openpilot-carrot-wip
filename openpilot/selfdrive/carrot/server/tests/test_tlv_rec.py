@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import io
+import json
 import os
 import zipfile
 from pathlib import Path
@@ -164,6 +165,66 @@ def test_page_is_korean_and_self_contained(tmp_path):
       assert "20260101-120000" in html
       assert "/api/tlv_rec/sessions/20260101-120000.zip" in html
       assert "http://" not in html and "https://" not in html
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_api_and_page_without_result(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(tmp_path / "dsp_probe"))
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.get("/api/tlv_rec/dsp_probe")
+      assert resp.status == 200
+      assert await resp.json() == {"ok": True, "probe": None}
+      page = await (await client.get("/tlv_rec")).text()
+      assert "DSP 시험 결과" in page
+      assert "아직 결과가 없습니다" in page
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  probe_root = tmp_path / "dsp_probe"
+  probe_root.mkdir()
+  payload = {
+    "commit": "abc1234",
+    "timestamp": "2026-10-13T08:00:00+09:00",
+    "device_type": "tici",
+    "agnos_version": "19.8",
+    "ok": False,
+    "error": None,
+    "steps": {
+      "presence": {"name": "presence", "status": "pass", "clang": {"status": "pass"}},
+      "smoke": {"name": "smoke", "status": "pass", "first_ms": 12.0, "steady_median_ms": 3.0},
+      "detector": {"name": "detector", "status": "fail", "error": "DSP op unsupported"},
+    },
+  }
+  (probe_root / "abc1234.json").write_text(json.dumps(payload), encoding="utf-8")
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.get("/api/tlv_rec/dsp_probe")
+      data = await resp.json()
+      assert data["ok"] is True
+      assert data["probe"]["commit"] == "abc1234"
+      assert data["probe"]["file"] == "abc1234.json"
+      assert data["probe"]["steps"]["detector"]["status"] == "fail"
+      page = await (await client.get("/tlv_rec")).text()
+      assert "DSP 시험 결과" in page
+      assert "통과" in page
+      assert "실패" in page
+      assert "DSP op unsupported" in page
+      assert "3.0" in page
     finally:
       await client.close()
 

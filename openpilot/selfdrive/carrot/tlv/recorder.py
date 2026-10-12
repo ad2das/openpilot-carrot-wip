@@ -144,11 +144,9 @@ class TlvRecorder:
     """Queue one view crop if the sampling policy allows it. Never raises."""
     slot: int | None = None
     try:
-      if not self.active:
-        return False
       prev_state = self._prev_state
       self._prev_state = int(state)
-      if self._paused is not None:
+      if not self.active or self._paused is not None:
         return False
 
       light = bool(dets) or bool(tracks) or bool(red_likely) or int(state) != 0

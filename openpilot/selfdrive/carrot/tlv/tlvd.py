@@ -50,6 +50,7 @@ LEFT_INTENT_ATCTYPES = ("turn left", "atc left")
 PROC_POLL_S = 1.0
 STATS_INTERVAL_S = 10.0
 ERROR_LOG_INTERVAL_S = 10.0
+RECORDER_RETRY_S = 60.0
 MAX_PUBLISHED_DETS = 16
 # Crash-loop guard: more than this many starts inside the window turns
 # CarrotTlvMode off so a struggling device cannot keep relaunching tlvd.
@@ -157,14 +158,13 @@ class TlvRunner:
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
     # Shadow-mode training recorder: CarrotTlvMode == 1 only, never mode 2.
-    # On a PC it is constructed only when a test injects a root.
+    # _poll_system re-reads the mode every second, so a live 1 <-> 2 switch
+    # takes effect without a tlvd restart; the root is only injected by tests.
+    self._recorder_root = recorder_root
+    self._recorder_last_try = -RECORDER_RETRY_S
+    self._recorder_failures = 0
     self.recorder = None
-    if _param_int(params, "CarrotTlvMode") == 1 and (_host_is_tici() or recorder_root is not None):
-      try:
-        self.recorder = recorder.TlvRecorder(root=recorder_root, active=True)
-        print(f"tlvd: recorder root={self.recorder.root}", flush=True)
-      except Exception as exc:
-        print(f"tlvd: recorder disabled: {exc!r}", flush=True)
+    self._sync_recorder_mode()
 
     self.governor = resources.DutyCycleGovernor()
     self.cpu_guard = resources.CpuContentionGuard()
@@ -342,6 +342,7 @@ class TlvRunner:
     if now - self._last_proc_poll < PROC_POLL_S:
       return
     self._last_proc_poll = now
+    self._sync_recorder_mode()
     self._cpu_reason = self.cpu_guard.update(now, resources.read_text(PROC_STAT))
     rss_bytes = resources.read_rss_bytes(PROC_SELF_STATM, self.page_size)
     mem_available = resources.read_mem_available_bytes(PROC_MEMINFO)
@@ -376,6 +377,31 @@ class TlvRunner:
       self.recorder.close(timeout_s=1.0)
     except Exception:
       pass
+
+  def _sync_recorder_mode(self) -> None:
+    """1 Hz CarrotTlvMode check: only mode 1 records.
+
+    The manager does not restart tlvd when the mode changes 1 <-> 2
+    (enable_tlvd is true for both), so the recorder is (de)activated here at
+    the existing poll. A tlvd that started in mode 2 constructs the recorder
+    lazily on the first mode-1 poll (TICI or an injected test root)."""
+    mode = _param_int(self.params, "CarrotTlvMode")
+    if self.recorder is not None:
+      self.recorder.active = mode == 1
+      return
+    if mode != 1 or not (_host_is_tici() or self._recorder_root is not None):
+      return
+    now = time.monotonic()
+    if now - self._recorder_last_try < RECORDER_RETRY_S:
+      return  # backoff so a failing construction cannot retry every second
+    self._recorder_last_try = now
+    try:
+      self.recorder = recorder.TlvRecorder(root=self._recorder_root, active=True)
+      print(f"tlvd: recorder root={self.recorder.root}", flush=True)
+    except Exception as exc:
+      self._recorder_failures += 1
+      if self._recorder_failures == 1:
+        print(f"tlvd: recorder disabled: {exc!r}", flush=True)
 
   # -- watchdog -------------------------------------------------------------
 
