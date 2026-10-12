@@ -113,6 +113,26 @@ def latest_dsp_probe(root: str | None = None) -> dict | None:
   return payload
 
 
+def _probe_commit() -> str:
+  from openpilot.selfdrive.carrot.tlv import dsp_probe
+  return dsp_probe.current_commit_short()
+
+
+def clear_dsp_probe_files(root: str | None = None) -> list[str]:
+  """Delete this commit's .json/.attempt/.progress so the probe can run again."""
+  root = root if root is not None else DSP_PROBE_ROOT
+  commit = _probe_commit()
+  removed = []
+  for suffix in (".json", ".attempt", ".progress"):
+    path = os.path.join(root, f"{commit}{suffix}")
+    try:
+      os.unlink(path)
+      removed.append(os.path.basename(path))
+    except OSError:
+      pass
+  return removed
+
+
 class _ChunkSink:
   """Unseekable zipfile sink; drain() hands the buffered bytes out as chunks."""
 
@@ -163,6 +183,12 @@ async def api_tlv_rec_sessions(_request: web.Request) -> web.Response:
 async def api_tlv_rec_dsp_probe(_request: web.Request) -> web.Response:
   probe = await asyncio.to_thread(latest_dsp_probe)
   return web.json_response({"ok": True, "probe": probe})
+
+
+async def api_tlv_rec_dsp_probe_retry(_request: web.Request) -> web.Response:
+  """User-triggered re-run: drop this commit's result/attempt/progress files."""
+  removed = await asyncio.to_thread(clear_dsp_probe_files)
+  return web.json_response({"ok": True, "removed": removed})
 
 
 async def api_tlv_rec_download(request: web.Request) -> web.StreamResponse:
@@ -247,6 +273,11 @@ tr.empty td{color:#888;text-align:center;padding:24px}
 """
 
 _PAGE_JS = """
+function retryDspProbe(){
+  if(!confirm('DSP \uc2dc\ud5d8\uc744 \ub2e4\uc2dc \uc2dc\uc791\ud560\uae4c\uc694? \uae30\ub85d\uc744 \uc9c0\uc6c1\ub2c8\ub2e4.')) return;
+  fetch('/api/tlv_rec/dsp_probe/retry', {method:'POST'})
+    .then(function(){location.reload();});
+}
 document.querySelectorAll('button.del').forEach(function(btn){
   btn.addEventListener('click', function(){
     if(!confirm('\uc774 \uc138\uc158\uc744 \uc0ad\uc81c\ud560\uae4c\uc694?')) return;
@@ -280,10 +311,18 @@ def _probe_detail(step: dict) -> str:
   return ""
 
 
+_PROBE_HINT = ("\uc8fc\ucc28(P) \uc0c1\ud0dc\ub85c \uc2dc\ub3d9\uc744 \ucf20 \ucc44 \uc57d 3\ubd84 \uae30\ub2e4\ub9ac\uba74 "
+               "\uc790\ub3d9\uc73c\ub85c \uc2dc\ud5d8\ud569\ub2c8\ub2e4. \uae30\uc5b4\ub97c \ubc14\uafb8\uba74 \uc989\uc2dc \uc911\ub2e8\ub429\ub2c8\ub2e4.")
+_PROBE_RETRY_BUTTON = ('<button class="btn" onclick="retryDspProbe()">'
+                       'DSP \uc2dc\ud5d8 \ub2e4\uc2dc \ud558\uae30</button>')
+
+
 def _probe_section(probe: dict | None) -> str:
-  section = "<h2>DSP \uc2dc\ud5d8 \uacb0\uacfc</h2>"
+  section = ("<h2>DSP \uc2dc\ud5d8 \uacb0\uacfc</h2>"
+             f'<p class="hint">{_PROBE_HINT}</p>')
   if not probe:
-    return section + '<p class="hint">\uc544\uc9c1 \uacb0\uacfc\uac00 \uc5c6\uc2b5\ub2c8\ub2e4. \uc8fc\ucc28(\uc2dc\ub3d9 \uafb8\uc9d0) \uc0c1\ud0dc\uc5d0\uc11c \uc790\ub3d9\uc73c\ub85c \uac80\uc0ac\ud569\ub2c8\ub2e4.</p>'
+    return (section + '<p class="hint">\uc544\uc9c1 \uacb0\uacfc\uac00 \uc5c6\uc2b5\ub2c8\ub2e4.</p>'
+            + f"<p>{_PROBE_RETRY_BUTTON}</p>")
   steps = probe.get("steps") or {}
   rows = []
   for name in ("presence", "smoke", "detector"):
@@ -296,7 +335,8 @@ def _probe_section(probe: dict | None) -> str:
   meta = f"commit {html.escape(str(probe.get('commit', '?')))} / {html.escape(str(probe.get('timestamp', '?')))} / \uc885\ud569 {overall}"
   return (section + f'<p class="hint">{meta}</p>'
           + "<table><thead><tr><th>\ub2e8\uacc4</th><th>\uacb0\uacfc</th><th>\uc2dc\uac04/\uc624\ub958</th></tr></thead><tbody>"
-          + "".join(rows) + "</tbody></table>")
+          + "".join(rows) + "</tbody></table>"
+          + f"<p>{_PROBE_RETRY_BUTTON}</p>")
 
 
 def _page_html(sessions: list[dict], probe: dict | None = None) -> str:
@@ -343,4 +383,5 @@ def register(app: web.Application) -> None:
   app.router.add_get("/api/tlv_rec/sessions/{name}.zip", api_tlv_rec_download)
   app.router.add_delete("/api/tlv_rec/sessions/{name}", api_tlv_rec_delete)
   app.router.add_get("/api/tlv_rec/dsp_probe", api_tlv_rec_dsp_probe)
+  app.router.add_post("/api/tlv_rec/dsp_probe/retry", api_tlv_rec_dsp_probe_retry)
   app.router.add_get("/tlv_rec", tlv_rec_page)

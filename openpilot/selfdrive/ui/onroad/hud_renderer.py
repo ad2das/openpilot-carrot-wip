@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from openpilot.common.constants import CV
 from openpilot.selfdrive.carrot.deceleration_source import deceleration_source_presentation
 from openpilot.selfdrive.ui.onroad import hud_style as hs
+from openpilot.selfdrive.ui.onroad.tlv_dsp_notice import TlvDspNotice
 from openpilot.selfdrive.ui.ui_state import ui_state, UIStatus
 from openpilot.system.hardware.usbgpu import usbgpu_badge_state
 from openpilot.system.ui.lib.application import gui_app, FontWeight
@@ -223,6 +224,7 @@ class HudRenderer(Widget):
     self._font_display = gui_app.font(FontWeight.DISPLAY)
 
     self._type = hs.Type()
+    self._tlv_dsp_notice = TlvDspNotice()
 
     self._set_speed_override = SetSpeedOverride()
     self._debug_speed_panel = False
@@ -361,7 +363,7 @@ class HudRenderer(Widget):
       self._plot_renderer = PlotRenderer()
     self._plot_renderer.draw(rect, self._font_display, self._show_plot_mode)
 
-    if not self._banner_alert_active():
+    if not self._banner_alert_active() and not self._tlv_dsp_notice.draw(rect):
       self._draw_clock(rect)
     self._draw_egpu_badge(rect)
     self._draw_cruise_speed_animation(rect)

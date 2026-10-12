@@ -184,6 +184,8 @@ def test_dsp_probe_api_and_page_without_result(tmp_path, monkeypatch):
       page = await (await client.get("/tlv_rec")).text()
       assert "DSP 시험 결과" in page
       assert "아직 결과가 없습니다" in page
+      assert "DSP 시험 다시 하기" in page
+      assert "주차(P) 상태로 시동을 켠 채 약 3분 기다리면 자동으로 시험합니다. 기어를 바꾸면 즉시 중단됩니다." in page
     finally:
       await client.close()
 
@@ -225,6 +227,39 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       assert "실패" in page
       assert "DSP op unsupported" in page
       assert "3.0" in page
+      assert "DSP 시험 다시 하기" in page
+      assert "주차(P) 상태로 시동을 켠 채 약 3분 기다리면 자동으로 시험합니다. 기어를 바꾸면 즉시 중단됩니다." in page
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_retry_clears_this_commit_only(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  probe_root = tmp_path / "dsp_probe"
+  probe_root.mkdir()
+  for suffix in (".json", ".attempt", ".progress"):
+    (probe_root / f"abc1234{suffix}").write_text("{}", encoding="utf-8")
+  (probe_root / "other.json").write_text("{}", encoding="utf-8")
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
+  monkeypatch.setattr(module, "_probe_commit", lambda: "abc1234")
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.post("/api/tlv_rec/dsp_probe/retry")
+      assert resp.status == 200
+      data = await resp.json()
+      assert data["ok"] is True
+      assert sorted(data["removed"]) == ["abc1234.attempt", "abc1234.json", "abc1234.progress"]
+      assert not (probe_root / "abc1234.json").exists()
+      assert not (probe_root / "abc1234.attempt").exists()
+      assert not (probe_root / "abc1234.progress").exists()
+      assert (probe_root / "other.json").exists()
+      # idempotent: a second retry finds nothing left to remove
+      resp = await client.post("/api/tlv_rec/dsp_probe/retry")
+      assert (await resp.json())["removed"] == []
     finally:
       await client.close()
 

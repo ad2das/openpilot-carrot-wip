@@ -143,8 +143,9 @@ def enable_tlvd(started, params, CP: car.CarParams) -> bool:
     return False
 
 def enable_tlv_dsp_probe(started, params, CP: car.CarParams) -> bool:
-  # Offroad one-time Hexagon DSP probe (W70 decision data). The result file for
-  # the current commit latches it off; see .../tlv/dsp_probe.py should_run().
+  # Onroad one-time Hexagon DSP probe (W70 decision data): the process idles
+  # until the car is parked, then runs. The result file for the current commit
+  # latches it off; see .../tlv/dsp_probe.py should_run()/run_probe().
   try:
     from openpilot.selfdrive.carrot.tlv import dsp_probe
     return dsp_probe.should_run(started, params)

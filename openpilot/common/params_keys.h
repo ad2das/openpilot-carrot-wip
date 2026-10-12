@@ -391,6 +391,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotTlvModelPath", {PERSISTENT, STRING}},
     {"CarrotTlvLampModelPath", {PERSISTENT, STRING}},  // lamp classifier (detect-then-track)
     {"CarrotTlvRecentStarts", {CLEAR_ON_MANAGER_START, STRING}},  // tlvd crash-loop guard (monotonic start times)
+    {"CarrotTlvDspNotice", {CLEAR_ON_MANAGER_START, JSON}},  // parked DSP probe UI notice (ui/onroad/tlv_dsp_notice.py)
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 
