@@ -39,7 +39,7 @@ os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
 # on TICI the QCOM GPU next to modeld. Overrides any inherited QCOM/CUDA value.
 os.environ["DEV"] = "CPU"
 
-from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, resources, tracker
+from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, recorder, resources, tracker
 from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNNING, STATUS_SUSPENDED, SuspendWatchdog
 
 CONNECT_RETRY_S = 0.5
@@ -81,13 +81,16 @@ def _param_text(params, key: str, default: str = "") -> str:
   value = str(value).strip()
   return value if value else default
 
-
 def _host_is_tici() -> bool:
   try:
     from openpilot.system.hardware import TICI
     return bool(TICI)
   except Exception:
     return False
+
+
+def _as_float(value):
+  return None if value is None else float(value)
 
 
 def resolve_backend_name(value: str, is_tici: bool) -> str:
@@ -122,7 +125,7 @@ def apply_cpu_policy() -> list[str]:
 
 
 class TlvRunner:
-  def __init__(self, params) -> None:
+  def __init__(self, params, *, recorder_root: str | None = None) -> None:
     self.params = params
     self.watchdog = SuspendWatchdog()
 
@@ -152,6 +155,16 @@ class TlvRunner:
           self.classifier_error = str(exc)
           self.classifier = backends.NullClassifier()
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
+
+    # Shadow-mode training recorder: CarrotTlvMode == 1 only, never mode 2.
+    # On a PC it is constructed only when a test injects a root.
+    self.recorder = None
+    if _param_int(params, "CarrotTlvMode") == 1 and (_host_is_tici() or recorder_root is not None):
+      try:
+        self.recorder = recorder.TlvRecorder(root=recorder_root, active=True)
+        print(f"tlvd: recorder root={self.recorder.root}", flush=True)
+      except Exception as exc:
+        print(f"tlvd: recorder disabled: {exc!r}", flush=True)
 
     self.governor = resources.DutyCycleGovernor()
     self.cpu_guard = resources.CpuContentionGuard()
@@ -258,6 +271,42 @@ class TlvRunner:
     )
     self.last_view = out.view
     self.processed += 1
+    if self.recorder is not None:
+      try:
+        self._offer_recorder(out, geom, view, raised, horizon)
+      except Exception as exc:
+        self._log_error(f"tlvd: recorder offer error: {exc!r}", time.monotonic())
+
+  def _offer_recorder(self, out, geom: crops.ViewGeometry, view: str, raised: bool, horizon: float) -> None:
+    """Hand this frame's crop + metadata to the shadow-mode recorder (hot path)."""
+    car = self.sm["carState"] if self.sm is not None and self.sm.seen["carState"] else None
+    if self.sm is not None and self.sm.seen["roadCameraState"]:
+      frame_id = int(self.sm["roadCameraState"].frameId)
+    else:
+      frame_id = int(self.pipeline.frame_idx)
+
+    self.recorder.offer(
+      self.pipeline.preprocess.model_input,
+      now=time.monotonic(),
+      frame_id=frame_id,
+      view=out.view,
+      raised=bool(raised),
+      geom=geom,
+      horizon_y=float(horizon),
+      calib_rpy=self._calib_rpy,
+      v_ego=_as_float(car.vEgo) if car is not None else None,
+      a_ego=_as_float(car.aEgo) if car is not None else None,
+      yaw_rate=_as_float(getattr(car, "yawRate", None)),
+      steering_angle_deg=_as_float(getattr(car, "steeringAngleDeg", None)),
+      left_blinker=bool(car.leftBlinker) if car is not None else None,
+      right_blinker=bool(car.rightBlinker) if car is not None else None,
+      dets=out.dets,
+      tracks=self.pipeline.tracker.tracks,
+      relevant_track_id=int(out.track_id),
+      state=int(out.state),
+      state_conf=float(out.state_conf),
+      red_likely=bool(out.red_likely),
+    )
 
   def _path_x(self):
     if self.sm is not None and self.sm.seen["modelV2"] and self._model_fresh():
@@ -318,6 +367,15 @@ class TlvRunner:
     except Exception as exc:
       print(f"tlvd: failed to clear CarrotTlvMode on {reason}: {exc!r}", flush=True)
     print(f"tlvd: hard memory limit ({reason}); exiting without restart", flush=True)
+
+  def close_recorder(self) -> None:
+    """Drain the recorder queue (bounded) when tlvd shuts down."""
+    if self.recorder is None:
+      return
+    try:
+      self.recorder.close(timeout_s=1.0)
+    except Exception:
+      pass
 
   # -- watchdog -------------------------------------------------------------
 
@@ -432,6 +490,15 @@ class TlvRunner:
       f"proc={self.pipeline.proc_ms:.0f}ms",
       status,
     )
+    if self.recorder is not None:
+      rec = self.recorder.stats()
+      parts = parts + (
+        f"rec_saved={rec['saved']}",
+        f"rec_full={rec['dropped_full']}",
+        f"rec_rate={rec['dropped_rate']}",
+        f"rec_mb={rec['bytes'] / resources.MB:.1f}",
+        f"rec_pause={rec['paused'] or 'no'}",
+      )
     print("tlvd: stats " + " ".join(parts), flush=True)
 
   # -- main loop ------------------------------------------------------------
@@ -529,7 +596,13 @@ def main() -> None:
   print(f"tlvd: start cpu-policy={apply_cpu_policy()}", flush=True)
   if not resources.write_oom_score_adj(1000):
     print("tlvd: oom_score_adj not writable (non-Linux or missing /proc)", flush=True)
-  TlvRunner(params).run()
+  runner = TlvRunner(params)
+  try:
+    runner.run()
+  finally:
+    close_recorder = getattr(runner, "close_recorder", None)
+    if close_recorder is not None:
+      close_recorder()
 
 
 if __name__ == "__main__":

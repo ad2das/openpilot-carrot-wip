@@ -20,6 +20,7 @@ from . import (
   support_terminal,
   system,
   terminal,
+  tlv_rec,
   tools,
   vision_diag,
   vision_test,
@@ -59,3 +60,4 @@ def register_all(app: web.Application) -> None:
   vision_test.register(app)
   vision_diag.register(app)
   web_sound.register(app)
+  tlv_rec.register(app)
