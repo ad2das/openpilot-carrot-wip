@@ -820,8 +820,9 @@ def regulatory_sign(cx: float, cy: float, value: str, type_: Type, k: float = 1.
     glow(cx, cy, 124 * k, rgba(255, 69, 58, 150))
   glow(cx, cy + 4 * k, 100 * k, rgba(0, 0, 0, 120))
   rl.draw_circle_v(rl.Vector2(cx, cy), 86 * k, SIGN_FACE)
-  rl.draw_ring(rl.Vector2(cx, cy), 64 * k, 84 * k, 0.0, 360.0, 64, SIGN_RING)
-  size = (62 if len(value) >= 3 else 76) * k
+  rl.draw_ring(rl.Vector2(cx, cy), 66 * k, 84 * k, 0.0, 360.0, 64, SIGN_RING)
+  # Figures as large as the white face allows: the limit is read at a glance, not studied.
+  size = (68 if len(value) >= 3 else 90) * k
   type_.draw(value, cx, cy + size * INTER_CAP / 2.0, size, SIGN_INK, BOLD, align=0.5, spacing=-2 * k)
 
 

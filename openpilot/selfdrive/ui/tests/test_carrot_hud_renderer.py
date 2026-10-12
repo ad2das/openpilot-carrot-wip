@@ -737,3 +737,15 @@ def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_mod
   assert override.label == "MAX"
   assert override.speed_color_mode == 0
   assert not override.force_persist
+
+
+@pytest.mark.parametrize("dist, text", [
+  (0, ""), (7, "10 m"), (83, "90 m"), (120, "120 m"), (299, "300 m"), (300, "300 m"),
+  (347, "350 m"), (951, "1.0 km"), (1287, "1.3 km"),
+])
+def test_turn_distance_counts_down_in_calm_steps(hud_module, dist, text):
+  module, fake_ui_state = hud_module
+  fake_ui_state.is_metric = True
+  renderer = object.__new__(module.HudRenderer)
+
+  assert renderer._format_turn_distance_text(dist) == text

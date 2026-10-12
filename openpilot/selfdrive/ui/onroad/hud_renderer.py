@@ -32,8 +32,8 @@ M_BOTTOM = 30
 CARD_R = 38
 TOP_SHADE_H = 250
 BOTTOM_SHADE_H = 400
-DRIVE_W = 640
-DRIVE_H = 362
+DRIVE_W = 740
+DRIVE_H = 412
 DRIVE_FOOT_H = 86    # status strip under the speed: gear, gap, mode
 GAP_LEVELS_MIN = 2   # CruiseGapLevels range: how many following gaps the gap button cycles
 GAP_LEVELS_MAX = 4
@@ -43,20 +43,19 @@ GAP_SEG_H = 20.0
 GAP_SEG_GAP = 8.0
 GAP_CAR_W = 54.0
 GAP_GLASS = hs.rgba(30, 33, 40, 255)
-SET_SIZE = 68
-SET_LABEL_SIZE = 34
-SET_BASE = 74
-CHIP_SIZE = 40
-CHIP_LABEL_SIZE = 36
-CHIP_H = 62
+SET_SIZE = 92
+SET_LABEL_SIZE = 42
+SET_BASE = 92
+CHIP_SIZE = 52
+CHIP_LABEL_SIZE = 46
+CHIP_H = 76
 SPEED_SIZE = 248
-SPEED_SIZE_3 = 192
-SPEED_BASE = 256
+SPEED_BASE = 300
 UNIT_SIZE = 44
-SIGN_R = 86
-SIGN_RIGHT = 118
-SIGN_RIGHT_LIGHT = 198
-SIGN_Y = 140
+SIGN_R = 100
+SIGN_RIGHT = 122
+SIGN_RIGHT_LIGHT = 212
+SIGN_Y = 180
 LIGHT_RIGHT = 62
 STATUS_SIZE = 42
 NAV_W_MIN = 540
@@ -68,9 +67,9 @@ NAV_DISTANCE_SIZE = 142
 NAV_UNIT_SIZE = 60
 NAV_TEXT_SIZE = 56
 NAV_PROGRESS_SPAN = 2000.0
-CLOCK_SIZE = 66
-DATE_SIZE = 42
-CLOCK_H = 92
+CLOCK_SIZE = 86
+DATE_SIZE = 54
+CLOCK_H = 116
 BADGE_SIZE = 34
 BADGE_H = 62
 TPMS_W = 340
@@ -772,7 +771,7 @@ class HudRenderer(Widget):
           limit_x = min(limit_x, sign_x - math.sqrt(SIGN_R * SIGN_R - dy * dy) - 10)
       cx = sx + number_w + 20
       # Full size, then a compact pill, and only then without the reason word.
-      for label_size, value_size, _chip_h, pad in ((CHIP_LABEL_SIZE, CHIP_SIZE, CHIP_H, 26), (30, 36, 54, 20)):
+      for label_size, value_size, _chip_h, pad in ((CHIP_LABEL_SIZE, CHIP_SIZE, CHIP_H, 28), (40, 46, 68, 24)):
         value_w = t.width(value, value_size, hs.BOLD)
         label_w = t.width(label, label_size, hs.BOLD) + 12 if label else 0.0
         if cx + label_w + value_w + 2 * pad <= limit_x:
@@ -785,14 +784,14 @@ class HudRenderer(Widget):
         t.draw_mid(label, cx + pad, mid, label_size, ink, hs.BOLD)
       t.draw_mid(value, cx + pad + label_w, mid, value_size, ink, hs.BOLD)
 
-    # Speed numerals, red over the limit, shrunk rather than run into the sign.
+    # Speed numerals, red over the limit. One size for every speed: it is fitted to a three-digit slot beside the
+    # limit sign whether or not a sign is up, so the figure never jumps at 100 or when a sign appears.
     speed_text = "123" if self._debug_speed_panel else str(int(round(self.speed)))
-    size = SPEED_SIZE if len(speed_text) < 3 else SPEED_SIZE_3
     unit = tr("km/h") if ui_state.is_metric else tr("mph")
-    room = column - (x + 26)
-    need = t.width(speed_text, size, hs.SEMI, -8 * size / SPEED_SIZE) + 12 + t.width(unit, UNIT_SIZE, hs.MEDIUM)
-    if need > room:
-      size *= max(0.7, room / need)
+    room = min(column, right - SIGN_RIGHT - SIGN_R - 20) - (x + 26)
+    slot = "0" * max(3, len(speed_text))
+    need = t.width(slot, SPEED_SIZE, hs.SEMI, -8.0) + 12 + t.width(unit, UNIT_SIZE, hs.MEDIUM)
+    size = SPEED_SIZE * min(1.0, max(0.6, room / need))
     self._overspeed = limit > 0 and self.speed > limit + 2
     w = t.draw(speed_text, x + 26, y + SPEED_BASE, size, hs.WARN_RED if self._overspeed else hs.TEXT, hs.SEMI,
                spacing=-8 * size / SPEED_SIZE)
@@ -801,8 +800,8 @@ class HudRenderer(Widget):
     if limit > 0:
       if alarm:
         pulse = 0.5 + 0.5 * math.sin(time.monotonic() * 2.0 * math.pi)
-        hs.glow(sign_x, y + SIGN_Y, 124, hs.rgba(255, 69, 58, int(90 + 90 * pulse)))
-      hs.regulatory_sign(sign_x, y + SIGN_Y, str(limit), t)
+        hs.glow(sign_x, y + SIGN_Y, 124 * SIGN_R / 86, hs.rgba(255, 69, 58, int(90 + 90 * pulse)))
+      hs.regulatory_sign(sign_x, y + SIGN_Y, str(limit), t, SIGN_R / 86)
     if light:
       lx = right - LIGHT_RIGHT
       hs.card(lx - 32, y + SIGN_Y - 82, 64, 164, hs.rgba(0, 0, 0, 160), 32, hs.rgba(255, 255, 255, 46), 1.5)
@@ -926,7 +925,7 @@ class HudRenderer(Widget):
     guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
     lo = guide[0] + guide[2] + 24 if guide is not None else rect.x
     hi = tpms[0] - 24 if tpms is not None else rect.x + rect.width
-    pad, sep = 38.0, 26.0
+    pad, sep = 44.0, 30.0
     clock_w = t.width(clock, CLOCK_SIZE, hs.SEMI) if clock else 0.0
     date_w = t.width(date, DATE_SIZE, hs.SEMI) if date else 0.0
     w = pad * 2 + clock_w + date_w + (2 * sep + 2 if clock and date else 0.0)
@@ -942,7 +941,7 @@ class HudRenderer(Widget):
     if clock:
       x += t.draw(clock, x, mid + CLOCK_SIZE * hs.INTER_CAP / 2, CLOCK_SIZE, hs.TEXT, hs.SEMI)
       if date:
-        hs.card(x + sep, mid - 22, 2, 44, hs.rgba(255, 255, 255, 56), 1, None)
+        hs.card(x + sep, mid - 28, 2, 56, hs.rgba(255, 255, 255, 56), 1, None)
         x += 2 * sep + 2
     if date:
       t.draw(date, x, mid + DATE_SIZE * 0.39, DATE_SIZE, hs.TEXT_2, hs.SEMI)
@@ -1091,13 +1090,18 @@ class HudRenderer(Widget):
     if dist_m <= 0:
       return ""
 
+    # Counted down in calm steps (10 m inside 300 m, 50 m further out), rounded up so it never reads past the point.
     if ui_state.is_metric:
+      step = 10 if dist_m < 300 else 50
+      dist_m = math.ceil(dist_m / step) * step
       if dist_m < 1000:
         return f"{dist_m} m"
       return f"{dist_m / 1000.0:.1f} km"
     else:
       if dist_m < 1609:
-        return f"{int(dist_m * 3.28084)} ft"
+        feet = dist_m * 3.28084
+        step = 10 if feet < 300 else 50
+        return f"{math.ceil(feet / step) * step} ft"
       return f"{dist_m / 1609.344:.1f} mi"
 
   def _progress(self, key: tuple, dist: int) -> float:
@@ -1130,8 +1134,9 @@ class HudRenderer(Widget):
       body, bar = hs.CARD_WARN, hs.WARN_RED
       key: tuple = ("camera", x_sign_type)
     else:
+      # Turn guidance is the arrow and the distance alone; the road name only cost a glance.
       dist = info["x_dist_to_turn"]
-      text, extra = info["tbt_main_text"], ""
+      text, extra = "", ""
       body, bar = hs.CARD_BODY, hs.LIVE_GREEN if info["atc_type"] else NAV_BLUE
       key = ("turn", info["x_turn_info"])
 

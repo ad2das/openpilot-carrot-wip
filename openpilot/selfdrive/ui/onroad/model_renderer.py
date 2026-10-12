@@ -66,13 +66,13 @@ LEAD_CLOSE_TTC_OFF = 4.0  # s to contact before it returns to the source colour 
 LEAD_CLOSE_MIN_VREL = 1.0  # m/s closing speed below which time-to-contact is not meaningful
 LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at a glance
 # Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
-LEAD_SIZE = 64  # the leading figure: the lead's speed, or the gap while its speed is unknown
-LEAD_GAP_SIZE = 46  # the gap beside the speed
-LEAD_UNIT_SIZE = 30
-LEAD_STATE_SIZE = 48
-LEAD_CAPSULE_H = 84.0
+LEAD_SIZE = 80  # the leading figure: the lead's speed, or the gap while its speed is unknown
+LEAD_GAP_SIZE = 58  # the gap beside the speed
+LEAD_UNIT_SIZE = 36
+LEAD_STATE_SIZE = 56
+LEAD_CAPSULE_H = 104.0
 # Gap and speed are two segments of one capsule, the speed's a lighter surface: no captions needed to tell them apart.
-LEAD_SEG_PAD = 26.0
+LEAD_SEG_PAD = 30.0
 LEAD_SEG_FILL = rl.Color(255, 255, 255, 36)
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
 LEAD_TWO = rl.Color(240, 243, 247, 150)
@@ -987,7 +987,7 @@ class ModelRenderer(Widget):
   def _draw_lead_capsule_carrot(self, line1, line2, cx: float, mid: float, w: float, h: float, car_top: float,
                                 seg1: float) -> None:
     bottom = mid + h / 2
-    tail = 12.0
+    tail = 14.0
     if bottom + tail < car_top - 40.0:
       # Pushed up by a HUD card: extend the tail with a stem that fades out (the lead's real height is unknown).
       rl.draw_rectangle_gradient_v(int(cx) - 1, int(bottom + tail - 2.0), 3, int(car_top - bottom - tail),
@@ -1425,9 +1425,12 @@ class ModelRenderer(Widget):
 
     # Nearest first, so the closest cars claim the clean spot above their roofs.
     leads = sorted([*radar_state.leadsLeft, *radar_state.leadsRight, *radar_state.leadsCenter], key=lambda ld: ld.dRel)
+    lead_one = radar_state.leadOne
     for lead in leads:
       d_rel = float(lead.dRel)
       if d_rel <= 2.5:
+        continue
+      if lead_one.status and self._is_lead_one_track(lead, lead_one):
         continue
 
       idx = self._get_path_length_idx(lane_x, d_rel)
@@ -1460,15 +1463,9 @@ class ModelRenderer(Widget):
         else:
           ring = hs.WARN_RED
 
-        # Same-direction traffic gets a pulling-away / closing cue relative to us.
-        trend = 0
-        if v >= 0.0:
-          rel = v - self._carrot_v_ego
-          trend = 1 if rel > 1.0 else (-1 if rel < -1.0 else 0)
-
         roof = self._map_to_screen(d_rel, -y_rel, road_z - 1.45)
         roof_x, roof_y = roof if roof is not None else (x, y - 60.0)
-        box = self._draw_speed_tag_carrot(roof_x, roof_y, speed_text, ring, trend, d_rel)
+        box = self._draw_speed_tag_carrot(roof_x, roof_y, speed_text, ring, d_rel)
 
         if self._carrot_show_radar_info >= 2 and box is not None:
           self._type.draw_mid(f"{d_rel:.1f}m  {y_rel:+.1f}", box[0], box[1] - box[2] / 2 - 20, 28, hs.TEXT_2, hs.BOLD,
@@ -1491,21 +1488,24 @@ class ModelRenderer(Widget):
 
   TAG_DROP_REACH = 160.0  # px beyond which a tag would point across the road, so it is not drawn
 
-  def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", trend: int, d_rel: float):
-    """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
+  @staticmethod
+  def _is_lead_one_track(track, lead_one) -> bool:
+    """The lead has its own readout, so its radar track gets no second speed tag: same track id, or (the stock
+    radar's or the camera's lead) the track sitting where the lead is."""
+    lead_id = int(getattr(lead_one, "radarTrackId", -1))
+    if lead_id >= 1 and int(getattr(track, "radarTrackId", -1)) == lead_id:
+      return True
+    lead_d = float(lead_one.dRel)
+    return abs(float(track.dRel) - lead_d) < max(2.5, 0.08 * lead_d) and abs(float(track.yRel) - float(lead_one.yRel)) < 1.5
 
-    trend 1 = pulling away, -1 = closing: a filled green/red disc with a white chevron hugs the tag's left end,
-    the speed follows. Returns (centre x, centre y, height) or None."""
+  def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", d_rel: float):
+    """Speed callout pinned above a tracked car's roof: the figure alone; the ring keeps the radar-state colour.
+
+    Returns (centre x, centre y, height) or None."""
     near = d_rel < 40.0
-    size = 46 if near else 40
-    h = 66.0 if near else 58.0
-    disc = 0.0 if trend == 0 else h - 14.0
-    text_w = self._type.width(text, size, hs.SEMI)
-    if disc:
-      # Disc inset by the same margin on top, bottom and left, then the figure and a pill-end right margin.
-      w = (h - disc) / 2.0 + disc + 12.0 + text_w + h * 0.42
-    else:
-      w = max(h * 1.6, text_w + h * 0.8)
+    size = 62 if near else 56
+    h = 86.0 if near else 78.0
+    w = max(h * 1.6, self._type.width(text, size, hs.SEMI) + h * 0.8)
     tail = 10.0
     spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
     if spot is None or abs(spot[0] - x) - w / 2 > self.TAG_DROP_REACH:
@@ -1529,24 +1529,7 @@ class ModelRenderer(Widget):
       rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
       hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
     hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230) if ring is not None else None, ring_width=3.0)
-    if disc:
-      r = disc / 2.0
-      gx = left + (h - disc) / 2.0 + r
-      hs.dot(gx, mid, r, hs.LIVE_GREEN if trend > 0 else hs.WARN_RED)
-      # A stroked chevron with rounded ends, centred in the disc.
-      cw, ch = r * 0.46, r * 0.26
-      tip = mid - ch if trend > 0 else mid + ch
-      foot = mid + ch if trend > 0 else mid - ch
-      pts = [(gx - cw, foot), (gx, tip), (gx + cw, foot)]
-      stroke = max(4.0, r * 0.2)
-      # Two straight strokes joined by round caps: a single ribbon would notch at the sharp apex.
-      hs.polyline(pts[:2], stroke, hs.TEXT)
-      hs.polyline(pts[1:], stroke, hs.TEXT)
-      for px, py in pts:
-        hs.dot(px, py, stroke / 2.0, hs.TEXT)
-      self._type.draw_mid(text, gx + r + 12.0, mid, size, hs.TEXT, hs.SEMI, align=0.0)
-    else:
-      self._type.draw_mid(text, tx, mid, size, hs.TEXT, hs.SEMI, align=0.5)
+    self._type.draw_mid(text, tx, mid, size, hs.TEXT, hs.SEMI, align=0.5)
     return tx, mid, h
 
 

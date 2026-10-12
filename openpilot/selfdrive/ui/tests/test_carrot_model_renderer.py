@@ -626,7 +626,7 @@ def test_speed_tag_drops_when_label_lands_beyond_reach(monkeypatch):
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
 
-  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 60.0)
 
   assert result is None
   assert renderer._float_boxes == []
@@ -642,8 +642,27 @@ def test_speed_tag_keeps_label_within_reach(monkeypatch):
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
 
-  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 60.0)
 
   assert result is not None
   assert result[:2] == spot
   assert len(renderer._float_boxes) == 1
+
+
+@pytest.mark.parametrize("track, expected", [
+  (SimpleNamespace(radarTrackId=7, dRel=80.0, yRel=3.5), True),   # the lead's own radar track, wherever it is
+  (SimpleNamespace(radarTrackId=3, dRel=49.6, yRel=0.4), True),   # sits where the lead is
+  (SimpleNamespace(radarTrackId=3, dRel=49.6, yRel=3.4), False),  # next lane at the same distance
+  (SimpleNamespace(radarTrackId=3, dRel=70.0, yRel=0.0), False),  # further up the same lane
+])
+def test_the_lead_track_gets_no_second_speed_tag(track, expected):
+  lead_one = SimpleNamespace(radarTrackId=7, dRel=49.0, yRel=0.0, status=True)
+
+  assert model_renderer.ModelRenderer._is_lead_one_track(track, lead_one) is expected
+
+
+def test_a_stock_radar_lead_matches_its_track_by_position():
+  lead_one = SimpleNamespace(radarTrackId=0, dRel=49.0, yRel=0.0, status=True)
+
+  assert model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=12, dRel=50.5, yRel=-0.6), lead_one)
+  assert not model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=0, dRel=20.0, yRel=0.0), lead_one)
