@@ -125,6 +125,7 @@ jobs:
       - name: Check ButterStop closed-loop stops
         env:
           BUTTER_SIM_OUT: ${{ runner.temp }}/butter_sim.json
+          BUTTER_SWEEP_OUT: ${{ runner.temp }}/butter_sweep.json
         run: |
           python -m pytest -o addopts='' -q -s openpilot/selfdrive/test/longitudinal_maneuvers/test_butter_stop_maneuvers.py
       - name: Upload ButterStop sim table
@@ -132,7 +133,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: butter-sim
-          path: ${{ runner.temp }}/butter_sim.json
+          path: |
+            ${{ runner.temp }}/butter_sim.json
+            ${{ runner.temp }}/butter_sweep.json
       - name: Check model, monitoring and Bluetooth integration
         run: |
           python -m pytest -o addopts='' -q \

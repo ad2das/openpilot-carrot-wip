@@ -25,6 +25,8 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib import longcontrol
+from openpilot.selfdrive.controls.lib import butter_stop
+from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
@@ -292,6 +294,7 @@ def compute_metrics(logs, name, butter):
   stopped = bool(stand_idx.size)
   stop_i = int(stand_idx[0]) if stopped else len(t) - 1
   final_gap = float(gaps[stop_i])
+  hold_creep = float(final_gap - np.min(gaps[stop_i:])) if stopped else None
   min_gap = float(np.min(gaps))
   if stopped:
     ts = t[stop_i]
@@ -311,6 +314,7 @@ def compute_metrics(logs, name, butter):
     "accel_last_0.5s_mean_abs": None if accel_last is None else round(accel_last, 4),
     "peak_jerk_last_1.5s_abs": None if peak_jerk is None else round(peak_jerk, 4),
     "time_3ms_to_standstill_s": None if time_3 is None else round(time_3, 3),
+    "hold_creep_m": None if hold_creep is None else round(hold_creep, 3),
   }
 
 
@@ -356,6 +360,40 @@ _CASES = ([("a", m) for m in _A_SCENARIOS] + [("b", _B_SCENARIO)]
 _CASE_IDS = [f"{group}-{maneuver.title}" for group, maneuver in _CASES]
 
 
+def _case_failures(group, off_metrics, on_metrics):
+  """Every PASS criterion for one scenario; an empty list means it passes."""
+  title = on_metrics["name"]
+  fails = []
+  if off_metrics["collision"]:
+    return fails
+  if on_metrics["collision"]:
+    fails.append(f"{title}: ON collides with min gap {on_metrics['min_gap_m']} m")
+  if not on_metrics["stopped"]:
+    fails.append(f"{title}: ON never stops")
+    return fails
+  off_gap = off_metrics["final_gap_m"]
+  on_gap = on_metrics["final_gap_m"]
+  if on_gap < off_gap - 0.1:
+    fails.append(f"{title}: ON final gap {on_gap} < OFF {off_gap} - 0.1")
+  if off_gap >= 3.0 and on_gap < 3.0:
+    fails.append(f"{title}: ON final gap {on_gap} < 3.0 m")
+  if off_gap < 3.0 and on_gap < off_gap:
+    fails.append(f"{title}: ON final gap {on_gap} below sub-3 m OFF baseline {off_gap}")
+  if on_metrics["hold_creep_m"] > 0.05:
+    fails.append(f"{title}: ON creeps {on_metrics['hold_creep_m']} m toward the lead while holding")
+  if group == "a":
+    off_soft = off_metrics["accel_last_0.5s_mean_abs"]
+    on_soft = on_metrics["accel_last_0.5s_mean_abs"]
+    if on_soft is None or off_soft is None:
+      fails.append(f"{title}: missing last-0.5s accel")
+    else:
+      if on_soft > 0.45:
+        fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} > 0.45")
+      if on_soft >= off_soft:
+        fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} not below OFF {off_soft}")
+  return fails
+
+
 @pytest.mark.parametrize("group,maneuver", _CASES, ids=_CASE_IDS)
 def test_butter_stop_maneuver(group, maneuver):
   off = ButterStopLoop(maneuver, butter=0).run()
@@ -370,21 +408,10 @@ def test_butter_stop_maneuver(group, maneuver):
     entry["mark"] = "xfail: baseline OFF collides"
     pytest.xfail("baseline OFF collides")
 
-  assert not on_metrics["collision"], (
-    f"{maneuver.title}: ON collides with min gap {on_metrics['min_gap_m']} m")
-  off_gap = off_metrics["final_gap_m"]
-  on_gap = on_metrics["final_gap_m"]
-  assert on_gap >= off_gap - 0.1, f"{maneuver.title}: ON final gap {on_gap} < OFF {off_gap} - 0.1"
-  assert on_gap >= 3.0, (
-    f"{maneuver.title}: ON final gap {on_gap} < 3.0 m")
-
-  if group == "a":
-    off_soft = off_metrics["accel_last_0.5s_mean_abs"]
-    on_soft = on_metrics["accel_last_0.5s_mean_abs"]
-    assert on_soft is not None
-    assert off_soft is not None
-    assert on_soft <= 0.45, f"{maneuver.title}: ON last-0.5s mean |accel| {on_soft} > 0.45"
-    assert on_soft < off_soft, f"{maneuver.title}: ON last-0.5s mean |accel| {on_soft} not below OFF {off_soft}"
+  if off_metrics["final_gap_m"] < 3.0:
+    entry["mark"] = "baseline OFF final gap below 3.0 m"
+  fails = _case_failures(group, off_metrics, on_metrics)
+  assert not fails, "; ".join(fails)
 
   if group == "a" and "stopped lead 40" in maneuver.title:
     # ButterStop=0 must be identical to the same run with the whole ButterStop
@@ -405,4 +432,38 @@ def test_write_butter_sim_table():
   if out_dir:
     os.makedirs(out_dir, exist_ok=True)
   with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(text + "\n")
+
+
+_SWEEP_D_EXTRA = (0.8, 1.0, 1.2)
+_SWEEP_SLACK = (0.3, 0.6, 0.8)
+
+
+@pytest.mark.skipif(not os.environ.get("BUTTER_SWEEP_OUT"), reason="tuning sweep runs only on request")
+def test_butter_stop_tuning_sweep(monkeypatch):
+  off_runs = [compute_metrics(ButterStopLoop(m, butter=0).run(), m.title, 0) for _, m in _CASES]
+  rows = []
+  for d_extra in _SWEEP_D_EXTRA:
+    for slack in _SWEEP_SLACK:
+      monkeypatch.setattr(butter_stop, "D_EXTRA", d_extra)
+      monkeypatch.setattr(long_mpc, "D_EXTRA", d_extra)
+      monkeypatch.setattr(butter_stop, "MIN_FINAL_GAP_SLACK", slack)
+      cases = []
+      fails = []
+      for (group, m), off_metrics in zip(_CASES, off_runs, strict=True):
+        on_metrics = compute_metrics(ButterStopLoop(m, butter=1).run(), m.title, 1)
+        fails += _case_failures(group, off_metrics, on_metrics)
+        cases.append({"scenario": m.title, "group": group,
+                      "off_final_gap_m": off_metrics["final_gap_m"],
+                      "on_final_gap_m": on_metrics["final_gap_m"],
+                      "on_min_gap_m": on_metrics["min_gap_m"],
+                      "off_soft": off_metrics["accel_last_0.5s_mean_abs"],
+                      "on_soft": on_metrics["accel_last_0.5s_mean_abs"],
+                      "on_hold_creep_m": on_metrics["hold_creep_m"],
+                      "on_time_3ms_to_standstill_s": on_metrics["time_3ms_to_standstill_s"]})
+      rows.append({"d_extra": d_extra, "min_final_gap_slack": slack,
+                   "all_pass": not fails, "failures": fails, "cases": cases})
+  text = json.dumps({"sweep": rows}, ensure_ascii=False, indent=2)
+  print(text)
+  with open(os.environ["BUTTER_SWEEP_OUT"], "w", encoding="utf-8") as handle:
     handle.write(text + "\n")
