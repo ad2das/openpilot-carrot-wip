@@ -20,7 +20,7 @@ import pytest
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
-from openpilot.common.params import Params
+from openpilot.common.params import Params, UnknownKeyName
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
@@ -38,6 +38,24 @@ PLANNER_PERIOD = 5  # 100 Hz loop, 20 Hz planner/model, as in the car
 COLLISION_GAP_M = 0.4  # same crash criterion as maneuver.py
 
 RESULTS: list[dict] = []
+
+
+def _seed_param_defaults():
+  """A fresh CI param store is empty; seed the catalog defaults like a device."""
+  params = Params()
+  for key in params.all_keys():
+    if params.get(key) is not None:
+      continue
+    default = params.get_default_value(key)
+    if default is None:
+      continue
+    try:
+      params.put(key, default)
+    except (UnknownKeyName, TypeError, ValueError):
+      pass
+
+
+_seed_param_defaults()
 
 
 class _Flags(dict):
