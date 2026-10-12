@@ -524,7 +524,7 @@ def lead_renderer(**overrides):
   return renderer
 
 
-def test_lead_runs_radar_and_vision_primary_carries_unit_and_cross_check(monkeypatch):
+def test_lead_runs_are_distance_then_quieter_speed_and_bare_trend(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(
     _carrot_radar_dist=12.5,
@@ -535,45 +535,39 @@ def test_lead_runs_radar_and_vision_primary_carries_unit_and_cross_check(monkeyp
     _carrot_lead_vrel=-12.0,
   )
 
+  # No source dots and no vision cross-check: the radar gap in whole metres, then the lead speed.
   assert renderer._lead_runs_carrot() == [
-    ("dot", model_renderer.LEAD_RED, 8.0),
-    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("num", "12", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("dot", model_renderer.LEAD_BLUE, 5.0),
-    ("num", "14.3", model_renderer.LEAD_SIZE_2, model_renderer.LEAD_CROSS),
     ("bar",),
-    ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("num", "30", model_renderer.LEAD_SPEED_SIZE, model_renderer.hs.TEXT_2),
     ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE),
+    ("trend", -1, "12", model_renderer.LEAD_TREND_SIZE),
   ]
 
 
-def test_lead_runs_vision_only_leads_blue_without_cross_check(monkeypatch):
+def test_lead_runs_vision_only_shows_vision_distance_with_tenths_up_close(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(_carrot_vision_dist=8.7)
 
   assert renderer._lead_runs_carrot() == [
-    ("dot", model_renderer.LEAD_BLUE, 8.0),
     ("num", "8.7", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
 
 
-def test_lead_runs_radar_only_has_no_vision_cross_check(monkeypatch):
+@pytest.mark.parametrize("dist, text", [(9.94, "9.9"), (9.96, "10"), (10.0, "10"), (49.6, "50")])
+def test_lead_distance_uses_tenths_only_below_ten_metres(monkeypatch, dist, text):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
-  renderer = lead_renderer(_carrot_radar_dist=12.5, _carrot_radar_track_id=7)
+  renderer = lead_renderer(_carrot_radar_dist=dist, _carrot_radar_track_id=7)
 
   runs = renderer._lead_runs_carrot()
 
-  assert runs == [
-    ("dot", model_renderer.LEAD_AMBER, 8.0),
-    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
-    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-  ]
-  assert not any(run[0] == "dot" and run[2] == 5.0 for run in runs)
+  assert runs[0] == ("num", text, model_renderer.LEAD_SIZE, model_renderer.hs.TEXT)
+  assert not any(run[0] == "dot" for run in runs)
 
 
-def test_lead_runs_trend_badge_needs_two_kph_and_keeps_sign(monkeypatch):
+def test_lead_runs_trend_needs_two_kph_and_keeps_sign(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
 
   for vrel in (-1.4, 0.0, 1.4):
@@ -591,7 +585,7 @@ def test_lead_runs_trend_badge_needs_two_kph_and_keeps_sign(monkeypatch):
     _carrot_lead_speed=30.0,
     _carrot_lead_vrel=-12.0,
   )
-  assert closing._lead_runs_carrot()[-1] == ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE)
+  assert closing._lead_runs_carrot()[-1] == ("trend", -1, "12", model_renderer.LEAD_TREND_SIZE)
 
   pulling_away = lead_renderer(
     _carrot_radar_dist=12.5,
@@ -599,15 +593,15 @@ def test_lead_runs_trend_badge_needs_two_kph_and_keeps_sign(monkeypatch):
     _carrot_lead_speed=30.0,
     _carrot_lead_vrel=12.4,
   )
-  assert pulling_away._lead_runs_carrot()[-1] == ("trend", 1, "12", model_renderer.LEAD_BADGE_SIZE)
+  assert pulling_away._lead_runs_carrot()[-1] == ("trend", 1, "12", model_renderer.LEAD_TREND_SIZE)
 
 
 def test_lead_run_width_trend_slot_is_independent_of_digit_shapes():
   renderer = object.__new__(model_renderer.ModelRenderer)
   renderer._type = SimpleNamespace(width=lambda text, size, weight: float(sum(10 if c == "1" else 20 for c in text)))
 
-  narrow = ("trend", -1, "11", model_renderer.LEAD_BADGE_SIZE)
-  wide = ("trend", -1, "88", model_renderer.LEAD_BADGE_SIZE)
+  narrow = ("trend", -1, "11", model_renderer.LEAD_TREND_SIZE)
+  wide = ("trend", -1, "88", model_renderer.LEAD_TREND_SIZE)
 
   assert renderer._lead_run_width(narrow, slot=True) == renderer._lead_run_width(wide, slot=True)
   assert renderer._lead_run_width(narrow) != renderer._lead_run_width(wide)

@@ -59,16 +59,15 @@ FADE_STOPS = [0.0, 0.3, 0.5]
 LEAD_RED = rl.Color(255, 69, 58, 255)
 LEAD_AMBER = rl.Color(255, 159, 10, 255)
 # Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
-LEAD_SIZE = 58
-LEAD_SIZE_2 = 40
-LEAD_UNIT_SIZE = 36
-LEAD_BADGE_SIZE = 42
-LEAD_BADGE_H = 56.0
-LEAD_BADGE_PAD = 14.0
+LEAD_SIZE = 62
+LEAD_SPEED_SIZE = 50
+LEAD_UNIT_SIZE = 34
+LEAD_TREND_SIZE = 42
+LEAD_TREND_ARROW = 0.62  # arrow width as a share of the trend figure size
+LEAD_TREND_GAP = 6.0
 LEAD_STATE_SIZE = 48
 LEAD_CAPSULE_H = 86.0
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
-LEAD_CROSS = rl.Color(255, 255, 255, 150)  # vision cross-check figure beside a radar distance
 LEAD_TWO = rl.Color(230, 126, 34, 255)
 
 
@@ -888,44 +887,39 @@ class ModelRenderer(Widget):
 
     text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
     runs: list[tuple] = []
-    radar = self._carrot_radar_dist > 0.0
-    vision = self._carrot_vision_dist > 0.0
-    # The distance that drives the car leads in its source colour and carries the unit; beside a radar
-    # distance the vision estimate is a quiet cross-check that follows it, a size down, unit-less.
-    if radar or vision:
-      primary = self._carrot_radar_dist if radar else self._carrot_vision_dist
-      source = (LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER) if radar else LEAD_BLUE
-      runs += [("dot", source, 8.0), ("num", f"{primary:.1f}", LEAD_SIZE, text_color),
+    # Two readings, nothing else: the gap that drives the car, then the lead's speed a step quieter.
+    # The source colour lives on the crescent under the car, not in the capsule.
+    dist = self._carrot_radar_dist if self._carrot_radar_dist > 0.0 else self._carrot_vision_dist
+    if dist > 0.0:
+      # Whole metres while far (tenths would flicker without meaning); tenths only up close.
+      runs += [("num", f"{dist:.1f}" if round(dist, 1) < 10.0 else f"{dist:.0f}", LEAD_SIZE, text_color),
                ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
-      if radar and vision:
-        runs += [("dot", LEAD_BLUE, 5.0), ("num", f"{self._carrot_vision_dist:.1f}", LEAD_SIZE_2, LEAD_CROSS)]
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       if runs:
         runs.append(("bar",))
-      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
+      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SPEED_SIZE, hs.TEXT_2),
                ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
-      # Speed relative to us as a tinted badge, in the radar tags' language: green up = pulling away,
-      # red down = closing.
+      # Speed relative to us as a bare tinted arrow and figure: green up = pulling away, red down = closing.
       rel = round(self._carrot_lead_vrel)
       if abs(rel) >= 2:
-        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_BADGE_SIZE))
+        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_TREND_SIZE))
     return runs
 
-  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 24.0, "trend": 18.0}
+  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 26.0, "trend": 16.0}
 
   def _lead_run_width(self, run, slot: bool = False) -> float:
     kind = run[0]
     if kind == "dot":
       return run[2] * 2.0
     if kind == "bar":
-      return 2.0 + 24.0
+      return 2.0 + 26.0
     if kind == "num" and slot:
       # Widest-digit slot: Inter's figures are proportional.
       return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], hs.SEMI)
     if kind == "trend":
-      # Badge: padding, arrow, gap, figure (widest-digit slot so the badge does not breathe either).
+      # Arrow, gap, figure (widest-digit slot so the capsule does not breathe either).
       figure = "".join("0" for _ in run[2]) if slot else run[2]
-      return 2 * LEAD_BADGE_PAD + run[3] * 0.5 + 6.0 + self._type.width(figure, run[3], hs.BOLD)
+      return run[3] * LEAD_TREND_ARROW + LEAD_TREND_GAP + self._type.width(figure, run[3], hs.SEMI)
     return self._type.width(run[1], run[2], hs.SEMI)
 
   def _lead_run_gap(self, prev, kind) -> float:
@@ -985,18 +979,17 @@ class ModelRenderer(Widget):
       elif kind == "num":
         t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
       elif kind == "trend":
+        # Sits on the shared baseline; the arrow spans the figure's cap height.
         size = run[3]
         color = hs.LIVE_GREEN if run[1] > 0 else hs.WARN_RED
-        bh = LEAD_BADGE_H
-        hs.card(x, mid - bh / 2, width, bh, hs.with_alpha(color, 46), bh / 2, hs.with_alpha(color, 90), 1.5)
-        g = size * 0.5
-        gh = g * 0.86
-        gx, gy = x + LEAD_BADGE_PAD, mid
+        g = size * LEAD_TREND_ARROW
+        cap = size * hs.INTER_CAP
+        top, bot = base - cap, base
         if run[1] > 0:
-          hs.triangle((gx, gy + gh / 2), (gx + g, gy + gh / 2), (gx + g / 2, gy - gh / 2), color)
+          hs.triangle((x, bot), (x + g, bot), (x + g / 2, top), color)
         else:
-          hs.triangle((gx, gy - gh / 2), (gx + g, gy - gh / 2), (gx + g / 2, gy + gh / 2), color)
-        t.draw(run[2], gx + g + 6.0, mid + size * hs.INTER_CAP / 2, size, color, hs.BOLD)
+          hs.triangle((x, top), (x + g, top), (x + g / 2, bot), color)
+        t.draw(run[2], x + g + LEAD_TREND_GAP, base, size, color, hs.SEMI)
       else:
         t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
       x += width
