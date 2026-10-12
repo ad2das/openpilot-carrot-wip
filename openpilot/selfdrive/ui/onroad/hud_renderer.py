@@ -35,6 +35,14 @@ BOTTOM_SHADE_H = 400
 DRIVE_W = 640
 DRIVE_H = 362
 DRIVE_FOOT_H = 86    # status strip under the speed: gear, gap, mode
+GAP_LEVELS_MIN = 2   # CruiseGapLevels range: how many following gaps the gap button cycles
+GAP_LEVELS_MAX = 4
+GAP_LEFT = 124.0     # meter span inside the foot strip, from the card's left edge
+GAP_RIGHT = 448.0
+GAP_SEG_H = 20.0
+GAP_SEG_GAP = 8.0
+GAP_CAR_W = 54.0
+GAP_GLASS = hs.rgba(30, 33, 40, 255)
 SET_SIZE = 68
 SET_LABEL_SIZE = 34
 SET_BASE = 74
@@ -261,6 +269,7 @@ class HudRenderer(Widget):
     self._show_tpms = 1
     self._show_plot_mode = 0
     self._longitudinal_personality = 7
+    self._cruise_gap_levels = GAP_LEVELS_MAX
 
     self._date_time_minute_key: tuple[int, int, int, int, int] | None = None
     self._date_time_text = ""
@@ -292,6 +301,11 @@ class HudRenderer(Widget):
     self._show_tpms = show_tpms
     self._show_plot_mode = show_plot_mode
     self._longitudinal_personality = longitudinal_personality
+    try:
+      levels = int(ui_state.params.get_int("CruiseGapLevels"))
+    except Exception:
+      levels = GAP_LEVELS_MAX
+    self._cruise_gap_levels = levels if GAP_LEVELS_MIN <= levels <= GAP_LEVELS_MAX else GAP_LEVELS_MAX
     self._hud_params_next_refresh_time = now if personality_read_failed else now + HUD_PARAM_REFRESH_INTERVAL
 
   def _update_state(self) -> None:
@@ -804,21 +818,34 @@ class HudRenderer(Widget):
     mid = foot + DRIVE_FOOT_H / 2
     hs.card(x + 30, mid - 28, 64, 56, hs.with_alpha(hs.TEXT, 240), 13, None)
     t.draw_mid(self._get_gear_text(), x + 62, mid, 40, hs.INK, hs.BOLD, align=0.5)
-    # Following gap, as on the cluster: the lead car on top, distance bars below it lit from our side up.
-    gap = self._get_cruise_gap()
-    gcx = x + 154
-    hs.card(gcx - 15, mid - 35, 30, 13, hs.TEXT, 5, None)
-    hs.card(gcx - 11, mid - 32, 22, 7, hs.rgba(30, 33, 40, 255), 3, None)
-    hs.card(gcx - 25, mid - 24, 50, 17, hs.TEXT, 6, None)
-    for i in range(4):
-      bw = 66 - i * 10
-      hs.card(gcx - bw / 2, mid + 27 - i * 9, bw, 5, hs.TEXT if i < gap else hs.with_alpha(hs.TEXT, 46), 2.5, None)
+    self._draw_gap_meter(x + GAP_LEFT, x + GAP_RIGHT, mid, self._get_cruise_gap(), self._cruise_gap_levels)
     mode_text, mode_color = self._get_driving_mode_text_and_color()
     if self._debug_speed_panel:
       mode_text, mode_color = "safe", hs.AMBER
     if mode_text:
       mode_w = t.draw_mid(mode_text, right - 32, mid, STATUS_SIZE, hs.TEXT, hs.SEMI, align=1.0)
       hs.dot(right - 32 - mode_w - 20, mid, 9, mode_color)
+
+  @staticmethod
+  def _draw_gap_meter(x0: float, x1: float, cy: float, gap: int, levels: int) -> None:
+    """Following gap as a level meter read left to right, from us to the lead car seen from behind: one pill per
+    level the gap button cycles, lit up to the selected gap."""
+    # Lead car: cabin with a dark rear window over a body with two tail lights.
+    cx = x1 - GAP_CAR_W / 2
+    body = cy - 6.0
+    hs.quad((cx - 14.0, cy - 21.0), (cx + 14.0, cy - 21.0), (cx + 21.0, body), (cx - 21.0, body), hs.TEXT)
+    hs.quad((cx - 10.5, cy - 17.5), (cx + 10.5, cy - 17.5), (cx + 15.5, body - 1.5), (cx - 15.5, body - 1.5), GAP_GLASS)
+    hs.card(cx - GAP_CAR_W / 2, body - 1.0, GAP_CAR_W, 19.0, hs.TEXT, 6.0, None)
+    for lx in (cx - GAP_CAR_W / 2 + 4.0, cx + GAP_CAR_W / 2 - 15.0):
+      hs.card(lx, body + 4.0, 11.0, 5.0, hs.WARN_RED, 2.5, None)
+    for wx in (cx - GAP_CAR_W / 2 + 5.0, cx + GAP_CAR_W / 2 - 15.0):
+      hs.card(wx, body + 17.0, 10.0, 7.0, hs.TEXT, 2.5, None)
+    # Level pills between us and the lead.
+    span = x1 - GAP_CAR_W - 18.0 - x0
+    seg = (span - GAP_SEG_GAP * (levels - 1)) / levels
+    for i in range(levels):
+      color = hs.TEXT if i < gap else hs.with_alpha(hs.TEXT, 50)
+      hs.card(x0 + i * (seg + GAP_SEG_GAP), cy - GAP_SEG_H / 2, seg, GAP_SEG_H, color, GAP_SEG_H / 2, None)
 
   def _update_cruise_speed_animation(self, cruise_text: str) -> None:
     if self._cruise_speed_text_last != cruise_text:

@@ -184,6 +184,7 @@ def test_direct_hud_param_reads_are_isolated_to_refresh():
     ("_refresh_hud_params", "ShowTpms"),
     ("_refresh_hud_params", "ShowPlotMode"),
     ("_refresh_hud_params", "LongitudinalPersonality"),
+    ("_refresh_hud_params", "CruiseGapLevels"),
   ]
 
 
@@ -219,6 +220,7 @@ def test_hud_params_are_refreshed_once_per_interval(hud_module):
     "ShowTpms": 3,
     "ShowPlotMode": 4,
     "LongitudinalPersonality": 4,
+    "CruiseGapLevels": 3,
   })
   fake_ui_state.params = params
   renderer = make_param_renderer(module)
@@ -232,20 +234,58 @@ def test_hud_params_are_refreshed_once_per_interval(hud_module):
     renderer._longitudinal_personality,
   ) == (1, 2, 3, 4, 4)
   assert renderer._hud_params_next_refresh_time == 1.0
+  assert renderer._cruise_gap_levels == 3
   assert params.calls == [
     "ShowDeviceState",
     "ShowDateTime",
     "ShowTpms",
     "ShowPlotMode",
     "LongitudinalPersonality",
+    "CruiseGapLevels",
   ]
 
   renderer._refresh_hud_params(0.999)
-  assert len(params.calls) == 5
+  assert len(params.calls) == 6
 
   renderer._refresh_hud_params(1.0)
-  assert len(params.calls) == 10
+  assert len(params.calls) == 12
   assert renderer._hud_params_next_refresh_time == 2.0
+
+
+@pytest.mark.parametrize("levels, expected", [(2, 2), (3, 3), (4, 4), (1, 4), (9, 4)])
+def test_cruise_gap_levels_outside_two_to_four_show_four(hud_module, levels, expected):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = FakeParams({
+    "ShowDeviceState": 1,
+    "ShowDateTime": 2,
+    "ShowTpms": 3,
+    "ShowPlotMode": 4,
+    "LongitudinalPersonality": 1,
+    "CruiseGapLevels": levels,
+  })
+  renderer = make_param_renderer(module)
+
+  renderer._refresh_hud_params(0.0)
+
+  assert renderer._cruise_gap_levels == expected
+
+
+def test_cruise_gap_levels_read_failure_shows_four(hud_module):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = FakeParams({
+    "ShowDeviceState": 1,
+    "ShowDateTime": 2,
+    "ShowTpms": 3,
+    "ShowPlotMode": 4,
+    "LongitudinalPersonality": 1,
+    "CruiseGapLevels": 2,
+  }, failures={"CruiseGapLevels": 1})
+  renderer = make_param_renderer(module)
+
+  renderer._refresh_hud_params(0.0)
+
+  assert renderer._cruise_gap_levels == 4
+  assert renderer._longitudinal_personality == 1
 
 
 def test_show_param_failure_keeps_complete_snapshot_and_retries(hud_module):

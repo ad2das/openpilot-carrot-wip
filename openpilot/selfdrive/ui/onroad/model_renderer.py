@@ -56,19 +56,26 @@ LANE_WHITE = (240, 243, 247)
 LANE_YELLOW = (255, 196, 0)
 # Screen-space fade (0 = bottom of the view, 1 = top): opaque underfoot, gone by the horizon.
 FADE_STOPS = [0.0, 0.3, 0.5]
+# Lead crescent: neutral for the stock radar's lead, amber for a radar track, blue when only the camera
+# sees it, red only while closing in fast. Red is kept for the one case worth a glance.
+LEAD_RADAR = rl.Color(240, 243, 247, 255)
+LEAD_TRACK = rl.Color(255, 159, 10, 255)  # a radar track (not the stock radar's own lead) holds the lead
 LEAD_RED = rl.Color(255, 69, 58, 255)
-LEAD_AMBER = rl.Color(255, 159, 10, 255)
+LEAD_CLOSE_TTC_ON = 3.0  # s to contact before the crescent turns red
+LEAD_CLOSE_TTC_OFF = 4.0  # s to contact before it returns to the source colour (hysteresis)
+LEAD_CLOSE_MIN_VREL = 1.0  # m/s closing speed below which time-to-contact is not meaningful
+LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at a glance
 # Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
-LEAD_SIZE = 62
-LEAD_SPEED_SIZE = 50
-LEAD_UNIT_SIZE = 34
-LEAD_TREND_SIZE = 42
-LEAD_TREND_ARROW = 0.62  # arrow width as a share of the trend figure size
-LEAD_TREND_GAP = 6.0
+LEAD_SIZE = 64  # the leading figure: the lead's speed, or the gap while its speed is unknown
+LEAD_GAP_SIZE = 46  # the gap beside the speed
+LEAD_UNIT_SIZE = 30
 LEAD_STATE_SIZE = 48
-LEAD_CAPSULE_H = 86.0
+LEAD_CAPSULE_H = 84.0
+# Gap and speed are two segments of one capsule, the speed's a lighter surface: no captions needed to tell them apart.
+LEAD_SEG_PAD = 26.0
+LEAD_SEG_FILL = rl.Color(255, 255, 255, 36)
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
-LEAD_TWO = rl.Color(230, 126, 34, 255)
+LEAD_TWO = rl.Color(240, 243, 247, 150)
 
 
 @dataclass
@@ -474,8 +481,9 @@ class ModelRenderer(Widget):
     self._carrot_radar_dist = 0.0
     self._carrot_vision_dist = 0.0
     self._carrot_lead_speed = 0.0
-    self._carrot_lead_vrel = 0.0
+    self._carrot_lead_closing = False
     self._lead_w = 0.0
+    self._lead_w2 = 0.0
     self._float_boxes: list[tuple[float, float, float, float]] = []
     self._lead_capsule = None
     self._carrot_x_state = 0
@@ -811,9 +819,10 @@ class ModelRenderer(Widget):
       self._carrot_radar_track_id = int(lead_one.radarTrackId)
       self._carrot_radar_dist = float(lead_one.dRel) if lead_one.radar else 0.0
       self._carrot_lead_speed = float(lead_one.vLead) * (3.6 if ui_state.is_metric else 2.2369363)
-      vrel = float(lead_one.vRel) * (3.6 if ui_state.is_metric else 2.2369363)
-      self._carrot_lead_vrel = vrel if not self._carrot_lead_status_prev else self._carrot_lead_vrel * 0.8 + vrel * 0.2
+      self._carrot_lead_closing = self._lead_closing_next(self._carrot_lead_closing, float(lead_one.dRel), float(lead_one.vRel))
       self._carrot_lead_status = True
+    else:
+      self._carrot_lead_closing = False
 
     left_pt = self._map_to_screen(max_distance, y - 1.2, z + 1.22)
     right_pt = self._map_to_screen(max_distance, y + 1.2, z + 1.22)
@@ -872,8 +881,8 @@ class ModelRenderer(Widget):
 
 
   def _lead_runs_carrot(self) -> list[tuple]:
-    """Readout contents on one baseline: ('dot', colour, r), ('num'/'text'/'unit', text, size, colour), ('bar',)
-    and ('trend', sign, text, size). The capsule is sized for widest-digit 'num' slots so it does not breathe as digits change."""
+    """Readout contents: ('dot', colour, r) and ('num'/'text'/'unit', text, size, colour); a ('bar',) splits the lead's
+    speed from the gap, which takes the lighter right segment. The capsule is sized for widest-digit 'num' slots so it does not breathe as digits change."""
     if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
       return [("text", text, LEAD_STATE_SIZE, hs.TEXT)]
@@ -887,40 +896,35 @@ class ModelRenderer(Widget):
 
     text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
     runs: list[tuple] = []
-    # Two readings, nothing else: the gap that drives the car, then the lead's speed a step quieter.
+    # Two readings, nothing else: the lead's speed first and loudest, then the gap a step quieter.
     # The source colour lives on the crescent under the car, not in the capsule.
+    if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
+      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
+               ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
     dist = self._carrot_radar_dist if self._carrot_radar_dist > 0.0 else self._carrot_vision_dist
     if dist > 0.0:
-      # Whole metres while far (tenths would flicker without meaning); tenths only up close.
-      runs += [("num", f"{dist:.1f}" if round(dist, 1) < 10.0 else f"{dist:.0f}", LEAD_SIZE, text_color),
-               ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
-    if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       if runs:
         runs.append(("bar",))
-      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SPEED_SIZE, hs.TEXT_2),
-               ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
-      # Speed relative to us as a bare tinted arrow and figure: green up = pulling away, red down = closing.
-      rel = round(self._carrot_lead_vrel)
-      if abs(rel) >= 2:
-        runs.append(("trend", 1 if rel > 0 else -1, f"{abs(rel)}", LEAD_TREND_SIZE))
+      # Whole metres while far (tenths would flicker without meaning); tenths only up close.
+      runs += [("num", f"{dist:.1f}" if round(dist, 1) < 10.0 else f"{dist:.0f}", LEAD_GAP_SIZE if runs else LEAD_SIZE,
+                text_color), ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
     return runs
 
-  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0, "bar": 26.0, "trend": 16.0}
+  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0}
+
+  @staticmethod
+  def _lead_run_weight(run):
+    # The leading figure is bold; everything else semi-bold.
+    return hs.BOLD if run[0] == "num" and run[2] == LEAD_SIZE else hs.SEMI
 
   def _lead_run_width(self, run, slot: bool = False) -> float:
     kind = run[0]
     if kind == "dot":
       return run[2] * 2.0
-    if kind == "bar":
-      return 2.0 + 26.0
     if kind == "num" and slot:
       # Widest-digit slot: Inter's figures are proportional.
-      return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], hs.SEMI)
-    if kind == "trend":
-      # Arrow, gap, figure (widest-digit slot so the capsule does not breathe either).
-      figure = "".join("0" for _ in run[2]) if slot else run[2]
-      return run[3] * LEAD_TREND_ARROW + LEAD_TREND_GAP + self._type.width(figure, run[3], hs.SEMI)
-    return self._type.width(run[1], run[2], hs.SEMI)
+      return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], self._lead_run_weight(run))
+    return self._type.width(run[1], run[2], self._lead_run_weight(run))
 
   def _lead_run_gap(self, prev, kind) -> float:
     if prev is None:
@@ -929,71 +933,98 @@ class ModelRenderer(Widget):
       return 9.0
     return (18.0 if prev == "unit" else 24.0) if kind == "dot" else self._LEAD_GAPS[kind]
 
+  def _place_lead_runs(self, runs, slot: bool = False):
+    """Left offsets of runs laid out on one line, and the line's width."""
+    placed: list[tuple[tuple, float]] = []
+    x = 0.0
+    prev = None
+    for run in runs:
+      x += self._lead_run_gap(prev, run[0])
+      placed.append((run, x))
+      x += self._lead_run_width(run, slot)
+      prev = run[0]
+    return placed, x
+
   def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
     runs = self._lead_runs_carrot()
     if not runs:
       self._lead_w = 0.0
       return
-    content = slots = 0.0
-    prev = None
-    for run in runs:
-      gap = self._lead_run_gap(prev, run[0])
-      content += gap + self._lead_run_width(run)
-      slots += gap + self._lead_run_width(run, slot=True)
-      prev = run[0]
+    split = runs.index(("bar",)) if ("bar",) in runs else len(runs)
+    first, second = runs[:split], runs[split + 1:]
+    p1, w1 = self._place_lead_runs(first)
+    p2, w2 = self._place_lead_runs(second)
+    s1 = self._place_lead_runs(first, slot=True)[1]
+    s2 = self._place_lead_runs(second, slot=True)[1]
     h = LEAD_CAPSULE_H
-    target = slots + 64.0
-    # Ease width changes (a figure gaining a digit, the trend cue appearing) instead of snapping.
-    self._lead_w = target if self._lead_w <= 0.0 or abs(target - self._lead_w) > 160.0 else self._lead_w * 0.7 + target * 0.3
-    w = max(self._lead_w, content + 48.0)
+    # Each segment is sized for its widest-digit slots; width changes (a figure gaining a digit, a state word
+    # replacing the figures) ease instead of snapping.
+    def ease(cur, target):
+      return target if cur <= 0.0 or abs(target - cur) > 160.0 else cur * 0.7 + target * 0.3
+    self._lead_w = ease(self._lead_w, s1 + 2.0 * LEAD_SEG_PAD if second else s1 + 64.0)
+    self._lead_w2 = ease(self._lead_w2, s2 + 2.0 * LEAD_SEG_PAD) if second else 0.0
+    seg1 = max(self._lead_w, w1 + 40.0)
+    seg2 = max(self._lead_w2, w2 + 40.0) if second else 0.0
+    w = seg1 + seg2
     # The tail tip sits just above the (truck-height) roof estimate.
     mid = hs.clear_of_panels(cx, car_top - 28.0 - h / 2, w, h)
     self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
-    self._lead_capsule = (runs, cx, mid, w, h, car_top, content)
+    self._lead_capsule = ((p1, w1), (p2, w2), cx, mid, w, h, car_top, seg1)
 
-  def _draw_lead_capsule_carrot(self, runs, cx: float, mid: float, w: float, h: float, car_top: float, content: float) -> None:
+  def _draw_lead_runs(self, placed, left: float, base: float) -> None:
     t = self._type
+    for i, (run, ox) in enumerate(placed):
+      kind = run[0]
+      x = left + ox
+      if kind == "dot":
+        # A source dot is centred on the cap height of the figure it labels.
+        nxt = placed[i + 1][0] if i + 1 < len(placed) else None
+        size = nxt[2] if nxt is not None and nxt[0] == "num" else LEAD_SIZE
+        hs.dot(x + run[2], base - size * hs.INTER_CAP / 2, run[2], run[1])
+      else:
+        t.draw(run[1], x, base, run[2], run[3], self._lead_run_weight(run))
+
+  def _draw_lead_capsule_carrot(self, line1, line2, cx: float, mid: float, w: float, h: float, car_top: float,
+                                seg1: float) -> None:
     bottom = mid + h / 2
     tail = 12.0
     if bottom + tail < car_top - 40.0:
       # Pushed up by a HUD card: extend the tail with a stem that fades out (the lead's real height is unknown).
       rl.draw_rectangle_gradient_v(int(cx) - 1, int(bottom + tail - 2.0), 3, int(car_top - bottom - tail),
                                    hs.rgba(255, 255, 255, 150), hs.rgba(255, 255, 255, 0))
-    hs.chip(cx - w / 2, mid - h / 2, w, h)
-    if bottom + tail < car_top:
+    left = cx - w / 2
+    hs.chip(left, mid - h / 2, w, h)
+    split = left + seg1
+    tip = bottom + tail < car_top
+    if tip:
       hs.triangle((cx - tail, bottom - 1.0), (cx + tail, bottom - 1.0), (cx, bottom + tail), hs.CHIP_FILL)
-    x = cx - content / 2
-    # Every run shares the large figures' baseline; smaller figures and units sit on it.
-    base = mid + max((run[2] for run in runs if run[0] in ("num", "text")), default=LEAD_SIZE) * hs.INTER_CAP / 2
-    prev = None
-    for i, run in enumerate(runs):
-      kind = run[0]
-      x += self._lead_run_gap(prev, kind)
-      width = self._lead_run_width(run)
-      if kind == "dot":
-        # A source dot is centred on the cap height of the figure it labels.
-        size = runs[i + 1][2] if i + 1 < len(runs) and runs[i + 1][0] == "num" else LEAD_SIZE
-        hs.dot(x + run[2], base - size * hs.INTER_CAP / 2, run[2], run[1])
-      elif kind == "bar":
-        rl.draw_rectangle_rounded(rl.Rectangle(x, mid - 24.0, 2.0, 48.0), 1.0, 4, hs.rgba(255, 255, 255, 56))
-      elif kind == "num":
-        t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
-      elif kind == "trend":
-        # Sits on the shared baseline; the arrow spans the figure's cap height.
-        size = run[3]
-        color = hs.LIVE_GREEN if run[1] > 0 else hs.WARN_RED
-        g = size * LEAD_TREND_ARROW
-        cap = size * hs.INTER_CAP
-        top, bot = base - cap, base
-        if run[1] > 0:
-          hs.triangle((x, bot), (x + g, bot), (x + g / 2, top), color)
-        else:
-          hs.triangle((x, top), (x + g, top), (x + g / 2, bot), color)
-        t.draw(run[2], x + g + LEAD_TREND_GAP, base, size, color, hs.SEMI)
-      else:
-        t.draw(run[1], x, base, run[2], run[3], hs.SEMI)
-      x += width
-      prev = kind
+    (p1, w1), (p2, w2) = line1, line2
+    if p2:
+      # The gap on the capsule's lighter right segment: square where it meets the speed, round at the end.
+      r = h / 2 - 1.5
+      right = left + w - 1.5
+      rl.draw_rectangle_rec(rl.Rectangle(split, mid - r, right - r - split, 2.0 * r), LEAD_SEG_FILL)
+      rl.draw_circle_sector(rl.Vector2(right - r, mid), r, -90.0, 90.0, 24, LEAD_SEG_FILL)
+      if tip and cx > split:
+        hs.triangle((cx - tail, bottom - 1.0), (cx + tail, bottom - 1.0), (cx, bottom + tail), LEAD_SEG_FILL)
+    cap1 = max((run[2] for run, _ in p1 if run[0] in ("num", "text")), default=LEAD_SIZE) * hs.INTER_CAP
+    self._draw_lead_runs(p1, left + (seg1 - w1) / 2, mid + cap1 / 2)
+    if p2:
+      cap2 = max(run[2] for run, _ in p2 if run[0] == "num") * hs.INTER_CAP
+      self._draw_lead_runs(p2, split + (w - seg1 - w2) / 2, mid + cap2 / 2)
+
+  @staticmethod
+  def _lead_closing_next(closing: bool, d_rel: float, v_rel: float) -> bool:
+    """Closing-in-fast state with hysteresis: on below LEAD_CLOSE_TTC_ON s to contact, off above LEAD_CLOSE_TTC_OFF."""
+    ttc = d_rel / -v_rel if v_rel < -LEAD_CLOSE_MIN_VREL else float("inf")
+    return ttc < (LEAD_CLOSE_TTC_OFF if closing else LEAD_CLOSE_TTC_ON)
+
+  def _lead_stroke_carrot(self) -> rl.Color:
+    if self._carrot_lead_closing:
+      return LEAD_RED
+    if self._carrot_radar_track_id < 0:
+      return LEAD_BLUE
+    return LEAD_TRACK if self._carrot_radar_track_id >= 1 else LEAD_RADAR
 
   def _draw_path_end_overlay_carrot(self):
     x = float(self._carrot_path_x)
@@ -1008,15 +1039,15 @@ class ModelRenderer(Widget):
         w2 = self._carrot_lead_two_xr - self._carrot_lead_two_xl
         y2 = self._carrot_lead_two_y
         if self._carrot_lead_two_status == 2:
-          hs.ellipse_glow(x2, y2 - 4, w2 * 0.7, w2 * 0.12, hs.with_alpha(LEAD_TWO, 150))
-        hs.taper_curve((x2 - w2 * 0.45, y2 - 5), (x2, y2 + 10), (x2 + w2 * 0.45, y2 - 5), 5.0, LEAD_TWO)
+          hs.ellipse_glow(x2, y2 - 4, w2 * 0.7, w2 * 0.12, hs.with_alpha(LEAD_TWO, 90))
+        hs.taper_curve((x2 - w2 * 0.45, y2 - 5), (x2, y2 + 10), (x2 + w2 * 0.45, y2 - 5), 6.0, LEAD_TWO)
 
-      # The lead stands in a pool of light in its source colour (radar red/amber, vision blue),
-      # underlined by a crescent that tapers to points at the wheels.
-      rcolor = LEAD_RED if self._carrot_radar_track_id < 1 else LEAD_AMBER
-      stroke = rcolor if self._carrot_radar_track_id >= 0 else LEAD_BLUE
-      hs.ellipse_glow(x, base - 4, w * 0.66, w * 0.11, hs.with_alpha(stroke, 170))
-      hs.taper_curve((x - w * 0.52, base - 9), (x, base + 15), (x + w * 0.52, base - 9), 7.0, stroke)
+      # The lead stands in a pool of light underlined by a crescent that tapers to points at the wheels:
+      # neutral for radar, blue for camera-only, red only while closing in fast.
+      stroke = self._lead_stroke_carrot()
+      cw = max(w, LEAD_MIN_WIDTH)
+      hs.ellipse_glow(x, base - 4, cw * 0.66, cw * 0.11, hs.with_alpha(stroke, 150 if stroke is LEAD_RADAR else 190))
+      hs.taper_curve((x - cw * 0.52, base - 10), (x, base + 17), (x + cw * 0.52, base - 10), 11.0, stroke)
 
     # Vehicle height is unknown: leave room for a truck so the readout never sits on the lead.
     self._layout_lead_capsule_carrot(x, base - w * 1.3)
@@ -1463,14 +1494,18 @@ class ModelRenderer(Widget):
   def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", trend: int, d_rel: float):
     """Speed callout pinned above a tracked car's roof; the ring keeps the radar-state colour.
 
-    trend 1 = pulling away (green up), -1 = closing (red down). Returns (centre x, centre y, height) or None."""
+    trend 1 = pulling away, -1 = closing: a filled green/red disc with a white chevron hugs the tag's left end,
+    the speed follows. Returns (centre x, centre y, height) or None."""
     near = d_rel < 40.0
     size = 46 if near else 40
     h = 66.0 if near else 58.0
-    glyph = 0.0 if trend == 0 else h * 0.36
+    disc = 0.0 if trend == 0 else h - 14.0
     text_w = self._type.width(text, size, hs.SEMI)
-    inner = text_w + (glyph + 10.0 if glyph else 0.0)
-    w = max(h * 1.6, inner + h * 0.8)
+    if disc:
+      # Disc inset by the same margin on top, bottom and left, then the figure and a pill-end right margin.
+      w = (h - disc) / 2.0 + disc + 12.0 + text_w + h * 0.42
+    else:
+      w = max(h * 1.6, text_w + h * 0.8)
     tail = 10.0
     spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
     if spot is None or abs(spot[0] - x) - w / 2 > self.TAG_DROP_REACH:
@@ -1494,16 +1529,24 @@ class ModelRenderer(Widget):
       rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
       hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
     hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230) if ring is not None else None, ring_width=3.0)
-    cx = tx - inner / 2
-    if glyph:
-      gy, gh = mid, glyph * 0.8
-      gx = cx + glyph / 2
-      if trend > 0:
-        hs.triangle((gx - glyph / 2, gy + gh / 2), (gx + glyph / 2, gy + gh / 2), (gx, gy - gh / 2), hs.LIVE_GREEN)
-      else:
-        hs.triangle((gx - glyph / 2, gy - gh / 2), (gx + glyph / 2, gy - gh / 2), (gx, gy + gh / 2), hs.WARN_RED)
-      cx += glyph + 10.0
-    self._type.draw_mid(text, cx, mid, size, hs.TEXT, hs.SEMI, align=0.0)
+    if disc:
+      r = disc / 2.0
+      gx = left + (h - disc) / 2.0 + r
+      hs.dot(gx, mid, r, hs.LIVE_GREEN if trend > 0 else hs.WARN_RED)
+      # A stroked chevron with rounded ends, centred in the disc.
+      cw, ch = r * 0.46, r * 0.26
+      tip = mid - ch if trend > 0 else mid + ch
+      foot = mid + ch if trend > 0 else mid - ch
+      pts = [(gx - cw, foot), (gx, tip), (gx + cw, foot)]
+      stroke = max(4.0, r * 0.2)
+      # Two straight strokes joined by round caps: a single ribbon would notch at the sharp apex.
+      hs.polyline(pts[:2], stroke, hs.TEXT)
+      hs.polyline(pts[1:], stroke, hs.TEXT)
+      for px, py in pts:
+        hs.dot(px, py, stroke / 2.0, hs.TEXT)
+      self._type.draw_mid(text, gx + r + 12.0, mid, size, hs.TEXT, hs.SEMI, align=0.0)
+    else:
+      self._type.draw_mid(text, tx, mid, size, hs.TEXT, hs.SEMI, align=0.5)
     return tx, mid, h
 
 

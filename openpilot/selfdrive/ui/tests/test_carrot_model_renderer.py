@@ -517,14 +517,14 @@ def lead_renderer(**overrides):
     "_carrot_radar_track_id": -1,
     "_carrot_lead_status": False,
     "_carrot_lead_speed": 0.0,
-    "_carrot_lead_vrel": 0.0,
+    "_carrot_lead_closing": False,
   }
   for key, value in {**defaults, **overrides}.items():
     setattr(renderer, key, value)
   return renderer
 
 
-def test_lead_runs_are_distance_then_quieter_speed_and_bare_trend(monkeypatch):
+def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(
     _carrot_radar_dist=12.5,
@@ -532,18 +532,26 @@ def test_lead_runs_are_distance_then_quieter_speed_and_bare_trend(monkeypatch):
     _carrot_radar_track_id=0,
     _carrot_lead_status=True,
     _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=-12.0,
+    _carrot_lead_closing=True,
   )
 
-  # No source dots and no vision cross-check: the radar gap in whole metres, then the lead speed.
+  # No source dots, no vision cross-check and no relative-speed arrow: the lead speed leads, then the radar gap.
   assert renderer._lead_runs_carrot() == [
-    ("num", "12", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
-    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("bar",),
-    ("num", "30", model_renderer.LEAD_SPEED_SIZE, model_renderer.hs.TEXT_2),
+    ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("trend", -1, "12", model_renderer.LEAD_TREND_SIZE),
+    ("bar",),
+    ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
+
+
+@pytest.mark.parametrize("run, weight", [
+  (("num", "80", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT), model_renderer.hs.BOLD),
+  (("num", "49", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT), model_renderer.hs.SEMI),
+  (("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3), model_renderer.hs.SEMI),
+])
+def test_only_the_leading_figure_is_bold(run, weight):
+  assert model_renderer.ModelRenderer._lead_run_weight(run) is weight
 
 
 def test_lead_runs_vision_only_shows_vision_distance_with_tenths_up_close(monkeypatch):
@@ -567,44 +575,32 @@ def test_lead_distance_uses_tenths_only_below_ten_metres(monkeypatch, dist, text
   assert not any(run[0] == "dot" for run in runs)
 
 
-def test_lead_runs_trend_needs_two_kph_and_keeps_sign(monkeypatch):
-  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+@pytest.mark.parametrize("track_id, closing, colour", [
+  (0, False, model_renderer.LEAD_RADAR),
+  (7, False, model_renderer.LEAD_TRACK),
+  (-1, False, model_renderer.LEAD_BLUE),
+  (0, True, model_renderer.LEAD_RED),
+  (-1, True, model_renderer.LEAD_RED),
+])
+def test_lead_crescent_neutral_radar_amber_track_blue_camera_red_only_when_closing(track_id, closing, colour):
+  renderer = lead_renderer(_carrot_radar_track_id=track_id, _carrot_lead_closing=closing)
 
-  for vrel in (-1.4, 0.0, 1.4):
-    renderer = lead_renderer(
-      _carrot_radar_dist=12.5,
-      _carrot_lead_status=True,
-      _carrot_lead_speed=30.0,
-      _carrot_lead_vrel=vrel,
-    )
-    assert not any(run[0] == "trend" for run in renderer._lead_runs_carrot())
-
-  closing = lead_renderer(
-    _carrot_radar_dist=12.5,
-    _carrot_lead_status=True,
-    _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=-12.0,
-  )
-  assert closing._lead_runs_carrot()[-1] == ("trend", -1, "12", model_renderer.LEAD_TREND_SIZE)
-
-  pulling_away = lead_renderer(
-    _carrot_radar_dist=12.5,
-    _carrot_lead_status=True,
-    _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=12.4,
-  )
-  assert pulling_away._lead_runs_carrot()[-1] == ("trend", 1, "12", model_renderer.LEAD_TREND_SIZE)
+  assert renderer._lead_stroke_carrot() is colour
 
 
-def test_lead_run_width_trend_slot_is_independent_of_digit_shapes():
-  renderer = object.__new__(model_renderer.ModelRenderer)
-  renderer._type = SimpleNamespace(width=lambda text, size, weight: float(sum(10 if c == "1" else 20 for c in text)))
+def test_lead_closing_needs_short_time_to_contact_and_holds_with_hysteresis():
+  closing_next = model_renderer.ModelRenderer._lead_closing_next
 
-  narrow = ("trend", -1, "11", model_renderer.LEAD_TREND_SIZE)
-  wide = ("trend", -1, "88", model_renderer.LEAD_TREND_SIZE)
-
-  assert renderer._lead_run_width(narrow, slot=True) == renderer._lead_run_width(wide, slot=True)
-  assert renderer._lead_run_width(narrow) != renderer._lead_run_width(wide)
+  # Standing or pulling away never reads as closing, nor does a crawl below the minimum closing speed.
+  assert not closing_next(False, 5.0, 0.0)
+  assert not closing_next(False, 5.0, 2.0)
+  assert not closing_next(True, 2.0, -0.9)
+  # 20 m at 8 m/s is 2.5 s to contact: on. 30 m at 8 m/s is 3.75 s: off when idle, held once on.
+  assert closing_next(False, 20.0, -8.0)
+  assert not closing_next(False, 30.0, -8.0)
+  assert closing_next(True, 30.0, -8.0)
+  # Beyond the release threshold it clears.
+  assert not closing_next(True, 40.0, -8.0)
 
 
 def speed_tag_renderer():
