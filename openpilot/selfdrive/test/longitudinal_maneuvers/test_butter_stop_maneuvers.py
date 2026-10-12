@@ -41,11 +41,9 @@ RESULTS: list[dict] = []
 
 
 def _seed_param_defaults():
-  """A fresh CI param store is empty; seed the catalog defaults like a device."""
+  """Each test runs in a fresh OpenpilotPrefix; seed catalog defaults like manager.set_default_params."""
   params = Params()
   for key in params.all_keys():
-    if params.get(key) is not None:
-      continue
     default = params.get_default_value(key)
     if default is None:
       continue
@@ -53,9 +51,8 @@ def _seed_param_defaults():
       params.put(key, default)
     except (UnknownKeyName, TypeError, ValueError):
       pass
-
-
-_seed_param_defaults()
+  params.put_int("MyDrivingMode", 3)
+  assert params.get_int("MyDrivingMode") == 3
 
 
 class _Flags(dict):
@@ -99,6 +96,7 @@ def _no_floor(*_args, **_kwargs):
 
 class ButterStopLoop:
   def __init__(self, maneuver, butter, neutralize=False):
+    _seed_param_defaults()
     params = Params()
     params.put_int("ButterStop", int(butter))
 
