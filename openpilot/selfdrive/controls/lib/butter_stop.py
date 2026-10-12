@@ -14,7 +14,7 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 V_TAPER = 3.0
 A_END = 0.25
 K_TAPER = 0.4
-D_EXTRA = 0.8
+D_EXTRA = 1.0
 MARGIN_BASE = 0.2
 MARGIN_V_SLOPE = 0.15
 MIN_FINAL_GAP_SLACK = 0.6
