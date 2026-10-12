@@ -4,7 +4,7 @@
   releases or creeps into a lead. Add Params ButterStop (int, default1, Carrot
   Web incl. labels) plus lib/butter_stop.py: below3m/s the output braking
   ceiling is tapered to A_END0.25+K_TAPER0.4*v, the MPC plans0.8m earlier
-  (D_EXTRA), standstill-confirmed hold ramps at2.0m/s3 and a latched creep
+  (D_EXTRA), standstill-confirmed hold ramps at 2.0 m/s^3 and a latched creep
   guard immediately restores braking above0.15m/s without gas. Stop entry,
   hold/release decisions, StopReq generation, soft hold and jerk limits are
   unchanged; ButterStop=0 replays bit-identically. 31 focused unit tests pass;

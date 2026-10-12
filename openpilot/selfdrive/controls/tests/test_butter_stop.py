@@ -126,8 +126,8 @@ def test_floor_lead_bound_and_absolute_gap():
   avail = min(plan_stop_distance(PLAN_T, speeds) + D_EXTRA - (MARGIN_BASE + MARGIN_V_SLOPE * 1.0), bound)
   expected = min(-(A_END + K_TAPER * 1.0), -(1.0 ** 2) / (2.0 * avail))
   assert butter_floor(1.0, PLAN_T, speeds, lead, 5.5) == pytest.approx(expected)
-  # dRel - 5.2 <= 0.05 -> no floor at all.
-  assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=True, dRel=5.2), 5.5) is None
+  # dRel at the lead bound -> no floor at all.
+  assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=True, dRel=5.5 - MIN_FINAL_GAP_SLACK), 5.5) is None
   # A small configured stop distance keeps the 3.0 m absolute minimum.
   strong = SimpleNamespace(status=True, dRel=6.0)
   assert butter_floor(1.0, PLAN_T, speeds, strong, 1.0) == pytest.approx(

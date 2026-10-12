@@ -19,7 +19,7 @@ Mechanism (`openpilot/selfdrive/controls/lib/butter_stop.py`):
 - `butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig)` computes
   the trapezoid distance to the plan's first sub-0.05 m/s sample, subtracts an
   actuator-lag margin `0.2 + 0.15*v`, is additionally bounded by the lead
-  (`dRel - max(3.0 m, stop_distance - 0.3 m)`), and returns the more negative
+  (`dRel - max(3.0 m, stop_distance - 0.6 m)`), and returns the more negative
   of the taper and the kinematic limit `-v^2 / (2*avail)`; `None` when no stop
   is planned or availability is at most 0.05 m.
 - Eligibility (all required): setting on, active, `STANDSTILL_V < vEgo <
