@@ -133,9 +133,12 @@ def enable_cluster_hud(started, params, CP: car.CarParams) -> bool:
   return cluster_hud_active(params)
 
 def enable_tlvd(started, params, CP: car.CarParams) -> bool:
-  # On-device traffic-light detector: onroad only and off by default.
+  # On-device traffic-light detector: onroad only and off by default. It also
+  # requires traffic-light detection (TrafficLightDetectMode) to be on, so
+  # turning that off in Carrot Web stops tlvd at the next manager pass.
   try:
-    return started and params.get_int("CarrotTlvMode") >= 1
+    return (started and params.get_int("CarrotTlvMode") >= 1
+            and params.get_int("TrafficLightDetectMode") >= 1)
   except Exception:
     return False
 

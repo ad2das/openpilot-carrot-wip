@@ -51,6 +51,10 @@ PROC_POLL_S = 1.0
 STATS_INTERVAL_S = 10.0
 ERROR_LOG_INTERVAL_S = 10.0
 MAX_PUBLISHED_DETS = 16
+# Crash-loop guard: more than this many starts inside the window turns
+# CarrotTlvMode off so a struggling device cannot keep relaunching tlvd.
+CRASH_LOOP_MAX_STARTS = 5
+CRASH_LOOP_WINDOW_S = 300.0
 
 PROC_STAT = "/proc/stat"
 PROC_MEMINFO = "/proc/meminfo"
@@ -485,11 +489,42 @@ class TlvRunner:
       rk.keep_time()
 
 
+def crash_loop_guard(params, now: float) -> bool:
+  """Record this start; True (and CarrotTlvMode cleared) when tlvd has started
+  more than CRASH_LOOP_MAX_STARTS times within CRASH_LOOP_WINDOW_S."""
+  starts: list[float] = []
+  for item in _param_text(params, "CarrotTlvRecentStarts", "").split(","):
+    try:
+      t = float(item)
+    except ValueError:
+      continue
+    if 0.0 <= now - t <= CRASH_LOOP_WINDOW_S:
+      starts.append(t)
+  starts.append(now)
+  try:
+    params.put("CarrotTlvRecentStarts", ",".join(f"{t:.1f}" for t in starts))
+  except Exception:
+    pass
+  if len(starts) <= CRASH_LOOP_MAX_STARTS:
+    return False
+  try:
+    params.put("CarrotTlvMode", b"0")
+  except Exception as exc:
+    print(f"tlvd: failed to clear CarrotTlvMode on crash loop: {exc!r}", flush=True)
+  return True
+
+
 def main() -> None:
   from openpilot.common.params import Params
   params = Params()
   if _param_int(params, "CarrotTlvMode") < 1:
     print("tlvd: disabled (CarrotTlvMode off)", flush=True)
+    return
+  if _param_int(params, "TrafficLightDetectMode", 2) < 1:
+    print("tlvd: disabled (TrafficLightDetectMode off)", flush=True)
+    return
+  if crash_loop_guard(params, time.monotonic()):
+    print(f"tlvd: >{CRASH_LOOP_MAX_STARTS} starts in {CRASH_LOOP_WINDOW_S:.0f} s; CarrotTlvMode cleared", flush=True)
     return
   print(f"tlvd: start cpu-policy={apply_cpu_policy()}", flush=True)
   if not resources.write_oom_score_adj(1000):

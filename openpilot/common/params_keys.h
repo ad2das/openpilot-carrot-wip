@@ -390,6 +390,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotTlvBackend", {PERSISTENT, STRING, "onnx"}},
     {"CarrotTlvModelPath", {PERSISTENT, STRING}},
     {"CarrotTlvLampModelPath", {PERSISTENT, STRING}},  // lamp classifier (detect-then-track)
+    {"CarrotTlvRecentStarts", {CLEAR_ON_MANAGER_START, STRING}},  // tlvd crash-loop guard (monotonic start times)
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 
