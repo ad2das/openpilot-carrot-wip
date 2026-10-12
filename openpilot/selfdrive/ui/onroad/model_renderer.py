@@ -1,5 +1,6 @@
 import math
 import colorsys
+import time
 import numpy as np
 
 from openpilot.selfdrive.ui.onroad import hud_style as hs
@@ -12,6 +13,7 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.selfdrive.locationd.calibrationd import HEIGHT_INIT
 from openpilot.selfdrive.ui.ui_state import ui_state
+from openpilot.selfdrive.ui.vision_status import blindspot_source_packet, blindspot_sources
 from openpilot.selfdrive.ui.road_markings import (
   LANE_DASH_LENGTH_M as LANE_DASH_LENGTH_M, LANE_DASH_GAP_M as LANE_DASH_GAP_M,
   lane_dash_segments, project_lane_segments, project_blindspot_barrier,
@@ -1218,39 +1220,50 @@ class ModelRenderer(Widget):
     return left_blindspot, right_blindspot, left_assist, right_assist
 
 
+  # Blind-spot wall colour by who saw the car: the car's own sensor (amber), Carrot Vision only (blue),
+  # or both agreeing (red). Green marks an assisted lane change with a radar side lead in reach.
+  BLIND_SPOT_ALPHA = 135
+  BLIND_SPOT_OEM = rl.Color(hs.AMBER.r, hs.AMBER.g, hs.AMBER.b, BLIND_SPOT_ALPHA)
+  BLIND_SPOT_VISION = rl.Color(hs.BLUE.r, hs.BLUE.g, hs.BLUE.b, BLIND_SPOT_ALPHA)
+  BLIND_SPOT_BOTH = rl.Color(hs.RED.r, hs.RED.g, hs.RED.b, BLIND_SPOT_ALPHA)
+  BLIND_SPOT_ASSIST = rl.Color(48, 209, 88, BLIND_SPOT_ALPHA)
+
+  @classmethod
+  def _blind_spot_source_color(cls, oem: bool, vision: bool) -> rl.Color:
+    if oem and vision:
+      return cls.BLIND_SPOT_BOTH
+    return cls.BLIND_SPOT_VISION if vision else cls.BLIND_SPOT_OEM
+
   def _draw_blind_spot_carrot(self, sm) -> None:
-    input_services = ("modelV2", "carState", "radarState")
-    if not all(sm.valid[service] for service in input_services):
+    # The car's own warning needs only carState and the model path; radarState only adds the assist cue.
+    if not (sm.valid['modelV2'] and sm.valid['carState']):
       return
 
     car_state = sm['carState']
-    radar_state = sm['radarState']
     meta = sm['modelV2'].meta
-
-    left_blindspot, right_blindspot, left_assist, right_assist = self._blind_spot_draw_state_carrot(
-      car_state, radar_state, meta,
-    )
+    if sm.valid['radarState']:
+      left_blindspot, right_blindspot, left_assist, right_assist = self._blind_spot_draw_state_carrot(
+        car_state, sm['radarState'], meta,
+      )
+    else:
+      left_blindspot, right_blindspot = bool(car_state.leftBlindspot), bool(car_state.rightBlindspot)
+      left_assist = right_assist = False
     if not (left_blindspot or right_blindspot or left_assist or right_assist):
       return
 
-    # Blind-spot barrier: flat amber (or green for an assisted change), no outline.
-    warn_color = rl.Color(255, 176, 32, 135)
-    assist_color = rl.Color(48, 209, 88, 135)
+    source_packet = blindspot_source_packet(sm, time.monotonic_ns()) if (left_blindspot or right_blindspot) else None
     self._update_blind_spot_barriers_carrot(
       sm,
       update_left=left_blindspot or left_assist,
       update_right=right_blindspot or right_assist,
     )
 
-    if left_blindspot:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], warn_color)
-    elif left_assist:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[0], assist_color)
-
-    if right_blindspot:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], warn_color)
-    elif right_assist:
-      self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[1], assist_color)
+    for idx, side, warn, assist in ((0, "left", left_blindspot, left_assist), (1, "right", right_blindspot, right_assist)):
+      if warn:
+        color = self._blind_spot_source_color(*blindspot_sources(car_state, side, source_packet))
+        self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[idx], color)
+      elif assist:
+        self._draw_blind_spot_segments_carrot(self._carrot_lane_barrier_vertices[idx], self.BLIND_SPOT_ASSIST)
 
 
   # ---- AR turn guidance: the card's own manoeuvre icon standing on the road at the corner ------------

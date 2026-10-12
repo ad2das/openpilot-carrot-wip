@@ -145,9 +145,9 @@ def test_blind_spot_updates_only_active_side():
 @pytest.mark.parametrize(
   "messages,sources,expected_rgb",
   [
-    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True), (255, 215, 0)),
-    (blind_spot_messages(left_blindspot=True), source_payload(left_vision=True), (64, 156, 255)),
-    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True, left_vision=True), (255, 128, 128)),
+    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True), (255, 179, 36)),
+    (blind_spot_messages(left_blindspot=True), source_payload(left_vision=True), (26, 136, 255)),
+    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True, left_vision=True), (255, 72, 64)),
   ],
 )
 def test_blind_spot_wall_color_reflects_detection_source(monkeypatch, messages, sources, expected_rgb):
@@ -186,8 +186,8 @@ def test_blind_spot_wall_colors_are_independent_by_side(monkeypatch):
   renderer._draw_blind_spot_carrot(sm)
 
   assert draws == [
-    (renderer._carrot_lane_barrier_vertices[0], (64, 156, 255)),
-    (renderer._carrot_lane_barrier_vertices[1], (255, 128, 128)),
+    (renderer._carrot_lane_barrier_vertices[0], (26, 136, 255)),
+    (renderer._carrot_lane_barrier_vertices[1], (255, 72, 64)),
   ]
 
 
@@ -209,7 +209,7 @@ def test_blind_spot_wall_color_prefers_carstate_source_fields_over_stale_packet(
 
   renderer._draw_blind_spot_carrot(sm)
 
-  assert draws == [(255, 128, 128)]
+  assert draws == [(255, 72, 64)]
 
 
 class FakeParams:
