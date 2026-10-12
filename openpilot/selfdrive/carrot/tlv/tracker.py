@@ -413,7 +413,8 @@ def select_relevant(confirmed: list[tuple[Track, int, float]], frame_idx: int, *
 
 
 class SignalStateMachine:
-  """Korean signal order: green->yellow->red, red->green/left/redLeft, timeout to off."""
+  """Korean signal order: green->yellow->red (green->red also accepted when yellow is
+  missed), red->green/left/redLeft, timeout to off."""
 
   def __init__(self, off_timeout_s: float = 2.0) -> None:
     self.off_timeout_s = float(off_timeout_s)
@@ -430,7 +431,10 @@ class SignalStateMachine:
     if cur == SignalState.yellow:
       return new in (SignalState.red, SignalState.redLeft)
     if cur in (SignalState.green, SignalState.greenLeft):
-      return new in (SignalState.yellow, SignalState.green, SignalState.greenLeft)
+      # W81: perception can miss the yellow phase (night/remote lights, high speed);
+      # a confirmed red must never be vetoed by a stale green.
+      return new in (SignalState.yellow, SignalState.green, SignalState.greenLeft,
+                     SignalState.red, SignalState.redLeft)
     if cur == SignalState.left:
       return new in (SignalState.yellow, SignalState.red, SignalState.redLeft)
     return False

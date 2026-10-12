@@ -98,16 +98,31 @@ def test_state_machine_korean_order():
   assert m.update(0.1, SignalState.yellow, 0.7) == (SignalState.red, 0.75)
   # Red -> green is the normal start trigger.
   assert m.update(0.2, SignalState.green, 0.75) == (SignalState.green, 0.75)
-  # Green -> red directly is rejected (yellow must come first).
-  assert m.update(0.3, SignalState.red, 0.75) == (SignalState.green, 0.75)
-  assert m.update(0.4, SignalState.yellow, 0.7) == (SignalState.yellow, 0.7)
-  assert m.update(0.5, SignalState.red, 0.75) == (SignalState.red, 0.75)
+  # W81: green -> red is accepted even without a yellow frame (perception can
+  # miss the yellow phase; a confirmed red must not be vetoed by a stale green).
+  assert m.update(0.3, SignalState.red, 0.75) == (SignalState.red, 0.75)
+  # Back to green, then the normal green -> yellow -> red order still works.
+  assert m.update(0.4, SignalState.green, 0.75) == (SignalState.green, 0.75)
+  assert m.update(0.5, SignalState.yellow, 0.7) == (SignalState.yellow, 0.7)
+  assert m.update(0.6, SignalState.red, 0.75) == (SignalState.red, 0.75)
   # Red -> left / redLeft are allowed by spec.
-  assert m.update(0.6, SignalState.left, 0.75) == (SignalState.left, 0.75)
-  assert m.update(0.7, SignalState.red, 0.75) == (SignalState.red, 0.75)
-  assert m.update(0.8, SignalState.redLeft, 0.75) == (SignalState.redLeft, 0.75)
+  assert m.update(0.7, SignalState.left, 0.75) == (SignalState.left, 0.75)
+  assert m.update(0.8, SignalState.red, 0.75) == (SignalState.red, 0.75)
+  assert m.update(0.9, SignalState.redLeft, 0.75) == (SignalState.redLeft, 0.75)
   # The red family rejects yellow; only green -> yellow -> red is legal.
-  assert m.update(0.9, SignalState.yellow, 0.7) == (SignalState.redLeft, 0.75)
+  assert m.update(1.0, SignalState.yellow, 0.7) == (SignalState.redLeft, 0.75)
+
+
+def test_state_machine_green_to_red_without_yellow():
+  # W81 incident (187_06484, night): the classifier confirmed RED at 0.9998 but
+  # the state machine stayed green because the yellow frame was never seen.
+  m = SignalStateMachine(off_timeout_s=2.0)
+  assert m.update(0.0, SignalState.green, 0.75) == (SignalState.green, 0.75)
+  assert m.update(0.1, SignalState.red, 0.9998) == (SignalState.red, 0.9998)
+  # The same rule covers the left-arrow phase: greenLeft -> redLeft.
+  m2 = SignalStateMachine(off_timeout_s=2.0)
+  assert m2.update(0.0, SignalState.greenLeft, 0.75) == (SignalState.greenLeft, 0.75)
+  assert m2.update(0.1, SignalState.redLeft, 0.9998) == (SignalState.redLeft, 0.9998)
 
 
 def test_state_machine_timeout_to_none():
