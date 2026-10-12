@@ -129,14 +129,14 @@ Changes apply within about one second, including while driving. Stronger output 
 
 ### `ButterStop` · Gentle final stop
 
-Default `1` (on); set `0` to carefully disable. While enabled, control tapers the braking ceiling in the final metres of a stop: below about 3 m/s the allowed deceleration magnitude is limited to `0.25 + 0.4 × speed` m/s², so braking no longer peaks at standstill and the pre-stop nod is reduced. The planner also targets its stop point slightly earlier (about 0.8 m) so the gentler final approach stays inside the planned distance.
+Default `1` (on); set `0` to carefully disable. While enabled, control tapers the braking ceiling in the final metres of a stop: below about 3 m/s the allowed deceleration magnitude is limited to `0.25 + 0.4 × speed` m/s², so braking no longer peaks at standstill and the pre-stop nod is reduced. The planner also targets its stop point slightly earlier (about 1.0 m) so the gentler final approach stays inside the planned distance.
 
 - Stop entry, standstill hold, departure decisions, StopReq output and soft hold are unchanged; the taper only limits how strong braking may become while still rolling below the taper speed.
 - After standstill is confirmed, output ramps to the hold acceleration faster (`2.0 m/s³`), and if the car still moves faster than about `0.15 m/s` while holding without accelerator input, braking is increased immediately and kept until the stop episode ends.
 - `0` disables the whole feature and is identical to the previous behavior.
 
 > [!NOTE]
-> The earlier stop target is small and is consumed by the gentler final braking, so the standstill gap is normally similar to before. Verified in desktop plant simulation only; not tested on a vehicle.
+> In simulation with the real MPC solver there were no collisions, the standstill gap was 0.2–0.8 m longer than before, and the mean deceleration over the last 0.5 s fell from about 0.5~0.51 to 0.3 m/s². Not tested on a vehicle.
 
 The description above concerns upstream control. The final CANFD request override is described below.
 
