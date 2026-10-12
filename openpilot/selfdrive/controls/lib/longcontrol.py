@@ -6,8 +6,13 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.common.params import Params
+from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.cruise_coasting import (
   CruiseCoastingControl, MAX_PLAN_AGE, coasting_relief, no_coasting_lead,
+)
+from openpilot.selfdrive.controls.lib.butter_stop import (
+  CREEP_ACCEL, CREEP_V, HOLD_RAMP, STANDSTILL_T, STANDSTILL_V, STOP_DISTANCE_DEFAULT,
+  butter_eligible, butter_floor,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -76,7 +81,15 @@ class LongControl:
     self.params = Params()
     self.readParamCount = 0
     self._refresh_stopping_accel()
+    self._refresh_butter_stop()
     self.j_lead = 0.0
+
+    # ButterStop stop-episode state. The standstill hold/release decision itself
+    # stays in long_control_state_trans and is not touched here.
+    self._butter_standstill_time = 0.0
+    self._butter_standstill_confirmed = False
+    self._butter_creep_latched = False
+    self._butter_creep_logged = False
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
@@ -97,6 +110,44 @@ class LongControl:
       value = STOPPING_ACCEL_DEFAULT
     # Enforce the menu bounds even for stale Params or direct writes.
     self.stopping_accel = min(STOPPING_ACCEL_MAX, max(STOPPING_ACCEL_MIN, value)) * 0.01
+
+  def _refresh_butter_stop(self):
+    try:
+      value = float(self.params.get_int("ButterStop"))
+    except (TypeError, ValueError, AttributeError):
+      value = 0.0
+    self.butter_stop = math.isfinite(value) and value != 0.0
+    if not self.butter_stop:
+      return
+    try:
+      dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
+    except (TypeError, ValueError, AttributeError):
+      dist = float("nan")
+    self.stop_distance_orig = dist if math.isfinite(dist) and dist >= 0.0 else STOP_DISTANCE_DEFAULT
+
+  def _butter_floor(self, active, CS, long_plan, t_since_plan, radarState):
+    if not self.butter_stop:
+      return None
+    try:
+      t_age = float(t_since_plan)
+    except (TypeError, ValueError):
+      return None
+    try:
+      v_ego = float(CS.vEgo)
+    except (TypeError, ValueError, AttributeError):
+      return None
+    lead = getattr(radarState, "leadOne", None) if radarState is not None else None
+    if not butter_eligible(
+        active=bool(active), v_ego=v_ego,
+        brake_pressed=bool(getattr(CS, "brakePressed", False)),
+        gas_pressed=bool(getattr(CS, "gasPressed", False)),
+        fcw=bool(getattr(long_plan, "fcw", False)),
+        t_since_plan=t_age, lead=lead):
+      return None
+    plan_speeds = getattr(long_plan, "speeds", None)
+    if plan_speeds is None:
+      return None
+    return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig)
 
   def _apply_hyundai_longitudinal_tuning(self):
     # Hyundai, Kia, and Genesis all use the opendbc "hyundai" brand. Keep the
@@ -142,6 +193,7 @@ class LongControl:
     if self.readParamCount >= 100:
       self.readParamCount = 0
       self._refresh_stopping_accel()
+      self._refresh_butter_stop()
     elif self.readParamCount == 10:
       self._refresh_longitudinal_tuning()
 
@@ -156,6 +208,27 @@ class LongControl:
     if active and soft_hold_active:
       self.long_control_state = LongCtrlState.stopping
 
+    # ButterStop episode bookkeeping. This only decides how much braking the
+    # taper may remove while still rolling and how fast the confirmed hold
+    # ramps; it never changes the state machine, hold or release conditions.
+    butter_floor_value = None
+    if self.butter_stop:
+      if (not active) or self.long_control_state != LongCtrlState.stopping:
+        self._butter_standstill_time = 0.0
+        self._butter_standstill_confirmed = False
+        self._butter_creep_latched = False
+        self._butter_creep_logged = False
+      else:
+        if float(CS.vEgo) < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
+          self._butter_standstill_time = min(STANDSTILL_T, self._butter_standstill_time + DT_CTRL)
+        else:
+          self._butter_standstill_time = 0.0
+        if bool(getattr(CS, "standstill", False)) or self._butter_standstill_time >= STANDSTILL_T:
+          self._butter_standstill_confirmed = True
+      if (self.long_control_state == LongCtrlState.pid
+          or (self.long_control_state == LongCtrlState.stopping and not self._butter_standstill_confirmed)):
+        butter_floor_value = self._butter_floor(active, CS, long_plan, t_since_plan, radarState)
+
     if self.long_control_state == LongCtrlState.off:
       self.reset()
       output_accel = 0.
@@ -165,10 +238,27 @@ class LongControl:
 
       if soft_hold_active:
         output_accel = self.CP.stopAccel
+      # ButterStop ramps to the standstill hold faster once standstill is
+      # confirmed; the soft-hold path and every other case keep today's rate.
+      ramp_rate = self.CP.stoppingDecelRate
+      if self.butter_stop and self._butter_standstill_confirmed and not soft_hold_active:
+        ramp_rate = HOLD_RAMP
       # Restore the original one-way ramp. Do not unwind stronger braking.
       if output_accel > self.stopping_accel:
         output_accel = min(output_accel, 0.0)
-        output_accel -= self.CP.stoppingDecelRate * DT_CTRL
+        output_accel -= ramp_rate * DT_CTRL
+      if self.butter_stop and not self._butter_standstill_confirmed and butter_floor_value is not None:
+        # The taper only limits braking while the car is still rolling.
+        output_accel = max(output_accel, butter_floor_value)
+      if self.butter_stop and self._butter_standstill_confirmed:
+        # Creep guard: while holding, never let the car creep toward the lead.
+        if float(CS.vEgo) > CREEP_V and not bool(getattr(CS, "gasPressed", False)):
+          self._butter_creep_latched = True
+        if self._butter_creep_latched:
+          output_accel = min(output_accel, CREEP_ACCEL)
+          if not self._butter_creep_logged:
+            cloudlog.event("butterStopCreepGuard", vEgo=float(CS.vEgo))
+            self._butter_creep_logged = True
       self.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
@@ -204,6 +294,12 @@ class LongControl:
         output_accel = self.coasting.apply(output_accel, relief, DT_CTRL)
       else:
         self.coasting.reset()
+      if butter_floor_value is not None and output_accel < butter_floor_value:
+        # ButterStop taper: only remove braking above the floor, never add any.
+        # Freeze the integrator while limited, like the coasting relief.
+        self.pid.i = previous_integral
+        output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
+        output_accel = min(0.0, max(output_accel, butter_floor_value))
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel, a_target_ff, j_target_now

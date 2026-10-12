@@ -1,5 +1,17 @@
 # Repository memory
 
+- On 2026-10-12, the user requested a butter-smooth final stop that never
+  releases or creeps into a lead. Add Params ButterStop (int, default1, Carrot
+  Web incl. labels) plus lib/butter_stop.py: below3m/s the output braking
+  ceiling is tapered to A_END0.25+K_TAPER0.4*v, the MPC plans0.8m earlier
+  (D_EXTRA), standstill-confirmed hold ramps at2.0m/s3 and a latched creep
+  guard immediately restores braking above0.15m/s without gas. Stop entry,
+  hold/release decisions, StopReq generation, soft hold and jerk limits are
+  unchanged; ButterStop=0 replays bit-identically. 31 focused unit tests pass;
+  Windows MPC shim abandoned, validation moved to real acados in CI
+  (tests.yaml ButterStop maneuver suite). Simulation only, no vehicle test.
+  See docs/butter_stop_20261012.md.
+
 - On 2026-10-12, the user clarified that traffic-light geometry must allow
   space on both sides of the ego lane. The opt-in stop preparation now expands
   each inner lane boundary by3.5m, clipped by reliable road edges with0.3m inward

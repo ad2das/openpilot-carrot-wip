@@ -327,6 +327,7 @@
               "params": [
                 "StopDistanceCarrot",
                 "StoppingAccel",
+                "ButterStop",
                 "VEgoStopping",
                 "AChangeCostStarting"
               ]
@@ -3339,6 +3340,22 @@
       "max": -50,
       "default": -50,
       "unit": 10
+    },
+    {
+      "group": "주행튜닝",
+      "name": "ButterStop",
+      "title": "버터스톱(부드러운 정차):(1)",
+      "descr": "정지 마지막 수 m 구간에서 속도에 따라 감속 상한을 부드럽게 낮춰 정차 직전의 끄덕임을 줄입니다. 1=켜짐(기본), 0=끔(기존과 완전히 동일). 정차 유지·출발 판단, StopReq 송신, 소프트홀드는 바뀌지 않으며, 정차가 확정된 뒤 밀림이 감지되면 즉시 더 강한 제동으로 잡습니다. 약 3m/s 이하에서만 동작합니다.",
+      "egroup": "LONG",
+      "etitle": "ButterStop(gentle stop):(1)",
+      "edescr": "Tapers the braking ceiling with speed over the final metres of a stop to reduce the pre-stop nod. 1=on (default), 0=off (identical to before). Standstill hold/release decisions, StopReq output and soft hold are unchanged; once standstill is confirmed, detected creep is arrested immediately. Active only below about 3 m/s.",
+      "cgroup": "纵向控制",
+      "ctitle": "ButterStop平滑停车:(1)",
+      "cdescr": "在停车最后数米根据车速平滑降低制动上限，减少停车前的点头。1=开启(默认)，0=关闭(与原行为完全一致)。停车保持/起步判断、StopReq 发送与软保持不变；确认停车后若检测到蠕动会立即加强制动。仅在约3m/s以下生效。",
+      "min": 0,
+      "max": 1,
+      "default": 1,
+      "unit": 1
     },
     {
       "group": "가속설정",

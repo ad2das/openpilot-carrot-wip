@@ -105,6 +105,7 @@ Tune the speed band containing the symptom instead of changing the whole table. 
 |---|---|---|
 | `StopDistanceCarrot` | `600` → 6.00 m | Increases fixed clearance to a stopped lead |
 | `VEgoStopping` | `50` → 0.50 m/s | Higher values enter stopping state at a higher planned speed |
+| `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s for a gentler stop |
 | `AChangeCostStarting` | MPC acceleration-change cost | Higher values smooth initial acceleration changes |
 
 ### `StopDistanceCarrot`
@@ -125,6 +126,17 @@ The original behavior enters stopping after `shouldStop` when actual acceleratio
 - **Lower it (toward −100):** requests stronger deceleration and advances that handover. It can increase stopping impact.
 
 Changes apply within about one second, including while driving. Stronger output already reached during a stop is retained, so selecting a weaker target does not immediately reduce braking. Control clamps old or directly written out-of-range values to the range endpoints; unreadable values use the default.
+
+### `ButterStop` · Gentle final stop
+
+Default `1` (on); set `0` to carefully disable. While enabled, control tapers the braking ceiling in the final metres of a stop: below about 3 m/s the allowed deceleration magnitude is limited to `0.25 + 0.4 × speed` m/s², so braking no longer peaks at standstill and the pre-stop nod is reduced. The planner also targets its stop point slightly earlier (about 0.8 m) so the gentler final approach stays inside the planned distance.
+
+- Stop entry, standstill hold, departure decisions, StopReq output and soft hold are unchanged; the taper only limits how strong braking may become while still rolling below the taper speed.
+- After standstill is confirmed, output ramps to the hold acceleration faster (`2.0 m/s³`), and if the car still moves faster than about `0.15 m/s` while holding without accelerator input, braking is increased immediately and kept until the stop episode ends.
+- `0` disables the whole feature and is identical to the previous behavior.
+
+> [!NOTE]
+> The earlier stop target is small and is consumed by the gentler final braking, so the standstill gap is normally similar to before. Verified in desktop plant simulation only; not tested on a vehicle.
 
 The description above concerns upstream control. The final CANFD request override is described below.
 

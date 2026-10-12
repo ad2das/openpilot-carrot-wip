@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_preview import LEAD_ACCEL_MIN
 from openpilot.selfdrive.controls.lib.longitudinal_cutout import cutout_obstacle_relief
 from openpilot.selfdrive.controls.lib.longitudinal_gap_recovery import LeadGapState, displayed_follow_distance
 from openpilot.selfdrive.controls.lib.longitudinal_braking_gap import BrakingGapState, braking_gap_reference, comfort_path_has_reserve
+from openpilot.selfdrive.controls.lib.butter_stop import D_EXTRA
 from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import LaneChangeGapPlan
 
 if __name__ == '__main__':  # generating code
@@ -416,6 +417,9 @@ class LongitudinalMpc:
     mode = self.mode
     comfort_brake = carrot.comfort_brake
     stop_distance = carrot.stop_distance
+    if getattr(carrot, "butter_stop", 0):
+      # Plan stops this much earlier so the taper can roll into the slack.
+      stop_distance = stop_distance + D_EXTRA
     self.base_desired_distances = np.array([
       desired_follow_distance(v_ego, lead_v_0, comfort_brake, stop_distance, t_follow),
       desired_follow_distance(v_ego, lead_v_1, comfort_brake, stop_distance, t_follow),
