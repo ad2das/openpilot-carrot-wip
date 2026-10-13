@@ -57,9 +57,16 @@ def planner_class(source):
             get_carrot_man=lambda sm: None, get_mode_lead_response=lambda requested, mode: requested,
             RADAR_TO_CAMERA=1.52, MyMovingAverage=filters.MyMovingAverage,
             TrafficStopModelLeadMatcher=stop.TrafficStopModelLeadMatcher,
-            is_traffic_stop_entry_allowed=stop.is_traffic_stop_entry_allowed)
+            is_traffic_stop_entry_allowed=stop.is_traffic_stop_entry_allowed,
+            deque=collections.deque, cloudlog=NS(event=lambda *a, **k: None), CARROT_MAN_TIMEOUT=1.0)
   ns.update({n: getattr(helpers, n) for n in dir(helpers) if not n.startswith('_')})
-  nodes = [n for n in ast.parse(source).body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
+  tree = ast.parse(source)
+  # keep the W74D TLV_* module constants alive: only class/function nodes are
+  # re-executed below, so their module-level assignments must run too
+  tlv_constants = [n for n in tree.body if isinstance(n, (ast.Assign, ast.AnnAssign))
+                   and all(isinstance(t, ast.Name) and t.id.startswith('TLV_')
+                           for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
+  nodes = tlv_constants + [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
   exec(compile(ast.Module(nodes, type_ignores=[]), 'carrot_source_replay', 'exec'), ns)
   cls = ns['CarrotPlanner']
   cls._params_update = lambda self: None

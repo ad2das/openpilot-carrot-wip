@@ -13,7 +13,7 @@ class SubMaster(dict):
     event = log.Event.new_message()
     event.init('carrotMan')
     event.carrotMan.desiredSpeed = speed
-    super().__init__(carrotMan=event.carrotMan, carState=SimpleNamespace(leftBlinker=False))
+    super().__init__(carrotMan=event.carrotMan, carState=SimpleNamespace(leftBlinker=False, rightBlinker=False, gasPressed=False))
     self.seen = {'carrotMan': seen}
     self.valid = {'carrotMan': valid}
     self.alive = {'carrotMan': alive}
@@ -28,8 +28,18 @@ def clock(monkeypatch):
 def planner():
   value = CarrotPlanner.__new__(CarrotPlanner)
   value.trafficState_carrot = 0
+  value.trafficState_carrot_src = 0
   value.soft_hold_active = 0
   value.xState = XState.e2eCruise
+  value.carrot_stay_stop = False
+  value.tlv_gas_cooldown_frames = 0
+  value.tlv_standstill_hold_frames = 0
+  value.tlv_hold_run = False
+  value.tlv_veto_active = False
+  value.tlv_red_confirmed_at = None
+  value.left_blinker_pre_stop = False
+  value.left_blinker_off_frames = 0
+  value.a4_lane_ok = False
   return value
 
 
