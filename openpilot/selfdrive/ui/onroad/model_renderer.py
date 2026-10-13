@@ -65,6 +65,9 @@ LEAD_CLOSE_TTC_ON = 3.0  # s to contact before the crescent turns red
 LEAD_CLOSE_TTC_OFF = 4.0  # s to contact before it returns to the source colour (hysteresis)
 LEAD_CLOSE_MIN_VREL = 1.0  # m/s closing speed below which time-to-contact is not meaningful
 LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at a glance
+LEAD_DROP = 0.11  # crescent drop below the projected road point, in lead widths
+LEAD_DROP_MIN = 14.0
+LEAD_ROOF = 0.9  # readout anchor above the road point, in lead widths: about 2.2 m
 # Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
 LEAD_SIZE = 80  # the leading figure: the lead's speed, or the gap while its speed is unknown
 LEAD_GAP_SIZE = 58  # the gap beside the speed
@@ -966,8 +969,8 @@ class ModelRenderer(Widget):
     seg1 = max(self._lead_w, w1 + 40.0)
     seg2 = max(self._lead_w2, w2 + 40.0) if second else 0.0
     w = seg1 + seg2
-    # The tail tip sits just above the (truck-height) roof estimate.
-    mid = hs.clear_of_panels(cx, car_top - 28.0 - h / 2, w, h)
+    # The tail tip sits just above the roof estimate.
+    mid = hs.clear_of_panels(cx, car_top - 18.0 - h / 2, w, h)
     self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
     self._lead_capsule = ((p1, w1), (p2, w2), cx, mid, w, h, car_top, seg1)
 
@@ -1046,11 +1049,13 @@ class ModelRenderer(Widget):
       # neutral for radar, blue for camera-only, red only while closing in fast.
       stroke = self._lead_stroke_carrot()
       cw = max(w, LEAD_MIN_WIDTH)
-      hs.ellipse_glow(x, base - 4, cw * 0.66, cw * 0.11, hs.with_alpha(stroke, 150 if stroke is LEAD_RADAR else 190))
-      hs.taper_curve((x - cw * 0.52, base - 10), (x, base + 17), (x + cw * 0.52, base - 10), 11.0, stroke)
+      # The projected road point lands on the lead's bumper; drop the crescent under the tyres.
+      y0 = base + max(LEAD_DROP_MIN, w * LEAD_DROP)
+      hs.ellipse_glow(x, y0 - 4, cw * 0.66, cw * 0.11, hs.with_alpha(stroke, 150 if stroke is LEAD_RADAR else 190))
+      hs.taper_curve((x - cw * 0.52, y0 - 10), (x, y0 + 17), (x + cw * 0.52, y0 - 10), 11.0, stroke)
 
-    # Vehicle height is unknown: leave room for a truck so the readout never sits on the lead.
-    self._layout_lead_capsule_carrot(x, base - w * 1.3)
+    # Pin the readout just above a car/SUV roof (w spans 2.4 m); on a truck it rests on the box's back.
+    self._layout_lead_capsule_carrot(x, base - w * LEAD_ROOF)
 
 
   def _draw_tf_marker_carrot(self):
