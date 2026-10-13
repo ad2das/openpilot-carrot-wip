@@ -597,6 +597,7 @@ struct PandaState @0xa7649e2575e4591e {
   # reserved for forks building alternate experiences.
   controlsAllowedRESERVED1 @38 :Bool;
   controlsAllowedRESERVED2 @39 :Bool;
+  wakeOnCan @40 :Bool;
 
   enum FaultStatus {
     none @0;
@@ -1344,6 +1345,12 @@ struct LateralPlan @0xe1e9318e2ae8b51e {
 
   position @35 :XYZTData;
   distances @36 :List(Float32);
+
+  laneCenterBlendCurvature @37 :Float32;
+  laneCenterBlendOffset @38 :Float32;
+  laneCenterBlendWeight @39 :Float32;
+  laneCenterBlendGates @40 :UInt16;
+  laneCenterBlendAvoidDev @41 :Float32;
 
   struct SolverState {
     x @0 :List(List(Float32));
@@ -2717,6 +2724,7 @@ struct Event {
     customReservedRawData0 @124 :Data;
     navRouteNavd @125 :NavRoute;
     navInstructionCarrot @126 :NavInstruction;
+    customReservedRawData1 @154 :Data;
 
     # DO change the name of the field and struct
     # DON'T change the ID (e.g. @107)

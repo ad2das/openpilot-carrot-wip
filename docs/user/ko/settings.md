@@ -35,6 +35,10 @@ carrotpilot의 세부 설정은 **Carrot Web에서 모두 확인하고 변경하
 
 `도구 > Web Settings > 화면 구성`의 처음 설치 기본값은 가로·세로 모두 **영역 1 전체**이며, 영역 1은 **당근비전**, 영역 2는 **당근네비**입니다. `기본값` 버튼은 두 방향을 모두 **영역 1 전체 + 영역 1 당근비전 + 영역 2 당근네비**로 되돌립니다. 화면별 설명은 [Carrot Web 화면 구성](carrot-web.md#화면-구성)을 참고하세요.
 
+### 자동 주행 로그 업로드
+
+`도구 > Web Settings > 업로드`의 자동 주행 로그 업로드는 기본 꺼짐이며, 켜면 주행 중에도 끝난 1분 구간마다 rlog와 qcamera를 자동 업로드 서버로 전송합니다. 자동 업로드 서버 주소는 소유자의 수신 서버가 기본값으로 들어 있고 직접 수정할 수 있습니다. 이 값을 기본 공용 업로드 서버로 바꾸면 자동 전송하지 않습니다. 수동 `로그 > 대시캠` 전송은 기존 업로드 서버 설정을 그대로 사용합니다.
+
 ## 설정 화면 사용법
 
 Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
@@ -127,6 +131,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | 오토크루즈 | `AutoCruiseControl`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | 크루즈 자동 활성화와 가속 페달 입력 시 동작 |
 
 - `AlwaysLateral`: 크루즈가 켜져 있지 않아도 조향 제어를 허용합니다. 지원 Tesla 차량에서는 전진 기어의 실제 정차 상태에서도 조향할 수 있으며, 최소 조향 속도 이하로 이동할 때의 제한은 유지됩니다. [Tesla 제어 진입](tesla.md#engagement-and-standstill)을 참고하세요.
+- 상시 조향도 시스템 시작 후 최초 준비 확인 전에는 조향하지 않습니다. 모델·차량 파라미터·자세 정보 등 필수 입력이 한 번 정상으로 확인되면 이 시작 검사는 종료되며, 이후 입력의 일시적 불량이나 조향 해제·재작동으로 다시 차단하지 않습니다. 기존 주행 중 안전 처리는 그대로 유지됩니다. 초기 대기시간 경과만으로 준비를 통과하지 않습니다.
 - `AutoEngage`: `0` 끄기, `1` 조향 ON, `2` 조향 ON과 크루즈 대기입니다.
 - `AutoCruiseControl`: 현대·기아 차량용 오토크루즈와 소프트홀드 관련 설정입니다.
 - `DisableMinSteerSpeed`: SMDPS 장착 차량의 저속 조향 제한과 관련된 차량별 설정입니다.
@@ -151,17 +156,19 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
-| ONNX 차선·BSD | `ShareData`, `OnnxLaneThreshold`, `OnnxLaneIntervalMs`, `OnnxBsdThreshold`, `OnnxBsdSmoothingMs`, `OnnxBsdIntervalMs` | 장치의 차선 종류와 조건부 카메라 BSD 인식·세부 조정 |
+| ONNX 차선·BSD | `ShareData`, `OnnxLaneThreshold`, `OnnxLaneIntervalMs`, `OnnxBsdThreshold`, `OnnxBsdSmoothingMs`, `OnnxBsdIntervalMs` | 장치의 차선 종류, 카메라 BSD 감지 출처 표시와 세부 조정 |
 | 중앙 보정 | `PathOffset`, `CameraYawTrimDeg` | 레인모드 경로의 좌우 위치와 카메라 YAW 미세 보정 |
 | 조향감 | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | 조향 시점, 평활화, 일시중지 각도와 조향비 |
 | [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건과 ATC 동작 |
-| 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | 레인모드 MPC 가중치와 차선 사용 조건 |
+| 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset`, `LaneCenterBlend` | 레인모드 MPC 가중치와 차선 사용 조건 |
 | 고급 토크·토크 계수 | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | 커스텀 토크 제어 계수 |
 | 고급 토크·조향 제한 | `CustomSteerMax`, `CustomSteerDeltaUp`, `CustomSteerDeltaDown`, `CustomSteerDeltaUpLC`, `CustomSteerDeltaDownLC` | 최대 조향 토크와 토크 변화율 제한 |
 
-`ONNX 차선·BSD 인식`(`ShareData`)은 장치에서 실선·점선과 조건부 카메라 BSD를 계산하는 설정입니다. 상세 화면은 기능 토글을 맨 위에 유지하고, 바로 아래의 분리된 카드에 BSD 감지영역 편집기를 표시합니다. 좌우 선택, 영상 갱신, 점 되돌리기, 점 초기화와 영역 저장만 기본 화면에 두며, 영상 왼쪽 위의 사각형 점 목록은 `1(좌)`, `1(우)` 형식으로 표시됩니다. 선택된 점이 없을 때 빈 화면을 누르면 별도 모드 없이 점이 추가되고, 확대·화면 이동·영역 전체 이동 없이 선택된 점만 이동합니다. 4개 편집 버튼 바로 아래의 좌우 2열 버튼으로 도로·와이드 카메라 영상을 팝업에서 확인합니다. 실행 상태·좌우 신뢰도·처리 성능과 5개 세부값은 우측 아래의 **고급 설정 펼치기/접기** 텍스트로 봅니다. 편집기는 마지막 카메라 영상 한 장을 보관하고, 영상이 없으면 흐린 기본 주행 예시 화면을 표시합니다. 영역 저장은 현재 세션에서 실제 카메라 영상을 받은 뒤에만 가능합니다. 기본값은 꺼짐이며 저장한 세부값은 서비스 재시작 후에도 유지됩니다. 필요한 OpenCV는 업데이트에 포함되어 정상 시작 시 자동 준비됩니다. 켜져 있어도 onroad 초기화와 모델·CAN·Panda 준비가 완료되어 주행 준비 상태가 0.5초 유지된 뒤 시작합니다. 실제 크루즈 활성화는 필요하지 않습니다. Offroad에서는 종료하고 다음 onroad에서도 다시 기다립니다. [동작 조건과 세부값](lane-change.md#sharedata--onnx-차선bsd-인식)을 참고하세요.
+`ONNX 차선·BSD 인식`(`ShareData`)은 장치에서 실선·점선과 카메라 BSD를 계산하는 설정입니다. BSD는 모델이 추정한 차로 폭이 2m 이상인 설정된 좌우 영역을 번갈아 검사하며 속도나 차로 변경 방향을 실행 조건으로 사용하지 않습니다. 3개 클래스는 사각지대 위협, 근접 차량 없음, 멀거나 뒤쪽에 있는 차량을 구분합니다. 상세 화면은 기능 토글을 맨 위에 유지하고, 바로 아래의 분리된 카드에 BSD 감지영역 편집기를 표시합니다. 좌우 선택, 영상 갱신, 점 되돌리기, 점 초기화와 영역 저장만 기본 화면에 두며, 영상 왼쪽 위의 사각형 점 목록은 `1(좌)`, `1(우)` 형식으로 표시됩니다. 선택된 점이 없을 때 빈 화면을 누르면 별도 모드 없이 점이 추가되고, 확대·화면 이동·영역 전체 이동 없이 선택된 점만 이동합니다. 4개 편집 버튼 바로 아래의 좌우 2열 버튼으로 도로·와이드 카메라 영상을 팝업에서 확인합니다. 실행 상태·좌우 신뢰도·처리 성능과 5개 세부값은 우측 아래의 **고급 설정 펼치기/접기** 텍스트로 봅니다. 편집기는 마지막 카메라 영상 한 장을 보관하고, 영상이 없으면 흐린 기본 주행 예시 화면을 표시합니다. 영역 저장은 현재 세션에서 실제 카메라 영상을 받은 뒤에만 가능합니다. 기본값은 꺼짐이며 저장한 세부값은 서비스 재시작 후에도 유지됩니다. 필요한 OpenCV는 업데이트에 포함되어 정상 시작 시 자동 준비됩니다. 켜져 있어도 onroad 초기화와 모델·CAN·Panda 준비가 완료되어 주행 준비 상태가 0.5초 유지된 뒤 시작합니다. 실제 크루즈 활성화는 필요하지 않습니다. Offroad에서는 종료하고 다음 onroad에서도 다시 기다립니다. [동작 조건과 세부값](lane-change.md#sharedata--onnx-차선bsd-인식)을 참고하세요.
 
 `UseLaneLineSpeed`로 레인모드를 사용하더라도 모델 속도 궤적의 시작값이 실제 차속의 70% 미만이거나 끝값이 시작값의 70% 미만이면 일시적으로 레인리스로 전환합니다. 속도 조건이 약 1초간 연속으로 정상이고 기존 차선·속도 조건도 충족해야 레인모드로 복귀합니다.
+
+`LaneCenterBlend`(혼합모드)를 켜면 레인리스 주행 중 양쪽 차선이 잘 보일 때 차가 차선 중앙에서 평소 치우치는 양을 직선·커브 곡률별로 천천히 학습해 보정합니다. 보정은 최대 약 0.3m 목표이고, 경로가 장애물 회피처럼 움직이거나 차선변경 중이거나 차선이 불확실하면 바로 빠집니다. 레인모드 동작 중에는 쓰이지 않으며 기본값은 꺼짐입니다.
 
 `SteerActuatorDelay`는 높을수록 더 일찍 조향하도록 보상하고, `LatSmoothSec`는 높을수록 부드러워지는 대신 반응이 늦어질 수 있습니다. 두 값을 동시에 바꾸면 원인을 구분하기 어렵습니다.
 
@@ -215,8 +222,8 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 |---|---|---|
 | [가속 성향·드라이브 모드](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | 연비, 안전, 일반, 고속 모드와 자동 전환 |
 | [가속 성향·속도별 가속값](cruise-gap.md#acceleration-table) | `CruiseMaxVals0`, `CruiseMaxVals1`, `CruiseMaxVals2`, `CruiseMaxVals3`, `CruiseMaxVals4`, `CruiseMaxVals5`, `CruiseMaxVals6` | 속도 구간별 최대 가속 성향 |
-| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입과 재출발 특성 |
-| [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차는 Kp/Ki/Kf `100/0/100` 고정·숨김; VW MEB(ID.4 포함)는 저장 게인 적용 |
+| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입, 부드러운 정차와 재출발 특성 |
+| [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차 `100/0/100`, 토요타·렉서스 `0/0/100` 고정·숨김; VW MEB(ID.4 포함)는 저장 게인 적용 |
 | [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollowLC`, `SpeedTFFactor`, `TFollowDecelBoost` | 차간 단계별 시간, 정상 선택 앞차 기준 차로 변경 완화와 감속 여유(기본 0%) |
 | [추종응답성](cruise-gap.md#lead-response) | `LeadAccelResponse`, `LeadAccelResponseTF1`–`LeadAccelResponseTF4` | 모든 차간 단계의 앞차 출발·가속 추종과 접근 반응 |
 | [당근 크루즈](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CruiseCoastingPercent`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | 연비 제어, 진입 기준속도를 고정하는 코스팅 여유(기본 0%: 기존 제어), 당근 크루즈 감속 특성 |
@@ -236,15 +243,17 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 감속 미리보기는 반응 단계와 별도로 동작합니다. 상대 가속도가 줄거나 앞차가 레이더·비전 사이에서 전환되거나 사라져도, 제어 중에는 남은 보정을 점진적으로 해제합니다. 가속·브레이크 페달 개입이나 종방향 제어 종료 시에는 초기화합니다.
 
-`LongTuning*`, `LongActuatorDelay`는 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 현대·기아·제네시스에서는 `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`가 안전값 `100/0/100`으로 고정되어 설정 화면에 나오지 않으며, 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
+`LongTuning*`, `LongActuatorDelay`는 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 현대·기아·제네시스에서는 `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`가 안전값 `100/0/100`으로 고정되어 설정 화면에 나오지 않으며, 토요타·렉서스는 전용 보정기 앞의 중복 보정을 막기 위해 공통 게인을 `0/0/100`으로 고정·숨깁니다. 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
 
 `StoppingAccel`(정지시작가속도)은 기본 `-50`, 범위 `-100~-50`, 변경 단위 `10`으로 다시 조정할 수 있습니다. 저장값에 0.01을 곱한 가속도를 사용하며, 제어에서도 범위를 제한합니다. 기존 정지 진입·감속 방식과 차종별 소프트홀드를 사용하고 변경은 약 1초 안에 반영됩니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
 
+`ButterStop`(버터스톱, 기본 켜짐)은 약 3m/s 이하 정지 마지막 구간의 감속 상한을 낮춰 더 부드럽게 정차하고, 정차 확인 후 밀림을 즉시 잡습니다. `0`으로 끄면 기존 동작과 완전히 동일합니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
+
 `VEgoStopping`(정지출발민감도)은 범위 `10~100`, 기본 `50`이며, `10`은 `0.10m/s`입니다. 기존의 `10` 미만 저장값은 자동으로 `10`으로 올리고, 주행 중에도 같은 최저값을 적용합니다.
 
-현대·기아 CANFD 오픈파일럿 종방향 제어는 실제 속도 재상승 또는 지속적인 감속 소실을 확인해 한 번의 정지 재시도를 기본 적용합니다. 저속에서 감속이 이어지면 거리·시간 조건만으로 재시도하지 않습니다. [CANFD 정지 제어](cruise-gap.md#canfd-stopping)를 참고하세요.
+현대·기아 CANFD 오픈파일럿 종방향 제어에서는 StopReq를 켜는 첫 프레임부터 aReqRaw·aReqValue를 0으로 보내므로, 이 설정은 StopReq 유지 중 송신 가속도를 바꾸지 않습니다. 자동 해제·재시도는 제거되었습니다.
 
-지원되는 Tesla 차량에서 추가 차량 버스가 감지되면 장치의 **alpha longitudinal**(`AlphaLongitudinalEnabled`) 토글을 켤 때 차량 수신 제한속도에 맞춘 [크루즈 설정속도 자동 조절](tesla.md#automatic-cruise-speed)도 활성화됩니다. 오른쪽 속도 휠을 직접 돌리면 일시 중지하며, 1초 안에 반대 방향으로 돌리거나 제어를 해제했다가 다시 켜면 재개합니다. 별도의 Carrot Web 설정은 없습니다.
+지원되는 Tesla 차량에서 추가 차량 버스가 감지되면 장치의 **alpha longitudinal**(`AlphaLongitudinalEnabled`) 토글을 켤 때 차량 수신 제한속도에 맞춘 [크루즈 설정속도 자동 조절](tesla.md#automatic-cruise-speed)도 활성화됩니다. 내비게이션·Carrot 속도 제어가 활성 상태이면 DAS 기반 조절을 중지하고, 해당 제어가 끝난 뒤 제한속도가 다시 안정되면 재개합니다. 수동 조작에 따른 중지는 그대로 유지됩니다. 오른쪽 속도 휠을 직접 돌리면 일시 중지하며, 1초 안에 반대 방향으로 돌리거나 제어를 해제했다가 다시 켜면 재개합니다. 별도의 Carrot Web 설정은 없습니다.
 
 <a id="vehicle-hardware"></a>
 ## 차량·하드웨어
@@ -280,7 +289,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 - `DriverMonitoringMode`: 운전자 감시가 켜져 있을 때 적용됩니다. 기본값 0은 카메라 사용 시 콤마 순정 감시 기준이며, 카메라 미장착·고장 시에는 15·30·45초 조작 감시로 전환합니다. 1은 빈 도로 시간 완화와 조작 후 카메라 경고 유예를 적용하는 시험 전용 실험 모드입니다. 공통 예외로 P단·완전 정차·인게이지 해제가 유효한 신호로 1초간 확인되면 재사용 제한을 초기화합니다. 모드 변경은 재부팅 없이 약 0.5초 주기로 적용됩니다. 전환해도 누적 감시시간·경고 횟수·재사용 제한은 초기화되지 않으며, 이전 조작 유예와 전방주시 연속 판정은 종료됩니다. [운전자 감시와 실험 모드 조건](driver-monitoring.md)을 확인하세요. 현대·기아·제네시스 CAN-FD의 검증된 원본 `STEER_TOUCH_2AF` 수신 신호를 차종명 제한 없이 처리하며 카메라·모드에 따라 유지와 새 접촉을 구분합니다.
 - `CarrotVisionEnabled`: 운전자 감시와 별도로 웹 도로 영상을 켭니다. `DisableDM`은 이관 전용이며, 기존 `DisableDM=2`의 영상 기능만 최초 전환 시 `CarrotVisionEnabled`로 승계합니다.
-- `SpeedFromPCM`: 기본값은 `2`(커브·카메라 감속)이며, 비롱컨 순정 SCC의 버튼 스패밍과 감속 방식에 영향을 줍니다. [버튼 전송 상세](buttons-presets.md#button-spam)를 참고하세요.
+- `SpeedFromPCM`: 기본값은 `2`(커브·카메라 감속)이며, PCM 차량의 버튼 스패밍과 속도 선택에 영향을 줍니다. `3`에서 토요타·렉서스는 순정 설정속도를 사용하며 가감속 제어 방식은 바뀌지 않습니다. [버튼 전송 상세](buttons-presets.md#button-spam)를 참고하세요.
 
 `HardwareC3xLite`는 일반 C3/C3X에서는 반드시 꺼 두고 C3X Lite에서만 켠 뒤 기기를 재부팅하세요. 이 설정을 켜면 존재하지 않는 앰프를 초기화하지 않아 I2C 재시도로 인한 시작 지연을 없애고, 경고음을 GPIO 부저로 출력합니다. 또한 `micd`, `soundd`, `loggerd`를 실행하지 않고 `RecordAudio`를 끄므로 이 하드웨어 모드에서는 일반 주행 로그 기록을 사용할 수 없습니다.
 
@@ -321,7 +330,9 @@ Onroad에서는 본체 UI가 CPU 6번, 외부 HUD가 CPU 7번을 일반 스케�
 
 `ShowRouteInfo` 설명에 남아 있는 APN 표기는 경로 정보 입력 상태를 뜻합니다. 이를 CarrotMan 또는 CarrotLink 지원 안내로 해석하면 안 됩니다.
 
-`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절이고, `ShowModelView`는 카메라와 모델 표시 조합을 선택합니다. `ShowCameraWithCluster=0`은 외부 HUD 연결 중 본체 카메라를 숨기는 기존 기본 동작이고, `1`은 본체 카메라 영상을 표시합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+`ShowCustomBrightness=0`은 주변 밝기에 따른 자동 조절입니다. `ShowCameraWithCluster=0`은 외부 HUD 연결 중 본체 카메라를 숨기는 기존 기본 동작이고, `1`은 본체 카메라 영상을 표시합니다. `ClusterHud` 계열은 지원되는 외부 HUD를 연결한 경우에만 사용하세요.
+
+`ShowModelView`(주행화면 구성)는 C4에서 `0` 카메라 + 차선·경로, `1` 카메라만, `2` 검은 배경에 차선·경로만, `3` 둘 다 숨김을 선택합니다. 차선·경로 그림에는 앞차 표시도 포함됩니다. 자동 밝기와 100%를 포함한 모든 밝기 설정에서 적용되며, 주행 시작 후 별도의 대기 시간은 없습니다. 주행 중 변경하면 재부팅 없이 약 5초 안에 반영됩니다. 속도·경고·운전자 상태는 계속 표시되고, 카메라 촬영·주행 판단·차량 제어는 바뀌지 않습니다. C3/C3X에는 적용되지 않습니다. 외부 HUD 연결 중 `ShowCameraWithCluster=0`이면 이 선택과 관계없이 본체의 카메라와 차선·경로를 모두 숨깁니다.
 
 `ClusterHudBrightness=0`은 카메라 노출값을 따르는 자동 밝기이고, `1~100`은 고정 밝기입니다. `ClusterHudOrientation`은 `0`(0도)과 `2`(180도)만 지원하며 `1`, `3`은 무시합니다. 실행 중인 TURZX 프로세스는 두 저장값을 100ms마다 확인합니다. 밝기는 실행 중 적용되고, 관리형 H.264의 회전값이 바뀌면 HUD가 자동 재시작되어 캡처와 동일한 스트림 설정 절차로 적용됩니다.
 
@@ -369,14 +380,12 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|
 | 녹화·전원 | `RecordRoadCam`, `MaxTimeOffroadMin` | 도로 카메라 저장과 시동 OFF 후 자동 전원 종료 시간 |
-| YouTube 라이브 | `CarrotYouTubeLive`, `CarrotYouTubeQuality`, `CarrotYouTubeTimestamp` | 카메라 영상 송출, 품질과 타임스탬프 |
 | 네트워크·지도 | `HotspotOnBoot`, `MapboxStyle` | 부팅 시 핫스팟과 지도 배경 스타일 |
 | 사운드 | `SoundLanguageSetting`, `SoundVolumeAdjust`, `SoundVolumeAdjustEngage` | 안내음 언어와 일반·인게이지 볼륨 |
 | 소프트웨어 | `SoftwareMenu` | Carrot Web의 소프트웨어 메뉴 활성화 |
 
 - `RecordRoadCam`: `0` 녹화 안 함, `1` 일반 카메라, `2` 일반+광각 카메라입니다. 저장 공간 사용량을 확인하세요.
 - `MaxTimeOffroadMin`: 시동이 꺼진 뒤 장치가 자동으로 꺼질 때까지의 시간입니다.
-- `CarrotYouTubeLive`: 네트워크 사용량, 발열과 개인정보 노출 가능성을 함께 확인하세요.
 - `HotspotOnBoot`: USIM을 장착한 장치에서 자동 핫스팟을 사용할 때의 설정입니다.
 - `SoftwareMenu`: 메모리 문제가 있을 때 끌 수 있는 Carrot Web 메뉴 설정입니다.
 

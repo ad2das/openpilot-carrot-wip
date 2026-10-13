@@ -39,6 +39,7 @@ class XState(Enum):
   e2eStop = 3
   e2ePrepare = 4
   e2eStopped = 5
+  e2eStopPrepare = 6
 
   def __str__(self):
     return self.name
@@ -90,7 +91,25 @@ TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
 
 class CarrotPlanner:
-  def __init__(self):
+  def __init__(self, signal_assist=None, start_guard=None, stop_prepare=None):
+    # Per-device opt-in only; no flag means the original controller path.
+    self.signal_assist = signal_assist
+    self._signal_runtime = None
+    if signal_assist is None:
+      from openpilot.selfdrive.carrot.signal_assist_runtime import SignalAssistRuntime
+      runtime = SignalAssistRuntime()
+      if runtime.assist is not None:
+        self._signal_runtime = runtime
+        self.signal_assist = runtime.assist
+    self.signal_decision = None
+    from openpilot.selfdrive.carrot.signal_start_guard import SignalStartRuntime
+    self._start_runtime = SignalStartRuntime() if start_guard is None else None
+    self.start_guard = start_guard if start_guard is not None else self._start_runtime.guard
+    self.start_decision = None
+    from openpilot.selfdrive.carrot.signal_stop_prepare_runtime import SignalPrepareRuntime
+    self._prepare_runtime = SignalPrepareRuntime() if stop_prepare is None else None
+    self.stop_prepare = stop_prepare if stop_prepare is not None else self._prepare_runtime.prepare
+    self.prepare_decision = None
     self.params = Params()
     self.params_count = 0
     self.frame = 0
@@ -133,6 +152,7 @@ class CarrotPlanner:
     self.stopSignCount = 0
 
     self.stop_distance = 6.0
+    self.butter_stop = False
     self.trafficStopDistanceAdjust = 2.5 #params.get_float("TrafficStopDistanceAdjust") / 100.
     self.comfortBrake = 2.4
     self.comfort_brake = self.comfortBrake
@@ -261,6 +281,10 @@ class CarrotPlanner:
       self.cruiseMaxVals6 = self.params.get_float("CruiseMaxVals6") / 100.
     elif self.params_count == 40:
       self.stop_distance = self.params.get_float("StopDistanceCarrot") / 100.
+      try:
+        self.butter_stop = int(self.params.get_int("ButterStop")) != 0
+      except (TypeError, ValueError, AttributeError):
+        self.butter_stop = False
       self.eco_over_speed = self.params.get_int("CruiseEcoControl")
       self.autoNaviSpeedDecelRate = float(self.params.get_int("AutoNaviSpeedDecelRate")) * 0.01
       self.aChangeCostStarting = self.params.get_float("AChangeCostStarting")
@@ -810,7 +834,8 @@ class CarrotPlanner:
     if self.myDrivingModeAuto > 0 and not self.myDrivingMode_disable_auto:
       self.myDrivingMode = self.drivingModeDetector.get_mode(self.myDrivingModeAuto)
 
-  def update(self, sm, v_cruise_kph, mode):
+  def update(self, sm, v_cruise_kph, mode, *, signal_observation=None, signal_context=None,
+             start_observation=None, start_context=None, prepare_observation=None, prepare_context=None):
     self._params_update()
     self._update_driving_mode(sm)
     self.leadAccelResponse = get_mode_lead_response(get_lead_response_for_gap(
@@ -895,11 +920,58 @@ class CarrotPlanner:
     self.tlv_red_active = self._read_tlv_red_active(sm)
     self._update_coast_cap(v_ego)
 
+    start_hold = False
+    if self.start_guard is not None:
+      if start_context is None and self._start_runtime is not None:
+        start_observation, start_context = self._start_runtime.read(sm)
+      context = start_context or {}
+      self.start_decision = self.start_guard.update(
+        context.get('now', time.monotonic()), start_observation,
+        enabled=bool(context.get('enabled', False)), valid=bool(context.get('valid', False)),
+        drive=bool(context.get('drive', False)), gas=carstate.gasPressed, speed=float(v_ego),
+        departure=self.trafficState == TrafficState.green or lead_detected or
+                  self.xState not in (XState.e2eStop, XState.e2eStopped))
+      start_hold = self.start_decision.hold
+      if self.start_decision.warn:
+        # Bypass unrelated navigation-event cooldown. refuse.wav plays once.
+        self.events.add(EventName.audioRefuse)
+      if self._start_runtime is not None:
+        self._start_runtime.record(self.start_decision, v_ego, stop_model_x_rl)
+
+    signal_hold = False
+    if self.signal_assist is not None:
+      if signal_context is None and self._signal_runtime is not None:
+        signal_observation, signal_context = self._signal_runtime.read(sm)
+      context = signal_context or {}
+      self.signal_decision = self.signal_assist.update(
+        context.get('now', time.monotonic()), signal_observation,
+        enabled=bool(context.get('enabled', False)) and self.myDrivingMode != DrivingMode.High and self.trafficLightDetectMode != 0,
+        valid=bool(context.get('valid', False)), drive=bool(context.get('drive', False)),
+        gas=carstate.gasPressed, speed=float(v_ego), model_distance=float(stop_model_x_rl),
+        model_y=float(y[-1]), comfort_brake=float(mode_comfort_brake), lead=lead_detected,
+        entry_allowed=is_traffic_stop_entry_allowed(carstate.steeringAngleDeg) and self.traffic_starting_count == 0,
+        turning=carstate.leftBlinker or carstate.rightBlinker)
+      signal_hold = self.signal_decision.hold
+      if self.signal_decision.red_sign:
+        self.trafficState = TrafficState.red
+      if self._signal_runtime is not None:
+        self._signal_runtime.record(self.signal_decision, v_ego, stop_model_x_rl)
+
     #self.update_user_control()
     if carstate.gasPressed or carstate.brakePressed:
       self.user_stop_distance = -1
 
-    if self.soft_hold_active > 0:
+    if signal_hold or start_hold:
+      # Keep the stop even if a lead appears/moves. Radar obstacles remain in MPC.
+      # Green only removes this override; it never manufactures a go request.
+      self.xState = XState.e2eStopped
+      self.actual_stop_distance = 0.0
+      stop_model_x = 0.0
+      self.stopping_count = max(self.stopping_count, 0.5 / DT_MDL)
+      v_cruise = 0.0
+      if start_hold:
+        self.trafficState = TrafficState.red
+    elif self.soft_hold_active > 0:
       self.xState = XState.e2eStopped
       if trafficState_last in [TrafficState.off, TrafficState.red] and self.trafficState == TrafficState.green:
         self.add_event(EventName.trafficSignChanged)
@@ -965,12 +1037,14 @@ class CarrotPlanner:
     if self.trafficState in [TrafficState.off, TrafficState.green] or self.xState not in [XState.e2eStop, XState.e2eStopped]:
       stop_model_x = 1000.0
 
-    if self.user_stop_distance >= 0:
+    if self.user_stop_distance >= 0 and not start_hold:
       self.user_stop_distance = max(0, self.user_stop_distance - v_ego * DT_MDL)
       self.actual_stop_distance = self.user_stop_distance
       self.xState = XState.e2eStop if self.user_stop_distance > 0 else XState.e2eStopped
 
-    if mode == 'acc':
+    if start_hold:
+      mode = 'acc'  # The blended path otherwise ignores the traffic-stop obstacle.
+    elif mode == 'acc':
       mode = 'blended' if self.xState in [XState.e2ePrepare] else 'acc'
 
     # Drive modes shape transient response through lead preview and preserve
@@ -1025,6 +1099,26 @@ class CarrotPlanner:
     self.v_cruise = v_cruise
     self.stop_dist = stop_dist
     self.mode = mode
+    if self.stop_prepare is not None:
+      if prepare_context is None and self._prepare_runtime is not None:
+        prepare_observation, prepare_context = self._prepare_runtime.read(sm)
+      context = prepare_context or {}
+      self.prepare_decision = self.stop_prepare.update(
+        context.get('now', time.monotonic()), prepare_observation,
+        enabled=bool(context.get('enabled', False)) and self.myDrivingMode != DrivingMode.High and self.trafficLightDetectMode != 0,
+        valid=bool(context.get('valid', False)), drive=bool(context.get('drive', False)),
+        speed=float(v_ego), gas=carstate.gasPressed, brake=carstate.brakePressed,
+        lead=lead_detected or bool(getattr(getattr(radarstate, 'leadTwo', None), 'status', False)),
+        turning=bool(context.get('turning', True)) or carstate.leftBlinker or carstate.rightBlinker,
+        model_stopping=self.xState in (XState.e2eStop, XState.e2eStopped, XState.e2ePrepare),
+        entry_allowed=self.traffic_starting_count == 0 and self.user_stop_distance < 0 and mode == 'acc',
+        geometry=context.get('geometry', lambda box: None))
+      if self.prepare_decision.active:
+        self.xState = XState.e2eStopPrepare
+        if self.prepare_decision.entered:
+          self.events.add(EventName.trafficSignChanged)
+      if self._prepare_runtime is not None:
+        self._prepare_runtime.record_prepare(self.prepare_decision)
     #return v_cruise, stop_dist, mode
 
     return v_cruise_kph

@@ -1,3 +1,4 @@
+import json
 import struct
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,11 +8,23 @@ import pytest
 
 from openpilot.selfdrive.ui.onroad import model_renderer
 
+SOURCE_NOW = 10_000_000_000
+
 
 class FakeSubMaster(dict):
   def __init__(self, **messages):
     super().__init__(messages)
     self.valid = dict.fromkeys(messages, True)
+
+
+def source_payload(*, left_oem=False, left_vision=False, right_oem=False, right_vision=False):
+  return json.dumps({
+    "type": "xiaogeBlindspotSources",
+    "version": 1,
+    "receivedMonoTimeNanos": SOURCE_NOW,
+    "left": {"oem": left_oem, "vision": left_vision},
+    "right": {"oem": right_oem, "vision": right_vision},
+  }).encode()
 
 
 def blind_spot_messages(
@@ -96,17 +109,20 @@ def test_blind_spot_inactive_skips_barrier_update():
   assert updates == []
 
 
-def test_blind_spot_invalid_input_skips_barrier_update():
+def test_blind_spot_does_not_require_radar_for_confirmed_warning():
   renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._carrot_lane_barrier_vertices = [np.ones((4, 2), dtype=np.float32), np.ones((4, 2), dtype=np.float32)]
   car_state, radar_state, meta = blind_spot_messages(left_blindspot=True)
   sm = FakeSubMaster(modelV2=SimpleNamespace(meta=meta), carState=car_state, radarState=radar_state)
   sm.valid["radarState"] = False
   updates = []
   renderer._update_blind_spot_barriers_carrot = lambda *args, **kwargs: updates.append((args, kwargs))
+  renderer._draw_blind_spot_segments_carrot = lambda *_args: None
 
   renderer._draw_blind_spot_carrot(sm)
 
-  assert updates == []
+  assert len(updates) == 1
+  assert updates[0][1] == {"update_left": True, "update_right": False}
 
 
 def test_blind_spot_updates_only_active_side():
@@ -124,6 +140,76 @@ def test_blind_spot_updates_only_active_side():
   assert updates == [{"update_left": True, "update_right": False}]
   assert len(draws) == 1
   assert draws[0][0] is renderer._carrot_lane_barrier_vertices[0]
+
+
+@pytest.mark.parametrize(
+  "messages,sources,expected_rgb",
+  [
+    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True), (255, 179, 36)),
+    (blind_spot_messages(left_blindspot=True), source_payload(left_vision=True), (26, 136, 255)),
+    (blind_spot_messages(left_blindspot=True), source_payload(left_oem=True, left_vision=True), (255, 72, 64)),
+  ],
+)
+def test_blind_spot_wall_color_reflects_detection_source(monkeypatch, messages, sources, expected_rgb):
+  monkeypatch.setattr(model_renderer.time, "monotonic_ns", lambda: SOURCE_NOW)
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._carrot_lane_barrier_vertices = [np.ones((4, 2), dtype=np.float32), np.ones((4, 2), dtype=np.float32)]
+  car_state, radar_state, meta = messages
+  sm = FakeSubMaster(modelV2=SimpleNamespace(meta=meta), carState=car_state, radarState=radar_state,
+                     customReservedRawData1=sources)
+  draws = []
+  renderer._update_blind_spot_barriers_carrot = lambda *_args, **_kwargs: None
+  renderer._draw_blind_spot_segments_carrot = lambda _points, color: draws.append((color.r, color.g, color.b))
+
+  renderer._draw_blind_spot_carrot(sm)
+
+  assert draws == [expected_rgb]
+
+
+def test_blind_spot_wall_colors_are_independent_by_side(monkeypatch):
+  monkeypatch.setattr(model_renderer.time, "monotonic_ns", lambda: SOURCE_NOW)
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._carrot_lane_barrier_vertices = [np.zeros((4, 2), dtype=np.float32), np.ones((4, 2), dtype=np.float32)]
+  car_state, radar_state, meta = blind_spot_messages(
+    left_blindspot=True, right_blindspot=True,
+  )
+  sm = FakeSubMaster(
+    modelV2=SimpleNamespace(meta=meta), carState=car_state, radarState=radar_state,
+    customReservedRawData1=source_payload(left_vision=True, right_oem=True, right_vision=True),
+  )
+  draws = []
+  renderer._update_blind_spot_barriers_carrot = lambda *_args, **_kwargs: None
+  renderer._draw_blind_spot_segments_carrot = lambda points, color: draws.append(
+    (points, (color.r, color.g, color.b))
+  )
+
+  renderer._draw_blind_spot_carrot(sm)
+
+  assert draws == [
+    (renderer._carrot_lane_barrier_vertices[0], (26, 136, 255)),
+    (renderer._carrot_lane_barrier_vertices[1], (255, 72, 64)),
+  ]
+
+
+def test_blind_spot_wall_color_prefers_carstate_source_fields_over_stale_packet(monkeypatch):
+  monkeypatch.setattr(model_renderer.time, "monotonic_ns", lambda: SOURCE_NOW)
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._carrot_lane_barrier_vertices = [np.ones((4, 2), dtype=np.float32), np.ones((4, 2), dtype=np.float32)]
+  car_state, radar_state, meta = blind_spot_messages(left_blindspot=True)
+  car_state.leftBlindspotOem = True
+  car_state.leftBlindspotOnnx = True
+  car_state.blindspotSplitSourcesValid = True
+  stale_sources = source_payload(left_oem=False, left_vision=False)
+  sm = FakeSubMaster(modelV2=SimpleNamespace(meta=meta), carState=car_state, radarState=radar_state,
+                     customReservedRawData1=stale_sources)
+  sm.valid["customReservedRawData1"] = False
+  draws = []
+  renderer._update_blind_spot_barriers_carrot = lambda *_args, **_kwargs: None
+  renderer._draw_blind_spot_segments_carrot = lambda _points, color: draws.append((color.r, color.g, color.b))
+
+  renderer._draw_blind_spot_carrot(sm)
+
+  assert draws == [(255, 72, 64)]
 
 
 class FakeParams:
@@ -431,14 +517,14 @@ def lead_renderer(**overrides):
     "_carrot_radar_track_id": -1,
     "_carrot_lead_status": False,
     "_carrot_lead_speed": 0.0,
-    "_carrot_lead_vrel": 0.0,
+    "_carrot_lead_closing": False,
   }
   for key, value in {**defaults, **overrides}.items():
     setattr(renderer, key, value)
   return renderer
 
 
-def test_lead_runs_radar_and_vision_primary_carries_unit_and_cross_check(monkeypatch):
+def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(
     _carrot_radar_dist=12.5,
@@ -446,85 +532,75 @@ def test_lead_runs_radar_and_vision_primary_carries_unit_and_cross_check(monkeyp
     _carrot_radar_track_id=0,
     _carrot_lead_status=True,
     _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=-12.0,
+    _carrot_lead_closing=True,
   )
 
+  # No source dots, no vision cross-check and no relative-speed arrow: the lead speed leads, then the radar gap.
   assert renderer._lead_runs_carrot() == [
-    ("dot", model_renderer.LEAD_RED, 8.0),
-    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
-    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("dot", model_renderer.LEAD_BLUE, 5.0),
-    ("num", "14.3", model_renderer.LEAD_SIZE_2, model_renderer.LEAD_CROSS),
-    ("bar",),
     ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-    ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE),
+    ("bar",),
+    ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
 
 
-def test_lead_runs_vision_only_leads_blue_without_cross_check(monkeypatch):
+@pytest.mark.parametrize("run, weight", [
+  (("num", "80", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT), model_renderer.hs.BOLD),
+  (("num", "49", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT), model_renderer.hs.SEMI),
+  (("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3), model_renderer.hs.SEMI),
+])
+def test_only_the_leading_figure_is_bold(run, weight):
+  assert model_renderer.ModelRenderer._lead_run_weight(run) is weight
+
+
+def test_lead_runs_vision_only_shows_vision_distance_with_tenths_up_close(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(_carrot_vision_dist=8.7)
 
   assert renderer._lead_runs_carrot() == [
-    ("dot", model_renderer.LEAD_BLUE, 8.0),
     ("num", "8.7", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
 
 
-def test_lead_runs_radar_only_has_no_vision_cross_check(monkeypatch):
+@pytest.mark.parametrize("dist, text", [(9.94, "9.9"), (9.96, "10"), (10.0, "10"), (49.6, "50")])
+def test_lead_distance_uses_tenths_only_below_ten_metres(monkeypatch, dist, text):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
-  renderer = lead_renderer(_carrot_radar_dist=12.5, _carrot_radar_track_id=7)
+  renderer = lead_renderer(_carrot_radar_dist=dist, _carrot_radar_track_id=7)
 
   runs = renderer._lead_runs_carrot()
 
-  assert runs == [
-    ("dot", model_renderer.LEAD_AMBER, 8.0),
-    ("num", "12.5", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
-    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
-  ]
-  assert not any(run[0] == "dot" and run[2] == 5.0 for run in runs)
+  assert runs[0] == ("num", text, model_renderer.LEAD_SIZE, model_renderer.hs.TEXT)
+  assert not any(run[0] == "dot" for run in runs)
 
 
-def test_lead_runs_trend_badge_needs_two_kph_and_keeps_sign(monkeypatch):
-  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+@pytest.mark.parametrize("track_id, closing, colour", [
+  (0, False, model_renderer.LEAD_RADAR),
+  (7, False, model_renderer.LEAD_TRACK),
+  (-1, False, model_renderer.LEAD_BLUE),
+  (0, True, model_renderer.LEAD_RED),
+  (-1, True, model_renderer.LEAD_RED),
+])
+def test_lead_crescent_neutral_radar_amber_track_blue_camera_red_only_when_closing(track_id, closing, colour):
+  renderer = lead_renderer(_carrot_radar_track_id=track_id, _carrot_lead_closing=closing)
 
-  for vrel in (-1.4, 0.0, 1.4):
-    renderer = lead_renderer(
-      _carrot_radar_dist=12.5,
-      _carrot_lead_status=True,
-      _carrot_lead_speed=30.0,
-      _carrot_lead_vrel=vrel,
-    )
-    assert not any(run[0] == "trend" for run in renderer._lead_runs_carrot())
-
-  closing = lead_renderer(
-    _carrot_radar_dist=12.5,
-    _carrot_lead_status=True,
-    _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=-12.0,
-  )
-  assert closing._lead_runs_carrot()[-1] == ("trend", -1, "12", model_renderer.LEAD_BADGE_SIZE)
-
-  pulling_away = lead_renderer(
-    _carrot_radar_dist=12.5,
-    _carrot_lead_status=True,
-    _carrot_lead_speed=30.0,
-    _carrot_lead_vrel=12.4,
-  )
-  assert pulling_away._lead_runs_carrot()[-1] == ("trend", 1, "12", model_renderer.LEAD_BADGE_SIZE)
+  assert renderer._lead_stroke_carrot() is colour
 
 
-def test_lead_run_width_trend_slot_is_independent_of_digit_shapes():
-  renderer = object.__new__(model_renderer.ModelRenderer)
-  renderer._type = SimpleNamespace(width=lambda text, size, weight: float(sum(10 if c == "1" else 20 for c in text)))
+def test_lead_closing_needs_short_time_to_contact_and_holds_with_hysteresis():
+  closing_next = model_renderer.ModelRenderer._lead_closing_next
 
-  narrow = ("trend", -1, "11", model_renderer.LEAD_BADGE_SIZE)
-  wide = ("trend", -1, "88", model_renderer.LEAD_BADGE_SIZE)
-
-  assert renderer._lead_run_width(narrow, slot=True) == renderer._lead_run_width(wide, slot=True)
-  assert renderer._lead_run_width(narrow) != renderer._lead_run_width(wide)
+  # Standing or pulling away never reads as closing, nor does a crawl below the minimum closing speed.
+  assert not closing_next(False, 5.0, 0.0)
+  assert not closing_next(False, 5.0, 2.0)
+  assert not closing_next(True, 2.0, -0.9)
+  # 20 m at 8 m/s is 2.5 s to contact: on. 30 m at 8 m/s is 3.75 s: off when idle, held once on.
+  assert closing_next(False, 20.0, -8.0)
+  assert not closing_next(False, 30.0, -8.0)
+  assert closing_next(True, 30.0, -8.0)
+  # Beyond the release threshold it clears.
+  assert not closing_next(True, 40.0, -8.0)
 
 
 def speed_tag_renderer():
@@ -550,7 +626,7 @@ def test_speed_tag_drops_when_label_lands_beyond_reach(monkeypatch):
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
 
-  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 60.0)
 
   assert result is None
   assert renderer._float_boxes == []
@@ -566,8 +642,27 @@ def test_speed_tag_keeps_label_within_reach(monkeypatch):
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
 
-  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 0, 60.0)
+  result = renderer._draw_speed_tag_carrot(960.0, 540.0, "80", None, 60.0)
 
   assert result is not None
   assert result[:2] == spot
   assert len(renderer._float_boxes) == 1
+
+
+@pytest.mark.parametrize("track, expected", [
+  (SimpleNamespace(radarTrackId=7, dRel=80.0, yRel=3.5), True),   # the lead's own radar track, wherever it is
+  (SimpleNamespace(radarTrackId=3, dRel=49.6, yRel=0.4), True),   # sits where the lead is
+  (SimpleNamespace(radarTrackId=3, dRel=49.6, yRel=3.4), False),  # next lane at the same distance
+  (SimpleNamespace(radarTrackId=3, dRel=70.0, yRel=0.0), False),  # further up the same lane
+])
+def test_the_lead_track_gets_no_second_speed_tag(track, expected):
+  lead_one = SimpleNamespace(radarTrackId=7, dRel=49.0, yRel=0.0, status=True)
+
+  assert model_renderer.ModelRenderer._is_lead_one_track(track, lead_one) is expected
+
+
+def test_a_stock_radar_lead_matches_its_track_by_position():
+  lead_one = SimpleNamespace(radarTrackId=0, dRel=49.0, yRel=0.0, status=True)
+
+  assert model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=12, dRel=50.5, yRel=-0.6), lead_one)
+  assert not model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=0, dRel=20.0, yRel=0.0), lead_one)

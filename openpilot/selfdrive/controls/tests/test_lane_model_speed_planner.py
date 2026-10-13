@@ -23,9 +23,28 @@ class StubMpc:
     self.input_speed = p[:, 0].copy()
 
 
+class StubLaneCenterBlend:
+  # The slim CI job has no openpilot runtime deps; routing does not depend on the blend.
+  def __init__(self, table=None):
+    self.table = np.zeros(7)
+    self.curvature = self.offset = self.w = self.r_dev = 0.0
+    self.gates = 0
+
+  def reset(self):
+    pass
+
+  def update(self, *args):
+    return 0.0
+
+
 class StubLanePlanner:
   def __init__(self):
     self.debugText = ''
+    self.l_prob = 0.0
+    self.r_prob = 0.0
+    self.ll_x = np.linspace(0, 300, 33)
+    self.lll_y = np.full(33, -1.75)
+    self.rll_y = np.full(33, 1.75)
 
   def parse_model(self, md):
     pass
@@ -39,7 +58,7 @@ def make_planner():
   # lane geometry, Params and IPC imports are substituted for routing tests.
   source = Path(__file__).parents[1] / 'lib/lateral_planner.py'
   tree = ast.parse(source.read_text(encoding='utf8'))
-  params = SimpleNamespace(get_int=lambda _: 1, get_float=lambda _: 1.0)
+  params = SimpleNamespace(get_int=lambda _: 1, get_float=lambda _: 1.0, get=lambda _: None, put_nonblocking=lambda *_: None)
   namespace = {
     'np': np,
     'DT_MDL': 0.05,
@@ -50,8 +69,11 @@ def make_planner():
     'LateralMpc': StubMpc,
     'LanePlanner': StubLanePlanner,
     'LaneModelSpeedGuard': LaneModelSpeedGuard,
+    'LaneCenterBlend': StubLaneCenterBlend,
+    'dump_table': lambda table: '[]',
+    'load_table': lambda text: None,
     'time': SimpleNamespace(monotonic=lambda: 0),
-    'log': SimpleNamespace(Desire=SimpleNamespace(none=0)),
+    'log': SimpleNamespace(Desire=SimpleNamespace(none=0), LaneChangeState=SimpleNamespace(off=0)),
     'yaw_from_path_no_scipy': lambda *a, **k: (np.zeros(33), np.zeros(33)),
   }
   exec(
@@ -69,11 +91,11 @@ def inputs(speed=30.0, start=30.0, end=30.0, lane_speed=1):
     orientationRate=SimpleNamespace(z=np.zeros(33)),
     velocity=SimpleNamespace(x=np.linspace(start, end, 33), y=np.zeros(33), z=np.zeros(33)),
     acceleration=SimpleNamespace(x=np.zeros(33)),
-    meta=SimpleNamespace(desire=0, laneWidthLeft=3.5, laneWidthRight=3.5),
+    meta=SimpleNamespace(desire=0, laneChangeState=0, laneWidthLeft=3.5, laneWidthRight=3.5),
   )
   return {
     'modelV2': model,
-    'carState': SimpleNamespace(vEgo=speed, useLaneLineSpeed=lane_speed),
+    'carState': SimpleNamespace(vEgo=speed, useLaneLineSpeed=lane_speed, steeringPressed=False),
     'controlsState': SimpleNamespace(curvature=0.0),
     'carrotMan': SimpleNamespace(vTurnSpeed=200),
   }

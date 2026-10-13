@@ -350,13 +350,17 @@ def drop_below(x: float, y: float, w: float, h: float, claimed, gap: float = 12.
 def place_label(x: float, y: float, w: float, h: float, claimed, gap: float = 10.0):
   """Centre for a floating label near (x, y) that overlaps no HUD card or claimed label, else None.
 
-  Tries the preferred spot, then directly above the obstacle, then beside it on either side."""
+  Tries the preferred spot, then beside the obstacle on the label's own side (it stays at the car's height),
+  then directly above it, then the far side."""
   boxes = list(claimed) + top_boxes + panels
   hit = _hits(boxes, x, y, w, h, gap)
   if hit is None:
     return x, y
   bx, by, bw, bh = hit
-  for cx, cy in ((x, by - h / 2 - gap), (bx - w / 2 - gap, y), (bx + bw + w / 2 + gap, y)):
+  near, far = (bx - w / 2 - gap, y), (bx + bw + w / 2 + gap, y)
+  if x > bx + bw / 2:
+    near, far = far, near
+  for cx, cy in (near, (x, by - h / 2 - gap), far):
     if cy - h / 2 > 0 and _hits(boxes, cx, cy, w, h, gap) is None:
       return cx, cy
   return None
@@ -820,8 +824,9 @@ def regulatory_sign(cx: float, cy: float, value: str, type_: Type, k: float = 1.
     glow(cx, cy, 124 * k, rgba(255, 69, 58, 150))
   glow(cx, cy + 4 * k, 100 * k, rgba(0, 0, 0, 120))
   rl.draw_circle_v(rl.Vector2(cx, cy), 86 * k, SIGN_FACE)
-  rl.draw_ring(rl.Vector2(cx, cy), 64 * k, 84 * k, 0.0, 360.0, 64, SIGN_RING)
-  size = (62 if len(value) >= 3 else 76) * k
+  rl.draw_ring(rl.Vector2(cx, cy), 66 * k, 84 * k, 0.0, 360.0, 64, SIGN_RING)
+  # Figures as large as the white face allows: the limit is read at a glance, not studied.
+  size = (68 if len(value) >= 3 else 90) * k
   type_.draw(value, cx, cy + size * INTER_CAP / 2.0, size, SIGN_INK, BOLD, align=0.5, spacing=-2 * k)
 
 

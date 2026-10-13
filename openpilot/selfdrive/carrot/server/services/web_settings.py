@@ -6,7 +6,7 @@ import re
 import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from openpilot.selfdrive.carrot.web_upload import DEFAULT_WEB_UPLOAD_URL, normalize_base_url
+from openpilot.selfdrive.carrot.web_upload import DEFAULT_LOG_SYNC_URL, DEFAULT_WEB_UPLOAD_URL, normalize_base_url
 
 from ..config import CARROT_WEB_SETTINGS_PATH, WEB_DIR
 from .web_capabilities import is_known_web_capability
@@ -343,6 +343,13 @@ def _normalize_web_upload_url(value: Any) -> str:
     return DEFAULT_WEB_UPLOAD_URL
 
 
+def _normalize_log_sync_url(value: Any) -> str:
+  try:
+    return normalize_base_url(value, DEFAULT_LOG_SYNC_URL) or DEFAULT_LOG_SYNC_URL
+  except ValueError:
+    return DEFAULT_LOG_SYNC_URL
+
+
 def _normalize_stripped(value: Any) -> str:
   return str(value or "").strip()
 
@@ -448,6 +455,10 @@ WEB_SETTINGS_SPEC: List[_Field] = [
   _Field("kmap_overlay_curvature_color", "bool", False),
   _Field("kmap_map_type", "enum", "roadmap", choices={"roadmap", "satellite", "hybrid"}),
   _Field("web_upload_url", "str", DEFAULT_WEB_UPLOAD_URL, normalize=_normalize_web_upload_url),
+  # Automatic drive-log upload (rlog + qcamera per finished segment) to the
+  # upload server above. Never sends to the shared default server.
+  _Field("log_sync_enabled", "bool", False),
+  _Field("log_sync_url", "str", DEFAULT_LOG_SYNC_URL, normalize=_normalize_log_sync_url),
   # Remote support last-used settings, persisted so the owner's choices survive a
   # reload. Stored as strings via the enum type (numeric values are parsed back
   # to ints client-side). Command permission defaults to "approve_each" so a

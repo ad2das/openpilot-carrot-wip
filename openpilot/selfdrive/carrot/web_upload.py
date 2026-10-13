@@ -13,6 +13,8 @@ from aiohttp import ClientSession, ClientTimeout
 
 DEFAULT_WEB_UPLOAD_URL = "https://upload.shind0.synology.me"
 DEFAULT_TMUX_WEB_UPLOAD_URL = "https://tmux.carrotpilot.app/upload"
+# Automatic drive-log upload target (the fork owner's own receiver).
+DEFAULT_LOG_SYNC_URL = "https://anjh.duckdns.org"
 
 
 def normalize_base_url(value: Any, default: str = "") -> str:

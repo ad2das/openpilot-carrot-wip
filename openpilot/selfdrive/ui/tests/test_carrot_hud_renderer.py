@@ -184,6 +184,7 @@ def test_direct_hud_param_reads_are_isolated_to_refresh():
     ("_refresh_hud_params", "ShowTpms"),
     ("_refresh_hud_params", "ShowPlotMode"),
     ("_refresh_hud_params", "LongitudinalPersonality"),
+    ("_refresh_hud_params", "CruiseGapLevels"),
   ]
 
 
@@ -219,6 +220,7 @@ def test_hud_params_are_refreshed_once_per_interval(hud_module):
     "ShowTpms": 3,
     "ShowPlotMode": 4,
     "LongitudinalPersonality": 4,
+    "CruiseGapLevels": 3,
   })
   fake_ui_state.params = params
   renderer = make_param_renderer(module)
@@ -232,20 +234,58 @@ def test_hud_params_are_refreshed_once_per_interval(hud_module):
     renderer._longitudinal_personality,
   ) == (1, 2, 3, 4, 4)
   assert renderer._hud_params_next_refresh_time == 1.0
+  assert renderer._cruise_gap_levels == 3
   assert params.calls == [
     "ShowDeviceState",
     "ShowDateTime",
     "ShowTpms",
     "ShowPlotMode",
     "LongitudinalPersonality",
+    "CruiseGapLevels",
   ]
 
   renderer._refresh_hud_params(0.999)
-  assert len(params.calls) == 5
+  assert len(params.calls) == 6
 
   renderer._refresh_hud_params(1.0)
-  assert len(params.calls) == 10
+  assert len(params.calls) == 12
   assert renderer._hud_params_next_refresh_time == 2.0
+
+
+@pytest.mark.parametrize("levels, expected", [(2, 2), (3, 3), (4, 4), (1, 4), (9, 4)])
+def test_cruise_gap_levels_outside_two_to_four_show_four(hud_module, levels, expected):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = FakeParams({
+    "ShowDeviceState": 1,
+    "ShowDateTime": 2,
+    "ShowTpms": 3,
+    "ShowPlotMode": 4,
+    "LongitudinalPersonality": 1,
+    "CruiseGapLevels": levels,
+  })
+  renderer = make_param_renderer(module)
+
+  renderer._refresh_hud_params(0.0)
+
+  assert renderer._cruise_gap_levels == expected
+
+
+def test_cruise_gap_levels_read_failure_shows_four(hud_module):
+  module, fake_ui_state = hud_module
+  fake_ui_state.params = FakeParams({
+    "ShowDeviceState": 1,
+    "ShowDateTime": 2,
+    "ShowTpms": 3,
+    "ShowPlotMode": 4,
+    "LongitudinalPersonality": 1,
+    "CruiseGapLevels": 2,
+  }, failures={"CruiseGapLevels": 1})
+  renderer = make_param_renderer(module)
+
+  renderer._refresh_hud_params(0.0)
+
+  assert renderer._cruise_gap_levels == 4
+  assert renderer._longitudinal_personality == 1
 
 
 def test_show_param_failure_keeps_complete_snapshot_and_retries(hud_module):
@@ -698,3 +738,45 @@ def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_mod
   assert override.label == "MAX"
   assert override.speed_color_mode == 0
   assert not override.force_persist
+
+
+@pytest.mark.parametrize("dist, text", [
+  (0, ""), (7, "10 m"), (83, "90 m"), (120, "120 m"), (299, "300 m"), (300, "300 m"),
+  (347, "350 m"), (951, "1.0 km"), (1287, "1.3 km"),
+])
+def test_turn_distance_counts_down_in_calm_steps(hud_module, dist, text):
+  module, fake_ui_state = hud_module
+  fake_ui_state.is_metric = True
+  renderer = object.__new__(module.HudRenderer)
+
+  assert renderer._format_turn_distance_text(dist) == text
+
+
+def turn_info(turn=0, dist=0, nxt=0, nxt_dist=0):
+  return {"x_turn_info": turn, "x_dist_to_turn": dist, "x_turn_info_next": nxt, "x_dist_to_turn_next": nxt_dist}
+
+
+@pytest.mark.parametrize("info, expected", [
+  (turn_info(2, 350, 1, 530), (2, 350, 1, 180)),  # the turn after next, 180 m past the first
+  (turn_info(2, 350), (2, 350, 0, 0)),            # no turn after next
+  (turn_info(2, 350, 1, 300), (2, 350, 0, 0)),    # a stale next short of the first is ignored
+  (turn_info(2, -10, 1, 170), (1, 170, 0, 0)),    # past the first turn: its successor is promoted
+  (turn_info(-1, 0, 1, 170), (1, 170, 0, 0)),
+  (turn_info(-1, 0), (0, 0, 0, 0)),
+])
+def test_turn_resolution_promotes_the_next_turn_once_past(hud_module, info, expected):
+  module, _ = hud_module
+
+  assert module.HudRenderer._resolve_turn(info) == expected
+
+
+def test_a_short_feed_dropout_keeps_the_last_turn(hud_module):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._guide_turn = None
+
+  assert renderer._held_turn(turn_info(2, 350, 1, 530), True, 10.0) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), True, 11.9) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), False, 11.9) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), True, 12.0) == (0, 0, 0, 0)
+  assert renderer._guide_turn is None

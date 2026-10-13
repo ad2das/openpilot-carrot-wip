@@ -105,6 +105,7 @@ Tune the speed band containing the symptom instead of changing the whole table. 
 |---|---|---|
 | `StopDistanceCarrot` | `600` → 6.00 m | Increases fixed clearance to a stopped lead |
 | `VEgoStopping` | `50` → 0.50 m/s | Higher values enter stopping state at a higher planned speed |
+| `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s for a gentler stop |
 | `AChangeCostStarting` | MPC acceleration-change cost | Higher values smooth initial acceleration changes |
 
 ### `StopDistanceCarrot`
@@ -126,19 +127,31 @@ The original behavior enters stopping after `shouldStop` when actual acceleratio
 
 Changes apply within about one second, including while driving. Stronger output already reached during a stop is retained, so selecting a weaker target does not immediately reduce braking. Control clamps old or directly written out-of-range values to the range endpoints; unreadable values use the default.
 
+### `ButterStop` · Gentle final stop
+
+Default `1` (on); set `0` to carefully disable. While enabled, control tapers the braking ceiling in the final metres of a stop: below about 3 m/s the allowed deceleration magnitude is limited to `0.25 + 0.4 × speed` m/s², so braking no longer peaks at standstill and the pre-stop nod is reduced. The planner also targets its stop point slightly earlier (about 1.0 m) so the gentler final approach stays inside the planned distance.
+
+- Stop entry, standstill hold, departure decisions, StopReq output and soft hold are unchanged; the taper only limits how strong braking may become while still rolling below the taper speed.
+- After standstill is confirmed, output ramps to the hold acceleration faster (`2.0 m/s³`), and if the car still moves faster than about `0.15 m/s` while holding without accelerator input, braking is increased immediately and kept until the stop episode ends.
+- `0` disables the whole feature and is identical to the previous behavior.
+
+> [!NOTE]
+> In simulation with the real MPC solver there were no collisions, the standstill gap was 0.2–0.8 m longer than before, and the mean deceleration over the last 0.5 s fell from about 0.5~0.51 to 0.3 m/s². Not tested on a vehicle.
+
+The description above concerns upstream control. The final CANFD request override is described below.
+
 <a id="canfd-stopping"></a>
-### CANFD stopping and retry
+### CANFD stopping control
 
-Retry runs by default on Hyundai/Kia CANFD with openpilot longitudinal control. There is no separate setting, and the removed `CanfdStopRetry` value is not read. Conventional CAN vehicles and stock ACC longitudinal control are outside its scope.
+This experimental sequence applies to Hyundai/Kia CANFD openpilot longitudinal control without a separate setting. Conventional CAN vehicles and stock ACC longitudinal control are unchanged.
 
-- Stop intent and acceleration use the original control path. The additional one-second stop preview, forced convergence to -0.50 m/s² after StopReq, and two-frame soft-hold preparation are removed.
-- While StopReq is active, aReqRaw follows control with `StoppingAccel`, and aReqValue uses normal packet limiting. InfoDisplay and byte7 remain zero; the lower band uses a fixed experimental value of 0.20 without copying stock SCC values.
-- At low speed, elapsed time or distance alone does not release StopReq while deceleration continues. Acceleration rising from negative toward zero alone does not trigger retry either. Retry requires a sustained speed rebound with positive acceleration, or sustained loss of deceleration with insufficient speed reduction.
-- Retry releases StopReq and requests the stronger deceleration of the existing request and -0.50 m/s², then reasserts once. Further failure retains negative acceleration requests without repeated toggling. This does not change the planner's departure decision or add reverse-direction detection.
-- Accelerator input, cruise disengagement, and interlocks such as Auto Hold cancel it. Requests while the brake is pressed are allowed only for an armed soft hold with every speed input at or below 0.10 m/s.
+- `StoppingAccel` still affects the original stop-entry decision and upstream acceleration calculation. However, both aReqRaw and aReqValue are overridden to zero from the first StopReq frame, including soft hold.
+- Initial entry requires the maximum absolute speed input to be at or below 0.7 m/s. After entry, speed rebound, loss of deceleration, time and distance do not release StopReq or trigger retry.
+- An increase in jerkUpper is blocked on the first StopReq frame; the ordinary value is allowed from the next frame. Decreases are immediate. InfoDisplay and byte7 remain zero, and the lower band remains the fixed experimental value 0.20.
+- Existing departure decisions, disengagement, pedal, CAN and gear interlocks remain. The brake-input exception requires an armed soft hold with every speed input at or below 0.10 m/s.
 
 > [!CAUTION]
-> Retry does not guarantee complete stopping or collision prevention across vehicles. Any reduction in stopping impact also requires vehicle validation.
+> This trial adopts part of an observed stock sequence; complete stopping and prevention of rolling have not been validated on the vehicle.
 
 ### `VEgoStopping`
 
@@ -168,7 +181,7 @@ Range 0–200, step 10, catalog default 10. Zero permits the quickest accelerati
 > [!IMPORTANT]
 > The displayed `LongTuningKiV` title says `×0.01`, but `longcontrol.py` currently applies **×0.001**. Stored `100` is Ki `0.100`, not `1.00`.
 
-Hyundai, Kia, and Genesis do not read the stored `LongTuningKpV`, `LongTuningKiV`, or `LongTuningKf` values. On other brands, the overrides apply only when the vehicle's base longitudinal tune has a single Kp point and a single Ki point. Multi-point vehicle tunes retain their defaults. These gains are also not the primary controller when stock SCC controls acceleration and braking.
+Hyundai, Kia, and Genesis do not read the stored `LongTuningKpV`, `LongTuningKiV`, or `LongTuningKf` values. Toyota/Lexus also ignore and hide these three settings. Their dedicated vehicle controller corrects acceleration tracking, so the common controller passes the target through with `Kp=0`, `Ki=0`, and `Kf=1`. Stopping control and acceleration limits remain active. On other brands, the overrides apply only when the vehicle's base longitudinal tune has a single Kp point and a single Ki point. Multi-point vehicle tunes retain their defaults. These gains are also not the primary controller when stock SCC controls acceleration and braking.
 
 Volkswagen MEB vehicles, including ID.4, use a single base Ki point of zero, so all three gain settings apply. Previously saved values also apply; the default stored values `100/0/100` produce `Kp=1`, `Ki=0`, and `Kf=1`. Updating does not reset saved gains.
 
@@ -416,6 +429,12 @@ Related: [Understanding Settings](settings.md) · [Tuning introduction](https://
 - `openpilot/selfdrive/controls/lib/longcontrol.py`
 - `openpilot/selfdrive/controls/radard.py`
 - `opendbc_repo/opendbc/car/hyundai/carcontroller.py`
+
+### Following distance during shared braking
+
+When both vehicles brake while the gap is closing, ACC can retain a bounded portion of the distance at braking onset and reduce it gradually as speed falls. This applies to all following-response levels, including level 5; the level-5 exclusion described above concerns opening-gap extra TF only. Track replacement, invalid data and disengagement clear this distance memory. It combines with existing headroom without adding the same allowance twice.
+
+With ample measured and predicted clearance, ACC may temporarily relax the comfort TF reference by up to 0.4 seconds, with a 0.7-second reference floor. This is automatic and does not change the saved gap setting. Closing speed, lead motion and predicted reserve must qualify; short gaps, stopped leads and constrained approaches receive no allowance. The reference floor is not a guaranteed safe following time or a brake limit. Original physical-obstacle and stopping constraints remain active, so strong braking can still be necessary. Actual vehicle clearance and ride comfort have not been validated for this change.
 
 ### Predicted departure of the lead vehicle
 

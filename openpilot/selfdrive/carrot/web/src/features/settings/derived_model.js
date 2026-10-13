@@ -1,3 +1,9 @@
+import {
+  extractSettingChosung,
+  settingSearchKeywords,
+  settingSearchMatches,
+} from "./search/match.js";
+
 export const SETTING_DERIVED_IDS = Object.freeze({
   favoritesGroup: "__setting_favorites__",
   searchGroup: "__setting_search__",
@@ -217,8 +223,11 @@ export function createSettingsDerivedModel(options = {}) {
   // finds controls normally tucked inside that feature's detail screen.
   let inlineSearchIndex = null;
   function searchItemEntries(query) {
+    const keywords = settingSearchKeywords(query);
+    if (!keywords.length) return { entries: [], total: 0 };
+    // Search-only controls (e.g. the hidden DisableDM override) match only on
+    // their exact parameter name, never through the fuzzy haystack matcher.
     const needle = String(query || "").trim().normalize("NFC").toLowerCase();
-    if (!needle) return { entries: [], total: 0 };
     if (!inlineSearchIndex) {
       const text = (node) => node
         ? [node.name, node.title, node.etitle, node.ctitle, node.descr, node.edescr, node.cdescr]
@@ -234,17 +243,20 @@ export function createSettingsDerivedModel(options = {}) {
         const { group, item } = entry;
         const parent = itemIndex.get(item.detail_parent)?.item;
         const meta = getGroupMeta(group);
+        const haystack = [group, meta?.egroup, meta?.ko, meta?.en, meta?.zh,
+          getItemContextLabel(group, item), ...text(item), ...text(parent)]
+          .filter(Boolean).join("\n").normalize("NFC").toLowerCase();
         return {
           entry,
-          haystack: [group, meta?.egroup, meta?.ko, meta?.en, meta?.zh,
-            getItemContextLabel(group, item), ...text(item), ...text(parent)]
-            .filter(Boolean).join("\n").normalize("NFC").toLowerCase(),
+          haystack,
+          // Precomputed Korean initial-consonant projection (초성 검색).
+          chosung: extractSettingChosung(haystack),
         };
       });
     }
-    const matches = inlineSearchIndex.filter(({ entry, haystack }) => entry.item.search_only
+    const matches = inlineSearchIndex.filter(({ entry, haystack, chosung }) => entry.item.search_only
       ? entry.item.name.toLowerCase() === needle
-      : haystack.includes(needle));
+      : settingSearchMatches(haystack, chosung, keywords));
     return { entries: matches.slice(0, 20).map(({ entry }) => entry), total: matches.length };
   }
 
@@ -259,6 +271,14 @@ export function createSettingsDerivedModel(options = {}) {
     const profileName = isProfile ? String(profile.name || "") : "";
     const sourceLabel = isProfile ? sourceLabels.profile : sourceLabels.carrot;
     const contextLabel = isProfile ? `${profileName} / ${contextGroupLabel}` : contextGroupLabel;
+    // NFC so a decomposed query (some IMEs, macOS) still matches; the shared
+    // matcher normalizes its query the same way. A child also carries the
+    // parent's text so the feature name finds its nested controls.
+    const haystack = [sourceLabel, profileName, groupLabel, contextGroupLabel, item.name, title, descr,
+      parentItem?.name, parentTitle, parentDescr]
+      .join("\n")
+      .normalize("NFC")
+      .toLowerCase();
     return {
       source: isProfile ? "profile" : "carrot",
       sourceLabel,
@@ -278,14 +298,9 @@ export function createSettingsDerivedModel(options = {}) {
       // Empty for a top-level item; a detail child points at the parent whose
       // detail screen must be open before the child row exists.
       detailParent: parentItem ? String(parentItem.name || "") : "",
-      // NFC so a decomposed query (some IMEs, macOS) still matches; the shared
-      // filter normalizes its query the same way. A child also carries the
-      // parent's text so the feature name finds its nested controls.
-      haystack: [sourceLabel, profileName, groupLabel, contextGroupLabel, item.name, title, descr,
-        parentItem?.name, parentTitle, parentDescr]
-        .join("\n")
-        .normalize("NFC")
-        .toLowerCase(),
+      haystack,
+      // Precomputed Korean initial-consonant projection (초성 검색).
+      chosung: extractSettingChosung(haystack),
     };
   }
 

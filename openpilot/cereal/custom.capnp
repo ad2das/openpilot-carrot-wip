@@ -45,8 +45,10 @@ struct CarrotMan @0x81c2f05a394cf4af {
 	vehicleNaviSpeed @30 : Int32;
 	vehicleNaviSectionActive @31 : Bool;
 	vehicleNaviAvailable @32 : Bool;
+	xTurnInfoNext @33 : Int32;
+	xDistToTurnNext @34 : Int32;
 	# 0 = external navi DETECT, 1 = carrotTlv device detector.
-	trafficStateSrc @33 : Int32;
+	trafficStateSrc @35 : Int32;
 }
 
 struct CarrotNaviState @0xaedffd8f31e7b55d {

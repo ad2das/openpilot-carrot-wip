@@ -122,6 +122,20 @@ jobs:
           openpilot/common/tests/test_display_scheduling.py
           openpilot/system/tests/test_camera_cpu_placement.py
           openpilot/selfdrive/ui/tests/test_carrot_ui_sched.py
+      - name: Check ButterStop closed-loop stops
+        env:
+          BUTTER_SIM_OUT: ${{ runner.temp }}/butter_sim.json
+        run: |
+          python -m pytest -o addopts='' -q -s openpilot/selfdrive/test/longitudinal_maneuvers/test_butter_stop_maneuvers.py
+      - name: Upload ButterStop sim table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: butter-sim
+          path: |
+            ${{ runner.temp }}/butter_sim.json
+            ${{ runner.temp }}/butter_sweep.json
+          if-no-files-found: warn
       - name: Check model, monitoring and Bluetooth integration
         run: |
           python -m pytest -o addopts='' -q \
