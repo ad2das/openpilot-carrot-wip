@@ -20,6 +20,16 @@ GPU_STRICT_KEY_TOKENS = ("QCOM", "CUDA", "OPENCL", "ROCM", "VULKAN")
 GPU_VALUE_TOKENS = ("QCOM", "CUDA", "OPENCL", "VULKAN", "ROCM")
 _FALSY = ("", "0", "false", "no", "off")
 
+# Bundled R3b traffic-light models: shipped so CarrotTlvMode works with no
+# model path params. Absolute paths resolved next to this module; the SHA256
+# values are the verified artifacts, checked by the unit tests only (tlvd never
+# hashes a model at startup).
+_BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
+BUNDLED_DETECTOR = os.path.join(_BUNDLED_DIR, "tl_detector_r3b.onnx")
+BUNDLED_LAMP = os.path.join(_BUNDLED_DIR, "tl_lamp_r3b.onnx")
+BUNDLED_DETECTOR_SHA256 = "d106b3f9f9d100ecdd71bd743683eac21f7b06b8e5ff2abd96841e934fb8db09"
+BUNDLED_LAMP_SHA256 = "467f7a1f25c5de1dd1e50280ca23f0d8abc3e9d72857af9bb044646f5b6f737f"
+
 
 class BackendError(RuntimeError):
   pass

@@ -32,7 +32,7 @@ import time
 
 import numpy as np
 
-from openpilot.selfdrive.carrot.tlv import resources
+from openpilot.selfdrive.carrot.tlv import backends, resources
 
 # Gate tolerances ("beyond noise").
 FRAME_DROP_DELTA = 1.0            # allowed frameDropPerc mean/p95 increase
@@ -615,7 +615,7 @@ def main(argv=None) -> int:
   parser.add_argument("--tlv-s", type=float, default=60.0)
   parser.add_argument("--soak-min", type=float, default=20.0, help="soak phase minutes; 0 skips the soak")
   parser.add_argument("--backend", default="null", help="null/onnx/tinygrad (tlvd CarrotTlvBackend)")
-  parser.add_argument("--model-path", default=None, help="CarrotTlvModelPath override")
+  parser.add_argument("--model-path", default=backends.BUNDLED_DETECTOR, help="CarrotTlvModelPath override (default: bundled detector)")
   parser.add_argument("--startup-wait-s", type=float, default=20.0)
   args = parser.parse_args(argv)
 

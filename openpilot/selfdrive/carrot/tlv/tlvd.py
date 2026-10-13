@@ -139,7 +139,7 @@ class TlvRunner:
     self.detector_throttle = resources.DetectorThrottle()
     if _param_int(params, "CarrotTlvMode") >= 1:
       name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
-      model_path = _param_text(params, "CarrotTlvModelPath", "")
+      model_path = _param_text(params, "CarrotTlvModelPath", "") or backends.BUNDLED_DETECTOR
       try:
         self.backend, self.decoder = backends.make_backend(name, model_path)
       except NotImplementedError as exc:
@@ -149,7 +149,7 @@ class TlvRunner:
       if self.backend is not None:
         # Lamp classifier: a bad/missing lamp model must never kill tlvd; fall
         # back to the detector-only behavior (CONTRACT.md detect-then-track).
-        lamp_path = _param_text(params, "CarrotTlvLampModelPath", "")
+        lamp_path = _param_text(params, "CarrotTlvLampModelPath", "") or backends.BUNDLED_LAMP
         try:
           self.classifier = backends.make_classifier(name, lamp_path)
           self.classifier.warmup()

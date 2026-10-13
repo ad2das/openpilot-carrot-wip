@@ -539,7 +539,7 @@ def _model_path_from_params() -> str:
   value = Params().get("CarrotTlvModelPath")
   if isinstance(value, bytes):
     value = value.decode("utf-8", "replace")
-  return str(value or "").strip()
+  return str(value or "").strip() or backends.BUNDLED_DETECTOR
 
 
 class _OnnxAdapter:
