@@ -67,6 +67,12 @@ NAV_DISTANCE_SIZE = 142
 NAV_UNIT_SIZE = 60
 NAV_TEXT_SIZE = 56
 NAV_PROGRESS_SPAN = 2000.0
+GUIDE_HOLD_S = 2.0      # a turn card outlives a dropout in the navigator's feed by this long instead of blinking
+NEXT_GAP = 12           # turn-after-next card: under the turn card, a step smaller
+NEXT_H = 104
+NEXT_ARROW = 84
+NEXT_DISTANCE_SIZE = 66
+NEXT_UNIT_SIZE = 34
 CLOCK_SIZE = 86
 DATE_SIZE = 54
 CLOCK_H = 116
@@ -236,6 +242,7 @@ class HudRenderer(Widget):
     self._engaged = False
     self._overspeed = False
     self._progress_key: tuple | None = None
+    self._guide_turn: tuple[int, int, int, int, float] | None = None
     self._progress_start = NAV_PROGRESS_SPAN
     self._progress_last = 0
     self._set_anchor = (0.0, 0.0)
@@ -1077,6 +1084,8 @@ class HudRenderer(Widget):
       "active_carrot": field("activeCarrot", int, 0),
       "x_turn_info": field("xTurnInfo", int, 0),
       "x_dist_to_turn": field("xDistToTurn", int, 0),
+      "x_turn_info_next": field("xTurnInfoNext", int, 0),
+      "x_dist_to_turn_next": field("xDistToTurnNext", int, 0),
       "x_spd_dist": field("xSpdDist", int, 0),
       "n_go_pos_dist": field("nGoPosDist", int, 0),
       "n_go_pos_time": field("nGoPosTime", int, 0),
@@ -1112,14 +1121,41 @@ class HudRenderer(Widget):
     self._progress_last = dist
     return min(1.0, max(0.0, 1.0 - dist / self._progress_start))
 
+  @staticmethod
+  def _resolve_turn(info: dict) -> tuple[int, int, int, int]:
+    """(turn, distance, turn after it, distance between the two). Once the car is past a turn its successor is
+    promoted, so the card does not blank while the navigator catches up."""
+    turn, dist = info["x_turn_info"], info["x_dist_to_turn"]
+    nxt, nxt_dist = info["x_turn_info_next"], info["x_dist_to_turn_next"]
+    if (turn <= 0 or dist <= 0) and nxt > 0 and nxt_dist > 0:
+      return nxt, nxt_dist, 0, 0
+    if turn <= 0:
+      return 0, 0, 0, 0
+    if nxt > 0 and nxt_dist > dist > 0:
+      return turn, dist, nxt, nxt_dist - dist
+    return turn, dist, 0, 0
+
+  def _held_turn(self, info: dict, route: bool, now: float) -> tuple[int, int, int, int]:
+    """The turn to show: live while the feed has one, else the last one for GUIDE_HOLD_S (frozen)."""
+    live = self._resolve_turn(info) if route else (0, 0, 0, 0)
+    if live[0] > 0:
+      self._guide_turn = (*live, now)
+      return live
+    held = self._guide_turn
+    if held is not None and now - held[4] < GUIDE_HOLD_S:
+      return held[:4]
+    self._guide_turn = None
+    return live
+
   def _draw_guidance_card(self, rect: rl.Rectangle, info: dict) -> None:
     t = self._type
     x_spd_limit, x_sign_type, _ = self._get_speed_limit_info()
     route = info["n_go_pos_dist"] > 0 and info["n_go_pos_time"] > 0
-    turn = route and info["x_turn_info"] > 0
+    turn_info, turn_dist, next_info, next_gap = self._held_turn(info, route, time.monotonic())
+    turn = turn_info > 0
     cam_dist = info["x_spd_dist"]
     camera = x_spd_limit > 0 and x_sign_type != 22 and cam_dist > 0
-    if camera and turn and info["x_dist_to_turn"] < cam_dist:
+    if camera and turn and turn_dist < cam_dist:
       camera = False
     if not (camera or turn):
       self._progress_key = None
@@ -1135,10 +1171,10 @@ class HudRenderer(Widget):
       key: tuple = ("camera", x_sign_type)
     else:
       # Turn guidance is the arrow and the distance alone; the road name only cost a glance.
-      dist = info["x_dist_to_turn"]
+      dist = turn_dist
       text, extra = "", ""
       body, bar = hs.CARD_BODY, hs.LIVE_GREEN if info["atc_type"] else NAV_BLUE
-      key = ("turn", info["x_turn_info"])
+      key = ("turn", turn_info)
 
     # The card hugs its content: no blank tail after the distance or the instruction line.
     number, _, unit = self._format_turn_distance_text(dist).partition(" ")
@@ -1156,8 +1192,8 @@ class HudRenderer(Widget):
     gx, gy = x + 120, y + (128 if text else 102)
     if camera:
       hs.regulatory_sign(gx, gy, extra, t, 0.92)
-    elif not hs.maneuver_arrow(info["x_turn_info"], gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if info["atc_type"] else hs.TEXT):
-      t.draw_mid(f"감속:{info['x_turn_info']}", gx, gy, 40, hs.TEXT, hs.BOLD, align=0.5)
+    elif not hs.maneuver_arrow(turn_info, gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if info["atc_type"] else hs.TEXT):
+      t.draw_mid(f"감속:{turn_info}", gx, gy, 40, hs.TEXT, hs.BOLD, align=0.5)
 
     if number:
       # Without an instruction line the distance sits on the arrow's centre.
@@ -1173,6 +1209,23 @@ class HudRenderer(Widget):
     hs.card(x + 30, bar_y, w - 60, 10, hs.rgba(255, 255, 255, 38), 5, None)
     if progress > 0.01:
       hs.card(x + 30, bar_y, max(10.0, (w - 60) * progress), 10, bar, 5, None)
+    if not camera and next_info > 0:
+      self._draw_next_turn(x, y + h + NEXT_GAP, next_info, next_gap)
+
+  def _draw_next_turn(self, x: float, y: float, turn_info: int, gap: int) -> None:
+    """The turn after next, a step smaller under the turn card: its arrow and the distance between the two turns."""
+    t = self._type
+    number, _, unit = self._format_turn_distance_text(gap).partition(" ")
+    if not number or turn_info not in hs.MANEUVER_ICONS:
+      return
+    w = 28 + NEXT_ARROW + 18 + t.width(number, NEXT_DISTANCE_SIZE, hs.SEMI, -2) + 10 + t.width(unit, NEXT_UNIT_SIZE, hs.MEDIUM) + 34
+    hs.glass_card(x, y, w, NEXT_H, 30, hs.CARD_BODY)
+    hs.top_boxes.append((x, y, w, NEXT_H))
+    mid = y + NEXT_H / 2
+    hs.maneuver_arrow(turn_info, x + 28 + NEXT_ARROW / 2, mid, NEXT_ARROW / 140.0, hs.TEXT_2)
+    base = mid + NEXT_DISTANCE_SIZE * hs.INTER_CAP / 2
+    nw = t.draw(number, x + 28 + NEXT_ARROW + 18, base, NEXT_DISTANCE_SIZE, hs.TEXT_2, hs.SEMI, spacing=-2)
+    t.draw(unit, x + 28 + NEXT_ARROW + 18 + nw + 10, base, NEXT_UNIT_SIZE, hs.TEXT_3, hs.MEDIUM)
 
   # ---- trip capsule (bottom-right) ----------------------------------------------------------
 

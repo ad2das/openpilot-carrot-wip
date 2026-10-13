@@ -1529,6 +1529,8 @@ class CarrotServ:
     msg.carrotMan.xSpdCountDown = int(left_spd_sec)
     msg.carrotMan.xTurnInfo = int(self.xTurnInfo)
     msg.carrotMan.xDistToTurn = int(self.xDistToTurn)
+    msg.carrotMan.xTurnInfoNext = int(self.xTurnInfoNext)
+    msg.carrotMan.xDistToTurnNext = int(self.xDistToTurnNext)
     msg.carrotMan.xTurnCountDown = int(left_tbt_sec)
     msg.carrotMan.atcType = self.atcType
     msg.carrotMan.vTurnSpeed = int(vturn_speed)

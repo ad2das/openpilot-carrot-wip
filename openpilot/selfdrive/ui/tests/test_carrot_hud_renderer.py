@@ -749,3 +749,33 @@ def test_turn_distance_counts_down_in_calm_steps(hud_module, dist, text):
   renderer = object.__new__(module.HudRenderer)
 
   assert renderer._format_turn_distance_text(dist) == text
+
+
+def turn_info(turn=0, dist=0, nxt=0, nxt_dist=0):
+  return {"x_turn_info": turn, "x_dist_to_turn": dist, "x_turn_info_next": nxt, "x_dist_to_turn_next": nxt_dist}
+
+
+@pytest.mark.parametrize("info, expected", [
+  (turn_info(2, 350, 1, 530), (2, 350, 1, 180)),  # the turn after next, 180 m past the first
+  (turn_info(2, 350), (2, 350, 0, 0)),            # no turn after next
+  (turn_info(2, 350, 1, 300), (2, 350, 0, 0)),    # a stale next short of the first is ignored
+  (turn_info(2, -10, 1, 170), (1, 170, 0, 0)),    # past the first turn: its successor is promoted
+  (turn_info(-1, 0, 1, 170), (1, 170, 0, 0)),
+  (turn_info(-1, 0), (0, 0, 0, 0)),
+])
+def test_turn_resolution_promotes_the_next_turn_once_past(hud_module, info, expected):
+  module, _ = hud_module
+
+  assert module.HudRenderer._resolve_turn(info) == expected
+
+
+def test_a_short_feed_dropout_keeps_the_last_turn(hud_module):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._guide_turn = None
+
+  assert renderer._held_turn(turn_info(2, 350, 1, 530), True, 10.0) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), True, 11.9) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), False, 11.9) == (2, 350, 1, 180)
+  assert renderer._held_turn(turn_info(), True, 12.0) == (0, 0, 0, 0)
+  assert renderer._guide_turn is None
