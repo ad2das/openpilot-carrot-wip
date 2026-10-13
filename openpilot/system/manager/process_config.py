@@ -225,6 +225,7 @@ procs = [
 
   # On-device traffic light detector (CarrotTlvMode 1=shadow, 2=active). Cores 1-3, SCHED_IDLE.
   PythonProcess("tlvd", "openpilot.selfdrive.carrot.tlv.tlvd", enable_tlvd, restart_if_crash=True),
+  PythonProcess("tlv_dsp_probe", "openpilot.selfdrive.carrot.tlv.dsp_probe", enable_tlv_dsp_probe),
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
   PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),

@@ -243,6 +243,14 @@ def test_enable_tlvd_unchanged_when_signal_color_not_requested(monkeypatch):
         assert result == (started and tlv >= 1 and tld >= 1), (started, tlv, tld)
 
 
+# -- tlv_dsp_probe process registration ---------------------------------------
+
+def test_tlv_dsp_probe_process_registered():
+  proc = process_config.managed_processes["tlv_dsp_probe"]
+  assert proc.module == "openpilot.selfdrive.carrot.tlv.dsp_probe"
+  assert proc.should_run is process_config.enable_tlv_dsp_probe
+
+
 # -- crash_loop_guard --------------------------------------------------------
 
 def test_crash_loop_guard_five_starts_ok_sixth_clears_mode():
