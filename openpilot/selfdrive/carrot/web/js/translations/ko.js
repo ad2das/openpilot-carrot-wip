@@ -429,7 +429,7 @@ window.CarrotTranslations.register("ko", {
     web_upload_url: "업로드 서버",
     web_upload_url_desc: "자동 세션으로 로그를 전송할 HTTPS API 주소",
     web_log_sync_enabled: "주행 로그 자동 업로드",
-    web_log_sync_enabled_desc: "주행 중에도 끝난 1분 구간마다 rlog와 qcamera를 아래 자동 업로드 서버로 자동 전송합니다. 기본 공용 업로드 서버로는 보내지 않습니다.",
+    web_log_sync_enabled_desc: "주행 중에도 끝난 1분 구간마다 rlog와 qcamera를 아래 자동 업로드 서버로 자동 전송합니다. 기본 공용 업로드 서버로는 보내지 않습니다. 신호등 기록기 사진도 함께 보내고, 보낸 사진은 기기에서 지웁니다.",
     web_log_sync_url: "자동 업로드 서버",
     web_log_sync_url_desc: "주행 로그를 자동으로 보낼 HTTPS 주소",
     web_upload_test: "연결 시험",

@@ -10,6 +10,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import shutil
 import time
 import tracemalloc
 from types import SimpleNamespace
@@ -506,8 +507,83 @@ def test_offer_no_allocation_growth(tmp_path):
   current, peak = tracemalloc.get_traced_memory()
   tracemalloc.stop()
   growth = current - before
-  print(f"\nalloc[tlv-recorder]: offers=500 saved={rec.stats()['saved']} "
-        f"net_growth={growth / 1024:.1f} KB peak_delta={(peak - before) / 1024:.1f} KB")
+  print(f"\nalloc[tlv-recorder]: offers=500 saved={rec.stats()['saved']} net_growth={growth / 1024:.1f} KB peak_delta={(peak - before) / 1024:.1f} KB")
   assert rec.stats()["saved"] == 50 + 50 + 500
   assert growth < 256 * 1024, f"net growth {growth / 1024:.1f} KB >= 256 KB"
+  rec.close()
+
+
+# ---------------------------------------------------------------------------
+# session rotation and .active heartbeat
+# ---------------------------------------------------------------------------
+
+def test_session_rotates_after_ten_minutes(tmp_path):
+  now = [1000.0]
+  names = iter(["20260101-000000", "20260101-010000"])
+  rec = make_recorder(tmp_path, clock=lambda: now[0], session_name_fn=lambda: next(names),
+                      encode_fn=lambda _rgb: b"jpeg")
+  assert offer(rec, 100.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  assert rec.stats()["session"] == "20260101-000000"
+
+  now[0] += recorder.SESSION_ROTATE_S
+  assert offer(rec, 200.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  assert rec.stats()["session"] == "20260101-010000"
+  assert rec.stats()["saved"] == 2
+  assert session_dirs(str(tmp_path)) == ["20260101-000000", "20260101-010000"]
+  assert os.path.isfile(os.path.join(str(tmp_path), "20260101-000000", "0000000.jpg"))
+  assert os.path.isfile(os.path.join(str(tmp_path), "20260101-010000", "0000001.jpg"))
+  rec.close()
+
+
+def test_vanished_session_is_recreated(tmp_path):
+  now = [1000.0]
+  names = iter(["20260101-000000", "20260101-000001"])
+  rec = make_recorder(tmp_path, clock=lambda: now[0], session_name_fn=lambda: next(names),
+                      encode_fn=lambda _rgb: b"jpeg")
+  assert offer(rec, 100.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  shutil.rmtree(os.path.join(str(tmp_path), "20260101-000000"))
+
+  assert offer(rec, 101.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  assert rec.stats()["saved"] == 2
+  assert rec.stats()["session"] == "20260101-000001"
+  assert session_dirs(str(tmp_path)) == ["20260101-000001"]
+  rec.close()
+
+
+def test_active_heartbeat_written_refreshed_and_removed(tmp_path):
+  now = [1000.0]
+  rec = make_recorder(tmp_path, clock=lambda: now[0], session_name_fn=lambda: "20260101-000000",
+                      encode_fn=lambda _rgb: b"jpeg")
+  assert offer(rec, 100.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  active_path = os.path.join(str(tmp_path), recorder.ACTIVE_NAME)
+  with open(active_path, encoding="utf-8") as f:
+    assert f.read() == "20260101-000000"
+  first_mtime = os.path.getmtime(active_path)
+
+  time.sleep(0.1)
+  now[0] += recorder.ACTIVE_HEARTBEAT_S + 1.0
+  assert offer(rec, 101.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  with open(active_path, encoding="utf-8") as f:
+    assert f.read() == "20260101-000000"
+  assert os.path.getmtime(active_path) > first_mtime
+
+  rec.close()
+  assert not os.path.exists(active_path)
+
+
+def test_session_name_collision_bumps_second(tmp_path):
+  (tmp_path / "20260101-000000").mkdir()
+  rec = make_recorder(tmp_path, session_name_fn=lambda: "20260101-000000",
+                      encode_fn=lambda _rgb: b"jpeg")
+  assert offer(rec, 100.0, dets=[make_det()]) is True
+  assert rec.wait_idle()
+  assert rec.stats()["session"] == "20260101-000001"
+  assert session_dirs(str(tmp_path)) == ["20260101-000000", "20260101-000001"]
+  assert os.listdir(str(tmp_path / "20260101-000000")) == []
   rec.close()

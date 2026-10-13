@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import shutil
 import time
 from typing import Any
 
@@ -29,6 +31,14 @@ BACKOFF_MIN_S = 30.0
 BACKOFF_MAX_S = 60.0
 SESSION_MAX_AGE_S = 3 * 3600
 MARKER_NAME = ".carrot_log_sync.json"
+
+TLVREC_ROOT = "/data/media/0/carrot_tlv_rec"
+TLVREC_SEGMENT_PREFIX = "tlvrec--"
+TLVREC_SESSION_RE = re.compile(r"^\d{8}-\d{6}$")
+TLVREC_FILE_RE = re.compile(r"^(?:\d{7}\.jpg|index\.jsonl)$")
+TLVREC_ACTIVE_NAME = ".active"
+TLVREC_ACTIVE_FRESH_S = 60.0
+TLVREC_QUIET_S = 120.0
 
 
 def target_url(settings: dict[str, Any]) -> str | None:
@@ -65,6 +75,85 @@ def mark_synced(seg_dir: str, base_url: str, files: dict[str, int]) -> None:
   with open(tmp_path, "w", encoding="utf-8") as f:
     json.dump({"base_url": base_url, "files": files}, f)
   os.replace(tmp_path, path)
+
+
+def tlvrec_files(session_dir: str) -> dict[str, int]:
+  try:
+    with os.scandir(session_dir) as entries:
+      scanned = list(entries)
+  except OSError:
+    return {}
+  files: dict[str, int] = {}
+  for entry in scanned:
+    try:
+      if entry.is_file(follow_symlinks=False) and TLVREC_FILE_RE.fullmatch(entry.name):
+        files[entry.name] = int(entry.stat(follow_symlinks=False).st_size)
+    except OSError:
+      continue
+  return files
+
+
+def _tlvrec_active_session(now: float) -> str | None:
+  try:
+    active_path = os.path.join(TLVREC_ROOT, TLVREC_ACTIVE_NAME)
+    with open(active_path, encoding="utf-8") as f:
+      name = f.read().strip()
+    if now - os.path.getmtime(active_path) < TLVREC_ACTIVE_FRESH_S:
+      return name
+  except (OSError, ValueError):
+    return None
+  return None
+
+
+def _newest_mtime(session_dir: str) -> float:
+  try:
+    newest = os.path.getmtime(session_dir)
+    with os.scandir(session_dir) as entries:
+      for entry in entries:
+        try:
+          newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+        except OSError:
+          continue
+    return newest
+  except OSError:
+    return time.time()  # noqa: TID251
+
+
+def next_tlvrec_session(now: float) -> tuple[str, dict[str, int]] | None:
+  """Oldest quiet finished tlv recorder session, or None while all are busy."""
+  try:
+    names = os.listdir(TLVREC_ROOT)
+  except OSError:
+    return None
+  active = _tlvrec_active_session(now)
+  for name in sorted(names):
+    if not TLVREC_SESSION_RE.fullmatch(name):
+      continue
+    session_dir = os.path.join(TLVREC_ROOT, name)
+    try:
+      if not os.path.isdir(session_dir) or os.path.islink(session_dir):
+        continue
+    except OSError:
+      continue
+    if name == active:
+      continue
+    if now - _newest_mtime(session_dir) < TLVREC_QUIET_S:
+      continue
+    files = tlvrec_files(session_dir)
+    if not files:
+      try:
+        leftovers = os.listdir(session_dir)
+      except OSError:
+        continue
+      if not leftovers:
+        try:
+          os.rmdir(session_dir)
+        except OSError:
+          pass
+        cloudlog.event("carrot_log_sync_tlvrec_empty", session=name)
+      continue
+    return name, files
+  return None
 
 
 def next_segment(base_url: str, now: float) -> tuple[str, dict[str, int]] | None:
@@ -116,7 +205,7 @@ class LogSync:
       return DISABLED_POLL_S
     picked = next_segment(base_url, time.time())  # noqa: TID251
     if picked is None:
-      return POLL_S
+      return await self._sync_tlvrec(base_url)
     name, files = picked
     seg_dir = os.path.join(DASHCAM_ROOT, name)
     ok = False
@@ -133,6 +222,39 @@ class LogSync:
       return 0.5
     self._session = None
     cloudlog.event("carrot_log_sync_fail", segment=name, error=error or "upload failed")
+    backoff = self._backoff
+    self._backoff = min(BACKOFF_MAX_S, self._backoff * 2)
+    return backoff
+
+  async def _sync_tlvrec(self, base_url: str) -> float:
+    """Drive segments always go first; tlv sessions are considered only here."""
+    picked = next_tlvrec_session(time.time())  # noqa: TID251
+    if picked is None:
+      return POLL_S
+    name, files = picked
+    session_dir = os.path.join(TLVREC_ROOT, name)
+    remote = TLVREC_SEGMENT_PREFIX + name
+    filenames = sorted(filename for filename in files if filename != "index.jsonl")
+    if "index.jsonl" in files:
+      filenames.append("index.jsonl")
+    ok = False
+    error: str | None = None
+    try:
+      token, meta = await self._token_for(base_url)
+      ok = await upload_folder_to_web(session_dir, upload_device_id(meta), remote, base_url, token, None, filenames=filenames)
+    except Exception as e:
+      error = str(e)
+    if ok:
+      after = tlvrec_files(session_dir)
+      if after == files and _tlvrec_active_session(time.time()) != name:  # noqa: TID251
+        shutil.rmtree(session_dir, ignore_errors=True)
+        cloudlog.event("carrot_log_sync_tlvrec_ok", session=name, files=len(files), bytes=sum(files.values()))
+      else:
+        cloudlog.event("carrot_log_sync_tlvrec_changed", session=name)
+      self._backoff = BACKOFF_MIN_S
+      return 0.5
+    self._session = None
+    cloudlog.event("carrot_log_sync_fail", segment=remote, error=error or "upload failed")
     backoff = self._backoff
     self._backoff = min(BACKOFF_MAX_S, self._backoff * 2)
     return backoff

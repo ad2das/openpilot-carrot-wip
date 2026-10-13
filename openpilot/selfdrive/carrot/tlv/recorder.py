@@ -19,6 +19,11 @@ one; a current session over 1.0 GB stops recording), and a pause below 5 GB
 free on the filesystem that clears above 6 GB. Caps are enforced in the writer
 thread with a running byte counter and a full rescan at most once per 60 s.
 
+Sessions: the session being written is named in root/.active (heartbeat every
+5 s) and rotates every 10 minutes (or when its directory disappears). Finished
+sessions are uploaded by carrot_log_sync as folder tlvrec--<session> and are
+deleted from the device after a complete upload (see log_sync.py).
+
 No GPS or location data of any kind is recorded.
 """
 from __future__ import annotations
@@ -31,7 +36,7 @@ import shutil
 import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 
@@ -62,6 +67,11 @@ TRANSITION_WINDOW_S = 10.0
 TRANSITION_MAX = 4
 RESCAN_INTERVAL_S = 60.0
 ERROR_LOG_INTERVAL_S = 60.0
+
+SESSION_ROTATE_S = 600.0
+ACTIVE_NAME = ".active"
+ACTIVE_HEARTBEAT_S = 5.0
+SESSION_NAME_BUMP_MAX = 60
 
 SESSION_NAME_RE = re.compile(r"^\d{8}-\d{6}$")
 
@@ -98,7 +108,8 @@ class TlvRecorder:
                max_root_bytes: int = DEFAULT_MAX_ROOT_BYTES,
                disk_min_free_bytes: int = DEFAULT_DISK_MIN_FREE_BYTES,
                disk_rearm_free_bytes: int = DEFAULT_DISK_REARM_FREE_BYTES,
-               rescan_interval_s: float = RESCAN_INTERVAL_S) -> None:
+               rescan_interval_s: float = RESCAN_INTERVAL_S,
+               session_name_fn=None) -> None:
     self.root = str(root) if root else DEFAULT_ROOT
     self.active = bool(active)
     self._clock = clock
@@ -108,6 +119,8 @@ class TlvRecorder:
     self._disk_min_free_bytes = int(disk_min_free_bytes)
     self._disk_rearm_free_bytes = int(disk_rearm_free_bytes)
     self._rescan_interval_s = float(rescan_interval_s)
+    self._session_name_fn = session_name_fn if session_name_fn is not None else (
+      lambda: time.strftime("%Y%m%d-%H%M%S", time.localtime()))
 
     self._slots = [np.empty((MODEL_H, MODEL_W, 3), dtype=np.uint8) for _ in range(RING_SLOTS)]
     self._busy = [False] * RING_SLOTS
@@ -127,6 +140,8 @@ class TlvRecorder:
     self._bytes = 0
     self._sizes: dict[str, int] = {}
     self._session_name: str | None = None
+    self._session_started = -float("inf")
+    self._last_heartbeat = -float("inf")
     self._last_scan = -float("inf")
     self._last_error_log = -float("inf")
 
@@ -297,12 +312,42 @@ class TlvRecorder:
       self._busy[slot] = False
 
   def _ensure_session(self) -> None:
-    if self._session_name is not None:
+    name = self._session_name
+    if name is not None:
+      rotated = self._clock() - self._session_started >= SESSION_ROTATE_S
+      vanished = not os.path.isdir(os.path.join(self.root, name))
+      if not rotated and not vanished:
+        return
+      self._session_name = None
+    chosen = self._session_name_fn()
+    bumps = 0
+    while os.path.exists(os.path.join(self.root, chosen)):
+      if bumps >= SESSION_NAME_BUMP_MAX:
+        raise RuntimeError("no free session name")
+      chosen = (datetime.strptime(chosen, "%Y%m%d-%H%M%S")
+                + timedelta(seconds=1)).strftime("%Y%m%d-%H%M%S")
+      bumps += 1
+    os.makedirs(os.path.join(self.root, chosen), exist_ok=False)
+    self._session_name = chosen
+    self._sizes.setdefault(chosen, 0)
+    self._session_started = self._clock()
+    self._write_heartbeat(force=True)
+
+  def _write_heartbeat(self, force: bool = False) -> None:
+    name = self._session_name
+    if name is None:
       return
-    name = time.strftime("%Y%m%d-%H%M%S", time.localtime())
-    os.makedirs(os.path.join(self.root, name), exist_ok=True)
-    self._session_name = name
-    self._sizes.setdefault(name, 0)
+    now = self._clock()
+    if not force and now - self._last_heartbeat < ACTIVE_HEARTBEAT_S:
+      return
+    try:
+      tmp_path = os.path.join(self.root, ACTIVE_NAME + ".tmp")
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(name)
+      os.replace(tmp_path, os.path.join(self.root, ACTIVE_NAME))
+      self._last_heartbeat = now
+    except OSError as exc:
+      self._log_error(exc)
 
   def _log_error(self, exc: Exception) -> None:
     now = self._clock()
@@ -325,6 +370,8 @@ class TlvRecorder:
       self._last_scan = now
       self._rescan()
     self._enforce_caps()
+    if self.active:
+      self._write_heartbeat()
 
   def _free_disk_bytes(self) -> int | None:
     fn = self._statvfs_fn if self._statvfs_fn is not None else getattr(os, "statvfs", None)
@@ -412,3 +459,14 @@ class TlvRecorder:
     thread = self._thread
     if thread is not None and thread.is_alive():
       thread.join(timeout_s)
+    name = self._session_name
+    if name is None:
+      return
+    try:
+      active_path = os.path.join(self.root, ACTIVE_NAME)
+      with open(active_path, encoding="utf-8") as f:
+        content = f.read()
+      if content == name:
+        os.remove(active_path)
+    except (OSError, ValueError):
+      pass

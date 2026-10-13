@@ -397,7 +397,7 @@ window.CarrotTranslations.register("zh", {
     web_upload_url: "Upload server",
     web_upload_url_desc: "HTTPS API address; sessions are created automatically",
     web_log_sync_enabled: "自动上传行车日志",
-    web_log_sync_enabled_desc: "行驶中也会把每个已结束的1分钟片段的 rlog 和 qcamera 自动发送到下面的自动上传服务器。不会发送到默认公共上传服务器。",
+    web_log_sync_enabled_desc: "行驶中也会把每个已结束的1分钟片段的 rlog 和 qcamera 自动发送到下面的自动上传服务器。不会发送到默认公共上传服务器。红绿灯记录器照片也会一并上传，上传后从设备删除。",
     web_log_sync_url: "自动上传服务器",
     web_log_sync_url_desc: "接收自动行车日志的 HTTPS 地址",
     web_upload_test: "Test connection",

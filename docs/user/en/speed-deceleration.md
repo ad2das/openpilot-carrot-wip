@@ -341,6 +341,8 @@ With the car parked in P and the ignition on, waiting about three minutes runs t
 
 When `TrafficLightDetectMode` is `0`, this setting does nothing regardless of its value. If device load causes repeated restarts within a short time, it automatically returns to `0`.
 
+When automatic drive-log upload is on, the recorded traffic-light photos are uploaded after drive segments, and uploaded sessions are deleted from the device; see [Automatic drive-log upload](settings.md#automatic-drive-log-upload).
+
 ## Quick troubleshooting
 
 | Symptom | Check first |

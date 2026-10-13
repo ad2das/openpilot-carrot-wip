@@ -39,6 +39,8 @@ On a fresh install, `Tools > Web Settings > Layout` starts with **Area 1 full sc
 
 Automatic drive-log upload is an off-by-default toggle in `Tools > Web Settings > Upload`; when enabled, it sends rlog and qcamera of every finished 1-minute segment to the automatic upload server, also while driving. The automatic upload server field defaults to the owner's receiver and can be edited. If it is set to the shared default upload server, nothing is sent. Manual `Logs > Dashcam` upload keeps using the normal upload server setting.
 
+When `CarrotTlvMode` (Vision traffic lights, experimental) is `1`, the recorder's traffic-light photos (640x320 JPEG and index.jsonl, no location data) are sent to the same automatic upload server as folder `tlvrec--<session>`, after drive segments. A session starts every 10 minutes and is uploaded once it has been quiet for 2 minutes, and a completely uploaded session is deleted from the device. The drive logs themselves are not deleted. Nothing is sent or deleted while the toggle is off or the URL is the shared default server.
+
 ## Using the Settings screen
 
 Carrot Web provides:

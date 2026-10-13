@@ -429,7 +429,7 @@ window.CarrotTranslations.register("en", {
     web_upload_url: "Upload server",
     web_upload_url_desc: "HTTPS API address; sessions are created automatically",
     web_log_sync_enabled: "Automatic drive-log upload",
-    web_log_sync_enabled_desc: "Sends rlog and qcamera of every finished 1-minute segment to the automatic upload server below, also while driving. Never sends to the shared default upload server.",
+    web_log_sync_enabled_desc: "Sends rlog and qcamera of every finished 1-minute segment to the automatic upload server below, also while driving. Never sends to the shared default upload server. Traffic-light recorder photos are sent too and deleted from the device after upload.",
     web_log_sync_url: "Automatic upload server",
     web_log_sync_url_desc: "HTTPS address that receives the automatic drive logs",
     web_upload_test: "Test connection",
