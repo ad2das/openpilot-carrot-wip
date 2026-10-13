@@ -20,6 +20,11 @@ import pytest
 from openpilot.selfdrive.carrot.tlv import dsp_probe
 
 
+def _load_json(path):
+  with open(path, encoding="utf-8") as f:
+    return json.load(f)
+
+
 class FakeParams:
   def __init__(self, values) -> None:
     self._values = dict(values)
@@ -714,7 +719,7 @@ def test_run_probe_clean_finish_deletes_latch_and_posts_done(tmp_path):
                                clock=clock, sleep=_advancing_sleep(clock),
                                rss_reader=lambda p: None, meta={"commit": "abc1234"}, notice=logs)
   assert status["status"] == "done"
-  assert json.loads(open(result, encoding="utf-8").read())["ok"] is True
+  assert _load_json(result)["ok"] is True
   assert not os.path.exists(attempt)
   assert not os.path.exists(progress)
   assert seen_attempts[0] == {"count": 2, "lost_steps": []}
@@ -804,7 +809,7 @@ def test_run_probe_timeout_writes_child_timeout_and_posts_failed(tmp_path):
                                meta={"commit": "abc1234"}, notice=logs)
   assert status["status"] == "timeout"
   assert procs[0].killed is True
-  payload = json.loads(open(result, encoding="utf-8").read())
+  payload = _load_json(result)
   assert payload["error"] == "child_timeout"
   assert payload["commit"] == "abc1234"
   assert payload["ok"] is False
@@ -829,7 +834,7 @@ def test_run_probe_rss_limit_writes_result(tmp_path):
                                rss_reader=lambda p: dsp_probe.CHILD_RSS_LIMIT_BYTES + 1,
                                meta={"commit": "abc1234"}, notice=logs)
   assert status["status"] == "rss"
-  payload = json.loads(open(result, encoding="utf-8").read())
+  payload = _load_json(result)
   assert payload["error"] == "child_rss_limit"
   assert len(logs.of_state("failed")) == 1
 
@@ -847,7 +852,7 @@ def test_run_probe_child_exit_without_result(tmp_path):
                                clock=clock, sleep=_advancing_sleep(clock), rss_reader=lambda p: None,
                                meta={"commit": "abc1234"})
   assert status["status"] == "exited"
-  payload = json.loads(open(result, encoding="utf-8").read())
+  payload = _load_json(result)
   assert payload["error"] == "child_exit_3"
   assert not os.path.exists(attempt)
   assert not os.path.exists(progress)
@@ -892,7 +897,7 @@ def test_main_latches_after_three_same_step_losses(probe_root, monkeypatch):
 
   dsp_probe.main()
 
-  payload = json.loads(open(result, encoding="utf-8").read())
+  payload = _load_json(result)
   assert payload["error"] == "lost_in_step:smoke"
   assert payload["ok"] is False
   assert dsp_probe._probe_disabled_by_lost_attempts is True
@@ -997,7 +1002,7 @@ def test_main_still_latches_three_separate_lost_runs(probe_root, monkeypatch):
   dsp_probe.write_progress(progress, "smoke")
   dsp_probe.main()
 
-  payload = json.loads(open(result, encoding="utf-8").read())
+  payload = _load_json(result)
   assert payload["error"] == "lost_in_step:smoke"
   assert dsp_probe._probe_disabled_by_lost_attempts is True
   assert not os.path.exists(attempt)
