@@ -10,8 +10,9 @@ then release the frame (the budget forbids holding it across inference).
 """
 from __future__ import annotations
 
+import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -22,6 +23,13 @@ FAR_RATE_V_KPH = 50.0
 NEAR_RATE_V_KPH = 20.0
 STANDSTILL_V_KPH = 5.0
 MAX_CLASSIFY_TRACKS = crops.MAX_LAMP_CROPS
+
+# Flat-road tail-light gate (user decision: every road is assumed FLAT). On flat
+# ground anything whose whole box lies below the calibrated horizon is closer to
+# the camera than the road plane at that image row, so it cannot be a traffic
+# light (>= 4.5 m up); car tail lights always are below it. The 0.25 deg margin
+# keeps boxes that merely touch the horizon.
+TAIL_GATE_MARGIN_DEG = 0.25
 
 
 class ViewScheduler:
@@ -66,6 +74,9 @@ class FrameOutput:
   infer_ms: float
   proc_ms: float
   red_likely: bool = False
+  # Flat-road tail-light gate: detections dropped this frame (below the
+  # horizon + margin while calibrated), full-frame boxes like dets.
+  gated: list[tracker.Detection] = field(default_factory=list)
 
 
 class FramePipeline:
@@ -82,10 +93,15 @@ class FramePipeline:
     self.infer_ms = 0.0
     self.proc_ms = 0.0
     self.last_dets: list[tracker.Detection] = []
+    self.last_gated: list[tracker.Detection] = []
+    self.tail_gated_total = 0
     self.last_state = tracker.SignalState.none
     self.last_conf = 0.0
     self.last_track_id = -1
     self.last_red_likely = False
+    # Per-frame ego snapshot (tracker.EgoFrame) set by tlvd; None keeps the
+    # legacy no-prediction behaviour (PC tools/tests).
+    self.ego: tracker.EgoFrame | None = None
     self._classifier_probs = np.empty((MAX_CLASSIFY_TRACKS, 8), dtype=np.float32)
 
   @staticmethod
@@ -137,13 +153,37 @@ class FramePipeline:
     rest.sort(key=lambda t: t.last_frame, reverse=True)
     return (relevant + rest)[:MAX_CLASSIFY_TRACKS]
 
+  def _predicted_box(self, track: tracker.Track) -> tuple[float, float, float, float]:
+    """Ego-motion predicted full-frame box, or the stored box without ego state."""
+    if self.ego is None:
+      return track.box
+    return tracker.predict_box(
+      track, self.ego.odo, focal_px=self.ego.focal_px, foe_x=self.ego.foe_x, foe_y=self.ego.foe_y,
+      image_w=self.ego.image_w, image_h=self.ego.image_h,
+    )
+
+  def classify_view(self, far_geom: crops.ViewGeometry) -> str:
+    """View for a classify-only frame; NEVER advances the detect scheduler.
+
+    "far" when the first (relevant-first) track's predicted box is fully inside
+    the FAR geometry, else "near" (crops are built from this frame's geometry).
+    """
+    ordered = self._classify_order()
+    if not ordered:
+      return "near"
+    x1, y1, x2, y2 = self._predicted_box(ordered[0])
+    inside = (x1 >= far_geom.x0 and y1 >= far_geom.y0
+              and x2 <= far_geom.x0 + far_geom.w and y2 <= far_geom.y0 + far_geom.h)
+    return "far" if inside else "near"
+
   def _classify_tracks(self, now: float, geom: crops.ViewGeometry) -> None:
     """Re-classify up to 4 tracked lights from THIS frame, any view."""
     classifier = self.classifier
     if classifier is None or not self.tracker.tracks:
       return
     ordered = self._classify_order()
-    batch, count = self.lamp_crops.build(self.preprocess.model_input, geom, [t.box for t in ordered])
+    boxes = [self._predicted_box(t) for t in ordered]
+    batch, count = self.lamp_crops.build(self.preprocess.model_input, geom, boxes)
     if count == 0:
       return
     logits = classifier.classify(batch)
@@ -158,7 +198,8 @@ class FramePipeline:
     self.tracker.record_votes(now, votes)
 
   def infer(self, view: str, geom: crops.ViewGeometry, *, image_width: int, path_x=(), path_y=(),
-            left_intent: bool = False, now: float | None = None, detect: bool = True) -> FrameOutput:
+            left_intent: bool = False, now: float | None = None, detect: bool = True,
+            horizon_y: float | None = None, gate_enabled: bool = False) -> FrameOutput:
     started = time.perf_counter()
     infer_started = time.perf_counter()
     raw = self.backend.infer(self.preprocess.model_input) if detect else []
@@ -171,10 +212,38 @@ class FramePipeline:
         x1, y1, x2, y2 = crops.map_model_box_to_full((det.x1, det.y1, det.x2, det.y2), geom)
         dets.append(tracker.Detection(cls=det.cls, score=det.score, x1=x1, y1=y1, x2=x2, y2=y2))
 
+      # Flat-road tail-light gate (calibrated only): a box whose TOP is below
+      # the horizon + margin is lower than the camera on flat ground, so it
+      # cannot be a >= 4.5 m traffic light; car tail lights are always below.
+      if gate_enabled and horizon_y is not None:
+        limit = float(horizon_y) + crops.focal_px_for_width(image_width) * math.tan(math.radians(TAIL_GATE_MARGIN_DEG))
+        gated: list[tracker.Detection] = []
+        kept: list[tracker.Detection] = []
+        for det in dets:
+          (gated if det.y1 > limit else kept).append(det)
+        self.last_gated = gated
+        self.tail_gated_total += len(gated)
+        dets = kept
+      else:
+        self.last_gated = []
+
     if now is None:
       now = time.monotonic()
     if detect:
-      self.tracker.update(self.frame_idx, dets, view, geom.focal_px, now=now)
+      predict = None
+      anchor = None
+      frame_box = None
+      if self.ego is not None:
+        ego = self.ego
+        predict = lambda t: tracker.predict_box(  # noqa: E731 - hot path closure
+          t, ego.odo, focal_px=ego.focal_px, foe_x=ego.foe_x, foe_y=ego.foe_y,
+          image_w=ego.image_w, image_h=ego.image_h,
+        )
+        anchor = (ego.odo.s, ego.odo.psi, now)
+        frame_box = (0.0, 0.0, float(ego.image_w), float(ego.image_h))
+      crop_box = (float(geom.x0), float(geom.y0), float(geom.x0 + geom.w), float(geom.y0 + geom.h))
+      self.tracker.update(self.frame_idx, dets, view, geom.focal_px, now=now, predict=predict,
+                          anchor=anchor, crop_box=crop_box, frame_box=frame_box)
     self._classify_tracks(now, geom)
 
     confirmed_relevant = tracker.select_relevant(
@@ -205,6 +274,8 @@ class FramePipeline:
 
     if detect:
       self.last_dets = dets
+    else:
+      self.last_gated = []
     self.last_track_id = relevant[0].track_id if relevant is not None else -1
     self.last_state, self.last_conf = state, conf
     self.last_red_likely = red_likely
@@ -214,6 +285,7 @@ class FramePipeline:
     return FrameOutput(
       view=view, dets=dets, matches=self.tracker.last_matches, state=state, state_conf=conf,
       track_id=self.last_track_id, infer_ms=infer_ms, proc_ms=self.proc_ms, red_likely=red_likely,
+      gated=self.last_gated,
     )
 
   def process(self, data, width: int, height: int, stride: int, uv_offset: int, geom: crops.ViewGeometry, **infer_kwargs) -> FrameOutput:

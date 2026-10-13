@@ -153,6 +153,138 @@ class DutyCycleGovernor:
 
 
 # ---------------------------------------------------------------------------
+# CPU credit budget (W99): strict long-run budget, cost-aware frame kinds
+# ---------------------------------------------------------------------------
+
+class CpuCreditBudget:
+  """Strict long-run CPU budget with per-frame-kind cost estimation.
+
+  Every tick charges ALL process CPU (os.times(), every thread: recorder writer,
+  SubMaster, publish, inference - not just the model call) against a credit that
+  refills at `budget` CPU-seconds per wall second and is capped at `cap_s`.
+  A frame of kind K may start when credit >= estimate(K), where the estimate is
+  a max of an EMA and 0.8x of the worst of the last 5 samples for that kind, so
+  a changed frame cost is absorbed after a few frames.
+
+  Guarantee: long-run process CPU <= budget; for any wall window W the process
+  CPU used is <= cap_s + budget*W + one frame's estimation error (at most one
+  under-estimated frame can start before the deficit is measured).
+
+  There is NO minimum frame rate: when the budget is exhausted, frames are
+  skipped (tlvd counts them as skipped_budget, not as droppedFrames).
+  """
+
+  CPU_BUDGET = 0.40
+  CREDIT_CAP_S = 2.0
+  CREDIT_START_S = 0.4
+  MAX_FRAME_HZ = 10.0
+  COST_EMA_ALPHA = 0.3
+  COST_INIT = {"detect": 0.5, "classify": 0.05}
+  DUTY_WINDOW_S = 10.0
+
+  def __init__(self, *, budget: float = CPU_BUDGET, cap_s: float = CREDIT_CAP_S,
+               cpu_clock=os_cpu_seconds, clock=time.monotonic) -> None:
+    self.budget = float(budget)
+    self.cap_s = float(cap_s)
+    self._cpu_clock = cpu_clock
+    self._clock = clock
+    self._credit = float(self.CREDIT_START_S)
+    self._last_now: float | None = None
+    self._last_cpu: float | None = None
+    self._samples: deque[tuple[float, float]] = deque()
+    self._ema: dict[str, float] = dict(self.COST_INIT)
+    self._costs: dict[str, deque[float]] = {kind: deque(maxlen=5) for kind in self.COST_INIT}
+    self._frame: tuple[str, float] | None = None
+    self._last_frame_start: float | None = None
+
+  # -- accounting -----------------------------------------------------------
+
+  def tick(self, now: float | None = None) -> None:
+    """Refill by wall time, charge all process CPU since the previous tick."""
+    if now is None:
+      now = self._clock()
+    now = float(now)
+    cpu_now = float(self._cpu_clock())
+    if self._last_now is not None:
+      self._credit += self.budget * (now - self._last_now) - (cpu_now - self._last_cpu)
+    self._credit = min(self._credit, self.cap_s)
+    self._last_now, self._last_cpu = now, cpu_now
+    self._samples.append((now, cpu_now))
+    # Keep one sample just before the window edge so the duty spans the window.
+    while len(self._samples) > 1 and self._samples[1][0] < now - self.DUTY_WINDOW_S:
+      self._samples.popleft()
+
+  # -- scheduling -----------------------------------------------------------
+
+  def estimate(self, kind: str) -> float:
+    """Seconds of CPU a frame of `kind` is expected to cost (COST_INIT first)."""
+    costs = self._costs.get(kind)
+    if not costs:
+      return float(self.COST_INIT.get(kind, self.COST_INIT["classify"]))
+    default = float(self.COST_INIT.get(kind, max(self.COST_INIT.values())))
+    return max(self._ema.get(kind, default), 0.8 * max(costs))
+
+  def can_run(self, kind: str, now: float | None = None) -> bool:
+    """True when a frame of `kind` may start now without breaking the budget."""
+    if now is None:
+      now = self._clock()
+    now = float(now)
+    self.tick(now)
+    if self._last_frame_start is not None and now - self._last_frame_start < 1.0 / self.MAX_FRAME_HZ:
+      return False
+    if self._credit >= self.estimate(kind):
+      return True
+    # A detector costlier than the cap still runs from a full bucket; credit
+    # then goes negative, so the long-run average still holds.
+    return kind == "detect" and self._credit >= self.cap_s - 1e-6
+
+  def begin(self, kind: str, now: float | None = None) -> None:
+    if now is None:
+      now = self._clock()
+    now = float(now)
+    self.tick(now)
+    self._frame = (str(kind), float(self._cpu_clock()))
+    self._last_frame_start = now
+
+  def end(self, now: float | None = None) -> None:
+    frame = self._frame
+    if frame is None:
+      return
+    if now is None:
+      now = self._clock()
+    now = float(now)
+    kind, cpu0 = frame
+    self._frame = None
+    cost = max(0.0, float(self._cpu_clock()) - cpu0)
+    costs = self._costs.setdefault(kind, deque(maxlen=5))
+    costs.append(cost)
+    default = float(self.COST_INIT.get(kind, cost))
+    self._ema[kind] = self.COST_EMA_ALPHA * cost + (1.0 - self.COST_EMA_ALPHA) * self._ema.get(kind, default)
+    self.tick(now)
+
+  # -- introspection --------------------------------------------------------
+
+  @property
+  def credit(self) -> float:
+    return self._credit
+
+  @property
+  def duty(self) -> float | None:
+    """Process CPU seconds per wall second over DUTY_WINDOW_S, None until spanned."""
+    if len(self._samples) < 2:
+      return None
+    t0, c0 = self._samples[0]
+    t1, c1 = self._samples[-1]
+    span = t1 - t0
+    if span < 2.0:
+      return None
+    return max(0.0, (c1 - c0) / span)
+
+  def estimate_ms(self, kind: str) -> float:
+    return 1000.0 * self.estimate(kind)
+
+
+# ---------------------------------------------------------------------------
 # Detector throttle (classifier priority)
 # ---------------------------------------------------------------------------
 

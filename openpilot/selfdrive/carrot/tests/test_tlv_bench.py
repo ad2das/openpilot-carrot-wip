@@ -31,6 +31,7 @@ def _summary(**overrides):
     "ui_draw_p95_ms": 20.0,
     "procs": {"tlvd": _proc(cpu_avg=30.0, max2=38.0, rss_max=180.0), "modeld": _proc(), "controlsd": _proc(),
               "ui": _proc(), "camerad": _proc()},
+    "tlvd_cpu_duty60_pct": 30.0, "tlvd_cpu_max10_pct": 38.0,
     "cores13_busy_pct_avg": 40.0,
     "mem_available_min_mb": 2500.0,
     "thermal_status_max": 0.0, "max_temp_c_max": 60.0, "gpu_temp_c_max": 45.0,
@@ -93,10 +94,26 @@ def test_ui_gate_unavailable_when_nothing_published():
 
 
 def test_tlvd_cpu_gate_fails_over_budget_and_on_cores_delta():
-  assert not bench.evaluate_gates(_summary(), _summary(procs={**_summary()["procs"], "tlvd": _proc(cpu_avg=30.0, max2=45.0, rss_max=180.0)}),
-                                  _summary())["gates"]["tlvd_cpu_budget"]["pass"]
-  idle_tlvd = _summary(procs={**_summary()["procs"], "tlvd": _proc(cpu_avg=5.0, max2=10.0)}, cores13_busy_pct_avg=60.0)
+  assert not bench.evaluate_gates(_summary(), _summary(tlvd_cpu_duty60_pct=45.0), _summary())["gates"]["tlvd_cpu_budget"]["pass"]
+  assert not bench.evaluate_gates(_summary(), _summary(tlvd_cpu_max10_pct=65.0), _summary())["gates"]["tlvd_cpu_budget"]["pass"]
+  # Missing duty data in BOTH gated phases cannot pass the gate.
+  no_duty = _summary(tlvd_cpu_duty60_pct=None, tlvd_cpu_max10_pct=None)
+  assert not bench.evaluate_gates(_summary(), no_duty, no_duty)["gates"]["tlvd_cpu_budget"]["pass"]
+  idle_tlvd = _summary(procs={**_summary()["procs"], "tlvd": _proc(cpu_avg=5.0)}, cores13_busy_pct_avg=60.0)
   assert not bench.evaluate_gates(_summary(), idle_tlvd, _summary())["gates"]["tlvd_cpu_budget"]["pass"]
+
+
+def test_cpu_pct_max_window():
+  points = [(0.0, 0.0), (5.0, 1.0), (10.0, 2.0), (15.0, 2.2), (20.0, 4.2)]
+  # 10 s spans: 0->10 = 20%, 5->15 = 12%, 10->20 = 22% (peak window).
+  assert bench.cpu_pct_max_window(points, 10.0) == pytest.approx(22.0)
+  # 5 s window: 0->5 = 20%, 15->20 = 40%.
+  assert bench.cpu_pct_max_window(points, 5.0) == pytest.approx(40.0)
+  # No pair spans the window -> None (caller falls back).
+  assert bench.cpu_pct_max_window(points, 60.0) is None
+  assert bench.cpu_pct_max_window([(0.0, 0.0)], 10.0) is None
+  # A counter that went backwards is skipped, not reported as negative.
+  assert bench.cpu_pct_max_window([(0.0, 5.0), (5.0, 1.0), (10.0, 1.5)], 5.0) == pytest.approx(10.0)
 
 
 def test_tlvd_rss_gate_fails_on_max_and_growth():

@@ -8,6 +8,7 @@ metres. Class ids follow CONTRACT.md:
 """
 from __future__ import annotations
 
+import math
 from collections import deque
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -15,6 +16,9 @@ from enum import IntEnum
 import numpy as np
 
 HOUSING_HEIGHT_M = 0.35
+# Drop a tracked light after this many consecutive detect frames in which its
+# predicted box was inside the detector's crop but no detection matched it.
+VIEW_MISS_LIMIT = 3
 
 
 class LampClass(IntEnum):
@@ -141,6 +145,13 @@ def _box_diag(box: tuple[float, float, float, float]) -> float:
   return float(np.hypot(box[2] - box[0], box[3] - box[1]))
 
 
+def _centre_inside(box: tuple[float, float, float, float], rect: tuple[float, float, float, float]) -> bool:
+  """True when the box centre is inside rect = (x0, y0, x1, y1)."""
+  cx = 0.5 * (box[0] + box[2])
+  cy = 0.5 * (box[1] + box[3])
+  return rect[0] <= cx <= rect[2] and rect[1] <= cy <= rect[3]
+
+
 def _center_distance(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
   return float(np.hypot(0.5 * (a[0] + a[2]) - 0.5 * (b[0] + b[2]), 0.5 * (a[1] + a[3]) - 0.5 * (b[1] + b[3])))
 
@@ -176,6 +187,16 @@ class Track:
   # Last red-family confirmation time (monotonic); the W74D same-track green
   # window. None until this track was ever confirmed red/redLeft.
   red_confirmed_s: float | None = None
+  # Ego-motion anchor: the detection box and odometry state it came from. All
+  # four are rewritten whenever the detector matches/creates the track, so
+  # predict_box() can propagate the light forward between detector frames.
+  anchor_box: tuple[float, float, float, float] | None = None
+  anchor_s: float = 0.0
+  anchor_psi: float = 0.0
+  anchor_t: float = 0.0
+  # Detect frames where the predicted box centre was inside the crop but the
+  # detector did not match; VIEW_MISS_LIMIT consecutive drops the track.
+  view_misses: int = 0
 
   @property
   def cx(self) -> float:
@@ -240,6 +261,78 @@ def _most_common(values: list[int]) -> int:
   return max(counts, key=lambda value: (counts[value], value))
 
 
+class EgoOdometry:
+  """Integrated ego motion (s metres, psi radians) for track prediction.
+
+  update() feeds one sample; None/NaN inputs keep the previous v/yaw, and dt is
+  clamped to [0, 0.2] s so a scheduling hiccup cannot integrate a huge jump.
+  """
+
+  def __init__(self) -> None:
+    self.s = 0.0
+    self.psi = 0.0
+    self._last_now: float | None = None
+    self._v: float | None = None
+    self._yaw: float | None = None
+
+  def update(self, now: float, v_ego_mps: float | None, yaw_rate_rps: float | None) -> None:
+    now = float(now)
+    if self._last_now is not None:
+      dt = min(max(now - self._last_now, 0.0), 0.2)
+      if self._v is not None:
+        self.s += self._v * dt
+      if self._yaw is not None:
+        self.psi += self._yaw * dt
+    self._last_now = now
+    if v_ego_mps is not None and math.isfinite(float(v_ego_mps)):
+      self._v = float(v_ego_mps)
+    if yaw_rate_rps is not None and math.isfinite(float(yaw_rate_rps)):
+      self._yaw = float(yaw_rate_rps)
+
+
+@dataclass(frozen=True)
+class EgoFrame:
+  """Per-frame camera geometry + odometry snapshot for ego-motion prediction."""
+  odo: EgoOdometry
+  focal_px: float
+  foe_x: float
+  foe_y: float
+  image_w: int
+  image_h: int
+
+
+def predict_box(track: Track, odo: EgoOdometry, *, focal_px: float, foe_x: float, foe_y: float,
+                image_w: int, image_h: int) -> tuple[float, float, float, float]:
+  """Ego-motion predicted full-frame box for a track (flat-ground pinhole).
+
+  The anchor box is scaled about the FOE by k = d0 / (d0 - ds) (clamped to 2x;
+  k = 1 when the geometry is unusable or the light is nearly reached) and then
+  shifted by the yaw change. Sign: openpilot convention has positive
+  yawRate/psi = LEFT turn; a static object then moves to +x (right) in the
+  image, hence x' += focal_px * tan(psi - psi_anchor). image_w/image_h are
+  accepted for caller symmetry; the result is not clamped.
+  """
+  anchored = track.anchor_box is not None
+  box = track.anchor_box if anchored else track.box
+  anchor_s = track.anchor_s if anchored else odo.s
+  anchor_psi = track.anchor_psi if anchored else odo.psi
+  x1, y1, x2, y2 = (float(v) for v in box)
+  d0 = estimate_distance_m(max(0.0, y2 - y1), focal_px)
+  ds = odo.s - anchor_s
+  dpsi = odo.psi - anchor_psi
+  if not math.isfinite(d0) or ds < 0.0 or d0 - ds < 5.0:
+    k = 1.0
+  else:
+    k = min(2.0, d0 / (d0 - ds))
+  cx = 0.5 * (x1 + x2)
+  cy = 0.5 * (y1 + y2)
+  ncx = foe_x + (cx - foe_x) * k + focal_px * math.tan(dpsi)
+  ncy = foe_y + (cy - foe_y) * k
+  w = (x2 - x1) * k
+  h = (y2 - y1) * k
+  return (ncx - 0.5 * w, ncy - 0.5 * h, ncx + 0.5 * w, ncy + 0.5 * h)
+
+
 class TrafficLightTracker:
   """IoU + centre tracker across views, in full-frame coordinates."""
 
@@ -251,11 +344,26 @@ class TrafficLightTracker:
     self._next_id = 1
 
   def update(self, frame_idx: int, detections: list[Detection], view: str, focal_px: float,
-             now: float | None = None) -> list[tuple[Detection, int]]:
+             now: float | None = None, *, predict=None, anchor: tuple[float, float, float] | None = None,
+             crop_box: tuple[float, float, float, float] | None = None,
+             frame_box: tuple[float, float, float, float] | None = None) -> list[tuple[Detection, int]]:
+    """Match detections to tracks; predict() supplies ego-motion predicted boxes.
+
+    `predict(track) -> box` is used for association and the expiry checks;
+    without it the stored track boxes are used (legacy behaviour). `anchor` is
+    the odometry state (s, psi, t) the new detections belong to; matched and
+    created tracks store it so later frames can predict from the anchor.
+    `crop_box` is the detector's crop this frame and `frame_box` the full image,
+    both full-frame pixels; with them, a track whose predicted centre left the
+    frame is dropped, and one unmatched while its predicted centre is inside
+    the crop accrues view_misses (VIEW_MISS_LIMIT drops it).
+    """
+    pred_boxes = [predict(t) if predict is not None else t.box for t in self.tracks]
+
     pairs: list[tuple[float, int, int]] = []
     for di, det in enumerate(detections):
-      for ti, track in enumerate(self.tracks):
-        score = match_score(track.box, det.box, self.center_factor)
+      for ti, _track in enumerate(self.tracks):
+        score = match_score(pred_boxes[ti], det.box, self.center_factor)
         if score > 0.0:
           pairs.append((score, di, ti))
     pairs.sort(key=lambda p: p[0], reverse=True)
@@ -268,6 +376,12 @@ class TrafficLightTracker:
       det_to_track[di] = ti
       used_tracks.add(ti)
 
+    def apply_anchor(track: Track) -> None:
+      if anchor is not None:
+        track.anchor_s, track.anchor_psi, track.anchor_t = float(anchor[0]), float(anchor[1]), float(anchor[2])
+      elif now is not None:
+        track.anchor_t = float(now)
+
     matched_track_ids: set[int] = set()
     self.last_matches = []
     for di, det in enumerate(detections):
@@ -276,11 +390,14 @@ class TrafficLightTracker:
         track.cls = int(det.cls)
         track.score = float(det.score)
         track.box = det.box
+        track.anchor_box = det.box
+        apply_anchor(track)
         track.view = view
         track.focal_px = focal_px
         track.last_frame = frame_idx
         track.hits += 1
         track.misses = 0
+        track.view_misses = 0
         track.history.append((frame_idx, int(det.cls)))
         matched_track_ids.add(track.track_id)
         self.last_matches.append((det, track.track_id))
@@ -289,19 +406,35 @@ class TrafficLightTracker:
           track_id=self._next_id, first_frame=frame_idx, last_frame=frame_idx, cls=int(det.cls),
           score=float(det.score), box=det.box, view=view, focal_px=focal_px,
         )
+        track.anchor_box = det.box
+        apply_anchor(track)
         track.history.append((frame_idx, int(det.cls)))
         self._next_id += 1
         self.tracks.append(track)
         matched_track_ids.add(track.track_id)
         self.last_matches.append((det, track.track_id))
 
-    for track in self.tracks:
-      if track.track_id not in matched_track_ids:
-        track.misses += 1
-    self.tracks = [t for t in self.tracks if self._alive(t, frame_idx, now)]
+    for ti, track in enumerate(self.tracks):
+      if track.track_id in matched_track_ids:
+        continue
+      track.misses += 1
+      if crop_box is not None and _centre_inside(pred_boxes[ti], crop_box):
+        track.view_misses += 1
+    keep: list[Track] = []
+    for ti, track in enumerate(self.tracks):
+      pred = pred_boxes[ti] if ti < len(pred_boxes) else track.box
+      if self._alive(track, frame_idx, now, pred=pred, frame_box=frame_box):
+        keep.append(track)
+    self.tracks = keep
     return self.last_matches
 
-  def _alive(self, track: Track, frame_idx: int, now: float | None) -> bool:
+  def _alive(self, track: Track, frame_idx: int, now: float | None, *,
+             pred: tuple[float, float, float, float] | None = None,
+             frame_box: tuple[float, float, float, float] | None = None) -> bool:
+    if pred is not None and frame_box is not None and not _centre_inside(pred, frame_box):
+      return False
+    if track.view_misses >= VIEW_MISS_LIMIT:
+      return False
     if frame_idx - track.last_frame <= self.max_misses:
       return True
     return now is not None and bool(track.votes) and now - track.votes[-1][0] <= VOTE_TRACK_KEEP_S

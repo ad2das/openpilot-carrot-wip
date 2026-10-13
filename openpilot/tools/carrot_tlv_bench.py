@@ -45,7 +45,11 @@ CAMERA_GAP_MAX_SKIP_SLACK = 1     # extra frames in the worst single gap
 UI_DRAW_P95_RATIO = 1.10
 UI_DRAW_P95_SLACK_MS = 1.0
 UI_CPU_SLACK_PCT = 5.0            # ui process CPU% increase
-TLVD_CPU_BUDGET_PCT = 40.0        # of one core, max over any 2 s window
+# W99: the strict credit budget replaces the 2 s duty / 1 Hz floor policy.
+TLVD_CPU_DUTY_PCT = 42.0          # 60 s process CPU duty (all tlvd threads)
+TLVD_CPU_WINDOW_PCT = 60.0        # any 10 s process CPU window
+TLVD_CPU_DUTY_WINDOW_S = 60.0
+TLVD_CPU_MAX_WINDOW_S = 10.0
 CORES13_CPU_SLACK_PCT = 5.0       # cores 1-3 total increase beyond tlvd's own CPU
 TLVD_RSS_MAX_MB = 220.0
 TLVD_RSS_GROWTH_MAX_MB = 5.0      # during the soak
@@ -205,6 +209,34 @@ def _growth_mb(series) -> float | None:
   return float(np.median(values[-k:]) - np.median(values[:k]))
 
 
+def cpu_pct_max_window(points: list[tuple[float, float]], window_s: float, *,
+                       tolerance: float = 0.25) -> float | None:
+  """Max process CPU% over ~window_s spans of (t, cpu_s) points; None when absent.
+
+  For each start sample the farthest sample within window_s*(1+tolerance) is
+  used, requiring a span of at least window_s*(1-tolerance). The result is
+  CPU seconds per wall second as a percentage of one core.
+  """
+  if len(points) < 2:
+    return None
+  lo = float(window_s) * (1.0 - tolerance)
+  hi = float(window_s) * (1.0 + tolerance)
+  best: float | None = None
+  j = 1
+  for i, (t0, c0) in enumerate(points):
+    j = max(j, i + 1)
+    while j + 1 < len(points) and points[j + 1][0] - t0 <= hi:
+      j += 1
+    if j >= len(points):
+      break
+    span = points[j][0] - t0
+    if span < lo or points[j][1] < c0:
+      continue
+    value = 100.0 * (points[j][1] - c0) / span
+    best = value if best is None else max(best, value)
+  return best
+
+
 def camera_gap_stats(frames: list) -> tuple[float | None, int, float | None]:
   """(skipped frameIds per second, worst single skip, worst gap ms)."""
   if len(frames) < 2:
@@ -333,9 +365,21 @@ def summarize_phase(report: dict) -> dict:
   samples = report.get("proc_samples", [])
   procs = _proc_summaries(samples)
   tlvd_rss_series = procs.get("tlvd", {}).get("rss_series_mb", [])
+  tlvd_points = [(s["t"], s["procs"]["tlvd"]["cpu_s"]) for s in samples if "tlvd" in s.get("procs", {})]
+  tlvd_cpu_avg = procs.get("tlvd", {}).get("cpu_pct_avg")
+  tlvd_duty60 = cpu_pct_max_window(tlvd_points, TLVD_CPU_DUTY_WINDOW_S)
+  if tlvd_duty60 is None:
+    tlvd_duty60 = tlvd_cpu_avg  # phase shorter than the duty window
+  tlvd_max10 = cpu_pct_max_window(tlvd_points, TLVD_CPU_MAX_WINDOW_S)
+  if tlvd_max10 is None:
+    tlvd_max10 = tlvd_cpu_avg
   tlv_states = report.get("tlv_states", [])
   _, classify_rates = classify_episodes(tlv_states)
   confirm_deltas = time_to_confirm(tlv_states)
+
+  def _last(series):
+    return series[-1] if series else None
+
   return {
     "seconds": report.get("seconds"),
     "counts": {
@@ -359,6 +403,8 @@ def summarize_phase(report: dict) -> dict:
     "camera_gap_max_ms": max_gap_ms,
     "ui_draw_p95_ms": _p95(report.get("ui_draw_ms", [])),
     "procs": procs,
+    "tlvd_cpu_duty60_pct": tlvd_duty60,
+    "tlvd_cpu_max10_pct": tlvd_max10,
     "cores13_busy_pct_avg": _cores13_busy_pct(samples),
     "mem_available_min_mb": _min_or_none([s.get("mem_available_mb") for s in samples]),
     "thermal_status_max": _max_or_none(report.get("thermal_status", [])),
@@ -375,6 +421,14 @@ def summarize_phase(report: dict) -> dict:
     "tlv_redlikely_episodes": len(time_to_confirm(tlv_states)),
     "tlv_time_to_confirm_s_median": float(np.median(confirm_deltas)) if confirm_deltas else None,
     "tlv_time_to_confirm_s_max": max(confirm_deltas) if confirm_deltas else None,
+    "tlv_cpu_credit": _last(report.get("tlv_credit", [])),
+    "tlv_cpu_duty": _last(report.get("tlv_duty", [])),
+    "tlv_det_hz": _last(report.get("tlv_det_hz", [])),
+    "tlv_cls_hz": _last(report.get("tlv_cls_hz", [])),
+    "tlv_det_cost_ms": _last(report.get("tlv_det_cost_ms", [])),
+    "tlv_cls_cost_ms": _last(report.get("tlv_cls_cost_ms", [])),
+    "tlv_skipped_budget_final": _last(report.get("tlv_skipped_budget", [])),
+    "tlv_tail_gated_final": _last(report.get("tlv_tail_gated", [])),
     "pid_changes": report.get("pid_changes", {}),
   }
 
@@ -450,11 +504,14 @@ def evaluate_gates(baseline: dict, tlv: dict, soak: dict | None) -> dict:
        f"draw p95 {draw_text}, ui CPU {cpu_text}",
        draw_ok=draw_ok, cpu_ok=cpu_ok, available=bool(checks))
 
-  # 5. tlvd CPU% and cores 1-3 total.
+  # 5. tlvd CPU: 60 s process duty <= 42% and every 10 s window <= 60%, plus
+  # the cores 1-3 delta check (W99 credit budget replaces the 2 s/1 Hz policy).
   tlvd_t = tlv["procs"].get("tlvd", {})
   tlvd_s = soak.get("procs", {}).get("tlvd", {})
-  windows = [v for v in (tlvd_t.get("cpu_pct_max_2s"), tlvd_s.get("cpu_pct_max_2s")) if v is not None]
-  cpu_budget_ok = bool(windows) and max(windows) <= TLVD_CPU_BUDGET_PCT
+  duty_vals = [v for v in (tlv.get("tlvd_cpu_duty60_pct"), soak.get("tlvd_cpu_duty60_pct")) if v is not None]
+  window_vals = [v for v in (tlv.get("tlvd_cpu_max10_pct"), soak.get("tlvd_cpu_max10_pct")) if v is not None]
+  duty_ok = bool(duty_vals) and max(duty_vals) <= TLVD_CPU_DUTY_PCT
+  window_ok = bool(window_vals) and max(window_vals) <= TLVD_CPU_WINDOW_PCT
   base_cores = baseline["cores13_busy_pct_avg"]
   deltas = []
   for phase in (tlv, soak):
@@ -462,12 +519,13 @@ def evaluate_gates(baseline: dict, tlv: dict, soak: dict | None) -> dict:
       deltas.append(phase["cores13_busy_pct_avg"] - base_cores)
   tlvd_cpu_avg = tlvd_t.get("cpu_pct_avg") or 0.0
   cores_ok = bool(deltas) and max(deltas) <= tlvd_cpu_avg + CORES13_CPU_SLACK_PCT
-  gate("tlvd_cpu_budget", cpu_budget_ok and cores_ok,
+  gate("tlvd_cpu_budget", duty_ok and window_ok and cores_ok,
        _join(
-         f"tlvd CPU max 2s window {max(windows) if windows else 'n/a'} <= {TLVD_CPU_BUDGET_PCT}%,",
+         f"tlvd 60 s duty {max(duty_vals) if duty_vals else 'n/a'} <= {TLVD_CPU_DUTY_PCT}%,",
+         f"10 s window {max(window_vals) if window_vals else 'n/a'} <= {TLVD_CPU_WINDOW_PCT}%,",
          f"cores1-3 delta {max(deltas) if deltas else 'n/a'} vs tlvd avg {tlvd_cpu_avg:.1f}%",
        ),
-       cpu_budget_ok=cpu_budget_ok, cores13_ok=cores_ok)
+       duty_ok=duty_ok, window_ok=window_ok, cores13_ok=cores_ok)
 
   # 6. tlvd RSS max and soak growth.
   rss_maxes = [v for v in (tlvd_t.get("rss_max_mb"), tlvd_s.get("rss_max_mb")) if v is not None]
@@ -526,6 +584,8 @@ def _collect(sm, seconds: float, rate_hz: float = 20.0, proc_sample_s: float = P
     "ui_draw_ms": [], "thermal_status": [], "max_temp_c": [], "gpu_temp_c": [],
     "tlv_infer_ms": [], "tlv_proc_ms": [], "tlv_status_seen": [], "tlv_dropped_final": None,
     "tlv_states": [], "carrot_tlv_seen": 0, "proc_samples": [], "pid_changes": {},
+    "tlv_credit": [], "tlv_duty": [], "tlv_det_hz": [], "tlv_cls_hz": [],
+    "tlv_det_cost_ms": [], "tlv_cls_cost_ms": [], "tlv_skipped_budget": [], "tlv_tail_gated": [],
   }
   rk = Ratekeeper(rate_hz, print_delay_threshold=None)
   next_proc = 0.0
@@ -558,6 +618,14 @@ def _collect(sm, seconds: float, rate_hz: float = 20.0, proc_sample_s: float = P
       report["tlv_proc_ms"].append(float(tlv.procMs))
       report["tlv_dropped_final"] = int(tlv.droppedFrames)
       report["tlv_states"].append((now, str(tlv.state), int(tlv.relevantTrackId)))
+      report["tlv_credit"].append(float(tlv.cpuCredit))
+      report["tlv_duty"].append(float(tlv.cpuDuty))
+      report["tlv_det_hz"].append(float(tlv.detHz))
+      report["tlv_cls_hz"].append(float(tlv.clsHz))
+      report["tlv_det_cost_ms"].append(float(tlv.detCostMs))
+      report["tlv_cls_cost_ms"].append(float(tlv.clsCostMs))
+      report["tlv_skipped_budget"].append(int(tlv.skippedBudget))
+      report["tlv_tail_gated"].append(int(tlv.tailGated))
       status = str(tlv.status)
       if status not in report["tlv_status_seen"]:
         report["tlv_status_seen"].append(status)
@@ -685,6 +753,19 @@ def main(argv=None) -> int:
     "backend": args.backend, "model_path": args.model_path,
     "original_mode": _param_text(original_mode),
   }
+  last = (soak or tlv)
+  telemetry = " ".join([
+    "carrot_tlv_bench: telemetry",
+    f"credit={last.get('tlv_cpu_credit')}",
+    f"duty={last.get('tlv_cpu_duty')}",
+    f"detHz={last.get('tlv_det_hz')}",
+    f"clsHz={last.get('tlv_cls_hz')}",
+    f"detCostMs={last.get('tlv_det_cost_ms')}",
+    f"clsCostMs={last.get('tlv_cls_cost_ms')}",
+    f"skippedBudget={last.get('tlv_skipped_budget_final')}",
+    f"tailGated={last.get('tlv_tail_gated_final')}",
+  ])
+  print(telemetry, file=sys.stderr)
   print(json.dumps(result, indent=2))
   return 0 if result["verdict"] == "pass" else 1
 

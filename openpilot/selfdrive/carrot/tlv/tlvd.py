@@ -10,19 +10,23 @@ Pipeline per processed frame:
 Zero-stutter policy (RESOURCE_BUDGET.md, enforced here, not by the scheduler):
   cores 1-3, SCHED_IDLE, nice 19, never config_realtime_process; newest frame
   only (no queueing; busy frames counted as droppedFrames); thread caps in the
-  environment before numpy loads; duty-cycle governor at <= 40% of one core over
-  a 2 s window with a 1..10 Hz adaptive rate; /proc/stat cores 1-3 idle guard;
-  RSS soft/hard caps with a clean non-restart-looping exit; MemAvailable floor;
-  oom_score_adj=1000; copy-then-release for VisionIPC frames; no per-frame
-  prints; <= 16 dets published.
+  environment before numpy loads; strict CPU credit budget at <= 40% of one
+  core of TOTAL process CPU (W99: no 1 Hz floor; frames that cannot afford
+  their estimated cost are skipped and counted in skippedBudget, never in
+  droppedFrames); /proc/stat cores 1-3 idle guard; RSS soft/hard caps with a
+  clean non-restart-looping exit; MemAvailable floor; oom_score_adj=1000;
+  copy-then-release for VisionIPC frames; no per-frame prints; <= 16 dets
+  published.
 
 Messaging imports are lazy so this module stays importable (and lintable) on a PC.
 """
 from __future__ import annotations
 
 import gc
+import math
 import os
 import time
+from collections import deque
 
 # Thread caps must be in the environment BEFORE numpy/OpenBLAS/MKL load (numpy
 # arrives through the tlv imports below). One thread for BLAS, and the tinygrad
@@ -53,6 +57,16 @@ ERROR_LOG_INTERVAL_S = 10.0
 RECORDER_RETRY_S = 60.0
 MAX_PUBLISHED_DETS = 16
 CAPNP_VIEW = {"far": "farView", "near": "nearView"}
+# W99 cost-aware scheduling (credit). Classify-only frames keep a 5 Hz cadence
+# target; the detector runs at 5 Hz without tracks and 2.5 Hz with them, but the
+# budget decides what actually runs - there is no frame-rate floor.
+CLASSIFY_INTERVAL_S = 0.2
+DETECT_INTERVAL_S = 0.2
+DETECT_INTERVAL_TRACKS_S = 0.4
+DETECT_MAX_GAP_S = 3.0
+# Flat-road tail-light gate needs a calibrated camera (crops.horizon_row uses
+# rpyCalib); str(calStatus) because pycapnp enums stringify as the enum name.
+GATE_CAL_STATUS = "calibrated"
 # Crash-loop guard: more than this many starts inside the window turns
 # CarrotTlvMode off so a struggling device cannot keep relaunching tlvd.
 CRASH_LOOP_MAX_STARTS = 5
@@ -61,6 +75,27 @@ CRASH_LOOP_WINDOW_S = 300.0
 PROC_STAT = "/proc/stat"
 PROC_MEMINFO = "/proc/meminfo"
 PROC_SELF_STATM = "/proc/self/statm"
+
+
+def choose_frame_kind(*, now: float, last_detect: float, last_classify: float, has_tracks: bool,
+                      classifier_enabled: bool, budget: resources.CpuCreditBudget) -> str | None:
+  """What this frame should run: "detect", "classify", or None (skip).
+
+  Detector first, then the cheap classifier while tracks exist; when the
+  detector is overdue (DETECT_MAX_GAP_S) a classify frame that would starve it
+  of its estimate is refused. Pure apart from budget.can_run()/estimate().
+  """
+  detect_interval = DETECT_INTERVAL_TRACKS_S if has_tracks else DETECT_INTERVAL_S
+  if now - last_detect >= detect_interval and budget.can_run("detect", now):
+    return "detect"
+  if not (classifier_enabled and has_tracks and now - last_classify >= CLASSIFY_INTERVAL_S):
+    return None
+  if not budget.can_run("classify", now):
+    return None
+  if (now - last_detect >= DETECT_MAX_GAP_S
+      and budget.credit - budget.estimate("classify") < budget.estimate("detect")):
+    return None  # save the credit for the overdue detector
+  return "classify"
 
 
 def _param_int(params, key: str, default: int = 0) -> int:
@@ -136,7 +171,6 @@ class TlvRunner:
     self.backend_error = ""
     self.classifier = backends.NullClassifier()
     self.classifier_error = ""
-    self.detector_throttle = resources.DetectorThrottle()
     if _param_int(params, "CarrotTlvMode") >= 1:
       name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
       model_path = _param_text(params, "CarrotTlvModelPath", "") or backends.BUNDLED_DETECTOR
@@ -167,7 +201,14 @@ class TlvRunner:
     self.recorder = None
     self._sync_recorder_mode()
 
-    self.governor = resources.DutyCycleGovernor()
+    # W99: strict CPU credit budget (replaces the pacing governor) and the
+    # ego-motion odometry used for track-box prediction between detect frames.
+    self.budget = resources.CpuCreditBudget()
+    self.odo = tracker.EgoOdometry()
+    self.last_detect = -float("inf")
+    self.last_classify = -float("inf")
+    self.skipped_budget = 0
+    self._frame_times: dict[str, deque[float]] = {"detect": deque(maxlen=256), "classify": deque(maxlen=256)}
     self.cpu_guard = resources.CpuContentionGuard()
     self.mem_guard = resources.MemoryGuard()
     self.page_size = resources.default_page_size()
@@ -191,6 +232,7 @@ class TlvRunner:
     self._prev_controls_mono: int | None = None
     self._horizon_y: float | None = None
     self._calib_rpy = None
+    self._gate_enabled = False
 
   # -- vision ---------------------------------------------------------------
 
@@ -234,6 +276,11 @@ class TlvRunner:
     if calib is not None:
       rpy = list(calib.rpyCalib) if len(calib.rpyCalib) == 3 else None
       self._calib_rpy = rpy
+      # Flat-road tail-light gate is only valid on a calibrated camera.
+      self._gate_enabled = bool(
+        rpy is not None and all(math.isfinite(v) for v in rpy)
+        and str(calib.calStatus) == GATE_CAL_STATUS
+      )
     width = self.client.width if self.client is not None else crops.REFERENCE_WIDTH
     height = self.client.height if self.client is not None else crops.REFERENCE_HEIGHT
     focal = crops.focal_px_for_width(width)
@@ -249,11 +296,22 @@ class TlvRunner:
             and self._cpu_reason is None
             and self._mem.suspend_reason is None)
 
-  def _process_frame(self, frame, *, detect: bool, v_ego_kph: float) -> None:
+  def _process_frame(self, frame, *, kind: str, v_ego_kph: float) -> None:
+    detect = kind == "detect"
     width, height = frame.width, frame.height
     focal = crops.focal_px_for_width(width)
     horizon = self._update_horizon()
-    view = self.pipeline.next_view(v_ego_kph)
+    # Ego-motion context for predicted track boxes (anchors/crops/association).
+    foe_x, _foe_y = crops.vanishing_point(self._calib_rpy, focal, width, height)
+    self.pipeline.ego = tracker.EgoFrame(
+      odo=self.odo, focal_px=focal, foe_x=foe_x, foe_y=horizon, image_w=width, image_h=height,
+    )
+    if detect:
+      # Only detect frames advance the speed-aware ViewScheduler.
+      view = self.pipeline.next_view(v_ego_kph)
+    else:
+      far_geom = pipeline.FramePipeline.geometry("far", horizon, width, height, focal)
+      view = self.pipeline.classify_view(far_geom)
     raised = view == "near" and v_ego_kph < pipeline.STANDSTILL_V_KPH
     geom = pipeline.FramePipeline.geometry(view, horizon, width, height, focal, raised=raised)
 
@@ -269,6 +327,7 @@ class TlvRunner:
     out = self.pipeline.infer(
       view, geom, image_width=width, path_x=self._path_x(), path_y=self._path_y(),
       left_intent=self._left_intent(), now=time.monotonic(), detect=detect,
+      horizon_y=horizon, gate_enabled=self._gate_enabled,
     )
     self.last_view = out.view
     self.processed += 1
@@ -302,6 +361,7 @@ class TlvRunner:
       left_blinker=bool(car.leftBlinker) if car is not None else None,
       right_blinker=bool(car.rightBlinker) if car is not None else None,
       dets=out.dets,
+      gated=out.gated,
       tracks=self.pipeline.tracker.tracks,
       relevant_track_id=int(out.track_id),
       state=int(out.state),
@@ -404,6 +464,12 @@ class TlvRunner:
       if self._recorder_failures == 1:
         print(f"tlvd: recorder disabled: {exc!r}", flush=True)
 
+  def _update_odometry(self, now: float) -> None:
+    """Integrate fresh carState vEgo/yawRate for ego-motion track prediction."""
+    if self.sm is not None and self.sm.updated["carState"]:
+      car = self.sm["carState"]
+      self.odo.update(now, _as_float(car.vEgo), _as_float(getattr(car, "yawRate", None)))
+
   # -- watchdog -------------------------------------------------------------
 
   def _feed_watchdog(self, now: float) -> None:
@@ -443,6 +509,15 @@ class TlvRunner:
     out.inferMs = float(self.pipeline.infer_ms)
     out.procMs = float(self.pipeline.proc_ms)
     out.droppedFrames = int(self.dropped)
+    now = time.monotonic()
+    out.cpuCredit = float(self.budget.credit)
+    out.cpuDuty = float(self.budget.duty or 0.0)
+    out.detHz = float(self._frame_rate("detect", now))
+    out.clsHz = float(self._frame_rate("classify", now))
+    out.detCostMs = float(self.budget.estimate_ms("detect"))
+    out.clsCostMs = float(self.budget.estimate_ms("classify"))
+    out.skippedBudget = int(self.skipped_budget)
+    out.tailGated = int(self.pipeline.tail_gated_total)
     ordered = self._ordered_dets()[:MAX_PUBLISHED_DETS]
     out.init("dets", len(ordered))
     for i, det in enumerate(ordered):
@@ -499,19 +574,35 @@ class TlvRunner:
       self._last_error_log = now
       print(text, flush=True)
 
+  def _frame_rate(self, kind: str, now: float) -> float:
+    """Frames per second of `kind` over the last STATS_INTERVAL_S seconds."""
+    times = self._frame_times[kind]
+    while times and now - times[0] > STATS_INTERVAL_S:
+      times.popleft()
+    if len(times) < 2:
+      return 0.0
+    span = times[-1] - times[0]
+    return (len(times) - 1) / span if span > 0.0 else 0.0
+
   def _maybe_log_stats(self, now: float) -> None:
     if now - self._last_stats < STATS_INTERVAL_S:
       return
     self._last_stats = now
-    duty = self.governor.window_duty
+    duty = self.budget.duty
     duty_text = "n/a" if duty is None else f"{duty * 100.0:.0f}%"
     status, _ = self._status()
     rss_mb = self._rss_bytes / resources.MB
     parts = (
       f"frames={self.processed}",
       f"dropped={self.dropped}",
-      f"rate={self.governor.rate_hz:.1f}Hz",
+      f"skipped_budget={self.skipped_budget}",
+      f"credit={self.budget.credit:.2f}s",
       f"duty={duty_text}",
+      f"est_det={self.budget.estimate_ms('detect'):.0f}ms",
+      f"est_cls={self.budget.estimate_ms('classify'):.0f}ms",
+      f"det_hz={self._frame_rate('detect', now):.2f}",
+      f"cls_hz={self._frame_rate('classify', now):.2f}",
+      f"tail_gated={self.pipeline.tail_gated_total}",
       f"rss={rss_mb:.0f}MB",
       f"infer={self.pipeline.infer_ms:.0f}ms",
       f"proc={self.pipeline.proc_ms:.0f}ms",
@@ -545,8 +636,11 @@ class TlvRunner:
     while True:
       now = time.monotonic()
       self.sm.update(0)
+      self._update_odometry(now)
       self._feed_watchdog(now)
       self._poll_system(now)
+      # Keep credit/duty live even across suspensions (all process CPU charged).
+      self.budget.tick(now)
       if self._hard_exit_reason is not None:
         self._handle_hard_exit()
         return  # exit code 0; CarrotTlvMode=0 keeps the manager from restarting tlvd
@@ -557,23 +651,29 @@ class TlvRunner:
         frame = self._drain_newest_frame()
         if frame is not None:
           self.last_frame_mono = now
-          if self._can_infer() and self.governor.ready(now):
-            # Classifier first: with the lamp classifier present only the
-            # detector is throttled; classification still runs every frame.
-            detect = resources.detector_due(
-              self.detector_throttle, now,
-              classifier_present=self.classifier.enabled,
-              has_tracks=self.pipeline.has_tracks,
+          if self._can_infer():
+            kind = choose_frame_kind(
+              now=now, last_detect=self.last_detect, last_classify=self.last_classify,
+              has_tracks=self.pipeline.has_tracks, classifier_enabled=self.classifier.enabled,
+              budget=self.budget,
             )
-            self.governor.begin_frame(now)
-            try:
-              if detect:
-                self.detector_throttle.mark(now)
-              self._process_frame(frame, detect=detect, v_ego_kph=self._v_ego_kph())
-            except Exception as exc:
-              self._log_error(f"tlvd: frame processing error: {exc!r}", now)
-            finally:
-              self.governor.end_frame()
+            if kind is None:
+              self.skipped_budget += 1  # budget/schedule skip, NOT a dropped frame
+            else:
+              self.budget.begin(kind, now)
+              try:
+                self._process_frame(frame, kind=kind, v_ego_kph=self._v_ego_kph())
+              except Exception as exc:
+                self._log_error(f"tlvd: frame processing error: {exc!r}", now)
+              finally:
+                self._frame_times[kind].append(now)
+                if kind == "detect":
+                  # A detect frame also classifies the tracked lights.
+                  self.last_detect = now
+                  self.last_classify = now
+                else:
+                  self.last_classify = now
+                self.budget.end(now)
         elif self.last_frame_mono > 0.0 and now - self.last_frame_mono > FRAME_STALE_S:
           self._disconnect()
 

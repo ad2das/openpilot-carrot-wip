@@ -288,6 +288,15 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	# within the last 120 s and is now confirmed green/greenLeft/left. A TLV
 	# green/left start edge is only valid from the same tracked light.
 	goAfterRed @10 :Bool;
+	# W99 CPU credit budget telemetry (tlvd local scheduling only).
+	cpuCredit @11 :Float32;
+	cpuDuty @12 :Float32;
+	detHz @13 :Float32;
+	clsHz @14 :Float32;
+	detCostMs @15 :Float32;
+	clsCostMs @16 :Float32;
+	skippedBudget @17 :UInt32;
+	tailGated @18 :UInt32;
 
 	enum Status {
 		off @0;

@@ -76,6 +76,21 @@ def horizon_row(rpy_calib, focal_px: float, width: int, height: int) -> float:
   return float(row)
 
 
+def vanishing_point(rpy_calib, focal_px: float, width: int, height: int) -> tuple[float, float]:
+  """(foe_x, foe_y) of the calibrated camera axis, in full-frame pixels.
+
+  foe_y is the horizon row; foe_x accounts for the calibration yaw only:
+  x = width/2 - focal * tan(yaw) for a valid rpyCalib, else the image centre.
+  """
+  y = horizon_row(rpy_calib, focal_px, width, height)
+  x = 0.5 * float(width)
+  if rpy_calib is not None and len(rpy_calib) == 3:
+    yaw = float(rpy_calib[2])
+    if np.isfinite(yaw):
+      x = 0.5 * float(width) - float(focal_px) * float(np.tan(yaw))
+  return float(x), float(y)
+
+
 def _even_down(value: int) -> int:
   return int(value) - (int(value) & 1)
 

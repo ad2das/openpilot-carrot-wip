@@ -80,3 +80,44 @@ def test_speed_aware_is_deterministic():
 def test_unknown_policy_rejected():
   with pytest.raises(ValueError):
     sim.simulate_approach(60.0, 5.0, policy="nope")
+
+
+# ---------------------------------------------------------------------------
+# W99 credit policy table
+# ---------------------------------------------------------------------------
+
+def test_old_governor_rate_floor():
+  # rate = budget / worst frame cost, clamped to [1, 10] Hz; the 1 Hz floor is
+  # what breaks the 40% budget for frame costs > 0.4 s.
+  assert sim.old_governor_rate_hz(0.3) == pytest.approx(0.4 / 0.3)
+  assert sim.old_governor_rate_hz(0.7) == pytest.approx(1.0)
+  assert sim.old_governor_rate_hz(1.3) == pytest.approx(1.0)
+  assert sim.old_governor_rate_hz(0.01, 0.02) == pytest.approx(10.0)
+
+
+def test_credit_governor_table_runs_and_improves_inside_budget_costs():
+  results = sim.credit_governor_table()
+  print("\n" + sim.format_credit_table(results))
+  assert len(results) == len(sim.CREDIT_DET_COSTS) * len(sim.CREDIT_SPEEDS) * 2
+  by = {(r.policy, r.speed_kph, r.det_cost_s): r for r in results}
+  # For frame costs inside the cap the old governor stays within the budget and
+  # the credit policy confirms earlier (it classifies at 5 Hz while detecting).
+  for cost in (0.3, 0.7):
+    for speed in sim.CREDIT_SPEEDS:
+      old = by[("speed_aware", speed, cost)]
+      new = by[("credit", speed, cost)]
+      assert old.d_confirm_m is not None and new.d_confirm_m is not None
+      assert new.d_confirm_m >= old.d_confirm_m
+  # At 1.3 s the old 1 Hz floor runs a 130% duty (budget-breaking) and therefore
+  # detects more often; the strict credit policy cannot confirm within this
+  # approach. W99 requirement: report the numbers, do not force the inequality.
+  old13 = by[("speed_aware", 80.0, 1.3)]
+  new13 = by[("credit", 80.0, 1.3)]
+  assert old13.d_confirm_m is not None and new13.d_confirm_m is None
+
+
+def test_credit_governor_table_is_deterministic():
+  first = sim.credit_governor_table()
+  second = sim.credit_governor_table()
+  assert [(r.policy, r.d_confirm_m, r.confirm_s, r.red_likely_m) for r in first] == \
+         [(r.policy, r.d_confirm_m, r.confirm_s, r.red_likely_m) for r in second]

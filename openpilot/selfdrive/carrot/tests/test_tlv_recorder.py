@@ -53,7 +53,7 @@ def make_track(vote=None) -> tracker.Track:
 
 
 def offer(rec, now, *, v_ego=10.0, state=0, dets=None, tracks=None, red_likely=False,
-          state_conf=0.0, relevant_track_id=-1, model_input=None) -> bool:
+          state_conf=0.0, relevant_track_id=-1, model_input=None, gated=()) -> bool:
   return rec.offer(
     model_input if model_input is not None else make_input(),
     now=now, frame_id=1, view="far", raised=False, geom=GEOM,
@@ -62,7 +62,7 @@ def offer(rec, now, *, v_ego=10.0, state=0, dets=None, tracks=None, red_likely=F
     left_blinker=False, right_blinker=False,
     dets=list(dets or []), tracks=list(tracks or []),
     relevant_track_id=relevant_track_id, state=state, state_conf=state_conf,
-    red_likely=red_likely, wall_time_iso="2026-01-01T00:00:00.000+09:00",
+    red_likely=red_likely, gated=list(gated), wall_time_iso="2026-01-01T00:00:00.000+09:00",
   )
 
 
@@ -337,9 +337,10 @@ def test_jpeg_and_index_metadata(tmp_path):
   meta = entries[0]
   expected = {"file", "t_mono", "wall_time_iso", "frame_id", "view", "raised", "geom", "horizon_y",
               "calib_rpy", "v_ego", "a_ego", "yaw_rate", "steering_angle_deg", "left_blinker",
-              "right_blinker", "dets", "tracks", "relevant_track_id", "state", "state_conf",
+              "right_blinker", "dets", "gated", "tracks", "relevant_track_id", "state", "state_conf",
               "red_likely", "reason"}
   assert expected <= set(meta), sorted(expected - set(meta))
+  assert meta["gated"] == []  # no tail-gate drops without the gate
   # first processed frame with state != none is a state transition (0 -> 2)
   assert meta["reason"] == "transition"
   assert meta["state"] == 2
@@ -375,6 +376,19 @@ def test_jpeg_and_index_metadata(tmp_path):
   assert image is not None
   assert image.shape == (320, 640, 3)
   assert abs(float(image.mean()) - 16.0) < 6.0
+
+
+def test_gated_dets_recorded_in_meta(tmp_path):
+  """Flat-road tail-light gate drops are auditable: "gated" mirrors "dets"."""
+  rec = make_recorder(tmp_path)
+  kept = make_det(cls=0, score=0.9)
+  dropped = tracker.Detection(cls=2, score=0.4, x1=600.0, y1=800.0, x2=620.0, y2=820.0)
+  assert offer(rec, 100.0, dets=[kept], gated=[dropped]) is True
+  assert rec.wait_idle()
+  rec.close()
+  meta = read_index(str(tmp_path))[0]
+  assert meta["dets"] == [{"cls": 0, "score": 0.9, "x1": 300.0, "y1": 200.0, "x2": 340.0, "y2": 240.0}]
+  assert meta["gated"] == [{"cls": 2, "score": 0.4, "x1": 600.0, "y1": 800.0, "x2": 620.0, "y2": 820.0}]
 
 
 def test_offer_never_raises_and_recovers(tmp_path):

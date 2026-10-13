@@ -155,7 +155,7 @@ class TlvRecorder:
             horizon_y: float, calib_rpy, v_ego, a_ego, yaw_rate, steering_angle_deg,
             left_blinker, right_blinker, dets, tracks, relevant_track_id: int,
             state: int, state_conf: float, red_likely: bool,
-            wall_time_iso: str | None = None) -> bool:
+            gated=(), wall_time_iso: str | None = None) -> bool:
     """Queue one view crop if the sampling policy allows it. Never raises."""
     slot: int | None = None
     try:
@@ -212,6 +212,13 @@ class TlvRecorder:
           {"cls": int(d.cls), "score": float(d.score), "x1": float(d.x1), "y1": float(d.y1),
            "x2": float(d.x2), "y2": float(d.y2)}
           for d in dets
+        ],
+        # Flat-road tail-light gate: detections dropped this frame, same format
+        # as "dets" (the kept list) so uploaded photos can be audited.
+        "gated": [
+          {"cls": int(d.cls), "score": float(d.score), "x1": float(d.x1), "y1": float(d.y1),
+           "x2": float(d.x2), "y2": float(d.y2)}
+          for d in gated
         ],
         "tracks": [self._track_meta(t) for t in tracks],
         "relevant_track_id": int(relevant_track_id),
