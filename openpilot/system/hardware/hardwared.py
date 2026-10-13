@@ -52,6 +52,25 @@ THERMAL_BANDS = OrderedDict({
 
 # Override to highest thermal band when offroad and above this temp
 OFFROAD_DANGER_TEMP = 75
+# Starting every process briefly heats the SoC past OFFROAD_DANGER_TEMP right after boot.
+# The offroad override waits this long after hardwared starts; the normal bands still apply.
+BOOT_THERMAL_GRACE_S = 60.
+
+
+def update_thermal_status(thermal_status, offroad_comp_temp: float, all_comp_temp: float,
+                          is_offroad_for_5_min: bool, since_boot: float):
+  if is_offroad_for_5_min and since_boot >= BOOT_THERMAL_GRACE_S and offroad_comp_temp > OFFROAD_DANGER_TEMP:
+    # if device is offroad and already hot without the extra onroad load,
+    # we want to cool down first before increasing load
+    return ThermalStatus.danger
+
+  current_band = THERMAL_BANDS[thermal_status]
+  band_idx = list(THERMAL_BANDS.keys()).index(thermal_status)
+  if current_band.min_temp is not None and all_comp_temp < current_band.min_temp:
+    return list(THERMAL_BANDS.keys())[band_idx - 1]
+  if current_band.max_temp is not None and all_comp_temp > current_band.max_temp:
+    return list(THERMAL_BANDS.keys())[band_idx + 1]
+  return thermal_status
 
 prev_offroad_states: dict[str, tuple[bool, str | None]] = {}
 
@@ -189,6 +208,7 @@ def hardware_thread(end_event, hw_queue) -> None:
   started_seen = False
   startup_blocked_ts: float | None = None
   thermal_status = ThermalStatus.yellow
+  boot_ts = time.monotonic()
 
   last_hw_state = HardwareState(
     network_type=NetworkType.none,
@@ -298,17 +318,8 @@ def hardware_thread(end_event, hw_queue) -> None:
       gpio_set(GPIO.SOM_ST_IO, int(msg.deviceState.fanSpeedPercentDesired > 0))
 
     is_offroad_for_5_min = (started_ts is None) and ((not started_seen) or (off_ts is None) or (time.monotonic() - off_ts > 60 * 5))
-    if is_offroad_for_5_min and offroad_comp_temp > OFFROAD_DANGER_TEMP:
-      # if device is offroad and already hot without the extra onroad load,
-      # we want to cool down first before increasing load
-      thermal_status = ThermalStatus.danger
-    else:
-      current_band = THERMAL_BANDS[thermal_status]
-      band_idx = list(THERMAL_BANDS.keys()).index(thermal_status)
-      if current_band.min_temp is not None and all_comp_temp < current_band.min_temp:
-        thermal_status = list(THERMAL_BANDS.keys())[band_idx - 1]
-      elif current_band.max_temp is not None and all_comp_temp > current_band.max_temp:
-        thermal_status = list(THERMAL_BANDS.keys())[band_idx + 1]
+    thermal_status = update_thermal_status(thermal_status, offroad_comp_temp, all_comp_temp,
+                                           is_offroad_for_5_min, time.monotonic() - boot_ts)
 
     # **** starting logic ****
 

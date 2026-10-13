@@ -26,7 +26,7 @@ POLL_S = 10.0          # idle / between-segment poll
 DISABLED_POLL_S = 15.0
 MAX_AGE_S = 7 * 86400  # never sync segments whose directory mtime is older
 BACKOFF_MIN_S = 30.0
-BACKOFF_MAX_S = 600.0
+BACKOFF_MAX_S = 60.0
 SESSION_MAX_AGE_S = 3 * 3600
 MARKER_NAME = ".carrot_log_sync.json"
 

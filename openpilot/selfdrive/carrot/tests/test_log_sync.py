@@ -139,7 +139,7 @@ def test_failures_back_off_to_the_cap(tmp_path, monkeypatch):
   uploads = prepare(monkeypatch, tmp_path, {"log_sync_enabled": True, "log_sync_url": BASE_URL}, upload_result=False)
   sync = log_sync.LogSync()
   waits = [asyncio.run(sync.run_once()) for _ in range(7)]
-  assert waits == [30.0, 60.0, 120.0, 240.0, 480.0, 600.0, 600.0]
+  assert waits == [30.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0]
   assert not os.path.exists(os.path.join(seg_dir, log_sync.MARKER_NAME))
   assert len(uploads) == 7
 
