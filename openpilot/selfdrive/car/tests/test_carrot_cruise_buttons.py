@@ -708,3 +708,36 @@ def test_gap_long_press_still_changes_driving_mode():
   helper.params = SimpleNamespace(get_int=values.__getitem__, put_int_nonblocking=values.__setitem__)
   helper._update_cruise_buttons(CS, CC, 80)
   assert values == {"MyDrivingMode": 1, "LongitudinalPersonality": 1}
+
+
+def gas_decel_helper():
+  helper = VCruiseCarrot.__new__(VCruiseCarrot)
+  helper._gas_tok_timer = 40
+  helper._gas_pressed_count = 100
+  helper._gas_decel_count = 0
+  return helper
+
+
+def run_gas_decel(helper, accels):
+  return [helper._gas_decel_cancel(SimpleNamespace(aEgo=a)) for a in accels]
+
+
+def test_brief_decel_with_gas_held_keeps_cruise():
+  # Field triggers: 1-39 frames just past -0.5 m/s^2 while modulating the gas.
+  helper = gas_decel_helper()
+  assert not any(run_gas_decel(helper, [-0.6] * 200))
+  assert not any(run_gas_decel(helper, ([-1.5] * 39 + [-0.2]) * 5))
+
+
+def test_sustained_decel_with_gas_held_cancels_after_half_a_second():
+  helper = gas_decel_helper()
+  results = run_gas_decel(helper, [-1.2] * 60)
+  assert results.index(True) == 49
+  assert all(results[49:])
+
+
+def test_decel_does_not_count_before_the_gas_tok_timer():
+  helper = gas_decel_helper()
+  helper._gas_pressed_count = 10
+  assert not any(run_gas_decel(helper, [-2.0] * 100))
+  assert helper._gas_decel_count == 0

@@ -27,6 +27,8 @@ CRUISE_LONG_PRESS = 50
 # Keep automatic re-engagement out of parking/full-lock turns. Hyundai EPS
 # fault avoidance begins at 85 degrees, so leave margin below that boundary.
 AUTO_CRUISE_MAX_STEERING_ANGLE = 70.0
+GAS_DECEL_CANCEL_ACCEL = -1.0  # m/s^2
+GAS_DECEL_CANCEL_TIME = 0.5    # s of continuous deceleration with the gas held
 CRUISE_NEAREST_FUNC = {
   ButtonType.accelCruise: math.ceil,
   ButtonType.decelCruise: math.floor,
@@ -192,6 +194,7 @@ class VCruiseCarrot:
     self._gas_pressed_value = 0
     self._gas_tok_timer = int(0.4 / 0.01) # 0.4 sec
     self._gas_tok = False
+    self._gas_decel_count = 0
     self._brake_pressed_count = 0
     self._soft_hold_count = 0
     self._soft_hold_active = 0
@@ -840,6 +843,15 @@ class VCruiseCarrot:
     self._soft_hold_active = 2
     self._cruise_control(1, -1, "Cruise on (soft hold)", allow_cancel_state=self.soft_hold_on_cancel)
 
+  def _gas_decel_cancel(self, CS):
+    # Only sustained real deceleration with the gas held cancels cruise; single-frame aEgo
+    # dips past the old -0.5 m/s^2 threshold cancelled it during ordinary gas modulation.
+    if self._gas_pressed_count > self._gas_tok_timer and CS.aEgo < GAS_DECEL_CANCEL_ACCEL:
+      self._gas_decel_count += 1
+    else:
+      self._gas_decel_count = 0
+    return self._gas_decel_count >= int(GAS_DECEL_CANCEL_TIME / 0.01)
+
   def _update_cruise_state(self, CS, CC, v_cruise_kph):
     if not CC.enabled:
       #self._pause_auto_speed_up = False
@@ -929,9 +941,9 @@ class VCruiseCarrot:
           v_cruise_kph = self.v_ego_kph_set
           
 
+    if self._gas_decel_cancel(CS):
+      self._cruise_control(-1, 5.0, "Cruise off (gas pressed while braking)")
     if self._gas_pressed_count > self._gas_tok_timer:
-      if CS.aEgo < -0.5:
-        self._cruise_control(-1, 5.0, "Cruise off (gas pressed while braking)")
       if self.v_ego_kph_set > v_cruise_kph and self.autoGasSyncSpeed:
         v_cruise_kph = self.v_ego_kph_set
 
