@@ -1346,6 +1346,12 @@ struct LateralPlan @0xe1e9318e2ae8b51e {
   position @35 :XYZTData;
   distances @36 :List(Float32);
 
+  laneCenterBlendCurvature @37 :Float32;
+  laneCenterBlendOffset @38 :Float32;
+  laneCenterBlendWeight @39 :Float32;
+  laneCenterBlendGates @40 :UInt16;
+  laneCenterBlendAvoidDev @41 :Float32;
+
   struct SolverState {
     x @0 :List(List(Float32));
     u @1 :List(Float32);

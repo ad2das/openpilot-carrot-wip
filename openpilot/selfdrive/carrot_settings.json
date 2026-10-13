@@ -168,7 +168,8 @@
                 "LatMpcInputOffset",
                 "UseLaneLineSpeed",
                 "UseLaneLineCurveSpeed",
-                "AdjustLaneOffset"
+                "AdjustLaneOffset",
+                "LaneCenterBlend"
               ]
             },
             {
@@ -2424,6 +2425,22 @@
       "default": 0,
       "unit": 10,
       "display_unit": "distanceCm"
+    },
+    {
+      "group": "레인모드",
+      "name": "LaneCenterBlend",
+      "title": "혼합모드: 차선중앙 보정(0)",
+      "descr": "0: 끔, 1: 켬. 레인리스로 주행하면서 양쪽 차선이 잘 보일 때 차가 차선 중앙에서 평소 치우치는 만큼을 직선과 커브 곡률별로 천천히 학습해 보정합니다. 보정은 최대 약 0.3m 목표, 횡가속 0.25m/s² 이내이며 경로가 장애물 회피처럼 움직이거나 차선변경 중이거나 차선이 불확실하면 즉시 빠지고 학습도 멈춥니다. 레인모드 동작 중에는 쓰이지 않습니다. 켤 때마다 학습을 처음부터 다시 합니다.",
+      "egroup": "LANE",
+      "etitle": "Blend: Lane-centre correction(0)",
+      "edescr": "0: off, 1: on. While driving laneless with both lane lines clearly visible, slowly learns how far the car usually sits off the lane centre on straights and per curve radius, and corrects it (about 0.3 m aim at most, within 0.25 m/s^2 lateral acceleration). It fades out immediately and stops learning when the path moves like an obstacle avoidance, during lane changes or when lanes are uncertain. Not used while lane mode is active. Turning it on restarts learning.",
+      "cgroup": "转向",
+      "ctitle": "混合模式: 车道居中修正 (0)",
+      "cdescr": "0: 关, 1: 开。无车道线模式行驶且两侧车道线清晰时，按直道和弯道曲率缓慢学习车辆平时偏离车道中央的量并修正（目标最多约0.3米，横向加速度0.25m/s²以内）。路径出现避障式移动、变道中或车道线不确定时立即退出并停止学习。车道模式运行时不使用。每次开启都会重新学习。",
+      "min": 0,
+      "max": 1,
+      "default": 0,
+      "unit": 1
     },
     {
       "group": "조향일반",

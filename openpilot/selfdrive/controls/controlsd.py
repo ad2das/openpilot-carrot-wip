@@ -220,8 +220,11 @@ class Controls:
       else:
         curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures, steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
         new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
-    else:      
-      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature, self.desired_curvature, 0.1)
+    else:
+      # LaneCenterBlend: small learned lane-centre bias; exactly 0.0 when OFF or stale.
+      blend_fresh = (self.sm.frame - self.sm.recv_frame['lateralPlan']) * DT_CTRL < 0.3
+      blend_curvature = float(lat_plan.laneCenterBlendCurvature) if blend_fresh else 0.0
+      new_desired_curvature = smooth_value(model_v2.action.desiredCurvature + blend_curvature, self.desired_curvature, 0.1)
 
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 

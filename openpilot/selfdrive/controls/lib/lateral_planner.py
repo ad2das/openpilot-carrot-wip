@@ -13,6 +13,7 @@ from openpilot.common.params import Params
 #from openpilot.selfdrive.controls.lib.lane_planner import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
+from openpilot.selfdrive.controls.lib.lane_center_blend import LaneCenterBlend, dump_table, load_table
 from collections import deque
 
 TRAJECTORY_SIZE = 33
@@ -75,6 +76,11 @@ class LateralPlanner:
     self.lane_model_speed_guard = LaneModelSpeedGuard(recovery_frames=int(1 / DT_MDL))
     self.laneless_only = True
 
+    self.lane_center_blend_enabled = self.params.get_int("LaneCenterBlend") > 0
+    self.lane_center_blend = LaneCenterBlend(load_table(self.params.get("LaneCenterBlendMap")))
+    self.lane_center_blend_saved = dump_table(self.lane_center_blend.table)
+    self.lane_center_blend_save_frame = 0
+
   def reset_mpc(self, x0=None):
     if x0 is None:
       x0 = np.zeros(4)
@@ -93,6 +99,10 @@ class LateralPlanner:
       LATERAL_ACCEL_COST = self.params.get_float("LatMpcAccelCost") * 0.01
       LATERAL_JERK_COST = self.params.get_float("LatMpcJerkCost") * 0.01
       STEERING_RATE_COST = self.params.get_float("LatMpcSteeringRateCost")
+      blend_enabled = self.params.get_int("LaneCenterBlend") > 0
+      if blend_enabled and not self.lane_center_blend_enabled:
+        self.lane_center_blend.reset()
+      self.lane_center_blend_enabled = blend_enabled
 
     # clip speed , lateral planning is not possible at 0 speed
     measured_curvature = sm['controlsState'].curvature
@@ -146,6 +156,8 @@ class LateralPlanner:
     self.LP.lane_width_left = md.meta.laneWidthLeft
     self.LP.lane_width_right = md.meta.laneWidthRight
     self.LP.curvature = measured_curvature
+    model_path_x = self.path_xyz[:, 0].copy()
+    model_path_y = self.path_xyz[:, 1].copy()
     self.path_xyz, self.lanelines_active = self.LP.get_d_path(sm['carState'], v_ego_car, self.t_idxs, self.path_xyz, self.curve_speed)
 
     if self.lanelines_active:
@@ -156,6 +168,20 @@ class LateralPlanner:
         align_first_yaw=None #md.orientation.z[0]  # 초기 정렬
       )
       
+    lane_change_active = (md.meta.desire != log.Desire.none or bool(carrot.atc_active) or
+                          md.meta.laneChangeState != log.LaneChangeState.off)
+    self.lane_center_blend.update(self.lane_center_blend_enabled, self.lanelines_active, v_ego_car,
+                                  self.LP.l_prob, self.LP.r_prob, self.LP.ll_x, self.LP.lll_y, self.LP.rll_y,
+                                  self.t_idxs, model_path_x, model_path_y,
+                                  lane_change_active, sm['carState'].steeringPressed)
+    self.lane_center_blend_save_frame += 1
+    if self.lane_center_blend_save_frame >= int(30.0 / DT_MDL):
+      self.lane_center_blend_save_frame = 0
+      table_text = dump_table(self.lane_center_blend.table)
+      if self.lane_center_blend_enabled and table_text != self.lane_center_blend_saved:
+        self.params.put_nonblocking("LaneCenterBlendMap", table_text)
+        self.lane_center_blend_saved = table_text
+
     self.latDebugText = self.LP.debugText
     #self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False
 
@@ -245,6 +271,11 @@ class LateralPlanner:
     lateralPlan.laneChangeState = sm['modelV2'].meta.laneChangeState
     lateralPlan.laneChangeDirection = sm['modelV2'].meta.laneChangeDirection
     lateralPlan.laneWidth = float(self.LP.lane_width)
+    lateralPlan.laneCenterBlendCurvature = float(self.lane_center_blend.curvature)
+    lateralPlan.laneCenterBlendOffset = float(self.lane_center_blend.offset)
+    lateralPlan.laneCenterBlendWeight = float(self.lane_center_blend.w)
+    lateralPlan.laneCenterBlendGates = int(self.lane_center_blend.gates)
+    lateralPlan.laneCenterBlendAvoidDev = float(self.lane_center_blend.r_dev)
 
     #plan_send.lateralPlan.dPathWLinesX = [float(x) for x in self.d_path_w_lines_xyz[:, 0]]
     #plan_send.lateralPlan.dPathWLinesY = [float(y) for y in self.d_path_w_lines_xyz[:, 1]]

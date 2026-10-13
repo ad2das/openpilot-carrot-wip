@@ -54,7 +54,7 @@ def control_fixture():
   sm = Messages()
   sm.update(longitudinalPlan=NS(), radarState=NS(), carrotMan=NS(vTurnSpeed=100), liveDelay=NS(lateralDelay=0.1))
   sm.frame = 1
-  sm.recv_frame = {'longitudinalPlan': 1}
+  sm.recv_frame = {'longitudinalPlan': 1, 'lateralPlan': 1}
   sm['carState'].gearShifter = 'drive'
   sm['carState'].latEnabled = True
   settings = {'AlwaysLateral': True, 'SteerRatioRate': 88, 'CustomSR': 0, 'LatSmoothSec': 13}
