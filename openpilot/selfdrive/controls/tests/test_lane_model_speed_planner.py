@@ -6,7 +6,6 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from openpilot.selfdrive.controls.lib.lane_center_blend import LaneCenterBlend, dump_table, load_table
 from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
 
 
@@ -22,6 +21,20 @@ class StubMpc:
 
   def run(self, x0, p, y, heading, yaw_rate):
     self.input_speed = p[:, 0].copy()
+
+
+class StubLaneCenterBlend:
+  # The slim CI job has no openpilot runtime deps; routing does not depend on the blend.
+  def __init__(self, table=None):
+    self.table = np.zeros(7)
+    self.curvature = self.offset = self.w = self.r_dev = 0.0
+    self.gates = 0
+
+  def reset(self):
+    pass
+
+  def update(self, *args):
+    return 0.0
 
 
 class StubLanePlanner:
@@ -56,9 +69,9 @@ def make_planner():
     'LateralMpc': StubMpc,
     'LanePlanner': StubLanePlanner,
     'LaneModelSpeedGuard': LaneModelSpeedGuard,
-    'LaneCenterBlend': LaneCenterBlend,
-    'dump_table': dump_table,
-    'load_table': load_table,
+    'LaneCenterBlend': StubLaneCenterBlend,
+    'dump_table': lambda table: '[]',
+    'load_table': lambda text: None,
     'time': SimpleNamespace(monotonic=lambda: 0),
     'log': SimpleNamespace(Desire=SimpleNamespace(none=0), LaneChangeState=SimpleNamespace(off=0)),
     'yaw_from_path_no_scipy': lambda *a, **k: (np.zeros(33), np.zeros(33)),
