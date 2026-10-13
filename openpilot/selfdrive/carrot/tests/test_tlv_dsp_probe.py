@@ -126,6 +126,14 @@ class FakeProc:
     return self.returncode
 
 
+class PowerCut(BaseException):
+  """Abrupt ignition-off: no signal handler runs and nothing is cleaned up."""
+
+
+def _power_cut(*args, **kwargs):
+  raise PowerCut()
+
+
 def _advancing_sleep(clock):
   def sleep(dt):
     clock.advance(dt)
@@ -942,6 +950,58 @@ def test_main_retries_messaging_then_runs_probe(probe_root, monkeypatch):
   assert attempts["n"] == 3
   assert calls and calls[0]["sm"] is fake_sm
   assert set(captured) == {signal.SIGINT, signal.SIGTERM}
+
+
+def test_main_consumes_progress_once_without_false_latch(probe_root, monkeypatch):
+  probe_root.mkdir(parents=True, exist_ok=True)
+  result = os.path.join(str(probe_root), "abc1234.json")
+  attempt = dsp_probe.attempt_path(result)
+  progress = dsp_probe.progress_path(result)
+  dsp_probe.write_attempt_state(attempt, {"count": 1, "lost_steps": []})
+  dsp_probe.write_progress(progress, "smoke")
+  monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", False)
+  monkeypatch.setattr(dsp_probe, "make_notice_sink", lambda *a, **k: (lambda payload: None))
+  monkeypatch.setattr(dsp_probe, "_SIGNAL", lambda sig, fn: None)
+  monkeypatch.setattr(dsp_probe.time, "sleep", lambda _s: None)
+  monkeypatch.setattr(dsp_probe, "_make_submaster", lambda: object())
+  monkeypatch.setattr(dsp_probe, "run_probe", _power_cut)
+
+  for _boot in range(2):
+    with pytest.raises(PowerCut):
+      dsp_probe.main()
+
+  assert dsp_probe.read_attempt_state(attempt) == {"count": 1, "lost_steps": ["smoke"]}
+  assert not os.path.exists(progress)
+  assert not os.path.exists(result)
+  assert dsp_probe._probe_disabled_by_lost_attempts is False
+
+
+def test_main_still_latches_three_separate_lost_runs(probe_root, monkeypatch):
+  probe_root.mkdir(parents=True, exist_ok=True)
+  result = os.path.join(str(probe_root), "abc1234.json")
+  attempt = dsp_probe.attempt_path(result)
+  progress = dsp_probe.progress_path(result)
+  dsp_probe.write_attempt_state(attempt, {"count": 1, "lost_steps": []})
+  monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", False)
+  monkeypatch.setattr(dsp_probe, "make_notice_sink", lambda *a, **k: (lambda payload: None))
+  monkeypatch.setattr(dsp_probe, "_SIGNAL", lambda sig, fn: None)
+  monkeypatch.setattr(dsp_probe.time, "sleep", lambda _s: None)
+  monkeypatch.setattr(dsp_probe, "_make_submaster", lambda: object())
+  monkeypatch.setattr(dsp_probe, "run_probe", _power_cut)
+
+  for _boot in range(2):
+    dsp_probe.write_progress(progress, "smoke")
+    with pytest.raises(PowerCut):
+      dsp_probe.main()
+
+  dsp_probe.write_progress(progress, "smoke")
+  dsp_probe.main()
+
+  payload = json.loads(open(result, encoding="utf-8").read())
+  assert payload["error"] == "lost_in_step:smoke"
+  assert dsp_probe._probe_disabled_by_lost_attempts is True
+  assert not os.path.exists(attempt)
+  assert not os.path.exists(progress)
 
 
 # ---------------------------------------------------------------------------

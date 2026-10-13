@@ -37,8 +37,10 @@ Every notice write is best-effort and never affects the probe outcome.
 Lost-step latch: the child writes <commit>.progress (step name + monotonic
 start, atomic) before each step. At startup an existing <commit>.attempt means
 the previous run was lost (power cut or device reset): the .progress step is
-appended to its "lost_steps" list, and a 3rd loss of the SAME step writes the
-final result error="lost_in_step:<step>" and sets
+appended to its "lost_steps" list and consumed immediately (the updated
+.attempt is persisted and .progress removed before the latch check), so a cut
+without a signal cannot count the same loss twice. A 3rd loss of the SAME
+step writes the final result error="lost_in_step:<step>" and sets
 _probe_disabled_by_lost_attempts. Losses spread over different steps (random
 power cuts) never latch. A clean finish deletes .attempt and .progress; a
 clean kill (unparked or signal) restores .attempt to its pre-spawn content.
@@ -995,6 +997,13 @@ def main() -> None:
     step = read_progress_step(progress_file)
     if step:
       pre_state["lost_steps"].append(step)
+      # Consume the lost run before the latch check: a power cut without a
+      # signal must not count the same .progress step again on the next boot.
+      try:
+        write_attempt_state(attempt_file, pre_state)
+        _remove_file(progress_file)
+      except Exception as exc:
+        print(f"dsp_probe: cannot persist lost-step accounting: {exc!r}", flush=True)
     latched = _latched_step(pre_state["lost_steps"])
     if latched is not None:
       _probe_disabled_by_lost_attempts = True
