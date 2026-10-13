@@ -187,3 +187,18 @@ def test_web_settings_round_trip_log_sync_enabled():
   assert sanitize_web_settings({"log_sync_enabled": True})["log_sync_enabled"] is True
   assert sanitize_web_settings({})["log_sync_url"] == "https://anjh.duckdns.org"
   assert sanitize_web_settings({"log_sync_url": "ftp://x"})["log_sync_url"] == "https://anjh.duckdns.org"
+
+
+def test_main_is_synchronous_and_runs_the_loop(monkeypatch):
+  # system/manager/process.py launcher() calls mod.main() without awaiting it.
+  import inspect
+  assert not inspect.iscoroutinefunction(log_sync.main)
+  ran = []
+
+  async def fake_run():
+    ran.append(True)
+
+  monkeypatch.setattr(log_sync, "run", fake_run)
+  monkeypatch.setattr(log_sync.os, "nice", lambda _: 0, raising=False)
+  log_sync.main()
+  assert ran == [True]

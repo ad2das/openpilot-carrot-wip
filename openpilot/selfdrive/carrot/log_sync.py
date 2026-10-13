@@ -138,11 +138,7 @@ class LogSync:
     return backoff
 
 
-async def main() -> None:
-  try:
-    os.nice(15)
-  except OSError:
-    pass
+async def run() -> None:
   sync = LogSync()
   while True:
     try:
@@ -152,5 +148,14 @@ async def main() -> None:
       await asyncio.sleep(BACKOFF_MIN_S)
 
 
+def main() -> None:
+  # The manager launcher calls main() synchronously; a coroutine here would exit at once.
+  try:
+    os.nice(15)
+  except OSError:
+    pass
+  asyncio.run(run())
+
+
 if __name__ == "__main__":
-  asyncio.run(main())
+  main()
