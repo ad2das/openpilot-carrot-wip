@@ -127,6 +127,15 @@ const WEB_SETTINGS_GROUPS = [
         id: "web_upload",
         component: "web-upload",
       },
+      {
+        id: "log_sync_enabled",
+        titleKey: "web_log_sync_enabled",
+        descKey: "web_log_sync_enabled_desc",
+      },
+      {
+        id: "log_sync_url",
+        component: "log-sync-url",
+      },
     ],
   },
 ];

@@ -35,6 +35,10 @@ See [Carrot Web](https://github.com/ajouatom/openpilot/wiki/Guide-Carrot-Web) fo
 
 On a fresh install, `Tools > Web Settings > Layout` starts with **Area 1 full screen** in both orientations: Area 1 is **Carrot Vision** and Area 2 is **Carrot Navi**. **Default** restores both orientations to Area 1 full screen with Carrot Vision in Area 1 and Carrot Navi in Area 2. See [Carrot Web layout](carrot-web.md#layout) for the per-screen details.
 
+### Automatic drive-log upload
+
+Automatic drive-log upload is an off-by-default toggle in `Tools > Web Settings > Upload`; when enabled, it sends rlog and qcamera of every finished 1-minute segment to the automatic upload server, also while driving. The automatic upload server field defaults to the owner's receiver and can be edited. If it is set to the shared default upload server, nothing is sent. Manual `Logs > Dashcam` upload keeps using the normal upload server setting.
+
 ## Using the Settings screen
 
 Carrot Web provides:

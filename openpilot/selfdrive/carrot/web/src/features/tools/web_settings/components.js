@@ -92,3 +92,35 @@ globalThis.WebSettingsComponents.register("web-upload", {
     });
   },
 });
+
+globalThis.WebSettingsComponents.register("log-sync-url", {
+  settingKeys: ["log_sync_url"],
+  render() {
+    const text = (key, fallback) => getUIText(key) || fallback;
+    const url = String(getWebSettingByKey("log_sync_url", "") || "");
+    return `
+      <div class="log-sync-url-settings">
+        <label class="web-settings-row web-settings-row--field">
+          <span class="web-settings-row__copy">
+            <span class="web-settings-row__title">${escapeHtml(text("web_log_sync_url", "Automatic upload server"))}</span>
+            <span class="web-settings-row__desc">${escapeHtml(text("web_log_sync_url_desc", "HTTPS address that receives the automatic drive logs"))}</span>
+          </span>
+          <input class="web-settings-text" data-log-sync-field="log_sync_url" type="url" inputmode="url" value="${escapeHtml(url)}" />
+        </label>
+      </div>`;
+  },
+  bind(root = document) {
+    const container = root.querySelector(".log-sync-url-settings");
+    if (!container || container.dataset.bound === "1") return;
+    container.dataset.bound = "1";
+    const fields = [...container.querySelectorAll("[data-log-sync-field]")];
+    const values = () => Object.fromEntries(fields.map((input) => [input.dataset.logSyncField, input.value.trim()]));
+    const save = () => setWebSettingsByKeys(values());
+
+    fields.forEach((input) => {
+      input.addEventListener("change", () => {
+        save().catch(() => {});
+      });
+    });
+  },
+});
