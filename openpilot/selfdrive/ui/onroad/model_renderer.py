@@ -67,7 +67,7 @@ LEAD_CLOSE_MIN_VREL = 1.0  # m/s closing speed below which time-to-contact is no
 LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at a glance
 LEAD_DROP = 0.11  # crescent drop below the projected road point, in lead widths
 LEAD_DROP_MIN = 14.0
-LEAD_ROOF = 0.9  # readout anchor above the road point, in lead widths: about 2.2 m
+LEAD_ROOF = 0.7  # readout anchor above the road point, in lead widths: about 1.7 m, a car/SUV roof
 # Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
 LEAD_SIZE = 80  # the leading figure: the lead's speed, or the gap while its speed is unknown
 LEAD_GAP_SIZE = 58  # the gap beside the speed
@@ -1054,7 +1054,7 @@ class ModelRenderer(Widget):
       hs.ellipse_glow(x, y0 - 4, cw * 0.66, cw * 0.11, hs.with_alpha(stroke, 150 if stroke is LEAD_RADAR else 190))
       hs.taper_curve((x - cw * 0.52, y0 - 10), (x, y0 + 17), (x + cw * 0.52, y0 - 10), 11.0, stroke)
 
-    # Pin the readout just above a car/SUV roof (w spans 2.4 m); on a truck it rests on the box's back.
+    # Pin the readout on a car/SUV roof (w spans 2.4 m); on a truck or bus it overlaps the top of the body.
     self._layout_lead_capsule_carrot(x, base - w * LEAD_ROOF)
 
 

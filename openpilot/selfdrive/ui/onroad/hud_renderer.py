@@ -99,7 +99,7 @@ OVERRIDE_COLORS = {1: hs.LIVE_GREEN, 2: hs.PROMPT_AMBER, 3: hs.rgba(175, 82, 222
 # Speed-override reasons as short Korean words; unknown sources fall back to the raw label.
 OVERRIDE_LABELS = {
   "eco": "에코", "apply": "감속", "cam": "단속", "section": "구간", "bump": "방지턱", "police": "경찰",
-  "road": "도로", "turn": "회전", "route": "경로", "school": "스쿨존", "gas": "주유", "vturn": "커브",
+  "road": "도로", "turn": "회전", "route": "경로", "school": "스쿨존", "gas": "엑셀", "vturn": "커브",
   "model": "모델", "waze": "WAZE",
 }
 
