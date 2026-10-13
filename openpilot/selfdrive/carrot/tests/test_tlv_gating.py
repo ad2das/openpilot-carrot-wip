@@ -221,6 +221,28 @@ def test_enable_tlvd_param_read_failure_is_off():
   assert process_config.enable_tlvd(True, Broken(), None) is False
 
 
+def _install_fake_signal_color_module(monkeypatch, requested):
+  module = types.ModuleType("openpilot.selfdrive.modeld.signal_color_shadow")
+  module.requested = lambda: requested
+  monkeypatch.setitem(sys.modules, "openpilot.selfdrive.modeld.signal_color_shadow", module)
+
+
+def test_enable_tlvd_disabled_when_signal_color_requested(monkeypatch):
+  _install_fake_signal_color_module(monkeypatch, True)
+  params = FakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 2})
+  assert process_config.enable_tlvd(True, params, None) is False
+
+
+def test_enable_tlvd_unchanged_when_signal_color_not_requested(monkeypatch):
+  _install_fake_signal_color_module(monkeypatch, False)
+  for started in (False, True):
+    for tlv in (0, 1, 2):
+      for tld in (0, 1, 2):
+        params = FakeParams({"CarrotTlvMode": tlv, "TrafficLightDetectMode": tld})
+        result = process_config.enable_tlvd(started, params, None)
+        assert result == (started and tlv >= 1 and tld >= 1), (started, tlv, tld)
+
+
 # -- crash_loop_guard --------------------------------------------------------
 
 def test_crash_loop_guard_five_starts_ok_sixth_clears_mode():

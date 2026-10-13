@@ -114,13 +114,23 @@ def c3x_lite(started: bool, params: Params, CP: car.CarParams) -> bool:
 def enable_cluster_hud(started, params, CP: car.CarParams) -> bool:
   return cluster_hud_active(params)
 
+def _signal_color_requested() -> bool:
+  # The opt-in signal-color observer owns the camera on /data. TLV must never
+  # run alongside it; missing module/file means not requested.
+  try:
+    from openpilot.selfdrive.modeld.signal_color_shadow import requested
+    return requested()
+  except Exception:
+    return False
+
 def enable_tlvd(started, params, CP: car.CarParams) -> bool:
   # On-device traffic-light detector: onroad only and off by default. It also
   # requires traffic-light detection (TrafficLightDetectMode) to be on, so
   # turning that off in Carrot Web stops tlvd at the next manager pass.
   try:
     return (started and params.get_int("CarrotTlvMode") >= 1
-            and params.get_int("TrafficLightDetectMode") >= 1)
+            and params.get_int("TrafficLightDetectMode") >= 1
+            and not _signal_color_requested())
   except Exception:
     return False
 

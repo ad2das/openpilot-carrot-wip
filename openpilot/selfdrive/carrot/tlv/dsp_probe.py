@@ -213,9 +213,19 @@ def progress_path(result_path: str) -> str:
   return os.path.splitext(result_path)[0] + ".progress"
 
 
+def _signal_color_requested() -> bool:
+  # The opt-in signal-color observer owns the camera on /data. The TLV probe
+  # must never run alongside it; missing module/file means not requested.
+  try:
+    from openpilot.selfdrive.modeld.signal_color_shadow import requested
+    return requested()
+  except Exception:
+    return False
+
+
 def should_run(started: bool, params) -> bool:
   """Manager enable condition: onroad, TLV enabled, no result, not latched."""
-  if not started or _probe_disabled_by_lost_attempts:
+  if not started or _probe_disabled_by_lost_attempts or _signal_color_requested():
     return False
   try:
     if params.get_int("CarrotTlvMode") < 1 or params.get_int("TrafficLightDetectMode") < 1:

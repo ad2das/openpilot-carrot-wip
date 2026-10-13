@@ -11,7 +11,9 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
+import types
 from types import SimpleNamespace
 
 import numpy as np
@@ -171,6 +173,24 @@ def test_should_run_false_when_latched(probe_root, monkeypatch):
   monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", True)
   params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is False
+
+
+def _install_fake_signal_color_module(monkeypatch, requested):
+  module = types.ModuleType("openpilot.selfdrive.modeld.signal_color_shadow")
+  module.requested = lambda: requested
+  monkeypatch.setitem(sys.modules, "openpilot.selfdrive.modeld.signal_color_shadow", module)
+
+
+def test_should_run_disabled_when_signal_color_requested(probe_root, monkeypatch):
+  _install_fake_signal_color_module(monkeypatch, True)
+  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  assert dsp_probe.should_run(True, params) is False
+
+
+def test_should_run_unchanged_when_signal_color_not_requested(probe_root, monkeypatch):
+  _install_fake_signal_color_module(monkeypatch, False)
+  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  assert dsp_probe.should_run(True, params) is True
 
 
 def test_result_and_latch_paths_use_short_commit(probe_root):
