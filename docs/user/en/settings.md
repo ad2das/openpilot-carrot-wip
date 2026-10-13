@@ -183,7 +183,7 @@ Hyundai/Kia/Genesis angle-control vehicles use the former combined mode 3 as sta
 
 Force-sensor trends do not establish loss of hand contact or driver consent to handover. Existing `steeringPressed` and driver monitoring remain unchanged. Making this behavior standard does not establish the same steering feel on every vehicle.
 
-### Speed and deceleration — 23 settings
+### Speed and deceleration — 24 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
@@ -191,7 +191,7 @@ Force-sensor trends do not establish loss of hand contact or driver consent to h
 | [Road speed limit](speed-deceleration.md#road-speed-limit) | `AutoRoadSpeedLimitOffset`, `AutoRoadSpeedAdjust`, `AutoSpeedUptoRoadSpeedLimit` | Desired-speed adjustment from the road limit |
 | [Speed bumps](speed-deceleration.md#speed-bump) | `AutoNaviSpeedBumpTime`, `AutoNaviSpeedBumpSpeed`, `AutoNaviSpeedBumpEndDistance` | Completion time, crossing speed, and early-release distance |
 | [Curves and turns](speed-deceleration.md#curve-turn) | `AutoCurveSpeedFactor`, `AutoCurveSpeedLowerLimit`, `TurnSpeedControlMode`, `MapTurnSpeedFactor`, `ApplyModelSpeed` | Curve slowing from curvature and distance, prompt recovery after confirmed easing, and route-turn speed |
-| [Traffic lights](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust` | Stop/go detection, stop-position adjustment, and automatic stopped-vehicle alignment |
+| [Traffic lights](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust`, `CarrotTlvMode` | Stop/go detection, stop-position adjustment, and automatic stopped-vehicle alignment |
 
 `AutoNaviSpeedCtrlMode` is `0` off, `1` fixed speed cameras, `2` cameras plus speed bumps, or `3` those events plus mobile-camera events.
 
@@ -202,6 +202,8 @@ While external navigation is connected, deceleration, countdowns, and navigation
 `AutoNaviSpeedDecelRate` defaults to `120` (1.20 m/s²); a lower value begins slowing farther away. Updating the software does not change an existing saved value. `AutoNaviSpeedSafetyFactor` applies a percentage of the event limit as the target. Before tuning either value, confirm that the event type, limit, and remaining distance are being received correctly.
 
 `TrafficLightDetectMode` is `0` off, `1` stop detection, or `2` stop and go detection. This is model-based assistance; the driver must always verify the signal.
+
+`CarrotTlvMode` is `0` off or `1` record and DSP test. It has no effect on driving control.
 
 ### Cruise and following gap — 29 settings overall, 26 on Hyundai/Kia/Genesis
 

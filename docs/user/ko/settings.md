@@ -183,7 +183,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 힘 센서의 추세는 손 접촉 해제나 운전자의 인계 동의를 뜻하지 않습니다. 기존 `steeringPressed` 판정과 운전자 감시는 그대로이며, 기본 적용이 모든 차량에서 동일한 조향감을 보장하지는 않습니다.
 
-### 속도·감속 — 23개
+### 속도·감속 — 24개
 
 아래 표의 **세부 구역 제목을 누르면** 카메라 감속 계산, 제한속도 연동과 커브·신호 로직을 설명한 페이지로 이동합니다.
 
@@ -193,7 +193,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 | [도로 제한속도](speed-deceleration.md#road-speed-limit) | `AutoRoadSpeedLimitOffset`, `AutoRoadSpeedAdjust`, `AutoSpeedUptoRoadSpeedLimit` | 도로 제한속도에 맞춘 목표 속도 조절 |
 | [과속방지턱](speed-deceleration.md#speed-bump) | `AutoNaviSpeedBumpTime`, `AutoNaviSpeedBumpSpeed`, `AutoNaviSpeedBumpEndDistance` | 방지턱 감속 완료 시점, 통과 속도와 조기 종료 거리 |
 | [커브·턴](speed-deceleration.md#curve-turn) | `AutoCurveSpeedFactor`, `AutoCurveSpeedLowerLimit`, `TurnSpeedControlMode`, `MapTurnSpeedFactor`, `ApplyModelSpeed` | 곡률·남은 거리 기반 감속, 회전 완화 확인 후 빠른 복구와 경로 턴 속도 |
-| [신호감지](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust` | 신호 정지·출발 감지, 정지 위치 및 정지차 기준 자동 보정 |
+| [신호감지](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust`, `CarrotTlvMode` | 신호 정지·출발 감지, 정지 위치 및 정지차 기준 자동 보정 |
 
 `AutoNaviSpeedCtrlMode`는 `0` 미사용, `1` 과속카메라, `2` 과속카메라+방지턱, `3` 과속카메라+방지턱+이동식카메라입니다.
 
@@ -204,6 +204,8 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 `AutoNaviSpeedDecelRate`의 기본값은 `120`(1.20m/s²)이며, 값이 낮을수록 더 먼 거리에서 감속을 시작합니다. 기존 저장값은 업데이트만으로 변경되지 않습니다. `AutoNaviSpeedSafetyFactor`는 감속 목표에 적용하는 제한속도 비율입니다. 감속이 이상하면 값부터 바꾸지 말고 이벤트 종류, 제한속도와 남은 거리가 정상 수신되는지 먼저 확인하세요.
 
 `TrafficLightDetectMode`는 `0` 미사용, `1` 정지만 감지, `2` 정지와 출발을 모두 감지합니다. 모델 판단에 의존하므로 운전자가 항상 직접 확인해야 합니다.
+
+`CarrotTlvMode`는 `0` 끔, `1` 기록·DSP 시험입니다. 주행 제어에는 영향이 없습니다.
 
 ### 크루즈·차간 — 전체 29개, 현대·기아·제네시스 26개
 

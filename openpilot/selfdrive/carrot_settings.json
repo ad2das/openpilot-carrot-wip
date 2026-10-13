@@ -275,6 +275,7 @@
               "zh": "信号灯",
               "params": [
                 "TrafficLightDetectMode",
+                "CarrotTlvMode",
                 "TrafficStopDistanceAdjust"
               ]
             }
@@ -3442,6 +3443,22 @@
       "min": 0,
       "max": 2,
       "default": 2,
+      "unit": 1
+    },
+    {
+      "group": "감속제어",
+      "name": "CarrotTlvMode",
+      "title": "신호등 비전 인식(실험)",
+      "descr": "0:끔\n 1:기록·DSP시험 (주행에는 영향 없음, 신호감지 기능이 꺼져 있으면 동작 안 함)",
+      "egroup": "SPEED",
+      "etitle": "Vision traffic lights (experimental)",
+      "edescr": "0:Off, 1:Record & DSP test (no effect on driving; needs TrafficLightDetectMode)",
+      "cgroup": "速度控制",
+      "ctitle": "视觉红绿灯识别(实验)",
+      "cdescr": "0: 关闭, 1: 记录·DSP测试 (不影响驾驶)",
+      "min": 0,
+      "max": 1,
+      "default": 0,
       "unit": 1
     },
     {

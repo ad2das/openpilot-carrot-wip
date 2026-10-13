@@ -330,6 +330,17 @@ There is one vehicle-relative exception. During an E2E stop with no active `lead
 
 Adjust by 100 (1 m) at a time under comparable no-lead signal stops, because the automatic vehicle-relative correction can take priority when a stopped vehicle is present. If false signal detection is the problem, diagnose the mode/model decision instead of the distance offset.
 
+### `CarrotTlvMode`
+
+This experimental feature recognizes traffic lights directly with the C3X front camera. It is not used for driving control yet.
+
+- `0` Off (default)
+- `1` Record & DSP test: runs traffic-light recognition in the background at low priority and records traffic-light scenes as training photos. Recording is capped at 1 GB and stops when less than 5 GB of free storage remains. No location data is recorded, and you can download or delete the photos from the Carrot Web `/tlv_rec` page.
+
+With the car parked in P and the ignition on, waiting about three minutes runs the DSP test once automatically. Progress is shown at the top of the screen, and changing gear or moving the car stops it immediately. Check the result on the `/tlv_rec` page and rerun the test from the same page.
+
+When `TrafficLightDetectMode` is `0`, this setting does nothing regardless of its value. If device load causes repeated restarts within a short time, it automatically returns to `0`.
+
 ## Quick troubleshooting
 
 | Symptom | Check first |
