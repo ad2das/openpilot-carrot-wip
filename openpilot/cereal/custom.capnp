@@ -296,9 +296,10 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 		error @3;
 	}
 
+	# Not far/near: C++ would emit FAR, which libjpeg defines as a macro.
 	enum View {
-		far @0;
-		near @1;
+		farView @0;
+		nearView @1;
 	}
 
 	enum State {

@@ -52,6 +52,7 @@ STATS_INTERVAL_S = 10.0
 ERROR_LOG_INTERVAL_S = 10.0
 RECORDER_RETRY_S = 60.0
 MAX_PUBLISHED_DETS = 16
+CAPNP_VIEW = {"far": "farView", "near": "nearView"}
 # Crash-loop guard: more than this many starts inside the window turns
 # CarrotTlvMode off so a struggling device cannot keep relaunching tlvd.
 CRASH_LOOP_MAX_STARTS = 5
@@ -438,7 +439,7 @@ class TlvRunner:
     out = msg.carrotTlv
     out.status = status
     out.suspendReason = reason
-    out.view = self.last_view
+    out.view = CAPNP_VIEW[self.last_view]
     out.inferMs = float(self.pipeline.infer_ms)
     out.procMs = float(self.pipeline.proc_ms)
     out.droppedFrames = int(self.dropped)
