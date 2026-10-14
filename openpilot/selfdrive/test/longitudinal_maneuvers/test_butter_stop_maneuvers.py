@@ -14,13 +14,16 @@ the scenario definitions. Simulation only; no vehicle validation.
 PASS criteria (enforced by _case_failures):
 - ALL scenarios: no collision; hold_creep <= 0.05 m (when stopped); final_gap_on >= min(3.0, final_gap_off) − 1e-9.
 - Normal (groups a/b/c, not gated): stopped; |gap_on − gap_off| <= 0.30; soft_on <= 0.30 OR
-  soft_on <= 0.70 × soft_off; peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81).
+  soft_on <= 0.70 × soft_off; peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81);
+  whole-run peak |jerk| ON <= max(OFF + 0.1, 0.81).
 - Gated (groups a/b/c, floor never active): stopped; gap_off − 0.10 <= gap_on <= gap_off + D_EXTRA + 0.20
   (stopping further back is the safe direction when the floor is gated off); soft_on <= soft_off + 0.05;
-  peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81).
-- Safety s1/s3/s3b/s3c: gap_on >= gap_off − 0.30 and min_gap_on >= min(3.0, min_gap_off) − 0.10.
-  s3/s3b/s3c additionally: peak_jerk_last_1.5s ON <= max(OFF + 0.2, 0.81) (smoothness under noise).
-  s2: min_gap_on >= min(3.0, min_gap_off) − 0.10; whole-run peak |jerk| ON <= OFF + 0.2 (add metric
+  peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81);
+  whole-run peak |jerk| ON <= max(OFF + 0.1, 0.81).
+- Safety s1/s3/s3b/s3c: gap_on >= gap_off − 0.30 and min_gap_on >= min(3.0, min_gap_off) − 0.10;
+  s3/s3b/s3c additionally: peak_jerk_last_1.5s ON <= max(OFF + 0.2, 0.81) (smoothness under noise);
+  whole-run peak |jerk| ON <= max(OFF + 0.1, 0.81).
+  s2: min_gap_on >= min(3.0, min_gap_off) − 0.10; whole-run peak |jerk| ON <= OFF + 0.2 (metric
   `peak_jerk_run_abs`); `stopped` not required.
 
 A scenario is gated when the ON run has floor_active_steps == 0. A scenario
@@ -484,6 +487,11 @@ def _case_failures(group, off_metrics, on_metrics):
         fails.append(f"{title}: missing peak jerk")
       elif on_jerk > limit + 1e-9:
         fails.append(f"{title}: ON peak jerk last 1.5 s {on_jerk} > max(OFF {off_jerk} + 0.2, 0.81)")
+    off_run_jerk = off_metrics["peak_jerk_run_abs"]
+    on_run_jerk = on_metrics["peak_jerk_run_abs"]
+    run_limit = max(off_run_jerk + 0.1, 0.81)
+    if on_run_jerk > run_limit + 1e-9:
+      fails.append(f"{title}: ON peak |jerk| run {on_run_jerk} > max(OFF {off_run_jerk} + 0.1, 0.81)")
     return fails
 
   if group == "s2":
@@ -523,6 +531,11 @@ def _case_failures(group, off_metrics, on_metrics):
     fails.append(f"{title}: missing peak jerk")
   elif on_jerk > max(off_jerk + 0.1, 0.81) + 1e-9:
     fails.append(f"{title}: ON peak jerk {on_jerk} > max(OFF {off_jerk} + 0.1, 0.81)")
+  off_run_jerk = off_metrics["peak_jerk_run_abs"]
+  on_run_jerk = on_metrics["peak_jerk_run_abs"]
+  run_limit = max(off_run_jerk + 0.1, 0.81)
+  if on_run_jerk > run_limit + 1e-9:
+    fails.append(f"{title}: ON peak |jerk| run {on_run_jerk} > max(OFF {off_run_jerk} + 0.1, 0.81)")
   return fails
 
 
@@ -583,12 +596,15 @@ _SWEEP_CRITERIA = [
   "a/b/c normal: |gap_on - gap_off| <= 0.30 m",
   "a/b/c normal: soft_on <= 0.30 or soft_on <= 0.70 x soft_off",
   "a/b/c normal: peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81)",
+  "a/b/c normal: peak_jerk_run ON <= max(OFF + 0.1, 0.81)",
   "a/b/c gated: stopped",
   "a/b/c gated: gap_off - 0.10 <= gap_on <= gap_off + D_EXTRA + 0.20",
   "a/b/c gated: soft_on <= soft_off + 0.05",
   "a/b/c gated: peak_jerk_on <= max(peak_jerk_off + 0.1, 0.81)",
+  "a/b/c gated: peak_jerk_run ON <= max(OFF + 0.1, 0.81)",
   "s1/s3/s3b/s3c: gap_on >= gap_off - 0.30 and min_gap_on >= min(3.0, min_gap_off) - 0.10",
   "s3/s3b/s3c: peak_jerk_last_1.5s ON <= max(OFF + 0.2, 0.81)",
+  "s1/s3/s3b/s3c: peak_jerk_run ON <= max(OFF + 0.1, 0.81)",
   "s2: min_gap_on >= min(3.0, min_gap_off) - 0.10",
   "s2: peak_jerk_run_abs ON <= OFF + 0.2",
 ]

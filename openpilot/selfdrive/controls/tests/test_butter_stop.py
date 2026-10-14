@@ -518,11 +518,38 @@ def test_stopping_state_floor_limits_braking_and_does_not_accumulate(monkeypatch
   control.last_output_accel = -2.0
   cs, plan, radar = stopping_inputs(v_ego=1.0)
   floor = butter_floor(1.0, PLAN_T, plan.speeds, radar.leadOne, 5.5)
+  # Seeded activation: the floor starts at min(applied, raw) and never rises
+  # faster than FLOOR_RELAX_JERK*DT, so appearing mid-braking cannot release.
+  prev = -2.0
   for _ in range(10):
     accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
-    assert accel == pytest.approx(floor)
+    assert accel >= prev - 1e-9
+    assert accel <= prev + FLOOR_RELAX_JERK * lc.DT_CTRL + 1e-9
+    assert control.butter_floor_last <= floor + 1e-9
+    prev = accel
+  assert control.butter_floor_last > -2.0
   # The stored value is the floored one, so the one-way ramp never drills below.
-  assert control.last_output_accel == pytest.approx(floor)
+  assert control.last_output_accel == pytest.approx(prev)
+
+
+def test_floor_activation_seeds_slew_from_applied_accel(monkeypatch):
+  # Floor appears while the car is braking at -1.0 with a raw floor of -0.3:
+  # the seeded slew must relax the applied floor by at most
+  # FLOOR_RELAX_JERK * DT_CTRL per step instead of adopting -0.3 instantly.
+  control, _ = make_control(monkeypatch)
+  control.long_control_state = LongCtrlState.stopping
+  control.last_output_accel = -1.0
+  cs, plan, radar = stopping_inputs(v_ego=1.0)
+  monkeypatch.setattr(lc, "butter_floor", lambda *a, **k: -0.3)
+  floor_values = []
+  for _ in range(10):
+    control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+    floor_values.append(control.butter_floor_last)
+  # Seeded at min(-1.0, -0.3) and rate-limited from there.
+  assert floor_values[0] == pytest.approx(-1.0 + FLOOR_RELAX_JERK * lc.DT_CTRL)
+  rises = np.diff([-1.0, *floor_values])
+  assert np.all(rises <= FLOOR_RELAX_JERK * lc.DT_CTRL + 1e-9)
+  assert floor_values[-1] < -0.3 + 1e-9
 
 
 def test_stopping_state_without_floor_keeps_original_ramp(monkeypatch):

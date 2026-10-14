@@ -274,8 +274,17 @@ class LongControl:
       # One-way floor slew: tightening (more negative) is instant, relaxing
       # (rising toward 0) is rate-limited at FLOOR_RELAX_JERK so radar noise
       # cannot flap the applied braking; that constant is read at call time so
-      # the tuning sweep can patch it.
-      butter_floor_value = butter_stop_module.slew_floor(self._butter_floor_prev, butter_floor_raw_value)
+      # the tuning sweep can patch it. On first activation (prev None) the slew
+      # is seeded with the previously applied accel, so the floor starts at or
+      # below what the car was already doing and relaxes at the same rate.
+      floor_prev = self._butter_floor_prev
+      if floor_prev is None and butter_floor_raw_value is not None:
+        try:
+          applied = float(self.last_output_accel)
+        except (TypeError, ValueError):
+          applied = float("nan")
+        floor_prev = min(applied, butter_floor_raw_value) if math.isfinite(applied) else butter_floor_raw_value
+      butter_floor_value = butter_stop_module.slew_floor(floor_prev, butter_floor_raw_value)
       self._butter_floor_prev = butter_floor_value
     else:
       self._butter_floor_prev = None
