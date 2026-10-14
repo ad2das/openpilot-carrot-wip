@@ -1,6 +1,9 @@
 """ButterStop: speed-tapered final stop floor and standstill creep guard.
 
-The taper only ever limits how hard braking may build up below V_TAPER. All
+The taper only ever limits how hard braking may build up below V_TAPER. The
+stop target is the plan's own stop point (the MPC is not shifted): the floor
+may soften the final braking only as far as the plan's remaining stop distance
+allows, so the car still stops where it would without ButterStop. All
 standstill hold/release logic lives unchanged in the LongControl stopping
 state machine; this module provides the bounded floor and the creep guard
 constants used there.
@@ -14,9 +17,7 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 V_TAPER = 3.0
 A_END = 0.25
 K_TAPER = 0.4
-D_EXTRA = 1.0
-MARGIN_BASE = 0.2
-MARGIN_V_SLOPE = 0.15
+MARGIN = 0.2
 MIN_FINAL_GAP_SLACK = 0.6
 MIN_FINAL_GAP_ABS = 3.0
 STANDSTILL_V = 0.05
@@ -51,7 +52,12 @@ def plan_stop_distance(plan_t, plan_speeds):
 
 
 def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
-  """Most-negative allowed acceleration at v_ego, or None to let the plan win."""
+  """Most-negative allowed acceleration at v_ego, or None to let the plan win.
+
+  The kinematic term uses only the plan's own remaining stop distance minus
+  MARGIN, so the taper can soften the final braking only while that distance
+  still allows stopping at the plan's stop point; it never moves the stop.
+  """
   if not math.isfinite(v_ego) or v_ego <= 0.0:
     return None
   if stop_distance_orig is None or not math.isfinite(stop_distance_orig) or stop_distance_orig < 0.0:
@@ -59,7 +65,7 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
   dist = plan_stop_distance(plan_t, plan_speeds)
   if dist is None:
     return None
-  avail = dist + D_EXTRA - (MARGIN_BASE + MARGIN_V_SLOPE * v_ego)
+  avail = dist - MARGIN
   if lead is not None and getattr(lead, "status", False):
     try:
       d_rel = float(lead.dRel)

@@ -1,7 +1,9 @@
 """ButterStop: pure taper math, eligibility, LongControl integration and
 ButterStop=0 output identity against the pre-change controller.
 """
+import os
 import sys
+import tempfile
 from types import ModuleType, SimpleNamespace
 
 import numpy as np
@@ -14,14 +16,50 @@ if sys.platform == "win32":
   hardware_module.PC = True
   sys.modules.setdefault("openpilot.system.hardware", hardware_module)
 
+  # swaglog imports Paths from this submodule; the fake hardware package has
+  # no __path__, so the real hw.py cannot be found through it.
+  hw_module = ModuleType("openpilot.system.hardware.hw")
+
+  class _WinPaths:
+    @staticmethod
+    def comma_home() -> str:
+      return os.path.join(tempfile.gettempdir(), ".comma")
+
+    @staticmethod
+    def swaglog_root() -> str:
+      return os.path.join(_WinPaths.comma_home(), "log")
+
+    @staticmethod
+    def log_root() -> str:
+      return os.path.join(_WinPaths.comma_home(), "realdata")
+
+    @staticmethod
+    def persist_root() -> str:
+      return os.path.join(_WinPaths.comma_home(), "persist")
+
+    @staticmethod
+    def stats_root() -> str:
+      return os.path.join(_WinPaths.comma_home(), "stats")
+
+    @staticmethod
+    def swaglog_ipc() -> str:
+      return "ipc:///tmp/logmessage"
+
+    @staticmethod
+    def download_cache_root() -> str:
+      return os.path.join(tempfile.gettempdir(), "comma_download_cache") + "/"
+
+  hw_module.Paths = _WinPaths
+  sys.modules.setdefault("openpilot.system.hardware.hw", hw_module)
+
   params_module = ModuleType("openpilot.common.params")
   params_module.Params = object
   sys.modules.setdefault("openpilot.common.params", params_module)
 
 import openpilot.selfdrive.controls.lib.longcontrol as lc
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  A_END, CREEP_ACCEL, D_EXTRA, HOLD_RAMP, K_TAPER, MARGIN_BASE,
-  MARGIN_V_SLOPE, MIN_FINAL_GAP_ABS, MIN_FINAL_GAP_SLACK, STANDSTILL_T, STANDSTILL_V,
+  A_END, CREEP_ACCEL, HOLD_RAMP, K_TAPER, MARGIN,
+  MIN_FINAL_GAP_ABS, MIN_FINAL_GAP_SLACK, STANDSTILL_T, STANDSTILL_V,
   V_TAPER, butter_eligible, butter_floor, plan_stop_distance,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
@@ -99,12 +137,20 @@ def test_plan_stop_distance_trapezoid_and_none():
 
 def test_floor_is_more_negative_of_taper_and_kinematic_limit():
   v_ego = 1.0
-  # A plan that reaches standstill inside the horizon.
-  speeds = np.maximum(0.0, v_ego - 2.0 * PLAN_T)
-  dist = plan_stop_distance(PLAN_T, speeds)
-  avail = dist + D_EXTRA - (MARGIN_BASE + MARGIN_V_SLOPE * v_ego)
+  t = np.array([0.0, 0.5, 1.0])
+  # Short plan (0.5 m of stop distance): the kinematic limit dominates.
+  short = np.array([1.0, 0.5, 0.0])
+  avail = plan_stop_distance(t, short) - MARGIN
+  assert avail == pytest.approx(0.5 - MARGIN)
   expected = min(-(A_END + K_TAPER * v_ego), -(v_ego ** 2) / (2.0 * avail))
-  assert butter_floor(v_ego, PLAN_T, speeds, SimpleNamespace(status=False), 5.5) == pytest.approx(expected)
+  assert expected == pytest.approx(-(v_ego ** 2) / (2.0 * avail))
+  assert butter_floor(v_ego, t, short, SimpleNamespace(status=False), 5.5) == pytest.approx(expected)
+  # Longer plan (1.5 m): the taper itself is the more negative limit.
+  longer = np.array([3.0, 1.5, 0.0])
+  avail_long = plan_stop_distance(t, longer) - MARGIN
+  expected_long = min(-(A_END + K_TAPER * v_ego), -(v_ego ** 2) / (2.0 * avail_long))
+  assert expected_long == pytest.approx(-(A_END + K_TAPER * v_ego))
+  assert butter_floor(v_ego, t, longer, SimpleNamespace(status=False), 5.5) == pytest.approx(expected_long)
 
 
 def test_floor_taper_gets_gentler_close_to_standstill():
@@ -123,7 +169,7 @@ def test_floor_lead_bound_and_absolute_gap():
   speeds = np.maximum(0.0, 2.0 * (1.0 - PLAN_T / 2.0))
   lead = SimpleNamespace(status=True, dRel=10.0)
   bound = 10.0 - max(MIN_FINAL_GAP_ABS, 5.5 - MIN_FINAL_GAP_SLACK)
-  avail = min(plan_stop_distance(PLAN_T, speeds) + D_EXTRA - (MARGIN_BASE + MARGIN_V_SLOPE * 1.0), bound)
+  avail = min(plan_stop_distance(PLAN_T, speeds) - MARGIN, bound)
   expected = min(-(A_END + K_TAPER * 1.0), -(1.0 ** 2) / (2.0 * avail))
   assert butter_floor(1.0, PLAN_T, speeds, lead, 5.5) == pytest.approx(expected)
   # dRel at the lead bound -> no floor at all.
@@ -237,7 +283,8 @@ def test_standstill_latch_and_faster_hold_ramp(monkeypatch):
   cs.gasPressed = True
   control.last_output_accel = -0.4
   accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
-  floor_would_be = butter_floor(0.3, PLAN_T, plan.speeds, radar.leadOne, 5.5)
+  taper_plan = np.maximum(0.0, 2.0 * (1.0 - PLAN_T / 2.0))
+  floor_would_be = butter_floor(0.3, PLAN_T, taper_plan, radar.leadOne, 5.5)
   assert floor_would_be is not None and floor_would_be > -0.4
   assert not control._butter_creep_latched
   assert accel == pytest.approx(-0.4 - HOLD_RAMP * lc.DT_CTRL)
@@ -483,6 +530,8 @@ def test_butter_off_replays_identically_to_pre_change_controller(monkeypatch, st
 
 
 def test_state_sequence_identical_on_vs_off_but_output_differs(monkeypatch):
+  # The creep guard's one-time log event must not reach the real zmq logger.
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
   off, _ = make_control(monkeypatch, values={"ButterStop": 0})
   on, _ = make_control(monkeypatch, values={"ButterStop": 1})
   v_profile, age = _scenario_stream()

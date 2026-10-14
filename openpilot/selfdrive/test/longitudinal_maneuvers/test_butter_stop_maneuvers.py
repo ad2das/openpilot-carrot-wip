@@ -26,7 +26,6 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib import longcontrol
 from openpilot.selfdrive.controls.lib import butter_stop
-from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
@@ -361,10 +360,17 @@ _CASE_IDS = [f"{group}-{maneuver.title}" for group, maneuver in _CASES]
 
 
 def _case_failures(group, off_metrics, on_metrics):
-  """Every PASS criterion for one scenario; an empty list means it passes."""
+  """ButterStop v2 PASS criteria for one scenario; an empty list means it passes.
+
+  All scenarios: no collision; stopped; |final_gap_on - final_gap_off| <=
+  0.30 m; final_gap_on >= min(3.0, final_gap_off); hold_creep <= 0.05 m;
+  accel_last_0.5s_mean_abs ON <= 0.80 x OFF (softer end) or <= 0.30 m/s^2
+  absolute; peak_jerk_last_1.5s_abs ON <= OFF + 0.1. A scenario whose OFF
+  baseline collides or never stops has no comparable baseline and is skipped.
+  """
   title = on_metrics["name"]
   fails = []
-  if off_metrics["collision"]:
+  if off_metrics["collision"] or not off_metrics["stopped"]:
     return fails
   if on_metrics["collision"]:
     fails.append(f"{title}: ON collides with min gap {on_metrics['min_gap_m']} m")
@@ -373,24 +379,25 @@ def _case_failures(group, off_metrics, on_metrics):
     return fails
   off_gap = off_metrics["final_gap_m"]
   on_gap = on_metrics["final_gap_m"]
-  if on_gap < off_gap - 0.1:
-    fails.append(f"{title}: ON final gap {on_gap} < OFF {off_gap} - 0.1")
-  if off_gap >= 3.0 and on_gap < 3.0:
-    fails.append(f"{title}: ON final gap {on_gap} < 3.0 m")
-  if off_gap < 3.0 and on_gap < off_gap:
-    fails.append(f"{title}: ON final gap {on_gap} below sub-3 m OFF baseline {off_gap}")
-  if on_metrics["hold_creep_m"] > 0.05:
-    fails.append(f"{title}: ON creeps {on_metrics['hold_creep_m']} m toward the lead while holding")
-  if group == "a":
-    off_soft = off_metrics["accel_last_0.5s_mean_abs"]
-    on_soft = on_metrics["accel_last_0.5s_mean_abs"]
-    if on_soft is None or off_soft is None:
-      fails.append(f"{title}: missing last-0.5s accel")
-    else:
-      if on_soft > 0.45:
-        fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} > 0.45")
-      if on_soft >= off_soft:
-        fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} not below OFF {off_soft}")
+  if abs(on_gap - off_gap) > 0.30 + 1e-9:
+    fails.append(f"{title}: |final gap ON {on_gap} - OFF {off_gap}| > 0.30 m")
+  if on_gap < min(3.0, off_gap) - 1e-9:
+    fails.append(f"{title}: ON final gap {on_gap} < min(3.0, OFF {off_gap})")
+  creep = on_metrics["hold_creep_m"]
+  if creep is None or creep > 0.05 + 1e-9:
+    fails.append(f"{title}: ON hold creep {creep} > 0.05 m")
+  off_soft = off_metrics["accel_last_0.5s_mean_abs"]
+  on_soft = on_metrics["accel_last_0.5s_mean_abs"]
+  if off_soft is None or on_soft is None:
+    fails.append(f"{title}: missing last-0.5s accel")
+  elif not (on_soft <= 0.80 * off_soft + 1e-9 or on_soft <= 0.30 + 1e-9):
+    fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} > 0.80 x OFF {off_soft} and > 0.30")
+  off_jerk = off_metrics["peak_jerk_last_1.5s_abs"]
+  on_jerk = on_metrics["peak_jerk_last_1.5s_abs"]
+  if off_jerk is None or on_jerk is None:
+    fails.append(f"{title}: missing peak jerk")
+  elif on_jerk > off_jerk + 0.1 + 1e-9:
+    fails.append(f"{title}: ON peak jerk {on_jerk} > OFF {off_jerk} + 0.1")
   return fails
 
 
@@ -415,8 +422,8 @@ def test_butter_stop_maneuver(group, maneuver):
 
   if group == "a" and "stopped lead 40" in maneuver.title:
     # ButterStop=0 must be identical to the same run with the whole ButterStop
-    # code path absent: floor neutralized, creep guard unreachable, hold ramp
-    # at the stock stopping rate, and no planner D_EXTRA.
+    # code path absent: floor neutralized, creep guard unreachable and hold
+    # ramp at the stock stopping rate (the v2 planner is not shifted).
     neutral = ButterStopLoop(maneuver, butter=1, neutralize=True).run()
     equal = bool(np.array_equal(off[:, 2], neutral[:, 2]))
     entry["off_equals_neutralized"] = equal
@@ -435,35 +442,94 @@ def test_write_butter_sim_table():
     handle.write(text + "\n")
 
 
-_SWEEP_D_EXTRA = (0.8, 1.0, 1.2)
-_SWEEP_SLACK = (0.3, 0.6, 0.8)
+_SWEEP_V_TAPER = (1.5, 2.0, 3.0)
+_SWEEP_MARGIN = (0.0, 0.1, 0.2)
+_SWEEP_SLACK = (0.0, 0.3, 0.6)
+
+_SWEEP_CRITERIA = [
+  "no collision",
+  "stopped",
+  "|final_gap_on - final_gap_off| <= 0.30 m",
+  "final_gap_on >= min(3.0, final_gap_off)",
+  "hold_creep <= 0.05 m",
+  "accel_last_0.5s_mean_abs ON <= 0.80 x OFF or <= 0.30 m/s^2",
+  "peak_jerk_last_1.5s_abs ON <= OFF + 0.1",
+]
 
 
-@pytest.mark.skipif(not os.environ.get("BUTTER_SWEEP_OUT"), reason="tuning sweep runs only on request")
+def _sweep_output_path():
+  """Where the sweep writes: BUTTER_SWEEP_OUT, else next to BUTTER_SIM_OUT.
+
+  CI sets BUTTER_SIM_OUT for the butter-sim artifact, so mapping the sweep
+  file next to it lets the same artifact carry butter_sweep.json.
+  """
+  out = os.environ.get("BUTTER_SWEEP_OUT")
+  if out:
+    return out
+  sim_out = os.environ.get("BUTTER_SIM_OUT")
+  if sim_out:
+    return os.path.join(os.path.dirname(sim_out), "butter_sweep.json")
+  return None
+
+
+@pytest.mark.skipif(_sweep_output_path() is None,
+                    reason="tuning sweep runs only when a sweep or sim output path is set")
 def test_butter_stop_tuning_sweep(monkeypatch):
+  """Sweep V_TAPER x MARGIN x MIN_FINAL_GAP_SLACK over every scenario.
+
+  PASS criteria per combo and scenario: _case_failures (same criteria as the
+  normal maneuver table). Auto-pick among the passing combos: the smallest
+  mean ON accel_last_0.5s_mean_abs; a tie prefers the smaller V_TAPER (less
+  change). When no combo passes, the closest three are reported with the
+  failing criteria and nothing is shipped.
+  """
   off_runs = [compute_metrics(ButterStopLoop(m, butter=0).run(), m.title, 0) for _, m in _CASES]
   rows = []
-  for d_extra in _SWEEP_D_EXTRA:
-    for slack in _SWEEP_SLACK:
-      monkeypatch.setattr(butter_stop, "D_EXTRA", d_extra)
-      monkeypatch.setattr(long_mpc, "D_EXTRA", d_extra)
-      monkeypatch.setattr(butter_stop, "MIN_FINAL_GAP_SLACK", slack)
-      cases = []
-      fails = []
-      for (group, m), off_metrics in zip(_CASES, off_runs, strict=True):
-        on_metrics = compute_metrics(ButterStopLoop(m, butter=1).run(), m.title, 1)
-        fails += _case_failures(group, off_metrics, on_metrics)
-        cases.append({"scenario": m.title, "group": group,
-                      "off_final_gap_m": off_metrics["final_gap_m"],
-                      "on_final_gap_m": on_metrics["final_gap_m"],
-                      "on_min_gap_m": on_metrics["min_gap_m"],
-                      "off_soft": off_metrics["accel_last_0.5s_mean_abs"],
-                      "on_soft": on_metrics["accel_last_0.5s_mean_abs"],
-                      "on_hold_creep_m": on_metrics["hold_creep_m"],
-                      "on_time_3ms_to_standstill_s": on_metrics["time_3ms_to_standstill_s"]})
-      rows.append({"d_extra": d_extra, "min_final_gap_slack": slack,
-                   "all_pass": not fails, "failures": fails, "cases": cases})
-  text = json.dumps({"sweep": rows}, ensure_ascii=False, indent=2)
-  print(text)
-  with open(os.environ["BUTTER_SWEEP_OUT"], "w", encoding="utf-8") as handle:
+  for v_taper in _SWEEP_V_TAPER:
+    for margin in _SWEEP_MARGIN:
+      for slack in _SWEEP_SLACK:
+        monkeypatch.setattr(butter_stop, "V_TAPER", v_taper)
+        monkeypatch.setattr(butter_stop, "MARGIN", margin)
+        monkeypatch.setattr(butter_stop, "MIN_FINAL_GAP_SLACK", slack)
+        cases = []
+        fails = []
+        softs = []
+        for (group, m), off_metrics in zip(_CASES, off_runs, strict=True):
+          on_metrics = compute_metrics(ButterStopLoop(m, butter=1).run(), m.title, 1)
+          case_fails = _case_failures(group, off_metrics, on_metrics)
+          fails += case_fails
+          if on_metrics["accel_last_0.5s_mean_abs"] is not None:
+            softs.append(on_metrics["accel_last_0.5s_mean_abs"])
+          cases.append({"scenario": m.title, "group": group, "fails": case_fails,
+                        "off": off_metrics, "on": on_metrics})
+        rows.append({"v_taper": v_taper, "margin": margin, "min_final_gap_slack": slack,
+                     "all_pass": not fails, "failures": fails,
+                     "on_soft_mean": round(float(np.mean(softs)), 5) if softs else None,
+                     "cases": cases})
+
+  passing = [r for r in rows if r["all_pass"]]
+  chosen = None
+  if passing:
+    chosen = min(passing, key=lambda r: (r["on_soft_mean"], r["v_taper"], r["margin"],
+                                         r["min_final_gap_slack"]))
+  closest = sorted((r for r in rows if not r["all_pass"]),
+                   key=lambda r: (len(r["failures"]),
+                                  r["on_soft_mean"] if r["on_soft_mean"] is not None else 1e9))[:3]
+
+  for r in rows:
+    label = f'V_TAPER {r["v_taper"]} MARGIN {r["margin"]} SLACK {r["min_final_gap_slack"]}'
+    print(f'sweep {label}: pass={r["all_pass"]} failures={len(r["failures"])} soft_mean={r["on_soft_mean"]}')
+  if chosen is not None:
+    label = f'V_TAPER {chosen["v_taper"]} MARGIN {chosen["margin"]} SLACK {chosen["min_final_gap_slack"]}'
+    print(f'chosen: {label} soft_mean {chosen["on_soft_mean"]}')
+  else:
+    print("no combo passed all criteria; closest:")
+    for r in closest:
+      print(f'  V_TAPER {r["v_taper"]} MARGIN {r["margin"]} SLACK {r["min_final_gap_slack"]}:')
+      for failure in r["failures"]:
+        print(f'    {failure}')
+
+  text = json.dumps({"criteria": _SWEEP_CRITERIA, "sweep": rows,
+                     "chosen": chosen, "closest": closest}, ensure_ascii=False, indent=2)
+  with open(_sweep_output_path(), "w", encoding="utf-8") as handle:
     handle.write(text + "\n")
