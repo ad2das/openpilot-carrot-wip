@@ -150,8 +150,23 @@ class FramePipeline:
   def has_tracks(self) -> bool:
     return bool(self.tracker.tracks)
 
+  @property
+  def single_class_detector(self) -> bool:
+    return getattr(self.decoder, "num_classes", None) == 1
+
   def _confirmed(self, now: float) -> list[tuple[tracker.Track, int, float]]:
     """Per-track confirmation: classifier votes OR the detector M-of-N belt."""
+    if self.single_class_detector:
+      # Single-class detector (class 0 for every lamp): the detector M-of-N belt
+      # would publish RED for green lights (W115 A6), so only lamp-classifier
+      # votes may confirm. No classifier/NullClassifier -> nothing confirms.
+      out = []
+      for track in self.tracker.tracks:
+        result = track.classifier_confirmed(now)
+        if result is not None:
+          out.append((track, result[0], result[1]))
+      self.tracker.note_red_confirmations(now, out)
+      return out
     if self.classifier is None:
       out = self.tracker.confirmed(self.frame_idx)
     else:
@@ -268,7 +283,7 @@ class FramePipeline:
                           anchor=anchor, crop_box=crop_box, frame_box=frame_box)
     self._classify_tracks(now, geom)
 
-    confirmed_relevant = tracker.select_relevant(
+    confirmed_relevant = tracker.select_relevant_tiered(
       self._confirmed(now), self.frame_idx, image_width=image_width,
       path_x=path_x, path_y=path_y, left_intent=left_intent,
       odo=self.ego.odo if self.ego is not None else None,
@@ -286,7 +301,7 @@ class FramePipeline:
         # graded redLikely state; the state machine stays on confirmed input.
         candidates = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks
                       if int(t.cls) != int(tracker.LampClass.OFF)]
-        candidate = tracker.select_relevant(
+        candidate = tracker.select_relevant_tiered(
           candidates, self.frame_idx, image_width=image_width,
           path_x=path_x, path_y=path_y, left_intent=left_intent,
           odo=self.ego.odo if self.ego is not None else None,

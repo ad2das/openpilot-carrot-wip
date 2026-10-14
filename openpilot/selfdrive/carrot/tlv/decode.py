@@ -1,6 +1,6 @@
 """Decoder interface for TLV model raw outputs.
 
-Real models (the bundled r3b detector, the r8 family) export 6 raw YOLO-style
+Real models (the bundled r8s50a detector, the r8 family) export 6 raw YOLO-style
 heads: `pN_box` / `pN_cls` per level, with Distribution Focal Loss box
 regression (reg_max 16) and either 8 classes (CONTRACT classes) or 1 class
 (single-class detectors, whose class 0 maps to RED on the device).
@@ -142,6 +142,7 @@ class RawHeadDecoder:
     self.score_threshold = float(score_threshold)
     self.iou_threshold = float(iou_threshold)
     self.max_det = int(max_det)
+    self.num_classes: int | None = None
     self._anchor_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
 
   def _anchors_for(self, shapes, strides):
@@ -169,6 +170,8 @@ class RawHeadDecoder:
         shapes.append(box.shape[-2:])
         level_strides.append(2 ** lvl)
         levels.append((box, cls))
+      if levels:
+        self.num_classes = int(levels[0][1].shape[1])
       anchors, strides = self._anchors_for(shapes, level_strides)
       all_boxes, all_scores, all_classes = [], [], []
       off = 0

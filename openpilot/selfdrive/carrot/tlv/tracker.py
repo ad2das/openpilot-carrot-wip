@@ -72,6 +72,10 @@ GO_AFTER_RED_WINDOW_S = 120.0
 # (0.88 vs 0.92; threshold 0.828), so no increase over the old default is
 # warranted; 160 m is the smallest gate at full parity with 240 m (0.92).
 RELEVANT_MAX_DISTANCE_M = 120.0
+# Tiered gate (W115 A5): nearest-path light within 120 m first; only when none
+# qualifies, look at (120, 200] m. W115: s50a + classifier-only, 80 km/h
+# P(confirm >= stop need) 0.94 -> 0.98, 100 km/h 0 -> 0.65, phantom red 0.
+RELEVANT_FAR_MAX_DISTANCE_M = 200.0
 
 # (window frames, required hits). Asymmetric on purpose: red is confirmed fast
 # (safety stop), green is confirmed slowly (never start on a flicker).
@@ -572,6 +576,17 @@ def select_relevant(confirmed: list[tuple[Track, int, float]], frame_idx: int, *
     return None
   best = min(pool, key=lambda entry: (entry[0], entry[1]))
   return best[2], best[3], best[4]
+
+
+def select_relevant_tiered(confirmed: list[tuple[Track, int, float]], frame_idx: int, **kwargs):
+  """select_relevant within RELEVANT_MAX_DISTANCE_M, else in the far tier."""
+  kwargs.pop("max_distance_m", None)
+  kwargs.pop("min_distance_m", None)
+  best = select_relevant(confirmed, frame_idx, **kwargs)
+  if best is not None:
+    return best
+  return select_relevant(confirmed, frame_idx, min_distance_m=RELEVANT_MAX_DISTANCE_M,
+                         max_distance_m=RELEVANT_FAR_MAX_DISTANCE_M, **kwargs)
 
 
 class SignalStateMachine:

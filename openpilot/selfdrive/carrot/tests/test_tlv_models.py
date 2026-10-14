@@ -1,4 +1,4 @@
-"""Tests for the bundled R3b traffic-light models and their default paths."""
+"""Tests for the bundled r8s50a traffic-light models and their default paths."""
 
 import hashlib
 import os
@@ -11,7 +11,7 @@ import pytest
 
 from openpilot.selfdrive.carrot.tlv import backends, dsp_probe, tlvd
 
-DETECTOR_OUTPUT_SHAPES = ((1, 64, 40, 80), (1, 8, 40, 80), (1, 64, 20, 40), (1, 8, 20, 40), (1, 64, 10, 20), (1, 8, 10, 20))
+DETECTOR_OUTPUT_SHAPES = ((1, 64, 40, 80), (1, 1, 40, 80), (1, 64, 20, 40), (1, 1, 20, 40), (1, 64, 10, 20), (1, 1, 10, 20))
 
 
 class FakeParams:

@@ -587,6 +587,8 @@ class TlvRunner:
     duty_text = "n/a" if duty is None else f"{duty * 100.0:.0f}%"
     status, _ = self._status()
     rss_mb = self._rss_bytes / resources.MB
+    decoder_nc = getattr(self.decoder, "num_classes", None)
+    det_nc_text = "-" if decoder_nc is None else str(decoder_nc)
     parts = (
       f"frames={self.processed}",
       f"dropped={self.dropped}",
@@ -595,6 +597,7 @@ class TlvRunner:
       f"duty={duty_text}",
       f"est_det={self.budget.estimate_ms('detect'):.0f}ms",
       f"est_cls={self.budget.estimate_ms('classify'):.0f}ms",
+      f"det_nc={det_nc_text}",
       f"det_hz={self._frame_rate('detect', now):.2f}",
       f"cls_hz={self._frame_rate('classify', now):.2f}",
       f"tail_gated={self.pipeline.tail_gated_total}",

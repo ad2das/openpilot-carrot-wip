@@ -115,7 +115,7 @@ def test_far_to_near_switch_keeps_distance_continuous():
 
 
 def test_pipeline_passes_ego_odometry_to_confirmed_selection():
-  distance_m = 150.0
+  distance_m = 210.0
   geom = geometry("far")
   backend = _StubBackend([model_box_at(distance_m, geom)], [0.9], [int(tracker.LampClass.RED)])
   pipe = pipeline.FramePipeline(backend, decode.PlaceholderDecoder())
@@ -124,9 +124,9 @@ def test_pipeline_passes_ego_odometry_to_confirmed_selection():
                               image_w=W, image_h=H)
   for i in range(3):
     pipe.infer("far", geom, image_width=W, now=0.6 * i)
-  # Stale 150 m anchor: outside the gate, the state machine never sees red.
+  # Stale 210 m anchor: outside both gate tiers, the state machine never sees red.
   assert pipe.last_state == tracker.SignalState.none
-  odo.s = 40.0  # 150 - 40 = 110 m -> the confirmed track becomes relevant
+  odo.s = 40.0  # 210 - 40 = 170 m -> inside the far tier (120, 200] m
   backend.raw = empty_raw()
   out = pipe.infer("far", geom, image_width=W, now=1.8)
   assert out.state == tracker.SignalState.red
@@ -134,7 +134,7 @@ def test_pipeline_passes_ego_odometry_to_confirmed_selection():
 
 
 def test_pipeline_passes_ego_odometry_to_candidate_selection():
-  distance_m = 150.0
+  distance_m = 210.0
   geom = geometry("far")
 
   def run(with_ego):
