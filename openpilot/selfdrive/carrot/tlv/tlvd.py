@@ -9,8 +9,9 @@ Pipeline per processed frame:
 
 Zero-stutter policy (RESOURCE_BUDGET.md, enforced here, not by the scheduler):
   cores 1-3, SCHED_IDLE, nice 19, never config_realtime_process; newest frame
-  only (no queueing; busy frames counted as droppedFrames); thread caps in the
-  environment before numpy loads; strict CPU credit budget at <= 40% of one
+  only (no queueing; busy frames counted as droppedFrames); thread caps set by
+  tlvd_launch before this module's numpy import (main() re-applies them for
+  direct runs); strict CPU credit budget at <= 40% of one
   core of TOTAL process CPU (W99: no 1 Hz floor; frames that cannot afford
   their estimated cost are skipped and counted in skippedBudget, never in
   droppedFrames); /proc/stat cores 1-3 idle guard; RSS soft/hard caps with a
@@ -28,21 +29,15 @@ import os
 import time
 from collections import deque
 
-# Thread caps must be in the environment BEFORE numpy/OpenBLAS/MKL load (numpy
-# arrives through the tlv imports below). One thread for BLAS, and the tinygrad
-# backend additionally caps its own CPU pool at 2 (TinygradCpuBackend).
-os.environ["OMP_NUM_THREADS"] = "1"
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["NUMEXPR_NUM_THREADS"] = "1"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
-
-# Pin tinygrad's default device to CPU before ANY tinygrad import. With DEV
-# unset, Device.DEFAULT probes ALL_DEVICES in order (CUDA/QCOM ahead of CPU,
-# tinygrad_repo/tinygrad/device.py:14,45-51) and opens the first that exists -
-# on TICI the QCOM GPU next to modeld. Overrides any inherited QCOM/CUDA value.
-os.environ["DEV"] = "CPU"
-
+# Thread caps (one thread for BLAS; the tinygrad backend additionally caps its
+# own CPU pool at 2) and DEV=CPU must be in the environment BEFORE this module
+# is imported: numpy/OpenBLAS load through the tlv imports below, and with DEV
+# unset tinygrad's Device.DEFAULT probes ALL_DEVICES in order (CUDA/QCOM ahead
+# of CPU, tinygrad_repo/tinygrad/device.py:14,45-51) and opens the first that
+# exists - on TICI the QCOM GPU next to modeld. tlvd_launch sets both in the
+# spawn child before importing this module; the module level must stay free of
+# os.environ writes so the manager's preimport (process.py:181-187) leaks
+# nothing. main() re-applies setdefaults for direct runs.
 from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, recorder, resources, tracker
 from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNNING, STATUS_SUSPENDED, SuspendWatchdog
 
@@ -709,6 +704,12 @@ def crash_loop_guard(params, now: float) -> bool:
 
 
 def main() -> None:
+  # Direct-run fallback: tlvd_launch sets these before importing this module in
+  # the spawn child; setdefault keeps an explicit parent value for direct runs.
+  for key in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(key, "1")
+  os.environ.setdefault("DEV", "CPU")
   from openpilot.common.params import Params
   params = Params()
   if _param_int(params, "CarrotTlvMode") < 1:
