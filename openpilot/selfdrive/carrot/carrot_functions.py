@@ -181,6 +181,7 @@ class CarrotPlanner:
     self.dynamicTFollowLC = 1.0
     self.speedTFFactor = 10
     self.tFollowDecelBoost = 0.0
+    self.t_follow_danger = self.tFollowGap3
     self._tf_decel_extra = 0.0
     self.personality = 1
 
@@ -356,6 +357,9 @@ class CarrotPlanner:
     # Apply the baseline increase ramp once per planner cycle.
     self._tf_base_last = ramp_t_follow(tf_final, getattr(self, '_tf_base_last', self.t_follow_last), self._tf_decel_extra, DT_MDL)
     self.t_follow_last = float(self._tf_base_last)
+    # The MPC danger boundary uses the static gap and mode factor only.
+    # SpeedTFFactor, the decel hold and the decel boost are comfort distance.
+    self.t_follow_danger = float(np.clip(tf_base * self._tf_mode_factor, 0.3, max(0.3, self.t_follow_last)))
     return self.t_follow_last
 
 

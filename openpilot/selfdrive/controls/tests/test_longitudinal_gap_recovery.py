@@ -28,9 +28,10 @@ def load_mpc_update(path):
 
   ns = {'np': np, 'log': SimpleNamespace(LongitudinalPersonality=SimpleNamespace(standard=1, aggressive=0)),
             'DT_MDL': .05, 'N': 12, 'COMFORT_BRAKE': 2.5, 'STOP_DISTANCE': 6., 'ACCEL_MIN': -3.5, 'LEAD_ACCEL_TAU': 1.5,
-            'MODEL_NAME': 'long', 'ACADOS_SOLVER_TYPE': 'SQP_RTI', 'COST_DIM': 6, 'COST_E_DIM': 5, 'X_DIM': 3, 'PARAM_DIM': 8,
+            'MODEL_NAME': 'long', 'ACADOS_SOLVER_TYPE': 'SQP_RTI', 'COST_DIM': 6, 'COST_E_DIM': 5, 'X_DIM': 3, 'PARAM_DIM': 9,
             'A_CHANGE_COST': 200., 'A_CHANGE_COST_STARTING': 10., 'LEAD_DANGER_FACTOR': .8, 'LIMIT_COST': 1e6,
             'DANGER_ZONE_COST': 100., 'CRASH_DISTANCE': .25, 'X_EGO_OBSTACLE_COST': 5., 'X_EGO_COST': 0.,
+            'DANGER_STATIC_T_FOLLOW': True,
             'V_EGO_COST': 0., 'A_EGO_COST': 0., 'SOURCES': ['lead0','lead1','cruise','e2e'],
             'AcadosOcpSolverCython': RecordingSolver, 'LEAD_ACCEL_MIN_TRACK_FRAMES': 3,
             'LeadAccelResponseState': preview.LeadAccelResponseState, 'get_lead_accel_mpc_request': preview.get_lead_accel_mpc_request,
