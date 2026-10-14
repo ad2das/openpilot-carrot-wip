@@ -20,10 +20,10 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 
 V_TAPER = 3.0
-K_TAPER = 0.4        # taper slope: a(v) = -(A + K_TAPER * v)
+K_TAPER = 0.5        # taper slope: a(v) = -(A + K_TAPER * v)
 A_MIN = 0.10         # softest end decel the taper may use (m/s^2)
 A_MAX = 1.0          # above this the taper is no softer than stock -> plan wins (None)
-D_EXTRA = 0.9        # MPC stop-point shift (m) when ButterStop is on
+D_EXTRA = 0.4        # MPC stop-point shift (m) when ButterStop is on
 MARGIN = 0.0         # distance kept unused at the end of the slack (m)
 LEAD_SLACK = 1.2     # lead bound: final gap >= max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
 SOLVE_ITERS = 30

@@ -299,18 +299,21 @@ def test_floor_invalid_inputs_and_stop_distance():
 
 
 def test_floor_d_rel_eff_overrides_raw_lead():
-  # Raw lead is far (30 m) while the smoothed d_eff (5.5 m) leaves a smaller
-  # slack than the plan: the returned floor must use d_eff, not the raw dRel,
-  # and be strictly tighter than the plan-only floor.
+  # Raw lead is far (30 m) while the smoothed d_eff does not: the returned
+  # floor must use d_eff, not the raw dRel, and be strictly tighter than the
+  # plan-only floor. d_eff is chosen so the lead bound is the binding term.
   t = np.array([0.0, 0.5])
   speeds = np.array([2.0, 0.0])
   plan_avail = plan_stop_distance(t, speeds) + D_EXTRA - MARGIN
   lead = SimpleNamespace(status=True, dRel=30.0)
   floor_raw = butter_floor(1.0, t, speeds, lead, 5.5)
   assert floor_raw == pytest.approx(-(solve_taper_a_end(1.0, plan_avail, K_TAPER) + K_TAPER))
-  bound = 5.5 - max(MIN_FINAL_GAP_ABS, 5.5 - LEAD_SLACK)
+  lead_offset = max(MIN_FINAL_GAP_ABS, 5.5 - LEAD_SLACK)
+  d_eff = plan_avail + lead_offset - 0.2  # lead bound tighter than the plan
+  bound = d_eff - lead_offset
   avail = min(plan_avail, bound)
-  floor_eff = butter_floor(1.0, t, speeds, lead, 5.5, d_rel_eff=5.5)
+  assert avail == pytest.approx(bound)
+  floor_eff = butter_floor(1.0, t, speeds, lead, 5.5, d_rel_eff=d_eff)
   assert floor_eff == pytest.approx(-(solve_taper_a_end(1.0, avail, K_TAPER) + K_TAPER))
   assert floor_eff < floor_raw
   assert taper_stop_distance(1.0, -(floor_eff + K_TAPER), K_TAPER) <= bound + 1e-9
