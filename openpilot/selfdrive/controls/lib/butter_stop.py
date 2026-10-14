@@ -5,7 +5,10 @@ target; this module turns that slack into a soft end: below V_TAPER the floor
 caps braking at -(a_end + K_TAPER*v), where a_end is solved so the taper stops
 the car within the plan's remaining distance plus D_EXTRA. The car therefore
 rolls through the whole slack and still ends at the OFF stop point, bounded by
-the lead gap. All standstill hold/release logic lives unchanged in the
+the lead gap. The lead bound uses a smoothed lead position (LeadPosFilter) in
+the ego odometry frame instead of raw dRel, so radar noise cannot flap the
+bound, and LongControl may only relax the floor at FLOOR_RELAX_JERK (tightening
+is instant). All standstill hold/release logic lives unchanged in the
 LongControl stopping state machine; this module provides the floor and the
 creep guard constants used there.
 """
@@ -13,6 +16,7 @@ import math
 
 import numpy as np
 
+from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 
 V_TAPER = 3.0
@@ -23,6 +27,10 @@ D_EXTRA = 0.9        # MPC stop-point shift (m) when ButterStop is on
 MARGIN = 0.0         # distance kept unused at the end of the slack (m)
 LEAD_SLACK = 1.2     # lead bound: final gap >= max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
 SOLVE_ITERS = 30
+LEAD_JUMP_M = 1.5      # raw-lead jump that forces a filter reset (m)
+LEAD_RAW_ALLOW = 0.5   # d_eff may never exceed raw dRel by more than this (m)
+TAU_LEAD = 0.3         # lead-position filter time constant (s)
+FLOOR_RELAX_JERK = 0.8  # max floor relaxation rate (m/s^3); tightening is instant
 MIN_FINAL_GAP_ABS = 3.0
 STANDSTILL_V = 0.05
 STANDSTILL_T = 0.2
@@ -55,6 +63,60 @@ def plan_stop_distance(plan_t, plan_speeds):
   return float(np.sum(v_avg * dt))
 
 
+class LeadPosFilter:
+  """Smoothed lead position in the ego-odometry frame.
+
+  x_raw = dRel + s_ego is the lead position relative to where the ego was when
+  the filter's episode began; for a stationary lead it is constant even while
+  the ego rolls, so radar noise does not move it. A lead that jumps closer
+  resets immediately (safe direction); a farther jump must persist for
+  JUMP_VERIFY_S before it is adopted. d_eff = min(x_f - s_ego, dRel +
+  LEAD_RAW_ALLOW) can therefore never exceed the raw gap by more than
+  LEAD_RAW_ALLOW.
+  """
+
+  JUMP_VERIFY_S = 0.5
+
+  def __init__(self):
+    self._x_f = None
+    self._far_jump_time = 0.0
+
+  def reset(self):
+    self._x_f = None
+    self._far_jump_time = 0.0
+
+  def update(self, status, d_rel, s_ego, dt=DT_CTRL, tau=None):
+    if not status or d_rel is None:
+      self.reset()
+      return None
+    tau = TAU_LEAD if tau is None else tau
+    try:
+      x_raw = float(d_rel) + float(s_ego)
+      s = float(s_ego)
+    except (TypeError, ValueError):
+      self.reset()
+      return None
+    if not (math.isfinite(x_raw) and math.isfinite(s)):
+      self.reset()
+      return None
+    if self._x_f is None:
+      self._x_f = x_raw
+      self._far_jump_time = 0.0
+    elif x_raw < self._x_f - LEAD_JUMP_M:
+      # Closer jump: adopt immediately, the safe direction.
+      self._x_f = x_raw
+      self._far_jump_time = 0.0
+    elif x_raw > self._x_f + LEAD_JUMP_M:
+      self._far_jump_time += dt
+      if self._far_jump_time + 1e-9 >= self.JUMP_VERIFY_S:
+        self._x_f = x_raw
+        self._far_jump_time = 0.0
+    else:
+      self._far_jump_time = 0.0
+      self._x_f += (dt / tau) * (x_raw - self._x_f)
+    return min(self._x_f - s, float(d_rel) + LEAD_RAW_ALLOW)
+
+
 def taper_stop_distance(v, a_end, k):
   """Distance to stop from v under a(v) = -(a_end + k*v); a_end > 0, k >= 0."""
   if k <= 0.0:
@@ -83,14 +145,33 @@ def solve_taper_a_end(v, avail, k):
   return hi
 
 
-def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
+def slew_floor(prev, floor_raw, dt=DT_CTRL):
+  """One-way floor slew: tightening is instant, relaxing is rate-limited.
+
+  Returns None (and lets the caller reset prev) when floor_raw is None; the
+  first raw value is adopted unchanged. FLOOR_RELAX_JERK is read at call time
+  so the tuning sweep can monkeypatch the module attribute.
+  """
+  if floor_raw is None:
+    return None
+  if prev is None:
+    return floor_raw
+  return min(floor_raw, prev + FLOOR_RELAX_JERK * dt)
+
+
+def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff=None, diag=None):
   """Most-negative allowed acceleration at v_ego, or None to let the plan win.
 
   The taper distance budget is the plan's own remaining stop distance plus
   D_EXTRA (the slack the shifted MPC left in front of it), so rolling through
   the slack still ends at the OFF stop point; the lead bound keeps the whole
-  slack outside the minimum final gap.
+  slack outside the minimum final gap. d_rel_eff replaces the raw lead dRel
+  when given (the smoothed lead position LongControl maintains); diag, when
+  given, records the binding term and the solved a_end for the sim telemetry.
   """
+  if diag is not None:
+    diag["bound"] = None
+    diag["a_end"] = None
   if not math.isfinite(v_ego) or v_ego <= 0.0:
     return None
   if stop_distance_orig is None or not math.isfinite(stop_distance_orig) or stop_distance_orig < 0.0:
@@ -99,19 +180,32 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
   if dist is None:
     return None
   avail = dist + D_EXTRA - MARGIN
+  bound = "plan"
   if lead is not None and getattr(lead, "status", False):
-    try:
-      d_rel = float(lead.dRel)
-    except (TypeError, ValueError, AttributeError):
-      return None
+    if d_rel_eff is not None:
+      try:
+        d_rel = float(d_rel_eff)
+      except (TypeError, ValueError):
+        return None
+    else:
+      try:
+        d_rel = float(lead.dRel)
+      except (TypeError, ValueError, AttributeError):
+        return None
     if not math.isfinite(d_rel):
       return None
-    avail = min(avail, d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK))
+    lead_avail = d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+    if lead_avail < avail:
+      bound = "lead"
+    avail = min(avail, lead_avail)
   if avail <= AVAIL_MIN:
     return None
   a_end = solve_taper_a_end(v_ego, avail, K_TAPER)
   if a_end is None:
     return None
+  if diag is not None:
+    diag["bound"] = bound
+    diag["a_end"] = a_end
   return -(a_end + K_TAPER * v_ego)
 
 

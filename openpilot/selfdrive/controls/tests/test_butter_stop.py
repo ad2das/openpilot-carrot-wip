@@ -1,5 +1,6 @@
-"""ButterStop: pure taper math, eligibility, LongControl integration and
-ButterStop=0 output identity against the pre-change controller.
+"""ButterStop: pure taper math, eligibility, the lead-position filter, floor
+slew, LongControl integration and ButterStop=0 output identity against the
+pre-change controller.
 """
 import os
 import sys
@@ -90,10 +91,10 @@ sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_
 import openpilot.selfdrive.controls.lib.longcontrol as lc
 from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  A_MAX, A_MIN, CREEP_ACCEL, D_EXTRA, HOLD_RAMP, K_TAPER, LEAD_SLACK, MARGIN,
-  MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V, V_TAPER,
-  butter_eligible, butter_floor, plan_stop_distance, solve_taper_a_end,
-  taper_stop_distance,
+  A_MAX, A_MIN, CREEP_ACCEL, D_EXTRA, FLOOR_RELAX_JERK, HOLD_RAMP, K_TAPER,
+  LEAD_JUMP_M, LEAD_RAW_ALLOW, LEAD_SLACK, MARGIN, MIN_FINAL_GAP_ABS, STANDSTILL_T,
+  STANDSTILL_V, V_TAPER, LeadPosFilter, butter_eligible, butter_floor,
+  plan_stop_distance, slew_floor, solve_taper_a_end, taper_stop_distance,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongControl, LongCtrlState,
@@ -295,6 +296,163 @@ def test_floor_invalid_inputs_and_stop_distance():
   assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=False), -1.0) is None
   assert butter_floor(0.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5) is None
   assert butter_floor(1.0, PLAN_T, np.full(3, 0.0), SimpleNamespace(status=False), 5.5) is None
+
+
+def test_floor_d_rel_eff_overrides_raw_lead():
+  # Raw lead is far (30 m) while the smoothed d_eff (5.5 m) leaves a smaller
+  # slack than the plan: the returned floor must use d_eff, not the raw dRel,
+  # and be strictly tighter than the plan-only floor.
+  t = np.array([0.0, 0.5])
+  speeds = np.array([2.0, 0.0])
+  plan_avail = plan_stop_distance(t, speeds) + D_EXTRA - MARGIN
+  lead = SimpleNamespace(status=True, dRel=30.0)
+  floor_raw = butter_floor(1.0, t, speeds, lead, 5.5)
+  assert floor_raw == pytest.approx(-(solve_taper_a_end(1.0, plan_avail, K_TAPER) + K_TAPER))
+  bound = 5.5 - max(MIN_FINAL_GAP_ABS, 5.5 - LEAD_SLACK)
+  avail = min(plan_avail, bound)
+  floor_eff = butter_floor(1.0, t, speeds, lead, 5.5, d_rel_eff=5.5)
+  assert floor_eff == pytest.approx(-(solve_taper_a_end(1.0, avail, K_TAPER) + K_TAPER))
+  assert floor_eff < floor_raw
+  assert taper_stop_distance(1.0, -(floor_eff + K_TAPER), K_TAPER) <= bound + 1e-9
+
+
+def test_floor_d_rel_eff_safety_grid():
+  for v in np.linspace(0.06, 2.99, 12):
+    for d_eff in np.linspace(3.5, 15.0, 12):
+      for stop_distance_orig in (3.0, 5.5, 7.0):
+        speeds = np.maximum(0.0, v * (1.0 - PLAN_T / 3.0))
+        lead = SimpleNamespace(status=True, dRel=3.0)
+        floor = butter_floor(float(v), PLAN_T, speeds, lead, stop_distance_orig, d_rel_eff=float(d_eff))
+        if floor is None:
+          continue
+        limit = d_eff - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+        a_end = -(floor + K_TAPER * v)
+        assert taper_stop_distance(float(v), a_end, K_TAPER) <= max(limit, 0.0) + 1e-9
+
+
+def test_floor_diag_records_binding_term_and_a_end():
+  speeds = np.maximum(0.0, 2.0 * (1.0 - PLAN_T / 2.0))
+  diag = {}
+  floor = butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5, diag=diag)
+  assert floor is not None
+  assert diag["bound"] == "plan"
+  assert diag["a_end"] == pytest.approx(-(floor + K_TAPER * 1.0))
+  diag2 = {}
+  lead = SimpleNamespace(status=True, dRel=6.0)
+  assert butter_floor(1.0, PLAN_T, speeds, lead, 5.5, diag=diag2) is not None
+  assert diag2["bound"] == "lead"
+  # None result still clears the diag fields.
+  diag3 = {"bound": "plan", "a_end": 0.5}
+  assert butter_floor(0.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5, diag=diag3) is None
+  assert diag3 == {"bound": None, "a_end": None}
+
+
+# ---------------------------------------------------------------------------
+# LeadPosFilter
+# ---------------------------------------------------------------------------
+
+def _filtered_sequence(noise, v_ego=2.0, d0=20.0, dt=0.05):
+  """20 Hz filter updates (dt=0.05) over the given noise draws."""
+  filt = LeadPosFilter()
+  s_ego = 0.0
+  devs = []
+  worst = -1e9
+  for n in noise:
+    true_d = d0 - s_ego
+    d_eff = filt.update(True, true_d + float(n), s_ego, dt=dt)
+    assert d_eff is not None
+    devs.append(d_eff - true_d)
+    worst = max(worst, d_eff - true_d)
+    s_ego += v_ego * dt
+  return np.asarray(devs), worst
+
+
+def test_lead_pos_filter_smooths_stationary_lead_noise():
+  rng = np.random.default_rng(0)
+  noise = rng.normal(0.0, 0.3, 100)  # 20 Hz over 5 s
+  devs, worst = _filtered_sequence(noise)
+  assert np.std(devs) <= 0.12
+  assert worst <= 0.5 + 1e-9
+
+
+def test_lead_pos_filter_closer_jump_drops_immediately():
+  filt = LeadPosFilter()
+  assert filt.update(True, 20.0, 0.0) == pytest.approx(20.0)
+  # A 2 m closer jump is adopted on the same step (safe direction).
+  assert filt.update(True, 18.0, 0.0) == pytest.approx(18.0)
+  # A larger-than-jump move with a moving ego frame follows immediately too.
+  assert filt.update(True, 18.0 - LEAD_JUMP_M - 0.1, 0.0) == pytest.approx(18.0 - LEAD_JUMP_M - 0.1)
+
+
+def test_lead_pos_filter_farther_jump_needs_hold_time():
+  dt = 0.05  # 20 Hz: 10 steps = the 0.5 s verification window
+  filt = LeadPosFilter()
+  assert filt.update(True, 20.0, 0.0, dt=dt) == pytest.approx(20.0)
+  # 2 m farther: no reset before 0.5 s of continuous verification.
+  for _ in range(9):
+    assert filt.update(True, 22.0, 0.0, dt=dt) == pytest.approx(20.0)
+  assert filt.update(True, 22.0, 0.0, dt=dt) == pytest.approx(22.0)
+  # A single in-band sample in between resets the verification timer.
+  filt2 = LeadPosFilter()
+  filt2.update(True, 20.0, 0.0, dt=dt)
+  for _ in range(5):
+    filt2.update(True, 22.0, 0.0, dt=dt)
+  filt2.update(True, 20.2, 0.0, dt=dt)
+  for _ in range(9):
+    filt2.update(True, 22.0, 0.0, dt=dt)
+  assert filt2.update(True, 22.0, 0.0, dt=dt) == pytest.approx(22.0)
+
+
+def test_lead_pos_filter_status_loss_resets():
+  filt = LeadPosFilter()
+  filt.update(True, 20.0, 0.0)
+  filt.update(True, 19.0, 0.0)
+  assert filt.update(False, 19.0, 0.0) is None
+  # Reacquisition re-initializes from the raw position, not the old state.
+  assert filt.update(True, 25.0, 0.0) == pytest.approx(25.0)
+  assert filt.update(True, None, 0.0) is None
+
+
+def test_lead_pos_filter_never_exceeds_raw_plus_allow():
+  filt = LeadPosFilter()
+  s_ego = 0.0
+  # The true lead runs away while the raw reading includes a big closer bias:
+  # d_eff must stay within LEAD_RAW_ALLOW of the raw value each step.
+  for k in range(60):
+    d_raw = 30.0 - 0.1 * k + (-0.4 if k % 2 else 0.0)
+    d_eff = filt.update(True, d_raw, s_ego)
+    assert d_eff is not None
+    assert d_eff <= d_raw + LEAD_RAW_ALLOW + 1e-9
+    s_ego += 1.0 * lc.DT_CTRL
+
+
+def test_lead_pos_filter_nan_and_invalid_inputs_reset():
+  filt = LeadPosFilter()
+  filt.update(True, 20.0, 0.0)
+  assert filt.update(True, float("nan"), 0.0) is None
+  assert filt.update(True, 20.0, float("nan")) is None
+  assert filt._x_f is None
+
+
+# ---------------------------------------------------------------------------
+# floor slew
+# ---------------------------------------------------------------------------
+
+def test_slew_floor_tightens_instantly_relaxes_rate_limited():
+  dt = lc.DT_CTRL
+  # First value adopted unchanged.
+  assert slew_floor(None, -1.0) == pytest.approx(-1.0)
+  # Tightening instantly.
+  assert slew_floor(-1.0, -2.0) == pytest.approx(-2.0)
+  # Relaxing only up to FLOOR_RELAX_JERK * dt per step.
+  assert slew_floor(-2.0, -0.5) == pytest.approx(-2.0 + FLOOR_RELAX_JERK * dt)
+  # None resets.
+  assert slew_floor(-2.0, None) is None
+
+
+def test_slew_floor_reads_constant_at_call_time(monkeypatch):
+  monkeypatch.setattr(butter_stop, "FLOOR_RELAX_JERK", 0.0)
+  assert slew_floor(-2.0, -1.0) == pytest.approx(-2.0)
 
 
 # ---------------------------------------------------------------------------

@@ -10,9 +10,10 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.selfdrive.controls.lib.cruise_coasting import (
   CruiseCoastingControl, MAX_PLAN_AGE, coasting_relief, no_coasting_lead,
 )
+from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, HOLD_RAMP, STANDSTILL_T, STANDSTILL_V, STOP_DISTANCE_DEFAULT,
-  butter_eligible, butter_floor,
+  CREEP_ACCEL, CREEP_V, HOLD_RAMP, LeadPosFilter, STANDSTILL_T, STANDSTILL_V,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -91,6 +92,13 @@ class LongControl:
     self._butter_creep_latched = False
     self._butter_creep_logged = False
     self.butter_floor_last = None
+    self.butter_floor_raw_last = None
+    self.butter_bound_last = None
+    self.butter_a_end_last = None
+    self._butter_floor_prev = None
+    self._butter_s_ego = 0.0
+    self._butter_lead_filter = LeadPosFilter()
+    self._butter_diag = {}
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
@@ -129,6 +137,8 @@ class LongControl:
   def _butter_floor(self, active, CS, long_plan, t_since_plan, radarState):
     if not self.butter_stop:
       return None
+    self._butter_diag["bound"] = None
+    self._butter_diag["a_end"] = None
     try:
       t_age = float(t_since_plan)
     except (TypeError, ValueError):
@@ -148,7 +158,21 @@ class LongControl:
     plan_speeds = getattr(long_plan, "speeds", None)
     if plan_speeds is None:
       return None
-    return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig)
+    # The lead bound uses the smoothed lead position (d_eff); every gate above
+    # still uses the raw radar values. s_ego is maintained by update().
+    d_eff = None
+    if lead is not None and bool(getattr(lead, "status", False)):
+      try:
+        d_rel_raw = float(lead.dRel)
+      except (TypeError, ValueError, AttributeError):
+        return None
+      d_eff = self._butter_lead_filter.update(True, d_rel_raw, self._butter_s_ego)
+      if d_eff is None:
+        return None
+    else:
+      self._butter_lead_filter.reset()
+    return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig,
+                        d_rel_eff=d_eff, diag=self._butter_diag)
 
   def _apply_hyundai_longitudinal_tuning(self):
     # Hyundai, Kia, and Genesis all use the opendbc "hyundai" brand. Keep the
@@ -213,6 +237,7 @@ class LongControl:
     # taper may remove while still rolling and how fast the confirmed hold
     # ramps; it never changes the state machine, hold or release conditions.
     butter_floor_value = None
+    butter_floor_raw_value = None
     if self.butter_stop:
       if (not active) or self.long_control_state != LongCtrlState.stopping:
         self._butter_standstill_time = 0.0
@@ -220,16 +245,50 @@ class LongControl:
         self._butter_creep_latched = False
         self._butter_creep_logged = False
       else:
-        if float(CS.vEgo) < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
+        try:
+          v_ego_now = float(CS.vEgo)
+        except (TypeError, ValueError):
+          v_ego_now = float("nan")
+        if v_ego_now < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
           self._butter_standstill_time = min(STANDSTILL_T, self._butter_standstill_time + DT_CTRL)
         else:
           self._butter_standstill_time = 0.0
         if bool(getattr(CS, "standstill", False)) or self._butter_standstill_time >= STANDSTILL_T:
           self._butter_standstill_confirmed = True
-      if (self.long_control_state == LongCtrlState.pid
-          or (self.long_control_state == LongCtrlState.stopping and not self._butter_standstill_confirmed)):
-        butter_floor_value = self._butter_floor(active, CS, long_plan, t_since_plan, radarState)
+      floor_live = (self.long_control_state == LongCtrlState.pid
+                    or (self.long_control_state == LongCtrlState.stopping
+                        and not self._butter_standstill_confirmed))
+      if floor_live:
+        # Ego odometry frame for the lead-position filter; it spans the whole
+        # floor-active episode (pid and the rolling part of stopping).
+        try:
+          v_ego_odom = float(CS.vEgo)
+        except (TypeError, ValueError):
+          v_ego_odom = float("nan")
+        if math.isfinite(v_ego_odom):
+          self._butter_s_ego += v_ego_odom * DT_CTRL
+        butter_floor_raw_value = self._butter_floor(active, CS, long_plan, t_since_plan, radarState)
+      else:
+        self._butter_s_ego = 0.0
+        self._butter_lead_filter.reset()
+      # One-way floor slew: tightening (more negative) is instant, relaxing
+      # (rising toward 0) is rate-limited at FLOOR_RELAX_JERK so radar noise
+      # cannot flap the applied braking; that constant is read at call time so
+      # the tuning sweep can patch it.
+      butter_floor_value = butter_stop_module.slew_floor(self._butter_floor_prev, butter_floor_raw_value)
+      self._butter_floor_prev = butter_floor_value
+    else:
+      self._butter_floor_prev = None
+      self._butter_lead_filter.reset()
+      self._butter_s_ego = 0.0
+    self.butter_floor_raw_last = butter_floor_raw_value
     self.butter_floor_last = butter_floor_value
+    if butter_floor_raw_value is None:
+      self.butter_bound_last = None
+      self.butter_a_end_last = None
+    else:
+      self.butter_bound_last = self._butter_diag.get("bound")
+      self.butter_a_end_last = self._butter_diag.get("a_end")
 
     if self.long_control_state == LongCtrlState.off:
       self.reset()
