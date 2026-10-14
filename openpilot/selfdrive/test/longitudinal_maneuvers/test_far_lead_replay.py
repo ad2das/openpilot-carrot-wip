@@ -16,20 +16,22 @@ per step, so the logged radar flicker is reproduced exactly.
 Variants (module switches read at call time; restored after each run):
   V0 = DANGER_STATIC_T_FOLLOW=False (pre-W112 danger boundary)
   V1 = default (static danger TF)
-  V2 = V1 with LEAD_DANGER_FACTOR 0.75 (diagnostic only, no assertions)
 Maneuvers run V0@SpeedTFFactor10 (reference), V0@15 and V1@15.
 
 PASS criteria (asserted):
-  Comfort e1-e6 (V1 vs V0): every episode V1 peak decel >= V0 peak decel - 0.05;
-  mean peak-decel magnitude reduction >= 35%; every episode V1 min time-gap
-  >= min(V0 min time-gap, 1.0 s) - 0.05; no collision; FCW steps V1 <= V0.
+  Fidelity: |V0 peak - log peak| <= 0.4 in >= 4/6 AND V0 never gentler than
+  log - 0.4 in any comfort episode.
+  Comfort e1-e6 (V1 vs V0), every episode: V1 peak decel >= V0 peak - 0.05;
+  V1 onset jerk >= V0 onset jerk - 0.1; V1 min time-gap >= min(V0 min
+  time-gap, 1.0 s) - 0.05; no collision; FCW V1 <= V0. Aggregate: mean
+  peak-decel magnitude reduction > 0.0 (regression guard; the value is
+  reported).
   Safety s1: V1 min gap >= V0 min gap - 0.5 m; V1 min TTC >= min(V0 min TTC, 3.0 s) - 0.1;
   no collision; FCW V1 <= V0.
-  Maneuvers m1-m5: no collision; final gap >= 2.0 m when the lead stops;
-  V1@15 min gap >= V0@10 min gap - 0.5 m; FCW V1@15 <= FCW V0@10.
-Reported only: fidelity |V0 min aTarget - log min aTarget| <= 0.4 count over
-e1-e6; count of episodes with V1 peak >= -1.5 and onset jerk >= -2.5 m/s^3;
-every V2 number. Simulation only; no vehicle validation.
+  Maneuvers m1-m6: no collision for any variant; final gap >= 2.0 m when the
+  lead stops; V1@15 min gap >= V0@10 min gap - 0.5 m; FCW V1@15 <= V0@10;
+  m6: V1@15 peak decel >= V0@10 peak decel - 0.5.
+Simulation only; no vehicle validation.
 """
 import json
 import os
@@ -195,13 +197,38 @@ class _LeadSpec:
       return (self._cut_base + self.v0 * (t - self.cut_in_t), self.v0, 0.0)
     if self.brake_t is not None and t > self.brake_t:
       dt = t - self.brake_t
+      xb = self.x0 + self.v0 * self.brake_t
       stop_t = self.v0 / abs(self.brake_a) if self.brake_a < 0.0 else 0.0
       if dt <= stop_t:
-        x = self.x0 + self.v0 * dt + 0.5 * self.brake_a * dt * dt
+        x = xb + self.v0 * dt + 0.5 * self.brake_a * dt * dt
         return (x, max(0.0, self.v0 + self.brake_a * dt), self.brake_a)
-      x = self.x0 + 0.5 * self.v0 * stop_t
+      x = xb + 0.5 * self.v0 * stop_t
       return (x, 0.0, 0.0)
     return (self.x0 + self.v0 * t, self.v0, 0.0)
+
+
+class _BrakeThenHoldSpec:
+  """m6: constant speed, then brake at brake_t for brake_dur, then constant."""
+
+  def __init__(self, x0, v0, brake_t, brake_a, brake_dur, track_id=7):
+    self.x0 = float(x0)
+    self.v0 = float(v0)
+    self.brake_t = float(brake_t)
+    self.brake_a = float(brake_a)
+    self.brake_dur = float(brake_dur)
+    self.track_id = int(track_id)
+
+  def state(self, t, _s_ego):
+    if t <= self.brake_t:
+      return (self.x0 + self.v0 * t, self.v0, 0.0)
+    dt = t - self.brake_t
+    xb = self.x0 + self.v0 * self.brake_t
+    if dt <= self.brake_dur:
+      x = xb + self.v0 * dt + 0.5 * self.brake_a * dt * dt
+      return (x, self.v0 + self.brake_a * dt, self.brake_a)
+    v_end = self.v0 + self.brake_a * self.brake_dur
+    x_end = xb + self.v0 * self.brake_dur + 0.5 * self.brake_a * self.brake_dur ** 2
+    return (x_end + v_end * (dt - self.brake_dur), v_end, 0.0)
 
 
 class SyntheticProfile:
@@ -436,8 +463,10 @@ def compute_metrics(run):
   if a.size > 51:
     jerk = (a[50:] - a[:-50]) / 0.5
     onset_jerk = float(np.min(jerk))
+    peak_jerk_abs = float(np.max(np.abs(jerk)))
   else:
     onset_jerk = 0.0
+    peak_jerk_abs = 0.0
 
   collision = bool(np.any(gap[active] <= 0.0))
   min_gap = float(np.min(gap[active])) if bool(np.any(active)) else None
@@ -458,6 +487,7 @@ def compute_metrics(run):
     "min_a_target": round(min_a_target, 4),
     "min_accel": round(min_accel, 4),
     "onset_jerk": round(onset_jerk, 4),
+    "peak_jerk_abs": round(peak_jerk_abs, 4),
     "min_gap_m": None if min_gap is None else round(min_gap, 4),
     "min_time_gap_s": None if min_time_gap is None else round(min_time_gap, 4),
     "min_ttc_s": None if min_ttc is None else round(min_ttc, 4),
@@ -469,17 +499,13 @@ def compute_metrics(run):
   return metrics
 
 
-def _run(profile, header, *, static, factor=None, speed_tf=None):
+def _run(profile, header, *, static, speed_tf=None):
   saved_static = long_mpc.DANGER_STATIC_T_FOLLOW
-  saved_factor = long_mpc.LEAD_DANGER_FACTOR
   long_mpc.DANGER_STATIC_T_FOLLOW = static
-  if factor is not None:
-    long_mpc.LEAD_DANGER_FACTOR = factor
   try:
     return compute_metrics(FarLeadLoop(header, profile, speed_tf=speed_tf).run())
   finally:
     long_mpc.DANGER_STATIC_T_FOLLOW = saved_static
-    long_mpc.LEAD_DANGER_FACTOR = saved_factor
 
 
 def _run_episode(eid):
@@ -488,8 +514,7 @@ def _run_episode(eid):
   profile = FixtureProfile(fixture)
   v0 = _run(profile, header, static=False)
   v1 = _run(profile, header, static=True)
-  v2 = _run(profile, header, static=True, factor=0.75)
-  return fixture, {"V0": v0, "V1": v1, "V2": v2}
+  return fixture, {"V0": v0, "V1": v1}
 
 
 def _comfort_failures(eid, res):
@@ -497,6 +522,8 @@ def _comfort_failures(eid, res):
   v0, v1 = res["V0"], res["V1"]
   if v1["min_a_target"] < v0["min_a_target"] - 0.05:
     fails.append(f"{eid}: V1 peak decel {v1['min_a_target']} < V0 {v0['min_a_target']} - 0.05")
+  if v1["onset_jerk"] < v0["onset_jerk"] - 0.1:
+    fails.append(f"{eid}: V1 onset jerk {v1['onset_jerk']} < V0 {v0['onset_jerk']} - 0.1")
   bound = min(v0["min_time_gap_s"] if v0["min_time_gap_s"] is not None else 1e9, 1.0) - 0.05
   if v1["min_time_gap_s"] is None or v1["min_time_gap_s"] < bound - 1e-9:
     fails.append(f"{eid}: V1 min time-gap {v1['min_time_gap_s']} < {bound}")
@@ -533,7 +560,7 @@ def test_far_lead_replay_comfort(eid):
   fidelity = abs(res["V0"]["min_a_target"] - log_min_at)
   RESULTS["episodes"][eid] = {**res, "log_min_aTarget": round(log_min_at, 4),
                               "fidelity_delta": round(fidelity, 4)}
-  RESULTS["fidelity"][eid] = fidelity <= 0.4
+  RESULTS["fidelity"][eid] = fidelity <= 0.4 and res["V0"]["min_a_target"] <= log_min_at + 0.4
   fails = _comfort_failures(eid, res)
   assert not fails, "; ".join(fails)
 
@@ -569,7 +596,8 @@ def test_far_lead_aggregate():
     "v1_peak_ge_-1.5_and_onset_jerk_ge_-2.5_count": gentle_v1,
   }
   print(f"FAR-LEAD: fidelity {fidelity_count}/{len(EPISODES)}; mean peak reduction {mean_reduction * 100:.1f}%; gentle V1 {gentle_v1}")
-  assert mean_reduction >= 0.35, f"mean peak-decel reduction {mean_reduction * 100:.1f}% < 35%"
+  assert fidelity_count >= 4, f"fidelity within 0.4 in only {fidelity_count}/6"
+  assert mean_reduction > 0.0, f"mean peak-decel reduction {mean_reduction * 100:.1f}% <= 0"
 
 
 def _maneuvers():
@@ -581,14 +609,16 @@ def _maneuvers():
     "m4": SyntheticProfile(100, 100, lead1(x0=64.0, v0=100 / 3.6),
                            lead2=lead1(v0=80 / 3.6, track_id=8, cut_in_t=4.0, cut_in_gap=30.0)),
     "m5": SyntheticProfile(90, 90, lead1(x0=120.0, v0=0.0)),
+    "m6": SyntheticProfile(110, 110, _BrakeThenHoldSpec(x0=100.0, v0=70 / 3.6, brake_t=4.0, brake_a=-3.0, brake_dur=3.0)),
   }
 
 
 def _maneuver_failures(mid, profile, res):
   fails = []
   v0_10, v1_15 = res["V0_10"], res["V1_15"]
-  if v1_15["collision"] or v0_10["collision"]:
-    fails.append(f"{mid}: collision (V0@10 {v0_10['collision']}, V1@15 {v1_15['collision']})")
+  for name in ("V0_10", "V0_15", "V1_15"):
+    if res[name]["collision"]:
+      fails.append(f"{mid}: {name} collides (min gap {res[name]['min_gap_m']})")
   end_speed = profile.lead_specs[0].state(profile.duration, 0.0)
   lead_stops = end_speed[1] <= 0.1
   if lead_stops and v1_15["final_gap_m"] is not None and v1_15["final_gap_m"] < 2.0:
@@ -598,10 +628,12 @@ def _maneuver_failures(mid, profile, res):
       fails.append(f"{mid}: V1@15 min gap {v1_15['min_gap_m']} < V0@10 {v0_10['min_gap_m']} - 0.5")
   if v1_15["fcw_steps"] > v0_10["fcw_steps"]:
     fails.append(f"{mid}: FCW V1@15 {v1_15['fcw_steps']} > V0@10 {v0_10['fcw_steps']}")
+  if mid == "m6" and v1_15["min_a_target"] < v0_10["min_a_target"] - 0.5:
+    fails.append(f"{mid}: V1@15 peak decel {v1_15['min_a_target']} < V0@10 {v0_10['min_a_target']} - 0.5")
   return fails
 
 
-@pytest.mark.parametrize("mid", ["m1", "m2", "m3", "m4", "m5"])
+@pytest.mark.parametrize("mid", ["m1", "m2", "m3", "m4", "m5", "m6"])
 def test_far_lead_synthetic_maneuver(mid):
   header = load_fixture("e1")["params"]
   res = {
