@@ -504,6 +504,8 @@ def compute_metrics(run):
     "collision": collision,
     "stopped": bool(run["stopped"]),
     "final_gap_m": None if final_gap is None else round(final_gap, 4),
+    "approach_steps": int(run.get("approach_steps", 0)),
+    "approach_scale_max": float(run.get("approach_scale_max", 0.0)),
   }
   return metrics
 
@@ -733,13 +735,19 @@ def test_far_lead_approach_sweep(monkeypatch):
       peaks = []
       worst = (None, 0.0)
       approach_steps = {}
+      reductions = []
       for eid, e in episodes.items():
         v3 = _run(e["profile"], e["fixture"]["params"], static=True, approach=True)
         fails += _comfort_failures(eid, {"V0": e["v0"], "V3": v3})
         peaks.append(v3["min_a_target"])
         approach_steps[eid] = v3["approach_steps"]
+        if e["v0"]["min_a_target"] < 0.0:
+          reductions.append((abs(e["v0"]["min_a_target"]) - abs(v3["min_a_target"])) / abs(e["v0"]["min_a_target"]))
         if worst[0] is None or v3["min_a_target"] < worst[1]:
           worst = (eid, v3["min_a_target"])
+      mean_reduction = float(np.mean(reductions)) if reductions else 0.0
+      if mean_reduction < 0.35:
+        fails.append(f"mean peak-decel reduction {mean_reduction * 100:.1f}% < 35%")
       v3_s1 = _run(s1["profile"], s1f["params"], static=True, approach=True)
       fails += _safety_failures("s1", {"V0": s1["v0"], "V3": v3_s1})
       approach_steps["s1"] = v3_s1["approach_steps"]
@@ -750,6 +758,7 @@ def test_far_lead_approach_sweep(monkeypatch):
       rows.append({
         "margin": margin, "a_max": a_max, "pass": not fails, "failures": fails,
         "mean_v3_peak": round(float(np.mean(peaks)), 4),
+        "mean_reduction": round(mean_reduction, 4),
         "worst_episode": worst[0], "worst_v3_peak": round(worst[1], 4),
         "approach_steps": approach_steps,
       })
