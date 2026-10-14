@@ -233,6 +233,8 @@ Increases the selected base TF linearly with speed. Range `10–30`, default `10
 - `20`: 1.0× when stopped, 1.5× at 50 km/h, 2.0× at 100 km/h and 3.0× at 200 km/h.
 - Higher values give a longer TF at the same speed. Following responsiveness is unchanged.
 
+The speed multiplier only lengthens the target (comfort) gap. The danger boundary that decides when hard braking is needed uses the base TF and the driving-mode multiplier without the speed multiplier or deceleration boost, which avoids unnecessary hard braking when closing on a slower lead that is still far away. The danger boundary is the same as with the default (10).
+
 With base TF 0.50 seconds and setting 20, TF is 0.50/0.75/1.00 seconds at 0/50/100 km/h. Driving-mode and deceleration adjustments follow. The speed-adjusted result is not clipped to the largest TF1–4 setting or the former two-second cap.
 
 The former `EnableSpeedTF` setting is removed; its value is not converted to the new multiplier. The new setting starts with no speed adjustment. Existing base TF and common following responsiveness values are retained.
@@ -267,6 +269,8 @@ The margin is added once to baseline TF and does not accumulate during sustained
 The default is `0%`, which adds no extra time gap based on deceleration strength. Existing saved vehicle settings are preserved after an update.
 
 At ego acceleration around -0.2 m/s² or below, the code first prevents speed adjustment from reducing the target gap. This prevention works even when the setting is zero. The setting then adds gap based on deceleration strength.
+
+The deceleration boost is added to the target gap only, not to the danger boundary.
 
 At `TFollowDecelBoost=50`, the addition is approximately 0.03 s at -0.3 m/s², 0.125 s at -1.0 m/s², and a maximum around 0.25 s at -2.5 m/s². Range is 0–100 in steps of 10.
 

@@ -1,4 +1,5 @@
 import pytest
+import numpy as np
 
 from openpilot.cereal import log
 from openpilot.selfdrive.carrot.carrot_functions import (
@@ -251,6 +252,53 @@ def test_modes_share_the_same_baseline_jerk_cost(personality):
     planner._get_base_t_follow(personality, 10.)
     factors.append(planner.jerk_factor)
   assert factors == [factors[0]] * len(factors)
+
+
+def _danger_tf_planner(speed_tf: int = 15, boost: float = 0.3, gap3: float = 1.4,
+                       applied: float = 1.4) -> CarrotPlanner:
+  planner = CarrotPlanner.__new__(CarrotPlanner)
+  planner.speedTFFactor = speed_tf
+  planner.tFollowGap1 = 0.5
+  planner.tFollowGap2 = 1.0
+  planner.tFollowGap3 = gap3
+  planner.tFollowGap4 = 1.6
+  planner.tFollowDecelBoost = boost
+  planner.leadAccelResponse = 0
+  planner.myDrivingMode = DrivingMode.Normal
+  planner.myTFollowFactor = 1.0
+  planner._tf_decel_extra = 0.0
+  planner._tf_applied = applied
+  planner.t_follow_last = applied
+  return planner
+
+
+def test_danger_tf_uses_static_gap_and_mode_factor_while_comfort_keeps_speed_scale():
+  planner = _danger_tf_planner()
+  t_follow = 0.0
+  for _ in range(400):
+    t_follow = planner.get_T_FOLLOW(log.LongitudinalPersonality.relaxed, v_ego=31.7, a_ego=0.)
+  assert planner.t_follow_danger == pytest.approx(1.4 * 1.0, abs=1e-9)
+  assert t_follow > planner.t_follow_danger
+
+
+def test_danger_tf_is_bounded_by_the_comfort_tf_across_random_settings():
+  rng = np.random.default_rng(0)
+  planner = _danger_tf_planner()
+  settings = ((10, 0.), (15, 0.3), (20, 1.0), (30, 0.))
+  personalities = list(log.LongitudinalPersonality.schema.enumerants.values())
+  for step in range(2000):
+    planner.speedTFFactor, planner.tFollowDecelBoost = settings[step % len(settings)]
+    personality = personalities[step % len(personalities)]
+    t_follow = planner.get_T_FOLLOW(personality, v_ego=float(rng.uniform(0., 40.)), a_ego=float(rng.uniform(-4., 2.)))
+    assert 0.3 <= planner.t_follow_danger <= t_follow
+
+
+def test_default_speed_settings_keep_danger_boundary_equal_to_the_comfort_tf():
+  planner = _danger_tf_planner(speed_tf=10, boost=0.0)
+  t_follow = 0.0
+  for _ in range(200):
+    t_follow = planner.get_T_FOLLOW(log.LongitudinalPersonality.relaxed, v_ego=25., a_ego=0.)
+  assert planner.t_follow_danger == pytest.approx(t_follow, abs=1e-9)
 
 
 def test_mode_margin_releases_slowly_without_delaying_manual_gap_reduction():

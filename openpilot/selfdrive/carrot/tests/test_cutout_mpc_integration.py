@@ -16,7 +16,7 @@ from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_distance_ad
 
 
 def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_distance=100., stop_x=1000., lane_change=None, selected_status=True,
-               lead_tau=None, jerk_factor=1., comfort_brake=2.5, t_follow=1.45):
+               lead_tau=None, jerk_factor=1., comfort_brake=2.5, t_follow=1.45, t_follow_danger=None, danger_static=True):
   path = Path(__file__).resolve().parents[2] / "controls/lib/longitudinal_mpc_lib/long_mpc.py"
   tree = ast.parse(path.read_text(encoding="utf-8"))
   mpc = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LongitudinalMpc")
@@ -33,6 +33,7 @@ def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_d
                    "A_CHANGE_COST_STARTING": 10., "COST_E_DIM": 5, "CRASH_DISTANCE": .25,
                    "A_CHANGE_COST": 200., "X_EGO_OBSTACLE_COST": 5.,
                    "X_EGO_COST": 0., "V_EGO_COST": 0., "A_EGO_COST": 0.,
+                   "DANGER_STATIC_T_FOLLOW": danger_static,
                    "LIMIT_COST": 1e6, "DANGER_ZONE_COST": 100., "LEAD_ACCEL_TAU": 1.5,
                    "LEAD_ACCEL_MIN_TRACK_FRAMES": 3,
                    "gap_reference": gap_reference, "displayed_follow_distance": displayed_follow_distance,
@@ -52,13 +53,15 @@ def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_d
   carrot = NS(comfort_brake=comfort_brake, stop_distance=6., v_cruise=20., stop_dist=stop_x, mode=mode, myDrivingMode=3,
               trafficStopDistanceAdjust=0., trafficStopModelLeadOffset=0., leadAccelResponse=0,
               get_T_FOLLOW=lambda *a, **kw:t_follow, jerk_factor=jerk_factor)
+  if t_follow_danger is not None:
+    carrot.t_follow_danger = t_follow_danger
   if lane_change is not None:
     carrot.lane_change_gap = lane_change
     carrot.dynamicTFollowLC = .9
   self = NS(dt=.05, lead_response_state=LeadAccelResponseState(), x0=np.array([0., 15., 0.]), source="lead0", mode=mode, max_a=1.5, cruise_min_a=-1.2,
             lead_gap_states=(LeadGapState(), LeadGapState()), lead_gap_margins=np.zeros((13,2)),
             braking_gap_states=(BrakingGapState(), BrakingGapState()),
-            params=np.zeros((13,8)), prev_a=np.zeros(13), yref=np.zeros((13,6)),
+            params=np.zeros((13,9)), prev_a=np.zeros(13), yref=np.zeros((13,6)),
             solver=NS(set=lambda *a:None), set_weights=lambda *a,**kw:None, crash_cnt=0,
             x_sol=np.column_stack([15.*times, np.full(13,15.), np.zeros(13)]), run=lambda:None)
   def process_lead(l):
@@ -153,3 +156,45 @@ def test_recorded_roadside_returns_cannot_brake_without_selected_leads(target):
   expected, _ = run_update(selected_status=False)
   np.testing.assert_array_equal(actual.params, expected.params)
   assert actual.source == expected.source == 'cruise'
+
+
+def test_danger_tf_parameter_is_static_on_lead_bound_stages():
+  mpc, times = run_update(t_follow=2.2, t_follow_danger=1.4)
+  np.testing.assert_allclose(mpc.params[:,8][times <= 1.3], 1.4)
+  np.testing.assert_allclose(mpc.params[:,4], 2.2)
+  assert mpc.t_follow_danger == pytest.approx(1.4)
+
+
+def test_cruise_and_traffic_stop_stages_keep_the_full_comfort_tf():
+  # No lead and far stop: cruise obstacle binds and keeps the full t_follow.
+  cruise, _ = run_update(t_follow=2.2, t_follow_danger=1.4, selected_status=False)
+  assert cruise.source == 'cruise'
+  np.testing.assert_allclose(cruise.params[:,8], 2.2)
+  # Close stop point: the traffic-stop obstacle binds (SOURCES[3]) and keeps it too.
+  traffic, _ = run_update(t_follow=2.2, t_follow_danger=1.4, stop_x=5.)
+  assert traffic.source == 'e2e'
+  np.testing.assert_allclose(traffic.params[:,8], 2.2)
+
+
+def test_blended_mode_keeps_the_full_comfort_tf_everywhere():
+  mpc, _ = run_update(mode='blended', t_follow=2.2, t_follow_danger=1.4)
+  np.testing.assert_allclose(mpc.params[:,8], 2.2)
+
+
+def test_missing_or_nan_danger_tf_falls_back_to_comfort():
+  mpc, _ = run_update(t_follow=2.2)
+  np.testing.assert_allclose(mpc.params[:,8], 2.2)
+  nan_mpc, _ = run_update(t_follow=2.2, t_follow_danger=float('nan'))
+  np.testing.assert_allclose(nan_mpc.params[:,8], 2.2)
+
+
+def test_v0_switch_reproduces_the_pre_w112_danger_boundary():
+  mpc, _ = run_update(t_follow=2.2, t_follow_danger=1.4, danger_static=False)
+  np.testing.assert_allclose(mpc.params[:,8], 2.2)
+
+
+def test_danger_tf_is_clipped_to_the_comfort_tf():
+  mpc, _ = run_update(t_follow=2.2, t_follow_danger=5.0)
+  np.testing.assert_allclose(mpc.params[:,8], 2.2)
+  low, _ = run_update(t_follow=2.2, t_follow_danger=0.1)
+  np.testing.assert_allclose(low.params[:,8], 0.3)

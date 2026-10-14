@@ -33,7 +33,7 @@ SOURCES = ['lead0', 'lead1', 'cruise', 'e2e']
 
 X_DIM = 3
 U_DIM = 1
-PARAM_DIM = 8
+PARAM_DIM = 9
 COST_E_DIM = 5
 COST_DIM = COST_E_DIM + 1
 CONSTR_DIM = 4
@@ -48,6 +48,7 @@ A_CHANGE_COST_STARTING = 10. #30.
 DANGER_ZONE_COST = 100.
 CRASH_DISTANCE = .25
 LEAD_DANGER_FACTOR = 0.8 # 0.75
+DANGER_STATIC_T_FOLLOW = True  # False reproduces the pre-W112 danger boundary (tests only)
 LIMIT_COST = 1e6
 ACADOS_SOLVER_TYPE = 'SQP_RTI'
 
@@ -139,7 +140,8 @@ def gen_long_model():
   lead_danger_factor = SX.sym('lead_danger_factor')
   comfort_brake = SX.sym('comfort_brake')
   stop_distance = SX.sym('stop_distance')
-  model.p = vertcat(a_min, a_max, x_obstacle, prev_a, lead_t_follow, lead_danger_factor, comfort_brake, stop_distance)
+  danger_t_follow = SX.sym('danger_t_follow')
+  model.p = vertcat(a_min, a_max, x_obstacle, prev_a, lead_t_follow, lead_danger_factor, comfort_brake, stop_distance, danger_t_follow)
 
   # dynamics model
   f_expl = vertcat(v_ego, a_ego, j_ego)
@@ -177,11 +179,13 @@ def gen_long_ocp():
   lead_danger_factor = ocp.model.p[5]
   comfort_brake = ocp.model.p[6]
   stop_distance = ocp.model.p[7]
+  danger_t_follow = ocp.model.p[8]
 
   ocp.cost.yref = np.zeros((COST_DIM, ))
   ocp.cost.yref_e = np.zeros((COST_E_DIM, ))
 
   desired_dist_comfort = get_safe_obstacle_distance(v_ego, lead_t_follow, comfort_brake, stop_distance)
+  desired_dist_danger = get_safe_obstacle_distance(v_ego, danger_t_follow, comfort_brake, stop_distance)
 
   # The main cost in normal operation is how close you are to the "desired" distance
   # from an obstacle at every timestep. This obstacle can be a lead car
@@ -202,12 +206,12 @@ def gen_long_ocp():
   constraints = vertcat(v_ego,
                         (a_ego - a_min),
                         (a_max - a_ego),
-                        ((x_obstacle - x_ego) - lead_danger_factor * (desired_dist_comfort)) / (v_ego + 10.))
+                        ((x_obstacle - x_ego) - lead_danger_factor * (desired_dist_danger)) / (v_ego + 10.))
   ocp.model.con_h_expr = constraints
 
   x0 = np.zeros(X_DIM)
   ocp.constraints.x0 = x0
-  ocp.parameter_values = np.array([-1.2, 1.2, 0.0, 0.0, lead_t_follow, LEAD_DANGER_FACTOR, comfort_brake, stop_distance])
+  ocp.parameter_values = np.array([-1.2, 1.2, 0.0, 0.0, lead_t_follow, LEAD_DANGER_FACTOR, comfort_brake, stop_distance, danger_t_follow])
 
 
   # We put all constraint cost weights to 0 and only set them at runtime
@@ -409,6 +413,10 @@ class LongitudinalMpc:
     a_ego = self.x0[2]
     self.status = radarstate.leadOne.status or radarstate.leadTwo.status
     t_follow = carrot.get_T_FOLLOW(personality, v_ego, a_ego)
+    t_follow_danger = getattr(carrot, 't_follow_danger', t_follow) if DANGER_STATIC_T_FOLLOW else t_follow
+    if not np.isfinite(t_follow_danger):
+      t_follow_danger = t_follow
+    t_follow_danger = float(min(max(t_follow_danger, 0.3), t_follow))
     jerk_factor = carrot.jerk_factor
 
     lead_xv_0, lead_v_0 = self.process_lead(radarstate.leadOne)
@@ -477,6 +485,10 @@ class LongitudinalMpc:
       # Only currently selected leadOne/leadTwo may constrain braking.
       # Entry snapshots and lane-change credit guards never add obstacles.
       self.source = SOURCES[np.argmin(x_obstacles[0])]
+      # The danger boundary is a static comfort gap; the speed-scaled TF stays
+      # a comfort target. Lead-bound stages use the static danger TF, cruise
+      # and traffic-stop-bound stages keep the full t_follow.
+      danger_tf = np.where(np.argmin(x_obstacles, axis=1) <= 1, t_follow_danger, t_follow)
 
       if v_cruise == 0 and self.source == 'cruise':
         self.params[:,0] = - carrot.autoNaviSpeedDecelRate
@@ -492,6 +504,7 @@ class LongitudinalMpc:
 
     elif mode == 'blended':
       self.params[:,5] = 1.0
+      danger_tf = np.full(N+1, t_follow)
 
       x_obstacles = np.column_stack([lead_0_obstacle,
                                      lead_1_obstacle])
@@ -551,6 +564,7 @@ class LongitudinalMpc:
     # Extra TF is a comfort preference, not a change to physical lead obstacles,
     # base TF, cruise/map targets or braking constraints. Level 5 bypasses the
     # opening-gap memory; braking-distance memory applies to every level.
+    lead_danger_t_follow = t_follow_danger if mode == 'acc' else t_follow
     gap_v = np.maximum(0.0, self.x_sol[:,1] + v_ego - self.x_sol[0,1])
     gap_x = np.cumsum(np.diff(T_IDXS, prepend=0.0) * np.concatenate(([gap_v[0]], (gap_v[1:] + gap_v[:-1]) * 0.5)))
     self.lead_gap_margins[:] = 0.0
@@ -583,7 +597,7 @@ class LongitudinalMpc:
       # Both memories describe comfort space; never add the same distance twice.
       self.lead_gap_margins[:,lead_index] = np.maximum(self.lead_gap_margins[:,lead_index], braking_margins)
       danger = lead_xv[:,0] + get_stopped_equivalence_factor(lead_xv[:,1]) - gap_x - self.params[0,5] * get_safe_obstacle_distance(
-        gap_v, t_follow, comfort_brake, stop_distance)
+        gap_v, lead_danger_t_follow, comfort_brake, stop_distance)
       relief = braking.comfort_relief(dt=self.dt, enabled=eligible and self.lead_gap_margins[0,lead_index] <= 0.01,
                                      base_tf=t_follow, ego_speeds=gap_v, lead_speeds=lead_xv[:,1],
                                      lead_accel=lead.aLeadK if eligible else 0.0, physical_gaps=lead_xv[:,0] - gap_x,
@@ -612,14 +626,16 @@ class LongitudinalMpc:
     self.params[:,4] = t_follow
     self.params[:,6] = comfort_brake
     self.params[:,7] = stop_distance
+    self.params[:,8] = danger_tf
 
     self.t_follow = t_follow
+    self.t_follow_danger = t_follow_danger
 
     self.run()
     if np.any(comfort_reliefs) and self.solution_status == 0 and any(state.relief > 0.0 for state in self.braking_gap_states):
       # The previous trajectory only admits a trial. Validate the resulting
       # trajectory too, and resolve once without slack if it spends the reserve.
-      safe = get_safe_obstacle_distance(self.x_sol[:,1], t_follow, comfort_brake, stop_distance)
+      safe = get_safe_obstacle_distance(self.x_sol[:,1], lead_danger_t_follow, comfort_brake, stop_distance)
       reserve_ok = all(
         not np.any(comfort_reliefs[:, i]) or comfort_path_has_reserve(
           self.x_sol[:,1], lead_xv[:,0] - self.x_sol[:,0],
@@ -644,7 +660,7 @@ class LongitudinalMpc:
         self.time_linearization += trial_times[2]
         self.time_integrator += trial_times[3]
     if mode == 'acc':
-      self.update_predicted_danger_margin(radarstate.leadOne, lead_0_obstacle, t_follow, comfort_brake, stop_distance)
+      self.update_predicted_danger_margin(radarstate.leadOne, lead_0_obstacle, lead_danger_t_follow, comfort_brake, stop_distance)
 
     if (np.any(lead_xv_0[FCW_IDXS,0] - self.x_sol[FCW_IDXS,0] < CRASH_DISTANCE) and
             radarstate.leadOne.modelProb > 0.9):
