@@ -283,8 +283,11 @@ class FramePipeline:
                           anchor=anchor, crop_box=crop_box, frame_box=frame_box)
     self._classify_tracks(now, geom)
 
+    live = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks
+            if int(t.cls) != int(tracker.LampClass.OFF)]
     confirmed_relevant = tracker.select_relevant_tiered(
-      self._confirmed(now), self.frame_idx, image_width=image_width,
+      self._confirmed(now), self.frame_idx, near_candidates=live,
+      image_width=image_width,
       path_x=path_x, path_y=path_y, left_intent=left_intent,
       odo=self.ego.odo if self.ego is not None else None,
     )
@@ -299,10 +302,8 @@ class FramePipeline:
       else:
         # Candidate-only frame: relevant selection for crop ordering and the
         # graded redLikely state; the state machine stays on confirmed input.
-        candidates = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks
-                      if int(t.cls) != int(tracker.LampClass.OFF)]
         candidate = tracker.select_relevant_tiered(
-          candidates, self.frame_idx, image_width=image_width,
+          live, self.frame_idx, near_candidates=live, image_width=image_width,
           path_x=path_x, path_y=path_y, left_intent=left_intent,
           odo=self.ego.odo if self.ego is not None else None,
         )

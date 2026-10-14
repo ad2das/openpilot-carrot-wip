@@ -75,6 +75,7 @@ RELEVANT_MAX_DISTANCE_M = 120.0
 # Tiered gate (W115 A5): nearest-path light within 120 m first; only when none
 # qualifies, look at (120, 200] m. W115: s50a + classifier-only, 80 km/h
 # P(confirm >= stop need) 0.94 -> 0.98, 100 km/h 0 -> 0.65, phantom red 0.
+# Far tier is blocked while an unconfirmed track sits in the near tier (W117B).
 RELEVANT_FAR_MAX_DISTANCE_M = 200.0
 
 # (window frames, required hits). Asymmetric on purpose: red is confirmed fast
@@ -578,13 +579,21 @@ def select_relevant(confirmed: list[tuple[Track, int, float]], frame_idx: int, *
   return best[2], best[3], best[4]
 
 
-def select_relevant_tiered(confirmed: list[tuple[Track, int, float]], frame_idx: int, **kwargs):
-  """select_relevant within RELEVANT_MAX_DISTANCE_M, else in the far tier."""
+def select_relevant_tiered(confirmed: list[tuple[Track, int, float]], frame_idx: int, *,
+                           near_candidates=None, **kwargs):
+  """select_relevant within RELEVANT_MAX_DISTANCE_M, else in the far tier.
+
+  The far tier is skipped while any live (possibly unconfirmed) track passes the
+  near-tier gate: a confirmed light at the NEXT intersection must not override
+  the unconfirmed light of the intersection we are approaching.
+  """
   kwargs.pop("max_distance_m", None)
   kwargs.pop("min_distance_m", None)
   best = select_relevant(confirmed, frame_idx, **kwargs)
   if best is not None:
     return best
+  if near_candidates and select_relevant(near_candidates, frame_idx, **kwargs) is not None:
+    return None
   return select_relevant(confirmed, frame_idx, min_distance_m=RELEVANT_MAX_DISTANCE_M,
                          max_distance_m=RELEVANT_FAR_MAX_DISTANCE_M, **kwargs)
 

@@ -22,7 +22,7 @@ from openpilot.selfdrive.carrot.tlv.tracker import (RELEVANT_FAR_MAX_DISTANCE_M,
                                                     select_relevant_tiered)
 from test_tlv_classifier import W, ScriptedBackend, _far_geom, _red_frame
 from test_tlv_decode import R3B_NAMES, _base, _pack
-from test_tlv_tracker import _track_at
+from test_tlv_tracker import _track_at, box_at
 
 BUNDLED_DETECTOR_SHA256 = "5f108f62567557e0ac35902a444812230b3da4bd9f0729163a8ff4c3bb909f94"
 RED = int(tracker.LampClass.RED)
@@ -142,3 +142,54 @@ def test_bundled_detector_is_single_class():
     assert digest.hexdigest() == BUNDLED_DETECTOR_SHA256
   finally:
     backend.close()
+
+
+# ---------------------------------------------------------------------------
+# W117B: the far tier must not jump over an unconfirmed near light
+# ---------------------------------------------------------------------------
+
+def _track_at_cx(distance_m, cx, *, focal=2648.0):
+  """Track at distance_m laterally at cx (box_at centres on image centre by default)."""
+  track = tracker.Track(track_id=9, first_frame=0, last_frame=0, cls=RED, score=0.9,
+                        box=box_at(distance_m, focal=focal, cx=cx), view="far", focal_px=focal)
+  track.anchor_box = track.box
+  return track
+
+
+def test_far_tier_blocked_by_unconfirmed_near_track():
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  near = _track_at(80.0)                 # unconfirmed, on the path
+  far_track = _track_at(170.0)           # confirmed RED at the next intersection
+  assert select_relevant_tiered([(far_track, RED, 0.75)], 0,
+                                near_candidates=[(near, RED, 0.9), (far_track, RED, 0.75)],
+                                **kwargs) is None
+
+
+def test_far_tier_used_without_near_track():
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  far_track = _track_at(170.0)
+  chosen = select_relevant_tiered([(far_track, RED, 0.75)], 0,
+                                  near_candidates=[(far_track, RED, 0.75)], **kwargs)
+  assert chosen is not None and chosen[0] is far_track
+  chosen = select_relevant_tiered([(far_track, RED, 0.75)], 0, near_candidates=[], **kwargs)
+  assert chosen is not None and chosen[0] is far_track
+
+
+def test_near_off_path_does_not_block():
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  near_off = _track_at_cx(80.0, 1200.0)  # ~7.1 m lateral > max_lateral_m (4 m)
+  far_track = _track_at(170.0)
+  chosen = select_relevant_tiered([(far_track, RED, 0.75)], 0,
+                                  near_candidates=[(near_off, RED, 0.9), (far_track, RED, 0.75)],
+                                  **kwargs)
+  assert chosen is not None and chosen[0] is far_track
+
+
+def test_near_confirmed_wins():
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  near = _track_at(80.0)
+  far_track = _track_at(170.0)
+  chosen = select_relevant_tiered([(near, RED, 0.75), (far_track, RED, 0.75)], 0,
+                                  near_candidates=[(near, RED, 0.9), (far_track, RED, 0.75)],
+                                  **kwargs)
+  assert chosen is not None and chosen[0] is near
