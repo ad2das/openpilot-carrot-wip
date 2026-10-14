@@ -18,6 +18,7 @@ def load_mpc_update(path):
   from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_distance_adjust, get_traffic_stop_obstacle_distance
   from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import LaneChangeGapPlan
   from openpilot.selfdrive.controls.lib.longitudinal_cutout import cutout_obstacle_relief
+  from openpilot.selfdrive.controls.lib.far_lead_approach import ApproachState, approach_path_safe
 
   class RecordingSolver:
     def __init__(self, *args): self.weights = {}
@@ -40,7 +41,8 @@ def load_mpc_update(path):
             'comfort_path_has_reserve': comfort_path_has_reserve,
             'get_traffic_stop_distance_adjust': get_traffic_stop_distance_adjust,
             'get_traffic_stop_obstacle_distance': get_traffic_stop_obstacle_distance,
-            'LaneChangeGapPlan': LaneChangeGapPlan, 'cutout_obstacle_relief': cutout_obstacle_relief}
+            'LaneChangeGapPlan': LaneChangeGapPlan, 'cutout_obstacle_relief': cutout_obstacle_relief,
+            'ApproachState': ApproachState, 'approach_path_safe': approach_path_safe}
   ns['T_IDXS'] = 10*(np.arange(13)/12)**2
   ns['T_DIFFS'] = np.diff(ns['T_IDXS'], prepend=0.)
   ns['FCW_IDXS'] = ns['T_IDXS'] < 5

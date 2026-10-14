@@ -14,6 +14,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_preview import LEAD_ACCEL_MIN
 from openpilot.selfdrive.controls.lib.longitudinal_cutout import cutout_obstacle_relief
 from openpilot.selfdrive.controls.lib.longitudinal_gap_recovery import LeadGapState, displayed_follow_distance
 from openpilot.selfdrive.controls.lib.longitudinal_braking_gap import BrakingGapState, braking_gap_reference, comfort_path_has_reserve
+from openpilot.selfdrive.controls.lib.far_lead_approach import ApproachState, approach_path_safe
 from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import LaneChangeGapPlan
 
@@ -211,7 +212,7 @@ def gen_long_ocp():
 
   x0 = np.zeros(X_DIM)
   ocp.constraints.x0 = x0
-  ocp.parameter_values = np.array([-1.2, 1.2, 0.0, 0.0, lead_t_follow, LEAD_DANGER_FACTOR, comfort_brake, stop_distance, danger_t_follow])
+  ocp.parameter_values = np.array([-1.2, 1.2, 0.0, 0.0, lead_t_follow, LEAD_DANGER_FACTOR, comfort_brake, stop_distance, get_T_FOLLOW()])
 
 
   # We put all constraint cost weights to 0 and only set them at runtime
@@ -297,6 +298,8 @@ class LongitudinalMpc:
     self.lead_response_state = LeadAccelResponseState()
     self.lead_gap_states = (LeadGapState(), LeadGapState())
     self.braking_gap_states = (BrakingGapState(), BrakingGapState())
+    self.approach_states = (ApproachState(), ApproachState())
+    self.approach_scale = 0.0
     self.lead_gap_margins = np.zeros((N+1, 2))
     self.solve_time = 0.0
     self.time_qp_solution = 0.0
@@ -596,14 +599,26 @@ class LongitudinalMpc:
                                         t_follow, stop_distance)
       # Both memories describe comfort space; never add the same distance twice.
       self.lead_gap_margins[:,lead_index] = np.maximum(self.lead_gap_margins[:,lead_index], braking_margins)
+      margin0 = float(self.lead_gap_margins[0, lead_index])
       danger = lead_xv[:,0] + get_stopped_equivalence_factor(lead_xv[:,1]) - gap_x - self.params[0,5] * get_safe_obstacle_distance(
         gap_v, lead_danger_t_follow, comfort_brake, stop_distance)
-      relief = braking.comfort_relief(dt=self.dt, enabled=eligible and self.lead_gap_margins[0,lead_index] <= 0.01,
+      relief = braking.comfort_relief(dt=self.dt, enabled=eligible and margin0 <= 0.01,
                                      base_tf=t_follow, ego_speeds=gap_v, lead_speeds=lead_xv[:,1],
                                      lead_accel=lead.aLeadK if eligible else 0.0, physical_gaps=lead_xv[:,0] - gap_x,
                                      danger_margins=danger, times=T_IDXS, stop_distance=stop_distance)
       self.lead_gap_margins[:,lead_index] -= relief
       comfort_reliefs[:,lead_index] = relief
+      approach = self.approach_states[lead_index].relief(
+        dt=self.dt, enabled=(mode == 'acc' and not reset_state
+                             and not getattr(carrot, 'lane_change_active', False)
+                             and bool(lead.radar) and margin0 <= 0.01),
+        lead_present=bool(lead.status), v_ego=v_ego,
+        gap=lead.dRel if lead.status else 0.0, v_lead=lead.vLead if lead.status else 0.0,
+        a_lead=lead.aLeadK if lead.status else 0.0,
+        t_follow=t_follow, t_follow_danger=lead_danger_t_follow, danger_factor=self.params[0,5],
+        comfort_brake=comfort_brake, stop_distance=stop_distance, times=T_IDXS)
+      self.lead_gap_margins[:,lead_index] -= approach
+      comfort_reliefs[:,lead_index] += approach
     # Display the current following reference, including comfort headroom and
     # any already-authorized cutout/lane-change relief. This does not select
     # control leads or modify solver obstacles.
@@ -632,20 +647,34 @@ class LongitudinalMpc:
     self.t_follow_danger = t_follow_danger
 
     self.run()
-    if np.any(comfort_reliefs) and self.solution_status == 0 and any(state.relief > 0.0 for state in self.braking_gap_states):
+    recheck_active = (np.any(comfort_reliefs) and self.solution_status == 0
+                      and (any(state.relief > 0.0 for state in self.braking_gap_states)
+                           or any(state.scale > 0.0 for state in self.approach_states)))
+    if recheck_active:
       # The previous trajectory only admits a trial. Validate the resulting
       # trajectory too, and resolve once without slack if it spends the reserve.
       safe = get_safe_obstacle_distance(self.x_sol[:,1], lead_danger_t_follow, comfort_brake, stop_distance)
-      reserve_ok = all(
-        not np.any(comfort_reliefs[:, i]) or comfort_path_has_reserve(
-          self.x_sol[:,1], lead_xv[:,0] - self.x_sol[:,0],
-          obstacle - self.x_sol[:,0] - self.params[:,5] * safe, T_IDXS, stop_distance)
-        for i, (lead_xv, obstacle) in enumerate(((lead_xv_0, lead_0_obstacle), (lead_xv_1, lead_1_obstacle)))
-      )
+      reserve_ok = True
+      for i, (lead_xv, obstacle) in enumerate(((lead_xv_0, lead_0_obstacle), (lead_xv_1, lead_1_obstacle))):
+        if not np.any(comfort_reliefs[:, i]):
+          continue
+        has_braking_relief = self.braking_gap_states[i].relief > 0.0
+        has_approach_relief = self.approach_states[i].scale > 0.0
+        danger_margins = obstacle - self.x_sol[:,0] - self.params[:,5] * safe
+        physical_gaps = lead_xv[:,0] - self.x_sol[:,0]
+        if has_braking_relief and not comfort_path_has_reserve(
+            self.x_sol[:,1], physical_gaps, danger_margins, T_IDXS, stop_distance):
+          reserve_ok = False
+        if has_approach_relief and not approach_path_safe(
+            T_IDXS, danger_margins, physical_gaps, self.x_sol[:,1], stop_distance):
+          reserve_ok = False
       if not reserve_ok:
         self.lead_gap_margins += comfort_reliefs
         for state in self.braking_gap_states:
           state.relief = 0.0
+        for state in self.approach_states:
+          state.scale = 0.0
+          state.hold = 0.0
         self.yref[:,0] = braking_gap_reference(x_obstacles, self.lead_gap_margins, gap_v)
         for i in range(N):
           self.solver.set(i, "yref", self.yref[i])
@@ -659,6 +688,7 @@ class LongitudinalMpc:
         self.time_qp_solution += trial_times[1]
         self.time_linearization += trial_times[2]
         self.time_integrator += trial_times[3]
+    self.approach_scale = max(state.scale for state in self.approach_states)
     if mode == 'acc':
       self.update_predicted_danger_margin(radarstate.leadOne, lead_0_obstacle, lead_danger_t_follow, comfort_brake, stop_distance)
 

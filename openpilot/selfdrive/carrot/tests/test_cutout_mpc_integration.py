@@ -10,13 +10,15 @@ import pytest
 from openpilot.selfdrive.controls.lib.longitudinal_cutout import cutout_obstacle_relief
 from openpilot.selfdrive.controls.lib.longitudinal_gap_recovery import LeadGapState, gap_reference, displayed_follow_distance
 from openpilot.selfdrive.controls.lib.longitudinal_braking_gap import BrakingGapState, braking_gap_reference, comfort_path_has_reserve
+from openpilot.selfdrive.controls.lib.far_lead_approach import ApproachState, approach_path_safe
 from openpilot.selfdrive.carrot.radar_motion.lane_change_gap import GapLead, LaneChangeGapPlan
 from openpilot.selfdrive.controls.lib.longitudinal_preview import LeadAccelResponseState, get_lead_accel_mpc_request
 from openpilot.selfdrive.carrot.traffic_stop import get_traffic_stop_distance_adjust, get_traffic_stop_obstacle_distance
 
 
 def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_distance=100., stop_x=1000., lane_change=None, selected_status=True,
-               lead_tau=None, jerk_factor=1., comfort_brake=2.5, t_follow=1.45, t_follow_danger=None, danger_static=True):
+               lead_tau=None, jerk_factor=1., comfort_brake=2.5, t_follow=1.45, t_follow_danger=None, danger_static=True,
+               lead_drel=25., lead_vlead=14., lead_accel=None, x_sol=None, ego_speed=15.):
   path = Path(__file__).resolve().parents[2] / "controls/lib/longitudinal_mpc_lib/long_mpc.py"
   tree = ast.parse(path.read_text(encoding="utf-8"))
   mpc = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "LongitudinalMpc")
@@ -39,6 +41,7 @@ def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_d
                    "gap_reference": gap_reference, "displayed_follow_distance": displayed_follow_distance,
                    "braking_gap_reference": braking_gap_reference,
                    "comfort_path_has_reserve": comfort_path_has_reserve,
+                   "ApproachState": ApproachState, "approach_path_safe": approach_path_safe,
                    "get_lead_accel_mpc_request": get_lead_accel_mpc_request,
                    "get_traffic_stop_distance_adjust": get_traffic_stop_distance_adjust,
                    "get_traffic_stop_obstacle_distance": get_traffic_stop_obstacle_distance,
@@ -46,9 +49,9 @@ def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_d
   jerk_cost = next(node for node in tree.body if isinstance(node, ast.Assign)
                    and any(isinstance(target, ast.Name) and target.id == 'J_EGO_COST' for target in node.targets))
   exec(compile(ast.Module(body=[jerk_cost]+helpers+methods, type_ignores=[]), str(path), "exec"), namespace)
-  lead = NS(status=selected_status, radar=True, radarTrackId=50, dRel=25., vRel=-1., vLead=14.,
-            aLeadK=-.5 if lead_tau is None else -2., aLeadTau=1.5 if lead_tau is None else lead_tau,
-            modelProb=.99, cutOutTime=1., cutOutConfidence=confidence)
+  lead = NS(status=selected_status, radar=True, radarTrackId=50, dRel=lead_drel, vRel=lead_vlead - ego_speed,
+            vLead=lead_vlead, aLeadK=(-0.5 if lead_tau is None else -2.) if lead_accel is None else lead_accel,
+            aLeadTau=1.5 if lead_tau is None else lead_tau, modelProb=.99, cutOutTime=1., cutOutConfidence=confidence)
   second = NS(**(vars(lead) | {"dRel": second_distance, "radarTrackId": 51, "cutOutConfidence": 0.}))
   carrot = NS(comfort_brake=comfort_brake, stop_distance=6., v_cruise=20., stop_dist=stop_x, mode=mode, myDrivingMode=3,
               trafficStopDistanceAdjust=0., trafficStopModelLeadOffset=0., leadAccelResponse=0,
@@ -58,12 +61,15 @@ def run_update(*, confidence=0., mode="acc", reset=False, enabled=True, second_d
   if lane_change is not None:
     carrot.lane_change_gap = lane_change
     carrot.dynamicTFollowLC = .9
-  self = NS(dt=.05, lead_response_state=LeadAccelResponseState(), x0=np.array([0., 15., 0.]), source="lead0", mode=mode, max_a=1.5, cruise_min_a=-1.2,
+  self = NS(dt=.05, lead_response_state=LeadAccelResponseState(), x0=np.array([0., ego_speed, 0.]), source="lead0", mode=mode, max_a=1.5, cruise_min_a=-1.2,
             lead_gap_states=(LeadGapState(), LeadGapState()), lead_gap_margins=np.zeros((13,2)),
             braking_gap_states=(BrakingGapState(), BrakingGapState()),
+            approach_states=(ApproachState(), ApproachState()), approach_scale=0.,
             params=np.zeros((13,9)), prev_a=np.zeros(13), yref=np.zeros((13,6)),
             solver=NS(set=lambda *a:None), set_weights=lambda *a,**kw:None, crash_cnt=0,
-            x_sol=np.column_stack([15.*times, np.full(13,15.), np.zeros(13)]), run=lambda:None)
+            solution_status=0, solve_time=0., time_qp_solution=0., time_linearization=0., time_integrator=0.,
+            x_sol=np.column_stack([15.*times, np.full(13,15.), np.zeros(13)]) if x_sol is None else x_sol,
+            run=lambda:None)
   def process_lead(l):
     distance, speed = (l.dRel, l.vLead) if l.status else (50., 25.)
     return np.column_stack([distance + speed * times, np.full(13, speed)]), speed
@@ -198,3 +204,22 @@ def test_danger_tf_is_clipped_to_the_comfort_tf():
   np.testing.assert_allclose(mpc.params[:,8], 2.2)
   low, _ = run_update(t_follow=2.2, t_follow_danger=0.1)
   np.testing.assert_allclose(low.params[:,8], 0.3)
+
+
+def test_approach_relief_moves_cost_only_and_keeps_constraints_identical():
+  from openpilot.selfdrive.controls.lib import far_lead_approach
+  # e1-like far lead: eligible for the smooth-approach relief.
+  kwargs = {"t_follow": 2.2, "t_follow_danger": 1.4, "comfort_brake": 2.4, "lead_drel": 96.,
+            "lead_vlead": 21.6, "lead_accel": 0., "ego_speed": 31.5}
+  saved = far_lead_approach.FAR_LEAD_APPROACH
+  try:
+    far_lead_approach.FAR_LEAD_APPROACH = False
+    baseline, _ = run_update(**kwargs)
+    far_lead_approach.FAR_LEAD_APPROACH = True
+    changed, _ = run_update(**kwargs)
+  finally:
+    far_lead_approach.FAR_LEAD_APPROACH = saved
+  assert not np.array_equal(changed.yref[:,0], baseline.yref[:,0])
+  np.testing.assert_array_equal(changed.params[:,2], baseline.params[:,2])
+  np.testing.assert_array_equal(changed.params[:,8], baseline.params[:,8])
+  assert changed.approach_scale > 0.0

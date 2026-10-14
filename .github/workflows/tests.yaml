@@ -139,6 +139,7 @@ jobs:
       - name: Check far-lead replay
         env:
           FAR_LEAD_SIM_OUT: ${{ runner.temp }}/far_lead_sim.json
+          FAR_LEAD_SWEEP: '1'
         run: |
           python -m pytest -o addopts='' -q -s openpilot/selfdrive/test/longitudinal_maneuvers/test_far_lead_replay.py
       - name: Upload far-lead sim table
@@ -146,7 +147,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: far-lead-sim
-          path: ${{ runner.temp }}/far_lead_sim.json
+          path: |
+            ${{ runner.temp }}/far_lead_sim.json
+            ${{ runner.temp }}/far_lead_sweep.json
           if-no-files-found: warn
       - name: Check model, monitoring and Bluetooth integration
         run: |
