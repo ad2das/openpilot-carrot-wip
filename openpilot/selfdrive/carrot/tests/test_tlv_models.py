@@ -157,3 +157,39 @@ def test_tinygrad_loads_bundled_detector_with_expected_shapes(tmp_path, monkeypa
     assert [tuple(np.asarray(out).shape) for out in outs] == list(DETECTOR_OUTPUT_SHAPES)
   finally:
     backend.close()
+
+
+def test_tinygrad_loads_bundled_lamp_matches_ort(tmp_path, monkeypatch):
+  try:
+    import tinygrad
+  except ImportError:
+    repo = backends._tinygrad_repo_path()
+    if repo not in sys.path:
+      sys.path.append(repo)
+    try:
+      import tinygrad  # noqa: F401
+    except ImportError:
+      pytest.skip("tinygrad is not available")
+  if not _ensure_cc(tmp_path, monkeypatch):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+
+  inputs = np.random.default_rng(0).integers(0, 256, (4, 3, 32, 64), dtype=np.uint8)
+  tg = backends.make_classifier("tinygrad", backends.BUNDLED_LAMP)
+  try:
+    out = tg.classify(inputs)
+    assert out is not None
+    assert np.asarray(out).shape == (4, 8)
+
+    try:
+      import onnxruntime  # noqa: F401
+    except ImportError:
+      return
+    ort = backends.make_classifier("onnx", backends.BUNDLED_LAMP)
+    try:
+      ort_out = ort.classify(inputs)
+      assert ort_out is not None
+      assert np.allclose(np.asarray(out), np.asarray(ort_out), atol=1e-3)
+    finally:
+      ort.close()
+  finally:
+    tg.close()

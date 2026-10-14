@@ -97,6 +97,42 @@ def test_pipeline_classifier_confirms_and_grades():
   assert out2.red_likely is False
 
 
+def test_vote_class_green_gate():
+  f32 = np.float32
+  # argmax GREEN but green mass 0.45 < 0.5 -> falls back to the best non-green (RED).
+  assert pipeline.vote_class(np.array([0.30, 0, 0.45, 0, 0, 0, 0, 0.25], dtype=f32)) == int(tracker.LampClass.RED)
+  # green mass 0.55 >= 0.5 -> GREEN stays.
+  assert pipeline.vote_class(np.array([0.20, 0, 0.40, 0, 0.15, 0, 0, 0.25], dtype=f32)) == int(tracker.LampClass.GREEN)
+  # argmax GREEN_LEFT but mass 0.46 < 0.5 -> OFF.
+  assert pipeline.vote_class(np.array([0.10, 0, 0.0, 0, 0.46, 0, 0, 0.44], dtype=f32)) == int(tracker.LampClass.OFF)
+  # RED_LEFT is not in the green family: unchanged.
+  assert pipeline.vote_class(np.array([0.05, 0, 0.05, 0.90, 0, 0, 0, 0], dtype=f32)) == int(tracker.LampClass.RED_LEFT)
+  # Exact 0.5: the argmax tie takes index 2 and the boundary is inclusive -> GREEN.
+  assert pipeline.vote_class(np.array([0, 0, 0.5, 0, 0, 0, 0, 0.5], dtype=f32)) == int(tracker.LampClass.GREEN)
+
+
+def test_pipeline_low_green_mass_votes_non_green():
+  probs = np.array([0.30, 0, 0.45, 0, 0, 0, 0, 0.25], dtype=np.float64)
+
+  class LowGreenClassifier:
+    def classify(self, batch):
+      logits = np.log(np.maximum(probs, 1e-12)).astype(np.float32)
+      return np.tile(logits, (len(batch), 1))
+
+  pipe, backend = _make_pipe([_red_frame()], LowGreenClassifier())
+  far = _far_geom()
+  near = pipeline.FramePipeline.geometry("near", 600.0, W, H, 2648.0)
+
+  pipe.infer("far", far, image_width=W, now=0.0, detect=True)
+  pipe.infer("near", near, image_width=W, now=0.2, detect=False)
+  out2 = pipe.infer("near", near, image_width=W, now=0.4, detect=False)
+
+  votes = [vote for track in pipe.tracker.tracks for vote in track.votes]
+  assert votes  # the gate still records votes
+  assert all(v[1] == RED_CLASS for v in votes)  # 0.45 green mass -> RED fallback
+  assert out2.state == tracker.SignalState.red  # 3 red votes in 0.6 s, no green
+
+
 def test_pipeline_without_classifier_keeps_detector_belt():
   pipe, backend = _make_pipe([_red_frame(), _red_frame(), _red_frame()], backends.NullClassifier())
   far = _far_geom()

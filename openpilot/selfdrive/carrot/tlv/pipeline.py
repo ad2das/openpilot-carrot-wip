@@ -63,6 +63,26 @@ def _softmax_rows_into(out: np.ndarray, logits) -> None:
   out /= out.sum(axis=1, keepdims=True)
 
 
+# A lamp vote may only be GREEN/GREEN_LEFT when the green family holds at least this
+# probability mass; otherwise the vote falls back to the best non-green class.
+# W110: r9 on cleaned val -> red->green 0/894 at 0.5 (green recall 95.1 %).
+GREEN_VOTE_MIN_PROB = 0.5
+_GREEN_IDX = (int(tracker.LampClass.GREEN), int(tracker.LampClass.GREEN_LEFT))
+_NON_GREEN_IDX = tuple(i for i in range(8) if i not in _GREEN_IDX)
+
+
+def vote_class(row) -> int:
+  """Lamp vote class for one softmax row (8,), with the green-mass gate."""
+  cls = int(np.argmax(row))
+  if cls in _GREEN_IDX and float(row[_GREEN_IDX[0]] + row[_GREEN_IDX[1]]) < GREEN_VOTE_MIN_PROB:
+    best = _NON_GREEN_IDX[0]
+    for i in _NON_GREEN_IDX[1:]:
+      if row[i] > row[best]:
+        best = i
+    cls = best
+  return cls
+
+
 @dataclass
 class FrameOutput:
   view: str
@@ -193,7 +213,7 @@ class FramePipeline:
     votes: list[tuple[int, int, float]] = []
     for i in range(min(count, len(ordered))):
       row = self._classifier_probs[i]
-      cls = int(np.argmax(row))
+      cls = vote_class(row)
       votes.append((ordered[i].track_id, cls, float(row[cls])))
     self.tracker.record_votes(now, votes)
 
