@@ -238,14 +238,14 @@ def test_gates_single_update_after_warm():
     assert blend.gates & bit, kwargs
     assert blend.w == pytest.approx(w_gated), kwargs
 
-  warm_steer = _warm(centre0=0.3)
+  warm_steer = _warm(centre0=0.12)
   table_before = warm_steer.table.copy()
-  blend = _one_update(warm_steer, centre0=0.3, steering=True)
-  assert blend.gates == GATE_STEER
+  blend = _one_update(warm_steer, centre0=0.12, steering=True)
+  assert not (blend.gates & GATE_STEER)
   assert blend.w == pytest.approx(1.0)
-  assert np.array_equal(blend.table, table_before)
-  learn_control = _one_update(warm_steer, centre0=0.3)
-  assert not np.array_equal(learn_control.table, table_before)
+  assert not np.array_equal(blend.table, table_before)
+  learn_control = _one_update(warm_steer, centre0=0.12)
+  assert np.allclose(blend.table, learn_control.table)
 
   warm_e = _warm(centre0=0.8)
   table_before = warm_e.table.copy()
@@ -276,13 +276,49 @@ def test_lane_change_hold_three_seconds():
   assert abs(count - 3.0 / DT) <= 1
 
 
-def test_stale_table_decay():
+def test_blocked_learning_keeps_table():
+  """Gated stretches (e.g. lane mode) pause learning but never erase it."""
   blend = LaneCenterBlend(table=np.full(7, 0.1))
   x, lll, rll, centre = _synth(centre0=0.0)
   for _ in range(int(round(70.0 / DT))):
-    blend.update(True, False, V, 0.9, 0.9, x, lll, rll, T, x, centre, False, True)
-  expected = 0.1 * np.exp(-(70.0 - 10.0) / 60.0)
-  assert np.allclose(blend.table, np.full(7, expected), rtol=0.02)
+    blend.update(True, True, V, 0.9, 0.9, x, lll, rll, T, x, centre, False, False)
+  assert blend.gates & GATE_LANE_MODE
+  assert np.allclose(blend.table, np.full(7, 0.1))
+
+
+def _hold(blend, centre0, frames, steering=True):
+  x, lll, rll, centre = _synth(centre0=centre0)
+  for _ in range(frames):
+    blend.update(True, False, V, 0.9, 0.9, x, lll, rll, T, x, centre, False, steering)
+
+
+def test_steer_blip_below_debounce_does_not_block_learning():
+  fast = _warm(centre0=0.12)
+  slow = copy.deepcopy(fast)
+  table0 = fast.table.copy()
+  _hold(fast, 0.3, 8, steering=True)   # 0.4 s press, below the 0.5 s debounce
+  _hold(slow, 0.3, 8, steering=False)
+  assert not (fast.gates & GATE_STEER)
+  assert np.allclose(fast.table, slow.table)
+  assert not np.allclose(fast.table, table0)
+
+
+def test_long_steer_blocks_until_one_second_after_release():
+  blend = _warm(centre0=0.12)
+  _hold(blend, 0.3, 9, steering=True)              # 0.45 s: still learning
+  assert not (blend.gates & GATE_STEER)
+  _hold(blend, 0.3, 2, steering=True)              # crosses 0.5 s -> latch
+  assert blend.steer_block
+  frozen = blend.table.copy()
+  _hold(blend, 0.3, 5, steering=True)
+  assert blend.gates & GATE_STEER
+  assert np.array_equal(blend.table, frozen)
+  _hold(blend, 0.3, int(0.9 / DT), steering=False)  # release: blocked for 1.0 s
+  assert blend.steer_block
+  assert np.array_equal(blend.table, frozen)
+  _hold(blend, 0.3, 3, steering=False)             # past 1.0 s after release
+  assert not blend.steer_block
+  assert not np.array_equal(blend.table, frozen)
 
 
 def test_load_table_validation():
@@ -315,7 +351,7 @@ def _step_bump(sign, amp, dur, t_start=2.0):
   return f
 
 
-@pytest.mark.parametrize("amp", [0.3, 0.5])
+@pytest.mark.parametrize("amp", [0.6, 0.8])
 @pytest.mark.parametrize("sign", [+1, -1])
 @pytest.mark.parametrize("dur", [5.0, 20.0])
 def test_avoidance_either_side_of_learned_bias(amp, sign, dur):
@@ -335,7 +371,32 @@ def test_avoidance_either_side_of_learned_bias(amp, sign, dur):
         f"avoid_frames_ON={len(on.avoid_frames)} table_change={table_change:.5f}")
   assert len(on.avoid_frames) >= int(round(1.0 / DT))
   assert peak_on >= peak_off - 0.08
-  assert table_change < (0.02 if dur <= 5.0 else 0.05)
+  assert table_change < (0.02 if dur <= 5.0 else 0.03)
+
+
+def _fast_jump(sign, amp=0.45, rise=0.3, hold=1.5):
+  def f(t):
+    t0 = 2.0
+    if t < t0 or t > t0 + 2.0 * rise + hold:
+      return 0.0
+    if t < t0 + rise:
+      return sign * amp * (t - t0) / rise
+    if t < t0 + rise + hold:
+      return sign * amp
+    return sign * amp * (t0 + 2.0 * rise + hold - t) / rise
+  return f
+
+
+@pytest.mark.parametrize("sign", [+1, -1])
+def test_fast_lateral_path_jump_trips_avoid(sign):
+  """A quick path shift trips the rate criterion even below the r/dev thresholds."""
+  base = _Sim(b0=0.25)
+  base.run(180.0)
+  sim = _Sim(b0=0.25, blend=copy.deepcopy(base.blend), bump_fn=_fast_jump(sign))
+  sim.p, sim.psi = base.p, base.psi
+  sim.run(8.0)
+  print(f"fast jump sign={sign:+d}: avoid_frames={len(sim.avoid_frames)}")
+  assert len(sim.avoid_frames) >= 5
 
 
 @pytest.mark.parametrize("b0", [0.3, -0.3])

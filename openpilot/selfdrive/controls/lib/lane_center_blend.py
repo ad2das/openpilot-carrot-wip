@@ -8,7 +8,8 @@ from openpilot.common.realtime import DT_MDL
 # Learned aim offset (m, model path-y units) per road curvature knot (1/m, path-y units).
 KNOTS = np.array([-0.010, -0.005, -0.002, 0.0, 0.002, 0.005, 0.010])
 OFFSET_MAX = 0.30        # per-knot aim offset cap, m
-T_I = 15.0               # learning time constant, s
+T_I = 5.0                # learning time constant, s (route replay: only 5 s reaches 70% of the
+                         # left-curve target within one drive on both reviewer routes; 8/10 stall)
 DEADBAND = 0.05          # no learning below this car-to-centre error, m
 LOOKAHEAD_S = 2.0        # pure-pursuit lookahead time for offset -> curvature
 LOOKAHEAD_MIN = 20.0
@@ -24,19 +25,25 @@ LANE_CHANGE_HOLD_S = 3.0
 E_MAX = 0.6              # no learning when the car is further than this from centre
 JUMP_M = 0.3             # lane-centre jump per model frame
 JUMP_HOLD_S = 2.0
-AVOID_R_MAX = 0.5        # PROVISIONAL: max |model path - lane centre| within 3 s
-AVOID_DEV_MAX = 0.15     # PROVISIONAL: |(path - centre at 3 s) - its learned baseline|, m
+# Avoid thresholds calibrated on 89,061 usable route frames (v>=40 km/h mask for
+# learning; exclusions: lane changes, desire != none, |e| jumps, lane probs < 0.7).
+# Pooled p99.5: |r| 0.519 m, |r_rate| 0.237 m/s, |r_dev| 0.503 m. The r_dev cap of
+# 0.35 m is the binding calibration limit, so |r_dev| above 0.35 m alone trips.
+AVOID_R_MAX = 0.52       # max |model path - lane centre| within 3 s, m
+AVOID_DEV_MAX = 0.35     # |(path - centre at 3 s) - its learned baseline|, m
 T_BASE = 10.0            # baseline tracking time constant while not avoiding, s
 T_BASE_HOLD = 60.0       # baseline tracking time constant while avoiding, s
-AVOID_RATE_MAX = 0.25    # PROVISIONAL: |d/dt (path - centre) at 1.5 s|, m/s
+AVOID_RATE_MAX = 0.237   # |d/dt (path - centre) at 1.5 s, m/s
 AVOID_RATE_TAU = 0.5
 AVOID_CLEAR_S = 2.0
+# A driver's short wheel blips (median 0.2-0.25 s in the route logs) must not
+# interrupt learning; only a sustained hold does.
+STEER_BLOCK_MIN_S = 0.5  # steering_pressed must last this long to block learning
+STEER_BLOCK_HOLD_S = 1.0 # once blocked, keep blocking this long after release
 FIT_HORIZON_S = 2.0
 FIT_MIN_M = 20.0
 R_HORIZON_S = 3.0
 R_RATE_T = 1.5
-STALE_S = 10.0
-DECAY_TAU = 60.0
 W_UP = 1.0               # output weight ramp, 1/s
 W_DOWN = 2.0
 
@@ -96,11 +103,16 @@ class LaneCenterBlend:
     self.lane_change_t = 0.0
     self.jump_t = 0.0
     self.avoid_clear_t = 0.0
-    self.stale_t = 0.0
+    self.steer_held_s = 0.0
+    self.steer_block = False
+    self.steer_release_s = 0.0
 
   def reset(self):
     self.table = np.zeros_like(KNOTS)
     self.r_base = np.zeros_like(KNOTS)
+    self.steer_held_s = 0.0
+    self.steer_block = False
+    self.steer_release_s = 0.0
 
   def update(self, enabled, lane_mode, v_ego, l_prob, r_prob, ll_x, lll_y, rll_y,
              path_t, path_x, path_y, lane_change_active, steering_pressed) -> float:
@@ -178,8 +190,20 @@ class LaneCenterBlend:
     else:
       self.w = max(w_target, self.w - W_DOWN * DT_MDL)
 
-    learn_block = 0
     if steering_pressed:
+      self.steer_held_s += DT_MDL
+      if self.steer_held_s >= STEER_BLOCK_MIN_S:
+        self.steer_block = True
+      self.steer_release_s = 0.0
+    else:
+      self.steer_held_s = 0.0
+      if self.steer_block:
+        self.steer_release_s += DT_MDL
+        if self.steer_release_s >= STEER_BLOCK_HOLD_S:
+          self.steer_block = False
+
+    learn_block = 0
+    if self.steer_block:
       learn_block |= GATE_STEER
     if valid and abs(self.e) > E_MAX:
       learn_block |= GATE_E_LARGE
@@ -189,14 +213,11 @@ class LaneCenterBlend:
     self.gates = gates | learn_block
 
     h = knot_weights(self.kappa_road)
-    if learn:
-      self.stale_t = 0.0
-      if abs(self.e) > DEADBAND:
-        self.table = np.clip(self.table + h * self.e * DT_MDL / T_I, -OFFSET_MAX, OFFSET_MAX)
-    else:
-      self.stale_t += DT_MDL
-      if self.stale_t > STALE_S:
-        self.table = self.table * math.exp(-DT_MDL / DECAY_TAU)
+    # The table is persistent knowledge: a blocked frame pauses learning but never
+    # erodes what was learned, so gated stretches (avoids, lane changes, low
+    # confidence) cannot shrink the map.
+    if learn and abs(self.e) > DEADBAND:
+      self.table = np.clip(self.table + h * self.e * DT_MDL / T_I, -OFFSET_MAX, OFFSET_MAX)
 
     if (gates & ~GATE_AVOID) == 0 and not steering_pressed:
       t_base = T_BASE_HOLD if avoid_now else T_BASE
