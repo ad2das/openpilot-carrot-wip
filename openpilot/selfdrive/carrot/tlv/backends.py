@@ -11,7 +11,7 @@ import sys
 
 import numpy as np
 
-from openpilot.selfdrive.carrot.tlv.decode import Decoder, PlaceholderDecoder
+from openpilot.selfdrive.carrot.tlv.decode import Decoder, PlaceholderDecoder, make_decoder
 
 GPU_ENV_KEYS = ("QCOM", "GPU", "CL", "CUDA", "OPENCL", "ROCM", "VULKAN", "TINY_GPU", "TINYGPU")
 GPU_ENV_PREFIXES = ("QCOM", "CUDA", "OPENCL", "ROCM", "VULKAN", "GPU_", "TINYGPU")
@@ -57,6 +57,7 @@ class NullBackend:
   """Pipeline-only backend: measures crop/convert cost without a model."""
 
   name = "null"
+  output_names: tuple[str, ...] = ()
 
   def __init__(self, model_path: str = "") -> None:
     self.model_path = model_path
@@ -95,6 +96,7 @@ class OnnxCpuBackend:
     if self._session.get_providers() != ["CPUExecutionProvider"]:
       raise BackendError(f"unexpected execution providers: {self._session.get_providers()}")
     self._input_name = self._session.get_inputs()[0].name
+    self.output_names = tuple(o.name for o in self._session.get_outputs())
     self.model_path = model_path
 
   def infer(self, model_input):
@@ -229,6 +231,7 @@ class TinygradCpuBackend:
     self._input_name = next(iter(runner.graph_inputs))
     self._input_spec = runner.graph_inputs[self._input_name]
     self._output_names = tuple(runner.graph_outputs)
+    self.output_names = self._output_names
     self._jits: dict[tuple, object] = {}
     self.model_path = model_path
     self._warmup()
@@ -306,6 +309,7 @@ class DspBackend:
   """Hexagon DSP backend placeholder; W70 decides the runtime."""
 
   name = "dsp"
+  output_names: tuple[str, ...] = ()
 
   def __init__(self, model_path: str = "") -> None:
     raise NotImplementedError("DSP backend is not implemented yet; W70 decides the Hexagon runtime")
@@ -398,14 +402,18 @@ class TinygradCpuClassifier(TinygradCpuBackend):
 def make_backend(name: str, model_path: str = "", decoder: Decoder | None = None):
   key = (name or "").strip().lower()
   if key in ("", "null", "none"):
-    return NullBackend(model_path), decoder or PlaceholderDecoder()
-  if key == "onnx":
-    return OnnxCpuBackend(model_path), decoder or PlaceholderDecoder()
-  if key == "tinygrad":
-    return TinygradCpuBackend(model_path), decoder or PlaceholderDecoder()
-  if key == "dsp":
-    return DspBackend(model_path), decoder or PlaceholderDecoder()
-  raise BackendError(f"unknown backend: {name!r}")
+    backend = NullBackend(model_path)
+  elif key == "onnx":
+    backend = OnnxCpuBackend(model_path)
+  elif key == "tinygrad":
+    backend = TinygradCpuBackend(model_path)
+  elif key == "dsp":
+    backend = DspBackend(model_path)
+  else:
+    raise BackendError(f"unknown backend: {name!r}")
+  if decoder is not None:
+    return backend, decoder
+  return backend, make_decoder(getattr(backend, "output_names", ()))
 
 
 def make_classifier(name: str, model_path: str = ""):

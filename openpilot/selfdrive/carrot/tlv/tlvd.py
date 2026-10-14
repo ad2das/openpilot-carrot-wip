@@ -3,7 +3,7 @@
 
 Pipeline per processed frame:
   VisionIPC road NV12 -> per-view crop (FAR native 640x320 / NEAR 1280x640 down X2)
-  -> NV12->RGB on the crop only -> CPU-only backend -> placeholder/W71 decoder
+  -> NV12->RGB on the crop only -> CPU-only backend -> raw-head decoder (train/decode.py port)
   -> full-frame detections -> tracker (IoU+centre, M-of-N) -> relevant-light
   selection -> Korean signal state machine -> carrotTlv @10 Hz.
 
