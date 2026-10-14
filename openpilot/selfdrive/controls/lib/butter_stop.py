@@ -1,12 +1,13 @@
-"""ButterStop: speed-tapered final stop floor and standstill creep guard.
+"""ButterStop: distance-exact taper floor and standstill creep guard.
 
-The taper only ever limits how hard braking may build up below V_TAPER. The
-stop target is the plan's own stop point (the MPC is not shifted): the floor
-may soften the final braking only as far as the plan's remaining stop distance
-allows, so the car still stops where it would without ButterStop. All
-standstill hold/release logic lives unchanged in the LongControl stopping
-state machine; this module provides the bounded floor and the creep guard
-constants used there.
+When ButterStop is on the MPC plans its stop D_EXTRA earlier than the OFF
+target; this module turns that slack into a soft end: below V_TAPER the floor
+caps braking at -(a_end + K_TAPER*v), where a_end is solved so the taper stops
+the car within the plan's remaining distance plus D_EXTRA. The car therefore
+rolls through the whole slack and still ends at the OFF stop point, bounded by
+the lead gap. All standstill hold/release logic lives unchanged in the
+LongControl stopping state machine; this module provides the floor and the
+creep guard constants used there.
 """
 import math
 
@@ -15,10 +16,13 @@ import numpy as np
 from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 
 V_TAPER = 3.0
-A_END = 0.25
-K_TAPER = 0.4
-MARGIN = 0.2
-MIN_FINAL_GAP_SLACK = 0.6
+K_TAPER = 0.4        # taper slope: a(v) = -(A + K_TAPER * v)
+A_MIN = 0.10         # softest end decel the taper may use (m/s^2)
+A_MAX = 1.0          # above this the taper is no softer than stock -> plan wins (None)
+D_EXTRA = 0.9        # MPC stop-point shift (m) when ButterStop is on
+MARGIN = 0.0         # distance kept unused at the end of the slack (m)
+LEAD_SLACK = 1.2     # lead bound: final gap >= max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+SOLVE_ITERS = 30
 MIN_FINAL_GAP_ABS = 3.0
 STANDSTILL_V = 0.05
 STANDSTILL_T = 0.2
@@ -51,12 +55,41 @@ def plan_stop_distance(plan_t, plan_speeds):
   return float(np.sum(v_avg * dt))
 
 
+def taper_stop_distance(v, a_end, k):
+  """Distance to stop from v under a(v) = -(a_end + k*v); a_end > 0, k >= 0."""
+  if k <= 0.0:
+    return v * v / (2.0 * a_end)
+  return v / k - (a_end / (k * k)) * math.log1p(k * v / a_end)
+
+
+def solve_taper_a_end(v, avail, k):
+  """Smallest a_end in [A_MIN, A_MAX] whose taper stops within avail, or None.
+
+  taper_stop_distance decreases monotonically in a_end. Returns A_MIN when
+  even the softest taper fits; None when even A_MAX overruns avail. Bisection
+  returns the upper bracket so the result always satisfies S <= avail.
+  """
+  if taper_stop_distance(v, A_MIN, k) <= avail:
+    return A_MIN
+  if taper_stop_distance(v, A_MAX, k) > avail:
+    return None
+  lo, hi = A_MIN, A_MAX
+  for _ in range(SOLVE_ITERS):
+    mid = 0.5 * (lo + hi)
+    if taper_stop_distance(v, mid, k) <= avail:
+      hi = mid
+    else:
+      lo = mid
+  return hi
+
+
 def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
   """Most-negative allowed acceleration at v_ego, or None to let the plan win.
 
-  The kinematic term uses only the plan's own remaining stop distance minus
-  MARGIN, so the taper can soften the final braking only while that distance
-  still allows stopping at the plan's stop point; it never moves the stop.
+  The taper distance budget is the plan's own remaining stop distance plus
+  D_EXTRA (the slack the shifted MPC left in front of it), so rolling through
+  the slack still ends at the OFF stop point; the lead bound keeps the whole
+  slack outside the minimum final gap.
   """
   if not math.isfinite(v_ego) or v_ego <= 0.0:
     return None
@@ -65,7 +98,7 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
   dist = plan_stop_distance(plan_t, plan_speeds)
   if dist is None:
     return None
-  avail = dist - MARGIN
+  avail = dist + D_EXTRA - MARGIN
   if lead is not None and getattr(lead, "status", False):
     try:
       d_rel = float(lead.dRel)
@@ -73,11 +106,13 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig):
       return None
     if not math.isfinite(d_rel):
       return None
-    avail = min(avail, d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - MIN_FINAL_GAP_SLACK))
+    avail = min(avail, d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK))
   if avail <= AVAIL_MIN:
     return None
-  a_kin = -(v_ego * v_ego) / (2.0 * avail)
-  return min(-(A_END + K_TAPER * v_ego), a_kin)
+  a_end = solve_taper_a_end(v_ego, avail, K_TAPER)
+  if a_end is None:
+    return None
+  return -(a_end + K_TAPER * v_ego)
 
 
 def butter_eligible(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan, lead):

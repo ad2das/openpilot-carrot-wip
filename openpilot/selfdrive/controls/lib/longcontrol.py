@@ -90,6 +90,7 @@ class LongControl:
     self._butter_standstill_confirmed = False
     self._butter_creep_latched = False
     self._butter_creep_logged = False
+    self.butter_floor_last = None
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
@@ -228,6 +229,7 @@ class LongControl:
       if (self.long_control_state == LongCtrlState.pid
           or (self.long_control_state == LongCtrlState.stopping and not self._butter_standstill_confirmed)):
         butter_floor_value = self._butter_floor(active, CS, long_plan, t_since_plan, radarState)
+    self.butter_floor_last = butter_floor_value
 
     if self.long_control_state == LongCtrlState.off:
       self.reset()

@@ -10,6 +10,24 @@ plant.Plant is not used directly: its update(sm) call predates this fork's
 update(sm, carrot) signature, it never runs LongControl (where the ButterStop
 floor and creep guard live) and it has no ButterStop hook. Maneuver provides
 the scenario definitions. Simulation only; no vehicle validation.
+
+PASS criteria (enforced by _case_failures):
+- ALL scenarios: no collision; hold_creep <= 0.05 m (when stopped); final_gap_on >= min(3.0, final_gap_off) − 1e-9.
+- Normal (groups a/b/c, not gated): stopped; |gap_on − gap_off| <= 0.30; soft_on <= 0.30 OR
+  soft_on <= 0.70 × soft_off; peak_jerk_on <= peak_jerk_off + 0.1.
+- Gated (groups a/b/c, floor never active): stopped; gap_off − 0.10 <= gap_on <= gap_off + D_EXTRA + 0.20
+  (stopping further back is the safe direction when the floor is gated off); soft_on <= soft_off + 0.05;
+  peak_jerk_on <= peak_jerk_off + 0.1.
+- Safety s1/s3: gap_on >= gap_off − 0.30 and min_gap_on >= min(3.0, min_gap_off) − 0.10.
+  s2: min_gap_on >= min(3.0, min_gap_off) − 0.10; whole-run peak |jerk| ON <= OFF + 0.2 (add metric
+  `peak_jerk_run_abs`); `stopped` not required.
+
+A scenario is gated when the ON run has floor_active_steps == 0. A scenario
+whose OFF baseline collides or never stops has no comparable baseline and is
+skipped. The tuning sweep covers D_EXTRA {0.6, 0.9, 1.2} x MARGIN {0.0, 0.15}
+x K_TAPER {0.3, 0.4, 0.5} x LEAD_SLACK {1.2, 2.5} (36 combos) and auto-picks
+the passing combo with the smallest LEAD_SLACK, then smallest D_EXTRA, then
+lowest mean soft_on over non-gated normal scenarios.
 """
 import json
 import os
@@ -78,7 +96,11 @@ class _FakeSM:
 
 
 class _NeutralCarrot:
-  """ButterStop code path absent for the planner: pins butter_stop=False."""
+  """ButterStop code path absent for the planner: pins butter_stop=False.
+
+  This also suppresses the v3 long_mpc stop-point shift, so the neutralized
+  ON run matches the OFF baseline exactly.
+  """
 
   def __init__(self, inner):
     self._inner = inner
@@ -103,6 +125,8 @@ class ButterStopLoop:
 
     self.maneuver = maneuver
     self.neutralize = neutralize
+    self.radar_noise_std = float(getattr(maneuver, "radar_noise_std", 0.0))
+    self._radar_rng = np.random.default_rng(0)
     cp = CarInterface.get_non_essential_params(CAR_MODEL)
     cp.openpilotLongitudinalControl = True
     self.cp = cp
@@ -224,6 +248,7 @@ class ButterStopLoop:
     if self.neutralize:
       # "ButterStop code path absent": neutralize every ON-only primitive the
       # real loop reaches so the controller behaves exactly like the OFF one.
+      # The _NeutralCarrot wrapper also suppresses the v3 long_mpc stop shift.
       saved = (longcontrol.butter_floor, longcontrol.CREEP_V, longcontrol.HOLD_RAMP)
       longcontrol.butter_floor = _no_floor
       longcontrol.CREEP_V = float("inf")
@@ -238,7 +263,7 @@ class ButterStopLoop:
     maneuver = self.maneuver
     dt = DT_CTRL
     frames = int(round(maneuver.duration / dt))
-    logs = np.zeros((frames + 1, 5))
+    logs = np.zeros((frames + 1, 6))
     msgs = None
     plan_view = None
     for frame in range(frames + 1):
@@ -255,8 +280,12 @@ class ButterStopLoop:
         self.v_lead_prev = v_lead
         if maneuver.lead_relevancy:
           status = True if maneuver.only_radar else prob_lead > 0.5
+          d_rel = max(0.0, self.lead_x - self.ego_x)
+          if self.radar_noise_std > 0.0:
+            # Same rng(0) sequence for OFF and ON: one draw per radar message.
+            d_rel += float(self._radar_rng.normal(0.0, self.radar_noise_std))
           lead = {
-            "d_rel": max(0.0, self.lead_x - self.ego_x),
+            "d_rel": d_rel,
             "v_rel": v_lead - self.ego_v,
             "v_lead": v_lead,
             "a_lead": a_lead if not np.isnan(a_lead) else 0.0,
@@ -278,8 +307,9 @@ class ButterStopLoop:
         bool(maneuver.enabled), self._cs_view(v_cruise_ms, standstill), plan_view,
         limits, t_since_plan, radar_view)
       accel = float(accel)
+      floor_active = 1.0 if self.long_control.butter_floor_last is not None else 0.0
 
-      logs[frame] = (t, self.ego_v, accel, self.ego_x, self.lead_x)
+      logs[frame] = (t, self.ego_v, accel, self.ego_x, self.lead_x, floor_active)
       self.ego_v = max(0.0, self.ego_v + accel * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       self.lead_x = self.lead_x + v_lead * dt
@@ -289,18 +319,20 @@ class ButterStopLoop:
 def compute_metrics(logs, name, butter):
   t, v, a = logs[:, 0], logs[:, 1], logs[:, 2]
   gaps = logs[:, 4] - logs[:, 3]
+  floor_active_steps = int(np.sum(logs[:, 5] > 0.5))
   stand_idx = np.flatnonzero(v < 0.05)
   stopped = bool(stand_idx.size)
   stop_i = int(stand_idx[0]) if stopped else len(t) - 1
   final_gap = float(gaps[stop_i])
   hold_creep = float(final_gap - np.min(gaps[stop_i:])) if stopped else None
   min_gap = float(np.min(gaps))
+  jerk = np.gradient(a, t) if t.size > 1 else np.zeros_like(a)
+  peak_jerk_run = float(np.max(np.abs(jerk))) if t.size > 1 else 0.0
   if stopped:
     ts = t[stop_i]
     window = (t >= ts - 0.5) & (t <= ts)
     accel_last = float(np.mean(np.abs(a[window]))) if window.any() else None
     jerk_window = (t >= max(0.0, ts - 1.5)) & (t <= ts)
-    jerk = np.gradient(a, t)
     peak_jerk = float(np.max(np.abs(jerk[jerk_window]))) if jerk_window.any() else None
     below3 = np.flatnonzero(v < 3.0)
     time_3 = float(ts - t[below3[0]]) if below3.size else None
@@ -312,14 +344,16 @@ def compute_metrics(logs, name, butter):
     "collision": bool(min_gap < COLLISION_GAP_M), "stopped": stopped,
     "accel_last_0.5s_mean_abs": None if accel_last is None else round(accel_last, 4),
     "peak_jerk_last_1.5s_abs": None if peak_jerk is None else round(peak_jerk, 4),
+    "peak_jerk_run_abs": round(peak_jerk_run, 4),
     "time_3ms_to_standstill_s": None if time_3 is None else round(time_3, 3),
     "hold_creep_m": None if hold_creep is None else round(hold_creep, 3),
+    "floor_active_steps": floor_active_steps,
   }
 
 
-def _stopped_lead(speed_kph, gap_m, duration):
+def _stopped_lead(speed_kph, gap_m, duration, title=None):
   return Maneuver(
-    f"stopped lead {speed_kph} km/h gap {gap_m} m",
+    title or f"stopped lead {speed_kph} km/h gap {gap_m} m",
     duration=duration,
     initial_speed=speed_kph / 3.6,
     lead_relevancy=1,
@@ -354,19 +388,41 @@ _B_SCENARIO = _lead_braking()
 # and the lead-decel 1/2/3 m/s^2 following cases.
 _C_SCENARIOS = create_maneuvers({"e2e": False, "force_decel": False})[:5]
 
+# Safety scenarios. s3 adds N(0, 0.3) noise to dRel on every radar message;
+# both runs use np.random.default_rng(0) so ON and OFF see the identical
+# sequence. The noise hook lives in ButterStopLoop (maneuver.radar_noise_std);
+# Maneuver itself is untouched.
+_S1 = _stopped_lead(15, 9, 20.0, title="s1 short-gap stopped lead 15 km/h gap 9 m")
+_S2 = Maneuver(
+  "s2 lead pulls away: stopped at 30 m, ego 20 km/h, lead 0->5 m/s at 6 s",
+  duration=20.0,
+  initial_speed=20 / 3.6,
+  lead_relevancy=1,
+  initial_distance_lead=30.0,
+  speed_lead_values=[0.0, 0.0, 5.0, 5.0],
+  breakpoints=[0.0, 6.0, 9.0, 20.0],
+)
+_S3 = _stopped_lead(40, 60, 25.0, title="s3 noisy radar stopped lead 40 km/h gap 60 m")
+_S3.radar_noise_std = 0.3
+
 _CASES = ([("a", m) for m in _A_SCENARIOS] + [("b", _B_SCENARIO)]
-          + [("c", m) for m in _C_SCENARIOS])
+          + [("c", m) for m in _C_SCENARIOS]
+          + [("s1", _S1), ("s2", _S2), ("s3", _S3)])
 _CASE_IDS = [f"{group}-{maneuver.title}" for group, maneuver in _CASES]
 
 
 def _case_failures(group, off_metrics, on_metrics):
-  """ButterStop v2 PASS criteria for one scenario; an empty list means it passes.
+  """ButterStop v3 PASS criteria for one scenario; an empty list means it passes.
 
-  All scenarios: no collision; stopped; |final_gap_on - final_gap_off| <=
-  0.30 m; final_gap_on >= min(3.0, final_gap_off); hold_creep <= 0.05 m;
-  accel_last_0.5s_mean_abs ON <= 0.80 x OFF (softer end) or <= 0.30 m/s^2
-  absolute; peak_jerk_last_1.5s_abs ON <= OFF + 0.1. A scenario whose OFF
-  baseline collides or never stops has no comparable baseline and is skipped.
+  The criteria are listed verbatim in the module docstring; they implement:
+  ALL: no collision; hold_creep <= 0.05 m; final_gap_on >= min(3.0, final_gap_off) − 1e-9.
+  Normal a/b/c (not gated): stopped; |gap_on − gap_off| <= 0.30; soft_on <= 0.30 OR <= 0.70 × soft_off;
+  peak_jerk_on <= peak_jerk_off + 0.1.
+  Gated a/b/c: stopped; gap_off − 0.10 <= gap_on <= gap_off + D_EXTRA + 0.20; soft_on <= soft_off + 0.05;
+  peak_jerk_on <= peak_jerk_off + 0.1.
+  s1/s3: gap_on >= gap_off − 0.30; min_gap_on >= min(3.0, min_gap_off) − 0.10.
+  s2: min_gap_on >= min(3.0, min_gap_off) − 0.10; peak_jerk_run_abs ON <= OFF + 0.2; stopped not required.
+  An OFF baseline that collides or never stops is skipped (no comparable baseline).
   """
   title = on_metrics["name"]
   fails = []
@@ -374,24 +430,54 @@ def _case_failures(group, off_metrics, on_metrics):
     return fails
   if on_metrics["collision"]:
     fails.append(f"{title}: ON collides with min gap {on_metrics['min_gap_m']} m")
+  if on_metrics["stopped"]:
+    creep = on_metrics["hold_creep_m"]
+    if creep is None or creep > 0.05 + 1e-9:
+      fails.append(f"{title}: ON hold creep {creep} > 0.05 m")
+  off_gap = off_metrics["final_gap_m"]
+  on_gap = on_metrics["final_gap_m"]
+  if on_gap < min(3.0, off_gap) - 1e-9:
+    fails.append(f"{title}: ON final gap {on_gap} < min(3.0, OFF {off_gap})")
+
+  if group in ("s1", "s3"):
+    if on_gap < off_gap - 0.30 - 1e-9:
+      fails.append(f"{title}: ON final gap {on_gap} < OFF {off_gap} - 0.30")
+    min_bound = min(3.0, off_metrics["min_gap_m"]) - 0.10
+    if on_metrics["min_gap_m"] < min_bound - 1e-9:
+      fails.append(f"{title}: ON min gap {on_metrics['min_gap_m']} < min(3.0, OFF {off_metrics['min_gap_m']}) - 0.10")
+    return fails
+
+  if group == "s2":
+    min_bound = min(3.0, off_metrics["min_gap_m"]) - 0.10
+    if on_metrics["min_gap_m"] < min_bound - 1e-9:
+      fails.append(f"{title}: ON min gap {on_metrics['min_gap_m']} < min(3.0, OFF {off_metrics['min_gap_m']}) - 0.10")
+    if on_metrics["peak_jerk_run_abs"] > off_metrics["peak_jerk_run_abs"] + 0.2 + 1e-9:
+      fails.append(f"{title}: ON peak |jerk| run {on_metrics['peak_jerk_run_abs']} > OFF {off_metrics['peak_jerk_run_abs']} + 0.2")
+    return fails
+
+  # groups a/b/c
   if not on_metrics["stopped"]:
     fails.append(f"{title}: ON never stops")
     return fails
-  off_gap = off_metrics["final_gap_m"]
-  on_gap = on_metrics["final_gap_m"]
-  if abs(on_gap - off_gap) > 0.30 + 1e-9:
-    fails.append(f"{title}: |final gap ON {on_gap} - OFF {off_gap}| > 0.30 m")
-  if on_gap < min(3.0, off_gap) - 1e-9:
-    fails.append(f"{title}: ON final gap {on_gap} < min(3.0, OFF {off_gap})")
-  creep = on_metrics["hold_creep_m"]
-  if creep is None or creep > 0.05 + 1e-9:
-    fails.append(f"{title}: ON hold creep {creep} > 0.05 m")
   off_soft = off_metrics["accel_last_0.5s_mean_abs"]
   on_soft = on_metrics["accel_last_0.5s_mean_abs"]
-  if off_soft is None or on_soft is None:
-    fails.append(f"{title}: missing last-0.5s accel")
-  elif not (on_soft <= 0.80 * off_soft + 1e-9 or on_soft <= 0.30 + 1e-9):
-    fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} > 0.80 x OFF {off_soft} and > 0.30")
+  gated = on_metrics["floor_active_steps"] == 0
+  if gated:
+    if on_gap < off_gap - 0.10 - 1e-9:
+      fails.append(f"{title}: gated ON final gap {on_gap} < OFF {off_gap} - 0.10")
+    if on_gap > off_gap + butter_stop.D_EXTRA + 0.20 + 1e-9:
+      fails.append(f"{title}: gated ON final gap {on_gap} > OFF {off_gap} + D_EXTRA + 0.20")
+    if off_soft is None or on_soft is None:
+      fails.append(f"{title}: missing last-0.5s accel")
+    elif on_soft > off_soft + 0.05 + 1e-9:
+      fails.append(f"{title}: gated ON last-0.5s mean |accel| {on_soft} > OFF {off_soft} + 0.05")
+  else:
+    if abs(on_gap - off_gap) > 0.30 + 1e-9:
+      fails.append(f"{title}: |final gap ON {on_gap} - OFF {off_gap}| > 0.30 m")
+    if off_soft is None or on_soft is None:
+      fails.append(f"{title}: missing last-0.5s accel")
+    elif not (on_soft <= 0.30 + 1e-9 or on_soft <= 0.70 * off_soft + 1e-9):
+      fails.append(f"{title}: ON last-0.5s mean |accel| {on_soft} > 0.30 and > 0.70 x OFF {off_soft}")
   off_jerk = off_metrics["peak_jerk_last_1.5s_abs"]
   on_jerk = on_metrics["peak_jerk_last_1.5s_abs"]
   if off_jerk is None or on_jerk is None:
@@ -408,7 +494,8 @@ def test_butter_stop_maneuver(group, maneuver):
   off_metrics = compute_metrics(off, maneuver.title, 0)
   on_metrics = compute_metrics(on, maneuver.title, 1)
   entry = {"scenario": maneuver.title, "group": group,
-           "off": off_metrics, "on": on_metrics}
+           "off": off_metrics, "on": on_metrics,
+           "gated": group in ("a", "b", "c") and on_metrics["floor_active_steps"] == 0}
   RESULTS.append(entry)
 
   if off_metrics["collision"]:
@@ -422,8 +509,9 @@ def test_butter_stop_maneuver(group, maneuver):
 
   if group == "a" and "stopped lead 40" in maneuver.title:
     # ButterStop=0 must be identical to the same run with the whole ButterStop
-    # code path absent: floor neutralized, creep guard unreachable and hold
-    # ramp at the stock stopping rate (the v2 planner is not shifted).
+    # code path absent: floor neutralized, creep guard unreachable, hold ramp
+    # at the stock stopping rate and the v3 planner shift suppressed by the
+    # neutralized carrot's butter_stop=False.
     neutral = ButterStopLoop(maneuver, butter=1, neutralize=True).run()
     equal = bool(np.array_equal(off[:, 2], neutral[:, 2]))
     entry["off_equals_neutralized"] = equal
@@ -442,18 +530,26 @@ def test_write_butter_sim_table():
     handle.write(text + "\n")
 
 
-_SWEEP_V_TAPER = (1.5, 2.0, 3.0)
-_SWEEP_MARGIN = (0.0, 0.1, 0.2)
-_SWEEP_SLACK = (0.0, 0.3, 0.6)
+_SWEEP_D_EXTRA = (0.6, 0.9, 1.2)
+_SWEEP_MARGIN = (0.0, 0.15)
+_SWEEP_K_TAPER = (0.3, 0.4, 0.5)
+_SWEEP_LEAD_SLACK = (1.2, 2.5)
 
 _SWEEP_CRITERIA = [
-  "no collision",
-  "stopped",
-  "|final_gap_on - final_gap_off| <= 0.30 m",
-  "final_gap_on >= min(3.0, final_gap_off)",
-  "hold_creep <= 0.05 m",
-  "accel_last_0.5s_mean_abs ON <= 0.80 x OFF or <= 0.30 m/s^2",
-  "peak_jerk_last_1.5s_abs ON <= OFF + 0.1",
+  "ALL: no collision",
+  "ALL: hold_creep <= 0.05 m (when stopped)",
+  "ALL: final_gap_on >= min(3.0, final_gap_off) - 1e-9",
+  "a/b/c normal: stopped",
+  "a/b/c normal: |gap_on - gap_off| <= 0.30 m",
+  "a/b/c normal: soft_on <= 0.30 or soft_on <= 0.70 x soft_off",
+  "a/b/c normal: peak_jerk_on <= peak_jerk_off + 0.1",
+  "a/b/c gated: stopped",
+  "a/b/c gated: gap_off - 0.10 <= gap_on <= gap_off + D_EXTRA + 0.20",
+  "a/b/c gated: soft_on <= soft_off + 0.05",
+  "a/b/c gated: peak_jerk_on <= peak_jerk_off + 0.1",
+  "s1/s3: gap_on >= gap_off - 0.30 and min_gap_on >= min(3.0, min_gap_off) - 0.10",
+  "s2: min_gap_on >= min(3.0, min_gap_off) - 0.10",
+  "s2: peak_jerk_run_abs ON <= OFF + 0.2",
 ]
 
 
@@ -472,60 +568,96 @@ def _sweep_output_path():
   return None
 
 
+def _sweep_lead_slacks():
+  """Full LEAD_SLACK tuple, or a single value when BUTTER_SWEEP_SHARD is set.
+
+  If the CI job would exceed its timeout-minutes, dispatch two runs with
+  BUTTER_SWEEP_SHARD=1.2 and BUTTER_SWEEP_SHARD=2.5 instead of raising the
+  timeout; each run writes its own butter_sweep.json subset.
+  """
+  shard = os.environ.get("BUTTER_SWEEP_SHARD")
+  if shard is None:
+    return _SWEEP_LEAD_SLACK
+  try:
+    value = float(shard)
+  except ValueError:
+    return _SWEEP_LEAD_SLACK
+  selected = tuple(v for v in _SWEEP_LEAD_SLACK if v == value)
+  return selected or _SWEEP_LEAD_SLACK
+
+
 @pytest.mark.skipif(_sweep_output_path() is None,
                     reason="tuning sweep runs only when a sweep or sim output path is set")
 def test_butter_stop_tuning_sweep(monkeypatch):
-  """Sweep V_TAPER x MARGIN x MIN_FINAL_GAP_SLACK over every scenario.
+  """Sweep D_EXTRA x MARGIN x K_TAPER x LEAD_SLACK over every scenario.
 
   PASS criteria per combo and scenario: _case_failures (same criteria as the
-  normal maneuver table). Auto-pick among the passing combos: the smallest
-  mean ON accel_last_0.5s_mean_abs; a tie prefers the smaller V_TAPER (less
-  change). When no combo passes, the closest three are reported with the
-  failing criteria and nothing is shipped.
+  normal maneuver table; the butter_stop module is monkeypatched, and long_mpc
+  reads D_EXTRA through the module at call time). Auto-pick (safety first):
+  among the passing combos the smallest LEAD_SLACK, then the smallest D_EXTRA,
+  then the lowest mean soft_on over non-gated normal scenarios. When no combo
+  passes, the closest three are reported by (failure count, mean soft_on) with
+  the failing criteria and nothing is shipped.
   """
-  off_runs = [compute_metrics(ButterStopLoop(m, butter=0).run(), m.title, 0) for _, m in _CASES]
+  off_cache = {m.title: compute_metrics(ButterStopLoop(m, butter=0).run(), m.title, 0) for _, m in _CASES}
   rows = []
-  for v_taper in _SWEEP_V_TAPER:
+  for d_extra in _SWEEP_D_EXTRA:
     for margin in _SWEEP_MARGIN:
-      for slack in _SWEEP_SLACK:
-        monkeypatch.setattr(butter_stop, "V_TAPER", v_taper)
-        monkeypatch.setattr(butter_stop, "MARGIN", margin)
-        monkeypatch.setattr(butter_stop, "MIN_FINAL_GAP_SLACK", slack)
-        cases = []
-        fails = []
-        softs = []
-        for (group, m), off_metrics in zip(_CASES, off_runs, strict=True):
-          on_metrics = compute_metrics(ButterStopLoop(m, butter=1).run(), m.title, 1)
-          case_fails = _case_failures(group, off_metrics, on_metrics)
-          fails += case_fails
-          if on_metrics["accel_last_0.5s_mean_abs"] is not None:
-            softs.append(on_metrics["accel_last_0.5s_mean_abs"])
-          cases.append({"scenario": m.title, "group": group, "fails": case_fails,
-                        "off": off_metrics, "on": on_metrics})
-        rows.append({"v_taper": v_taper, "margin": margin, "min_final_gap_slack": slack,
-                     "all_pass": not fails, "failures": fails,
-                     "on_soft_mean": round(float(np.mean(softs)), 5) if softs else None,
-                     "cases": cases})
+      for k_taper in _SWEEP_K_TAPER:
+        for lead_slack in _sweep_lead_slacks():
+          monkeypatch.setattr(butter_stop, "D_EXTRA", d_extra)
+          monkeypatch.setattr(butter_stop, "MARGIN", margin)
+          monkeypatch.setattr(butter_stop, "K_TAPER", k_taper)
+          monkeypatch.setattr(butter_stop, "LEAD_SLACK", lead_slack)
+          cases = []
+          fails = []
+          gated = []
+          normal_softs = []
+          normal_dgaps = []
+          for group, m in _CASES:
+            off_metrics = off_cache[m.title]
+            on_metrics = compute_metrics(ButterStopLoop(m, butter=1).run(), m.title, 1)
+            case_fails = _case_failures(group, off_metrics, on_metrics)
+            fails += case_fails
+            is_normal = group in ("a", "b", "c")
+            is_gated = is_normal and on_metrics["floor_active_steps"] == 0
+            if is_gated:
+              gated.append(m.title)
+            if is_normal and not is_gated:
+              if on_metrics["accel_last_0.5s_mean_abs"] is not None:
+                normal_softs.append(on_metrics["accel_last_0.5s_mean_abs"])
+              if off_metrics["stopped"] and not off_metrics["collision"]:
+                normal_dgaps.append(abs(on_metrics["final_gap_m"] - off_metrics["final_gap_m"]))
+            cases.append({"scenario": m.title, "group": group, "fails": case_fails,
+                          "off": off_metrics, "on": on_metrics})
+          rows.append({
+            "d_extra": d_extra, "margin": margin, "k_taper": k_taper, "lead_slack": lead_slack,
+            "all_pass": not fails, "failures": fails, "gated": gated,
+            "mean_soft_on": round(float(np.mean(normal_softs)), 5) if normal_softs else None,
+            "max_abs_dgap": round(float(np.max(normal_dgaps)), 4) if normal_dgaps else None,
+            "cases": cases,
+          })
 
   passing = [r for r in rows if r["all_pass"]]
   chosen = None
   if passing:
-    chosen = min(passing, key=lambda r: (r["on_soft_mean"], r["v_taper"], r["margin"],
-                                         r["min_final_gap_slack"]))
+    chosen = min(passing, key=lambda r: (r["lead_slack"], r["d_extra"],
+                                         r["mean_soft_on"] if r["mean_soft_on"] is not None else 1e9))
   closest = sorted((r for r in rows if not r["all_pass"]),
                    key=lambda r: (len(r["failures"]),
-                                  r["on_soft_mean"] if r["on_soft_mean"] is not None else 1e9))[:3]
+                                  r["mean_soft_on"] if r["mean_soft_on"] is not None else 1e9))[:3]
 
   for r in rows:
-    label = f'V_TAPER {r["v_taper"]} MARGIN {r["margin"]} SLACK {r["min_final_gap_slack"]}'
-    print(f'sweep {label}: pass={r["all_pass"]} failures={len(r["failures"])} soft_mean={r["on_soft_mean"]}')
+    label = f'D {r["d_extra"]} M {r["margin"]} K {r["k_taper"]} S {r["lead_slack"]}'
+    stats = f'pass={r["all_pass"]} fails={len(r["failures"])} gated={len(r["gated"])}'
+    print(f'sweep {label}: {stats} soft_mean={r["mean_soft_on"]} max_dgap={r["max_abs_dgap"]}')
   if chosen is not None:
-    label = f'V_TAPER {chosen["v_taper"]} MARGIN {chosen["margin"]} SLACK {chosen["min_final_gap_slack"]}'
-    print(f'chosen: {label} soft_mean {chosen["on_soft_mean"]}')
+    label = f'D {chosen["d_extra"]} M {chosen["margin"]} K {chosen["k_taper"]} S {chosen["lead_slack"]}'
+    print(f'chosen: {label} soft_mean {chosen["mean_soft_on"]} max_dgap {chosen["max_abs_dgap"]}')
   else:
     print("no combo passed all criteria; closest:")
     for r in closest:
-      print(f'  V_TAPER {r["v_taper"]} MARGIN {r["margin"]} SLACK {r["min_final_gap_slack"]}:')
+      print(f'  D_EXTRA {r["d_extra"]} MARGIN {r["margin"]} K_TAPER {r["k_taper"]} LEAD_SLACK {r["lead_slack"]}:')
       for failure in r["failures"]:
         print(f'    {failure}')
 

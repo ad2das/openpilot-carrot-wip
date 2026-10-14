@@ -56,11 +56,44 @@ if sys.platform == "win32":
   params_module.Params = object
   sys.modules.setdefault("openpilot.common.params", params_module)
 
+# Stub casadi and the native solver for the long_mpc import; the tests only
+# exercise the pure stop_distance shift, never the solver itself.
+if "casadi" not in sys.modules:
+  casadi_module = ModuleType("casadi")
+  casadi_module.SX = lambda *a, **k: None
+  casadi_module.vertcat = lambda *a, **k: None
+  sys.modules.setdefault("casadi", casadi_module)
+
+if "acados" not in sys.modules:
+  acados_module = ModuleType("acados")
+  acados_template_module = ModuleType("acados.acados_template")
+
+  class _StubAcadosOcp:
+    pass
+
+  class _StubAcadosModel:
+    pass
+
+  acados_template_module.AcadosModel = _StubAcadosModel
+  acados_template_module.AcadosOcp = _StubAcadosOcp
+  acados_template_module.AcadosOcpSolver = None
+  sys.modules.setdefault("acados", acados_module)
+  sys.modules.setdefault("acados.acados_template", acados_template_module)
+
+_generated_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code")
+_generated_module.__path__ = []
+_solver_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx")
+_solver_module.AcadosOcpSolverCython = None
+sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code", _generated_module)
+sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
+
 import openpilot.selfdrive.controls.lib.longcontrol as lc
+from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  A_END, CREEP_ACCEL, HOLD_RAMP, K_TAPER, MARGIN,
-  MIN_FINAL_GAP_ABS, MIN_FINAL_GAP_SLACK, STANDSTILL_T, STANDSTILL_V,
-  V_TAPER, butter_eligible, butter_floor, plan_stop_distance,
+  A_MAX, A_MIN, CREEP_ACCEL, D_EXTRA, HOLD_RAMP, K_TAPER, LEAD_SLACK, MARGIN,
+  MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V, V_TAPER,
+  butter_eligible, butter_floor, plan_stop_distance, solve_taper_a_end,
+  taper_stop_distance,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongControl, LongCtrlState,
@@ -122,6 +155,54 @@ def stopping_inputs(*, v_ego=1.0, standstill=False, plan_speeds=None, lead_statu
 
 
 # ---------------------------------------------------------------------------
+# taper math
+# ---------------------------------------------------------------------------
+
+def _euler_taper_stop_distance(v0, a_end, k, dt=1e-4):
+  """Numeric integration of a(v) = -(a_end + k*v) to standstill."""
+  v = float(v0)
+  s = 0.0
+  while v > 0.0:
+    a = -(a_end + k * v)
+    s += v * dt
+    v = max(0.0, v + a * dt)
+  return s
+
+
+def test_taper_stop_distance_matches_numeric_integration():
+  for v in (0.2, 1.0, 2.0, 3.0):
+    for a_end in (0.1, 0.25, 0.5, 1.0):
+      for k in (0.0, 0.3, 0.4, 0.5):
+        expected = _euler_taper_stop_distance(v, a_end, k)
+        got = taper_stop_distance(v, a_end, k)
+        assert got == pytest.approx(expected, rel=0.01), (v, a_end, k)
+
+
+def test_taper_stop_distance_k_zero_is_constant_decel():
+  assert taper_stop_distance(2.0, 0.5, 0.0) == pytest.approx(2.0 ** 2 / (2.0 * 0.5))
+
+
+def test_taper_stop_distance_decreases_in_a_end():
+  for v in (0.2, 1.0, 2.0, 3.0):
+    for k in (0.0, 0.3, 0.4, 0.5):
+      dists = [taper_stop_distance(v, a_end, k) for a_end in (0.1, 0.25, 0.5, 1.0)]
+      for earlier, later in zip(dists, dists[1:], strict=False):
+        assert later < earlier, (v, k)
+
+
+def test_solve_taper_a_end_safety_property():
+  for v in np.linspace(0.06, 2.99, 30):
+    for avail in np.linspace(0.06, 20.0, 40):
+      for k in (0.3, 0.4, 0.5):
+        a_end = solve_taper_a_end(float(v), float(avail), k)
+        if a_end is None:
+          assert taper_stop_distance(float(v), A_MAX, k) > float(avail) + 1e-9
+        else:
+          assert A_MIN <= a_end <= A_MAX
+          assert taper_stop_distance(float(v), a_end, k) <= float(avail) + 1e-9
+
+
+# ---------------------------------------------------------------------------
 # butter_floor math
 # ---------------------------------------------------------------------------
 
@@ -135,25 +216,17 @@ def test_plan_stop_distance_trapezoid_and_none():
   assert plan_stop_distance(t[:1], v[:1]) is None
 
 
-def test_floor_is_more_negative_of_taper_and_kinematic_limit():
+def test_floor_uses_plan_distance_plus_extra():
   v_ego = 1.0
   t = np.array([0.0, 0.5, 1.0])
-  # Short plan (0.5 m of stop distance): the kinematic limit dominates.
-  short = np.array([1.0, 0.5, 0.0])
-  avail = plan_stop_distance(t, short) - MARGIN
-  assert avail == pytest.approx(0.5 - MARGIN)
-  expected = min(-(A_END + K_TAPER * v_ego), -(v_ego ** 2) / (2.0 * avail))
-  assert expected == pytest.approx(-(v_ego ** 2) / (2.0 * avail))
+  short = np.array([3.0, 1.5, 0.0])
+  dist = plan_stop_distance(t, short)
+  avail = dist + D_EXTRA - MARGIN
+  expected = -(solve_taper_a_end(v_ego, avail, K_TAPER) + K_TAPER * v_ego)
   assert butter_floor(v_ego, t, short, SimpleNamespace(status=False), 5.5) == pytest.approx(expected)
-  # Longer plan (1.5 m): the taper itself is the more negative limit.
-  longer = np.array([3.0, 1.5, 0.0])
-  avail_long = plan_stop_distance(t, longer) - MARGIN
-  expected_long = min(-(A_END + K_TAPER * v_ego), -(v_ego ** 2) / (2.0 * avail_long))
-  assert expected_long == pytest.approx(-(A_END + K_TAPER * v_ego))
-  assert butter_floor(v_ego, t, longer, SimpleNamespace(status=False), 5.5) == pytest.approx(expected_long)
 
 
-def test_floor_taper_gets_gentler_close_to_standstill():
+def test_floor_gets_gentler_close_to_standstill():
   speeds = np.maximum(0.0, 3.0 - 2.0 * PLAN_T)  # stops within ~2.3 m
   floor_far = butter_floor(2.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5)
   floor_near = butter_floor(0.2, PLAN_T, speeds, SimpleNamespace(status=False), 5.5)
@@ -165,19 +238,53 @@ def test_floor_returns_none_without_a_planned_stop():
   assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5) is None
 
 
-def test_floor_lead_bound_and_absolute_gap():
+def test_floor_returns_none_when_taper_cannot_fit():
+  # 3 m/s comes to a stop in less than the A_MAX taper needs.
+  speeds = np.array([3.0, 0.0])
+  t = np.array([0.0, 0.1])
+  assert butter_floor(3.0, t, speeds, SimpleNamespace(status=False), 5.5) is None
+
+
+def test_floor_lead_bound_stationary_lead():
   speeds = np.maximum(0.0, 2.0 * (1.0 - PLAN_T / 2.0))
   lead = SimpleNamespace(status=True, dRel=10.0)
-  bound = 10.0 - max(MIN_FINAL_GAP_ABS, 5.5 - MIN_FINAL_GAP_SLACK)
-  avail = min(plan_stop_distance(PLAN_T, speeds) - MARGIN, bound)
-  expected = min(-(A_END + K_TAPER * 1.0), -(1.0 ** 2) / (2.0 * avail))
-  assert butter_floor(1.0, PLAN_T, speeds, lead, 5.5) == pytest.approx(expected)
-  # dRel at the lead bound -> no floor at all.
-  assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=True, dRel=5.5 - MIN_FINAL_GAP_SLACK), 5.5) is None
+  bound = 10.0 - max(MIN_FINAL_GAP_ABS, 5.5 - LEAD_SLACK)
+  avail = min(plan_stop_distance(PLAN_T, speeds) + D_EXTRA - MARGIN, bound)
+  expected = -(solve_taper_a_end(1.0, avail, K_TAPER) + K_TAPER * 1.0)
+  floor = butter_floor(1.0, PLAN_T, speeds, lead, 5.5)
+  assert floor == pytest.approx(expected)
+  taper = taper_stop_distance(1.0, -(floor + K_TAPER * 1.0), K_TAPER) if floor is not None else None
+  assert taper <= bound + 1e-9
+  # dRel inside the lead bound -> no floor at all.
+  assert butter_floor(1.0, PLAN_T, speeds, SimpleNamespace(status=True, dRel=5.5 - LEAD_SLACK), 5.5) is None
   # A small configured stop distance keeps the 3.0 m absolute minimum.
   strong = SimpleNamespace(status=True, dRel=6.0)
+  strong_avail = 6.0 - MIN_FINAL_GAP_ABS
   assert butter_floor(1.0, PLAN_T, speeds, strong, 1.0) == pytest.approx(
-    min(-(A_END + K_TAPER * 1.0), -(1.0 ** 2) / (2.0 * (6.0 - MIN_FINAL_GAP_ABS))))
+    -(solve_taper_a_end(1.0, strong_avail, K_TAPER) + K_TAPER * 1.0))
+
+
+def test_floor_lead_bound_safety_grid():
+  rng = np.random.default_rng(1)
+  for v in np.linspace(0.06, 2.99, 12):
+    for d_rel in np.linspace(3.5, 15.0, 12):
+      for stop_distance_orig in (3.0, 5.5, 7.0):
+        speeds = np.maximum(0.0, v * (1.0 - PLAN_T / 3.0))
+        lead = SimpleNamespace(status=True, dRel=float(d_rel))
+        floor = butter_floor(float(v), PLAN_T, speeds, lead, stop_distance_orig)
+        if floor is None:
+          continue
+        limit = d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+        a_end = -(floor + K_TAPER * v)
+        assert taper_stop_distance(float(v), a_end, K_TAPER) <= limit + 1e-9
+  _ = rng
+
+
+def test_floor_returns_none_when_lead_bound_leaves_no_avail():
+  # avail below AVAIL_MIN when the lead bound eats the whole slack.
+  speeds = np.maximum(0.0, 1.0 - PLAN_T)
+  lead = SimpleNamespace(status=True, dRel=MIN_FINAL_GAP_ABS + 0.01)
+  assert butter_floor(1.0, PLAN_T, speeds, lead, MIN_FINAL_GAP_ABS) is None
 
 
 def test_floor_invalid_inputs_and_stop_distance():
@@ -265,6 +372,16 @@ def test_stopping_state_without_floor_keeps_original_ramp(monkeypatch):
   cs, plan, radar = stopping_inputs(v_ego=1.0, plan_speeds=np.array([np.nan]))
   accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
   assert accel == pytest.approx(-0.2 - control.CP.stoppingDecelRate * lc.DT_CTRL)
+
+
+def test_butter_floor_last_telemetry(monkeypatch):
+  control, _ = make_control(monkeypatch)
+  control.long_control_state = LongCtrlState.stopping
+  cs, plan, radar = stopping_inputs(v_ego=1.0)
+  assert control.butter_floor_last is None
+  floor = butter_floor(1.0, PLAN_T, plan.speeds, radar.leadOne, 5.5)
+  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control.butter_floor_last == pytest.approx(floor)
 
 
 def test_standstill_latch_and_faster_hold_ramp(monkeypatch):
@@ -375,7 +492,7 @@ def test_pid_state_floor_limits_without_adding_braking(monkeypatch):
   assert accel == pytest.approx(floor)
   assert accel < 0.0
   # A softer plan whose PID output already sits above the floor is untouched.
-  plan.vTargetNow = 0.5
+  plan.vTargetNow = 1.0
   plan.aTarget = -0.05
   accel2, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
   assert accel2 > floor
@@ -385,6 +502,75 @@ def test_butter_stop_defaults_off_when_param_missing(monkeypatch):
   monkeypatch.setattr(lc, "Params", lambda: DictParams({"StoppingAccel": -50}))
   control = lc.LongControl(make_cp())
   assert control.butter_stop is False
+
+
+# ---------------------------------------------------------------------------
+# long_mpc stop-distance shift (call-time read through the module)
+# ---------------------------------------------------------------------------
+
+def _mpc_with_stub_solver(monkeypatch):
+  import openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc as long_mpc
+
+  class _StubSolver:
+    def __init__(self, *args, **kwargs):
+      pass
+
+    def reset(self):
+      pass
+
+    def cost_set(self, *args, **kwargs):
+      pass
+
+    def set(self, *args, **kwargs):
+      pass
+
+  monkeypatch.setattr(long_mpc, "AcadosOcpSolverCython", _StubSolver)
+  return long_mpc
+
+
+def _mpc_carrot(monkeypatch, butter):
+  carrot = SimpleNamespace(
+    comfort_brake=2.4, stop_distance=6.0, butter_stop=butter, mode="acc",
+    v_cruise=0.0, stop_dist=1000.0, trafficStopDistanceAdjust=0.0,
+    trafficStopModelLeadOffset=0.0, autoNaviSpeedDecelRate=1.0,
+    dynamicTFollowLC=0.0, lane_change_active=False, leadAccelResponse=0,
+    get_T_FOLLOW=lambda *a, **k: 1.5, jerk_factor=1.0, aChangeCostStarting=10.0,
+  )
+  return carrot
+
+
+def _run_mpc_capture_stop_distance(monkeypatch, butter, d_extra=None):
+  long_mpc = _mpc_with_stub_solver(monkeypatch)
+  captured = {}
+
+  def _patched_run(self):
+    for i in range(long_mpc.N + 1):
+      self.solver.set(i, 'p', self.params[i])
+    captured["stop_distance"] = float(self.params[0, 7])
+
+  monkeypatch.setattr(long_mpc.LongitudinalMpc, "run", _patched_run)
+
+  mpc = long_mpc.LongitudinalMpc()
+  mpc.set_accel_limits(-3.5, 2.0)
+  carrot = _mpc_carrot(monkeypatch, butter)
+  if d_extra is not None:
+    monkeypatch.setattr(butter_stop, "D_EXTRA", d_extra)
+  lead = SimpleNamespace(status=False, radarTrackId=-1, radar=False, modelProb=0.0,
+                         dRel=200.0, vLead=0.0, vRel=0.0, aLeadK=0.0, aLeadTau=0.5)
+  radarstate = SimpleNamespace(leadOne=lead, leadTwo=lead)
+  mpc.update(carrot, False, radarstate, 0.0, np.zeros(long_mpc.N + 1),
+             np.zeros(long_mpc.N + 1), np.zeros(long_mpc.N + 1), np.zeros(long_mpc.N + 1),
+             measured_a_ego=0.0)
+  return captured["stop_distance"]
+
+
+def test_long_mpc_stop_distance_shift_call_time(monkeypatch):
+  off = _run_mpc_capture_stop_distance(monkeypatch, butter=0)
+  assert off == pytest.approx(6.0)
+  on = _run_mpc_capture_stop_distance(monkeypatch, butter=1)
+  assert on == pytest.approx(6.0 + butter_stop.D_EXTRA)
+  patched = _run_mpc_capture_stop_distance(monkeypatch, butter=1, d_extra=0.42)
+  assert patched == pytest.approx(6.0 + 0.42)
 
 
 # ---------------------------------------------------------------------------
