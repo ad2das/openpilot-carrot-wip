@@ -1,6 +1,6 @@
 """Decoder interface for TLV model raw outputs.
 
-Real models (the bundled r8s50a detector, the r8 family) export 6 raw YOLO-style
+Real models (the bundled r8s50a40 detector, the r8 family) export 6 raw YOLO-style
 heads: `pN_box` / `pN_cls` per level, with Distribution Focal Loss box
 regression (reg_max 16) and either 8 classes (CONTRACT classes) or 1 class
 (single-class detectors, whose class 0 maps to RED on the device).

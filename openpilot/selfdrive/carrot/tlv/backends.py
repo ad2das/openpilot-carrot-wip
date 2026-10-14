@@ -21,14 +21,14 @@ GPU_VALUE_TOKENS = ("QCOM", "CUDA", "OPENCL", "VULKAN", "ROCM")
 _FALSY = ("", "0", "false", "no", "off")
 
 # Bundled traffic-light models: shipped so CarrotTlvMode works with no model
-# path params. The detector is r8s50a (single-class); the lamp is the r9
-# device-crop retrain. Absolute paths resolved next to this module; the SHA256
-# values are the verified artifacts, checked by the unit tests only (tlvd never
-# hashes a model at startup).
+# path params. The detector is r8s50a40 (single-class, 40-epoch r8s50a); the
+# lamp is the r9 device-crop retrain. Absolute paths resolved next to this
+# module; the SHA256 values are the verified artifacts, checked by the unit
+# tests only (tlvd never hashes a model at startup).
 _BUNDLED_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
-BUNDLED_DETECTOR = os.path.join(_BUNDLED_DIR, "tl_detector_r8s50a.onnx")
+BUNDLED_DETECTOR = os.path.join(_BUNDLED_DIR, "tl_detector_r8s50a40.onnx")
 BUNDLED_LAMP = os.path.join(_BUNDLED_DIR, "tl_lamp_r9.onnx")
-BUNDLED_DETECTOR_SHA256 = "5f108f62567557e0ac35902a444812230b3da4bd9f0729163a8ff4c3bb909f94"
+BUNDLED_DETECTOR_SHA256 = "fc895608b547b0224080e0ee9f183bbfa9a5b441ce5ba381e722f4cc28939162"
 BUNDLED_LAMP_SHA256 = "665d3649c0392a6d306a822dfe905070e1149cea68f3e6c5b0cddfbd3dc38be7"
 
 

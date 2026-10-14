@@ -1,6 +1,6 @@
 """Single-class detector confirmation + tiered relevance gate (W117).
 
-The bundled r8s50a detector is single-class (class 0 for every lamp): its
+The bundled r8s50a40 detector is single-class (class 0 for every lamp): its
 M-of-N detector belt would publish RED for green lights (W115 A6), so
 FramePipeline confirms single-class tracks through lamp-classifier votes only.
 The relevance gate is tiered: the nearest-path light within 120 m first, and
@@ -24,7 +24,7 @@ from test_tlv_classifier import W, ScriptedBackend, _far_geom, _red_frame
 from test_tlv_decode import R3B_NAMES, _base, _pack
 from test_tlv_tracker import _track_at, box_at
 
-BUNDLED_DETECTOR_SHA256 = "5f108f62567557e0ac35902a444812230b3da4bd9f0729163a8ff4c3bb909f94"
+BUNDLED_DETECTOR_SHA256 = "fc895608b547b0224080e0ee9f183bbfa9a5b441ce5ba381e722f4cc28939162"
 RED = int(tracker.LampClass.RED)
 GREEN = int(tracker.LampClass.GREEN)
 

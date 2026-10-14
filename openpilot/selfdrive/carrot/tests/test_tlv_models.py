@@ -1,4 +1,4 @@
-"""Tests for the bundled r8s50a traffic-light models and their default paths."""
+"""Tests for the bundled r8s50a40 traffic-light models and their default paths."""
 
 import hashlib
 import os
