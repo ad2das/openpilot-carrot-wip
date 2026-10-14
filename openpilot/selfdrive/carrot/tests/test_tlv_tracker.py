@@ -1,11 +1,16 @@
 """Tests for the pure carrot TLV tracker / state machine / relevant selection."""
 import math
 
+import pytest
+
 from openpilot.selfdrive.carrot.tlv.tracker import (
+  RELEVANT_MAX_DISTANCE_M,
   Detection,
+  EgoOdometry,
   LampClass,
   SignalState,
   SignalStateMachine,
+  Track,
   TrafficLightTracker,
   estimate_distance_m,
   iou,
@@ -14,6 +19,7 @@ from openpilot.selfdrive.carrot.tlv.tracker import (
   match_score,
   path_lateral_m,
   select_relevant,
+  track_distance_m,
 )
 
 BOX = (100.0, 50.0, 140.0, 90.0)
@@ -320,3 +326,86 @@ def test_go_after_red_window_is_120s():
   t.note_red_confirmations(10.0, [(track, int(LampClass.RED_LEFT), 1.0)])
   assert t.go_after_red(track.track_id, 130.0) is True    # exactly 120 s
   assert t.go_after_red(track.track_id, 130.001) is False  # beyond the window
+
+
+# ---------------------------------------------------------------------------
+# W101: odometry-decayed track distance and the relevance gate
+# ---------------------------------------------------------------------------
+
+def box_at(distance_m, *, focal=2648.0, cx=964.0, top=300.0):
+  """Full-frame box whose height encodes distance_m; centred on the path."""
+  h = focal * 0.35 / distance_m
+  return (cx - 0.5 * h, top, cx + 0.5 * h, top + h)
+
+
+def _track_at(distance_m, *, focal=2648.0, anchor_s=0.0):
+  track = Track(track_id=1, first_frame=0, last_frame=0, cls=int(LampClass.RED), score=0.9,
+                box=box_at(distance_m, focal=focal), view="far", focal_px=focal)
+  track.anchor_box = track.box
+  track.anchor_s = anchor_s
+  return track
+
+
+def test_track_distance_m_decays_with_ego_travel():
+  track = _track_at(150.0)
+  odo = EgoOdometry()
+  # No odometry (or no travel yet): the stale anchor estimate.
+  assert track_distance_m(track, None) == pytest.approx(150.0, rel=0.02)
+  assert track_distance_m(track, odo) == pytest.approx(150.0, rel=0.02)
+  odo.s = 40.0
+  assert track_distance_m(track, odo) == pytest.approx(110.0, rel=0.02)
+  # Negative travel (anchor ahead of the odometer) clamps to zero.
+  odo.s = -5.0
+  assert track_distance_m(track, odo) == pytest.approx(150.0, rel=0.02)
+
+
+def test_track_distance_m_inf_for_unusable_anchor_box():
+  track = _track_at(150.0)
+  track.anchor_box = (900.0, 300.0, 940.0, 300.4)  # height < 0.5 px
+  odo = EgoOdometry()
+  odo.s = 40.0
+  assert track_distance_m(track, odo) == float("inf")
+
+
+def test_anchor_refreshes_on_every_matched_detection():
+  t = TrafficLightTracker()
+  odo = EgoOdometry()
+  t.update(0, [det(LampClass.RED, box=box_at(150.0))], "far", 2648.0, now=0.0,
+           anchor=(odo.s, odo.psi, 0.0))
+  track = t.tracks[0]
+  assert track.anchor_box == pytest.approx(box_at(150.0))
+  assert track.anchor_s == pytest.approx(0.0)
+  odo.s = 40.0
+  t.update(1, [det(LampClass.RED, box=box_at(110.0))], "far", 2648.0, now=2.0,
+           anchor=(odo.s, odo.psi, 2.0))
+  assert len(t.tracks) == 1
+  assert track.anchor_box == pytest.approx(box_at(110.0))
+  assert track.anchor_s == pytest.approx(40.0)
+  assert track_distance_m(track, odo) == pytest.approx(110.0, rel=0.02)
+
+
+def test_select_relevant_gate_uses_odometry():
+  track = _track_at(150.0)
+  entry = [(track, int(LampClass.RED), 0.75)]
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  # Stale 150 m estimate: outside the 120 m gate without odometry.
+  assert select_relevant(entry, 0, **kwargs) is None
+  odo = EgoOdometry()
+  odo.s = 40.0  # 150 - 40 = 110 m -> inside the gate
+  chosen = select_relevant(entry, 0, **kwargs, odo=odo)
+  assert chosen is not None and chosen[0] is track
+
+
+def test_select_relevant_default_gate_is_the_module_constant():
+  import inspect
+  assert (inspect.signature(select_relevant).parameters["max_distance_m"].default
+          == RELEVANT_MAX_DISTANCE_M)
+  # Behavioural bound: a stale 130 m track is out of the default gate; only
+  # odometry travel (130 - 30 = 100 m) brings it in.
+  track = _track_at(130.0)
+  entry = [(track, int(LampClass.RED), 0.75)]
+  kwargs = dict(image_width=1928, path_x=(0.0, 200.0), path_y=(0.0, 0.0), left_intent=False)
+  assert select_relevant(entry, 0, **kwargs) is None
+  odo = EgoOdometry()
+  odo.s = 30.0
+  assert select_relevant(entry, 0, **kwargs, odo=odo) is not None

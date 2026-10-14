@@ -8,9 +8,11 @@ stopping need from CONTRACT.md "High-speed approach":
   stopping need = v * latency + v^2 / (2 * 2.5 m/s^2)
 
 Box pixel size is exact pinhole geometry: focal * housing_m / distance, with
-housing 0.35 m and focal 2648 px (FAR) or 1324 px (NEAR). The detector and lamp
-classifier hit probabilities are PARAMETERS (ASSUMPTIONS) until W71's eval
-numbers exist: a logistic curve in the model-space box height.
+housing 0.35 m and focal 2648 px (FAR) or 1324 px (NEAR) for the detector's
+model-space crop height (the hit-curve argument). The tracker always receives
+full-frame boxes and the full-frame focal (2648 px), as pipeline.infer does.
+The detector and lamp classifier hit probabilities are PARAMETERS (ASSUMPTIONS)
+until W71's eval numbers exist: a logistic curve in the model-space box height.
 
 No messaging/openpilot runtime imports, so this runs (and is unit-tested) on a
 PC with numpy only.
@@ -110,10 +112,10 @@ def _detection(box_h_full_px: float) -> tracker.Detection:
   )
 
 
-def _select(tracks: list[tuple], frame_idx: int):
+def _select(tracks: list[tuple], frame_idx: int, odo=None):
   return tracker.select_relevant(
     tracks, frame_idx, image_width=REFERENCE_WIDTH,
-    path_x=(0.0, 40.0), path_y=(0.0, 0.0), left_intent=False,
+    path_x=(0.0, 40.0), path_y=(0.0, 0.0), left_intent=False, odo=odo,
   )
 
 
@@ -162,11 +164,13 @@ def simulate_approach(speed_kph: float, rate_hz: float, *, policy: str = "curren
 
   while d > 1.0 and t <= max_s:
     view = scheduler.next_view(speed_kph) if scheduler is not None else ("far" if frame % 2 == 0 else "near")
-    focal = REFERENCE_FOCAL if view == "far" else NEAR_FOCAL
-    model_box_h = focal * HOUSING_HEIGHT_M / d          # detector input pixels
+    model_focal = REFERENCE_FOCAL if view == "far" else NEAR_FOCAL
+    model_box_h = model_focal * HOUSING_HEIGHT_M / d      # detector input pixels (model space)
     full_box_h = REFERENCE_FOCAL * HOUSING_HEIGHT_M / d  # full-frame pixels
     dets = [_detection(full_box_h)] if rng.random() < detector_hit(model_box_h) else []
-    light.update(frame, dets, view, focal, now=t)
+    # The tracker gets full-frame boxes, so it needs the full-frame focal on both
+    # views (the model-space focal is only for the detector hit curve).
+    light.update(frame, dets, view, REFERENCE_FOCAL, now=t)
 
     if use_classifier and light.tracks:
       vote_prob = classifier_hit(full_box_h)
@@ -279,13 +283,14 @@ def simulate_credit_approach(speed_kph: float, camera_hz: float = DEFAULT_CAMERA
       full_box_h = REFERENCE_FOCAL * HOUSING_HEIGHT_M / max(d, 0.1)
       if kind == "detect":
         view = scheduler.next_view(speed_kph)
-        focal = REFERENCE_FOCAL if view == "far" else NEAR_FOCAL
-        model_box_h = focal * HOUSING_HEIGHT_M / d
+        model_focal = REFERENCE_FOCAL if view == "far" else NEAR_FOCAL
+        model_box_h = model_focal * HOUSING_HEIGHT_M / d
         dets = [_detection(full_box_h)] if rng.random() < detector_hit(model_box_h) else []
         ego = tracker.EgoFrame(odo=odo, focal_px=REFERENCE_FOCAL, foe_x=IMAGE_X0, foe_y=BOX_CENTER_Y,
                                image_w=REFERENCE_WIDTH, image_h=1208)
+        # Full-frame boxes -> full-frame focal for the tracker, both views.
         light.update(
-          frame, dets, view, focal, now=t,
+          frame, dets, view, REFERENCE_FOCAL, now=t,
           predict=lambda tr, ego=ego: tracker.predict_box(
             tr, ego.odo, focal_px=ego.focal_px, foe_x=ego.foe_x, foe_y=ego.foe_y,
             image_w=ego.image_w, image_h=ego.image_h,
@@ -305,13 +310,13 @@ def simulate_credit_approach(speed_kph: float, camera_hz: float = DEFAULT_CAMERA
         result = light.confirm_track(track, frame, t, use_classifier=True)
         if result is not None:
           merged.append((track, result[0], result[1]))
-      confirmed_relevant = _select(merged, frame)
+      confirmed_relevant = _select(merged, frame, odo=odo)
       relevant = confirmed_relevant
       lamp_state = tracker.lamp_state_for(confirmed_relevant[1]) if confirmed_relevant is not None else None
       machine_conf = confirmed_relevant[2] if confirmed_relevant is not None else 0.0
       if relevant is None and light.tracks:
         candidates = [(track, int(track.cls), float(track.score)) for track in light.tracks]
-        relevant = _select(candidates, frame)
+        relevant = _select(candidates, frame, odo=odo)
       state, _ = machine.update(t, lamp_state, machine_conf)
       if state == tracker.SignalState.red and d_confirm is None:
         d_confirm = d

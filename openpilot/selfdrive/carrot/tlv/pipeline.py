@@ -242,13 +242,16 @@ class FramePipeline:
         anchor = (ego.odo.s, ego.odo.psi, now)
         frame_box = (0.0, 0.0, float(ego.image_w), float(ego.image_h))
       crop_box = (float(geom.x0), float(geom.y0), float(geom.x0 + geom.w), float(geom.y0 + geom.h))
-      self.tracker.update(self.frame_idx, dets, view, geom.focal_px, now=now, predict=predict,
+      # dets are full-frame; the tracker needs the FULL-frame focal, not the
+      # crop's model-space focal (geom.focal_px = focal / geom.scale).
+      self.tracker.update(self.frame_idx, dets, view, geom.focal_px * geom.scale, now=now, predict=predict,
                           anchor=anchor, crop_box=crop_box, frame_box=frame_box)
     self._classify_tracks(now, geom)
 
     confirmed_relevant = tracker.select_relevant(
       self._confirmed(now), self.frame_idx, image_width=image_width,
       path_x=path_x, path_y=path_y, left_intent=left_intent,
+      odo=self.ego.odo if self.ego is not None else None,
     )
     relevant = confirmed_relevant
     lamp_state = tracker.lamp_state_for(confirmed_relevant[1]) if confirmed_relevant is not None else None
@@ -266,6 +269,7 @@ class FramePipeline:
         candidate = tracker.select_relevant(
           candidates, self.frame_idx, image_width=image_width,
           path_x=path_x, path_y=path_y, left_intent=left_intent,
+          odo=self.ego.odo if self.ego is not None else None,
         )
         if candidate is not None:
           relevant = candidate

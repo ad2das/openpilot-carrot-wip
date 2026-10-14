@@ -65,6 +65,13 @@ VOTE_TRACK_KEEP_S = 0.75
 # Same-track green (W74D): a TLV green/left start edge is only valid from the
 # tracked light that was confirmed red/redLeft within this window.
 GO_AFTER_RED_WINDOW_S = 120.0
+# select_relevant default distance gate. W101 sweep (gates 120/160/200/240 m x
+# r3b/r8s50/r8t100s x 60/80/100 km/h, seeds 0..99, measured R8A curves, after
+# the full-frame-focal and odometry-decay fixes): 120 m is the smallest gate
+# with s50 80 km/h P(d_confirm >= stop need) >= 0.9 x the 240 m value
+# (0.88 vs 0.92; threshold 0.828), so no increase over the old default is
+# warranted; 160 m is the smallest gate at full parity with 240 m (0.92).
+RELEVANT_MAX_DISTANCE_M = 120.0
 
 # (window frames, required hits). Asymmetric on purpose: red is confirmed fast
 # (safety stop), green is confirmed slowly (never start on a flicker).
@@ -499,6 +506,22 @@ def estimate_distance_m(box_height_px: float, focal_px: float, housing_m: float 
   return focal_px * housing_m / box_height_px
 
 
+def track_distance_m(track: Track, odo: EgoOdometry | None = None) -> float:
+  """Distance to the light, advanced by the ego travel since its anchor.
+
+  With odometry, the anchor-box distance d0 (the box from the LAST matched
+  detection, tracker.update) is decayed by ds = max(0, odo.s - anchor_s), so a
+  slow detector cannot keep reporting a light the car has already closed on.
+  Without odometry, or before the first matched detection, this is the stale
+  estimate from the stored box. d0 = inf (unusable box) stays inf.
+  """
+  if odo is not None and track.anchor_box is not None:
+    d0 = estimate_distance_m(max(0.0, track.anchor_box[3] - track.anchor_box[1]), track.focal_px)
+    ds = max(0.0, odo.s - track.anchor_s)
+    return max(0.0, d0 - ds)
+  return estimate_distance_m(track.height, track.focal_px)
+
+
 def lateral_offset_m(center_x_px: float, image_width: int, focal_px: float, distance_m: float) -> float:
   """Lateral (left-positive? camera axis offset) position in metres at distance_m."""
   return (center_x_px - 0.5 * image_width) * distance_m / focal_px
@@ -515,9 +538,15 @@ def path_lateral_m(distance_m: float, path_x, path_y) -> float:
 
 def select_relevant(confirmed: list[tuple[Track, int, float]], frame_idx: int, *,
                     image_width: int, path_x, path_y, left_intent: bool,
-                    max_lateral_m: float = 4.0, max_distance_m: float = 120.0,
+                    odo: EgoOdometry | None = None,
+                    max_lateral_m: float = 4.0, max_distance_m: float = RELEVANT_MAX_DISTANCE_M,
                     min_distance_m: float = 2.0) -> tuple[Track, int, float] | None:
   """Track nearest to the projected model path at its estimated distance.
+
+  With `odo` (tracker.EgoOdometry), both the distance gate and the lateral
+  geometry use track_distance_m, i.e. the anchor distance decayed by the ego
+  travel since the last matched detection; without it the stale box estimate is
+  used (legacy behaviour).
 
   With left intent, arrow-bearing tracks are preferred over the plain ones when
   both are plausible (the turn arrow is the light that matters for the path).
@@ -527,7 +556,7 @@ def select_relevant(confirmed: list[tuple[Track, int, float]], frame_idx: int, *
   for track, cls, conf in confirmed:
     if cls == LampClass.OFF:
       continue
-    distance = estimate_distance_m(track.height, track.focal_px)
+    distance = track_distance_m(track, odo)
     if not (min_distance_m <= distance <= max_distance_m):
       continue
     lateral = lateral_offset_m(track.cx, image_width, track.focal_px, distance)
