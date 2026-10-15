@@ -256,7 +256,6 @@ class TlvRunner:
     self.dropped = 0
     self.processed = 0
     self.last_view = "far"
-    self._prev_controls_mono: int | None = None
     self._horizon_y: float | None = None
     self._calib_rpy = None
     self._gate_enabled = False
@@ -500,27 +499,25 @@ class TlvRunner:
   # -- watchdog -------------------------------------------------------------
 
   def _feed_watchdog(self, now: float) -> None:
+    # Every signal is intrinsic to its message (a value the publisher wrote),
+    # never an inter-arrival time measured by tlvd: tlvd blocks ~0.7 s in each
+    # detect, so its own sampling gaps looked like controls/camera stress and
+    # suspended tlvd right after every resume (field route 447).
     frame_drop = None
     exec_time = None
     thermal = None
-    controls_interval = None
-    camera_frame_id = None
+    controls_lag_ms = None
     if self.sm.updated["modelV2"]:
       model = self.sm["modelV2"]
       frame_drop = float(model.frameDropPerc)
       exec_time = _as_float(model.modelExecutionTime)
     if self.sm.updated["deviceState"]:
       thermal = _enum_ordinal(self.sm["deviceState"].thermalStatus)
-    if self.sm.seen["controlsState"] and self.sm.updated["controlsState"]:
-      mono_ns = int(self.sm.logMonoTime["controlsState"])
-      if self._prev_controls_mono is not None and mono_ns > self._prev_controls_mono:
-        controls_interval = (mono_ns - self._prev_controls_mono) / 1e9
-      self._prev_controls_mono = mono_ns
-    if self.sm.seen["roadCameraState"] and self.sm.updated["roadCameraState"]:
-      camera_frame_id = int(self.sm["roadCameraState"].frameId)
+    if self.sm.seen["carState"] and self.sm.updated["carState"]:
+      controls_lag_ms = _as_float(getattr(self.sm["carState"], "cumLagMs", None))
     self.watchdog.update(
       now, frame_drop=frame_drop, exec_time=exec_time, thermal=thermal,
-      controls_interval=controls_interval, camera_frame_id=camera_frame_id,
+      controls_lag_ms=controls_lag_ms,
     )
 
   # -- publish --------------------------------------------------------------

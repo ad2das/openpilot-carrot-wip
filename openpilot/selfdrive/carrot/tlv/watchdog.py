@@ -2,14 +2,20 @@
 
 Suspends inference when the rest of the stack shows stress so the detector can
 never add load on top of an already struggling system. Pure logic (no messaging
-imports); tlvd feeds it the latest modelV2 / deviceState values.
+imports); tlvd feeds it the latest modelV2 / deviceState / carState values.
+
+Rule: every watchdog signal must be intrinsic to each message (a value the
+publisher wrote), never an inter-arrival time measured by tlvd. tlvd loops at
+10 Hz and blocks for about 0.7 s in each detect, so any gap it samples reflects
+its own blocking, not the system's; field route 447 measured those gaps as
+"controls_jitter" and suspended tlvd right after every resume.
 
 Suspend triggers (per task spec):
-  - modelV2.frameDropPerc rises > 1.0 above its rolling baseline,
-  - modelV2 model execution time p95 rises > 10% above baseline,
-  - deviceState.thermalStatus >= yellow,
-  - controlsState logMonoTime delta p99 exceeds the baseline + 2 ms (loop jitter),
-  - roadCameraState frameId skip rate exceeds the baseline skip rate (frame gaps).
+  - modelV2.frameDropPerc rises > 1.0 above its rolling baseline (intrinsic),
+  - modelV2 modelExecutionTime p95 rises > 10% above baseline (intrinsic),
+  - deviceState.thermalStatus >= yellow (intrinsic),
+  - carState.cumLagMs (card loop lateness, written per message by card.py:338)
+    p99 exceeds its baseline + controls_lag_slack_ms (intrinsic).
 Baseline = rolling window of samples observed while tlvd was NOT inferring.
 Resume after 30 s clean with exponential backoff (30 -> 60 -> 120 -> 240 s) when
 suspensions repeat within the re-arm window.
@@ -30,18 +36,16 @@ THERMAL_YELLOW = 1
 class SuspendWatchdog:
   def __init__(self, *, baseline_min_s: float = 10.0, baseline_min_samples: int = 50, window: int = 600,
                frame_drop_delta: float = 1.0, exec_p95_ratio: float = 1.10,
-               controls_slack_s: float = 0.002, camera_gap_slack_per_s: float = 0.5, camera_min_span_s: float = 3.0,
-               camera_window_s: float = 10.0,
+               controls_lag_slack_ms: float = 4.0,
                clean_resume_s: float = 30.0, rearm_window_s: float = 60.0, max_clean_resume_s: float = 240.0,
                thermal_suspend: int = THERMAL_YELLOW) -> None:
     self.baseline_min_s = float(baseline_min_s)
     self.baseline_min_samples = int(baseline_min_samples)
     self.frame_drop_delta = float(frame_drop_delta)
     self.exec_p95_ratio = float(exec_p95_ratio)
-    self.controls_slack_s = float(controls_slack_s)
-    self.camera_gap_slack_per_s = float(camera_gap_slack_per_s)
-    self.camera_min_span_s = float(camera_min_span_s)
-    self.camera_window_s = float(camera_window_s)
+    # Route 447 baseline p99 22.5 ms, max 24.1 ms; a 2 ms slack sits inside the
+    # noise, so use 4 ms.
+    self.controls_lag_slack_ms = float(controls_lag_slack_ms)
     self.clean_resume_s = float(clean_resume_s)
     self.rearm_window_s = float(rearm_window_s)
     self.max_clean_resume_s = float(max_clean_resume_s)
@@ -50,14 +54,10 @@ class SuspendWatchdog:
     self._window = int(window)
     self._fd_live: deque[float] = deque(maxlen=self._window)
     self._exec_live: deque[float] = deque(maxlen=self._window)
+    self._lag_live: deque[float] = deque(maxlen=self._window)
     self._fd_base: deque[float] = deque(maxlen=self._window)
     self._exec_base: deque[float] = deque(maxlen=self._window)
-    self._ctl_live: deque[float] = deque(maxlen=self._window)
-    self._ctl_base: deque[float] = deque(maxlen=self._window)
-    self._gap_live: deque[float] = deque(maxlen=self._window)
-    self._gap_base: deque[float] = deque(maxlen=self._window)
-    self._fid_samples: deque[tuple[float, int]] = deque(maxlen=self._window)
-    self._last_fid: int | None = None
+    self._lag_base: deque[float] = deque(maxlen=self._window)
 
     self._first_sample_t: float | None = None
     self._last_sample_t: float | None = None
@@ -89,8 +89,7 @@ class SuspendWatchdog:
     return self._clean_required
 
   def update(self, now: float, *, frame_drop: float | None = None, exec_time: float | None = None,
-             thermal: int | None = None, controls_interval: float | None = None,
-             camera_frame_id: int | None = None) -> bool:
+             thermal: int | None = None, controls_lag_ms: float | None = None) -> bool:
     """Feed one loop tick; returns whether inference may run."""
     if frame_drop is not None:
       value = float(frame_drop)
@@ -106,23 +105,13 @@ class SuspendWatchdog:
           self._exec_base.append(value)
     if thermal is not None:
       self._thermal = int(thermal)
-    if controls_interval is not None:
-      value = float(controls_interval)
+    if controls_lag_ms is not None:
+      value = float(controls_lag_ms)
       if np.isfinite(value) and value > 0.0:
-        self._ctl_live.append(value)
+        self._lag_live.append(value)
         if not self._inferring:
-          self._ctl_base.append(value)
-    if camera_frame_id is not None:
-      fid = int(camera_frame_id)
-      if self._last_fid is not None and fid >= self._last_fid:
-        self._fid_samples.append((float(now), fid - self._last_fid - 1))
-        self._prune_fid(float(now))
-        rate = self._camera_gap_rate()
-        if rate is not None:
-          (self._gap_live if self._inferring else self._gap_base).append(rate)
-      self._last_fid = fid
-    if (frame_drop is not None or exec_time is not None or thermal is not None
-        or controls_interval is not None or camera_frame_id is not None):
+          self._lag_base.append(value)
+    if frame_drop is not None or exec_time is not None or thermal is not None or controls_lag_ms is not None:
       self._last_sample_t = float(now)
       if self._first_sample_t is None:
         self._first_sample_t = float(now)
@@ -169,9 +158,17 @@ class SuspendWatchdog:
     self._status = STATUS_SUSPENDED
     self._reason = reason
     self._clean_since = None
-    # Re-baseline from the now interference-free stream before the next resume.
+    # Drop the live stress samples and re-baseline from the now interference-free
+    # stream before the next resume. Without this the *_live deques keep the
+    # stress samples and get no fresh samples while suspended, so
+    # _trigger_reason() stays non-None forever and every resume is blocked
+    # (field route 447: never resumed after the 2nd suspension).
+    self._fd_live.clear()
+    self._exec_live.clear()
+    self._lag_live.clear()
     self._fd_base.clear()
     self._exec_base.clear()
+    self._lag_base.clear()
 
   def _trigger_reason(self) -> str | None:
     if self._thermal >= self.thermal_suspend:
@@ -186,35 +183,12 @@ class SuspendWatchdog:
       base_p95 = self._p95(self._exec_base)
       if base_p95 > 0.0 and live_p95 > base_p95 * self.exec_p95_ratio:
         return "model_exec_time"
-    if len(self._ctl_live) >= 20 and len(self._ctl_base) >= 20:
-      live_p99 = _recent_p99(self._ctl_live, 150)
-      base_p99 = self._p99(self._ctl_base)
-      if base_p99 > 0.0 and live_p99 > base_p99 + self.controls_slack_s:
+    if len(self._lag_live) >= 20 and len(self._lag_base) >= 20:
+      live_p99 = _recent_p99(self._lag_live, 150)
+      base_p99 = self._p99(self._lag_base)
+      if base_p99 > 0.0 and live_p99 > base_p99 + self.controls_lag_slack_ms:
         return "controls_jitter"
-    if len(self._gap_live) >= 20 and len(self._gap_base) >= 20:
-      live_gap = _recent_mean(self._gap_live, 50)
-      base_gap = float(np.mean(np.fromiter(self._gap_base, dtype=np.float64, count=len(self._gap_base))))
-      if live_gap > base_gap + self.camera_gap_slack_per_s:
-        return "camera_gaps"
     return None
-
-  def _prune_fid(self, now: float) -> None:
-    # Keep the rate local to camera_window_s so a new gap pattern shows up even
-    # after a long clean run.
-    while len(self._fid_samples) > 2 and self._fid_samples[1][0] < now - self.camera_window_s:
-      self._fid_samples.popleft()
-
-  def _camera_gap_rate(self) -> float | None:
-    """Skipped road-camera frameIds per second over the retained window."""
-    if len(self._fid_samples) < 20:
-      return None
-    t0 = self._fid_samples[0][0]
-    t1 = self._fid_samples[-1][0]
-    span = t1 - t0
-    if span < self.camera_min_span_s:
-      return None
-    skipped = sum(skip for _, skip in self._fid_samples)
-    return skipped / span
 
   @staticmethod
   def _p95(values: deque[float]) -> float:

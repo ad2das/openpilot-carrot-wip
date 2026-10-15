@@ -83,6 +83,7 @@ def real_services(now: float):
   car.carState.steeringAngleDeg = 0.0
   car.carState.leftBlinker = True
   car.carState.rightBlinker = False
+  car.carState.cumLagMs = 20.5  # card loop lateness, the watchdog lag signal
 
   carrot_man = messaging.new_message("carrotMan")
   carrot_man.carrotMan.atcType = "atc left"
@@ -128,12 +129,10 @@ def test_runner_helpers_accept_real_cereal_messages(monkeypatch):
   assert updates and updates[-1]["exec_time"] == pytest.approx(0.031)
   assert updates[-1]["frame_drop"] == pytest.approx(0.5)
   assert updates[-1]["thermal"] == 0  # real _DynamicEnum -> ordinal, not int()
-  assert updates[-1]["camera_frame_id"] == 123
-
-  # Second feed exercises the controls logMonoTime delta branch.
-  runner.sm.logMonoTime["controlsState"] = 960_000_000
-  runner._feed_watchdog(now + 0.05)
-  assert updates[-1]["controls_interval"] == pytest.approx(0.01)
+  # carState.cumLagMs (card.py:338) is the intrinsic controls-stress signal.
+  assert updates[-1]["controls_lag_ms"] == pytest.approx(20.5)
+  assert "camera_frame_id" not in updates[-1]
+  assert "controls_interval" not in updates[-1]
 
 
 def test_offer_recorder_accepts_real_cereal_messages():
