@@ -36,9 +36,31 @@ TLVD_ENV = {
   "DEV": "CPU",
 }
 
+# launch_env.sh exports QCOM_PRIORITY=12 for modeld; tlvd inherits it and the
+# backend GPU guard (backends.gpu_env_reason) then refuses to start (field:
+# route 00000441, 5 crash-loop starts). tlvd never uses a GPU, so drop every
+# inherited GPU-routing variable before tlvd imports anything.
+SCRUB_ENV_PREFIXES = ("QCOM", "CUDA", "OPENCL", "ROCM", "VULKAN", "GPU_", "TINYGPU")
+SCRUB_ENV_KEYS = ("GPU", "CL", "TINY_GPU")
+
+
+def scrub_gpu_env(environ=None) -> list[str]:
+  """Delete inherited GPU-routing keys; returns the removed key names."""
+  env = os.environ if environ is None else environ
+  removed: list[str] = []
+  for key in list(env.keys()):
+    upper = str(key).upper()
+    if upper in SCRUB_ENV_KEYS or any(upper.startswith(p) for p in SCRUB_ENV_PREFIXES):
+      removed.append(key)
+      del env[key]
+  return sorted(removed)
+
 
 def set_process_env() -> None:
   """Thread caps + DEV=CPU for the tlvd child, before numpy/tinygrad load."""
+  scrubbed = scrub_gpu_env()
+  if scrubbed:
+    print(f"tlvd_launch: scrubbed env {scrubbed}", flush=True)
   for key, value in TLVD_ENV.items():
     os.environ[key] = value
 

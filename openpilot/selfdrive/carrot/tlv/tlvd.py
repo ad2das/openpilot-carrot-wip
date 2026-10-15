@@ -129,6 +129,16 @@ def _as_float(value):
   return None if value is None else float(value)
 
 
+def _enum_ordinal(value) -> int:
+  """Ordinal for a capnp enum field (int() on _DynamicEnum raises TypeError).
+
+  Real cereal enums (e.g. deviceState.thermalStatus) expose `.raw` as the
+  schema index (green=0, yellow=1, ...); plain ints from test fakes pass
+  through int()."""
+  raw = getattr(value, "raw", None)
+  return int(raw) if raw is not None else int(value)
+
+
 def resolve_backend_name(value: str, is_tici: bool) -> str:
   """Resolve CarrotTlvBackend. The param default 'onnx' means the onnxruntime
   CPU backend on PC, but tinygrad on TICI where onnxruntime is not a device
@@ -480,10 +490,9 @@ class TlvRunner:
     if self.sm.updated["modelV2"]:
       model = self.sm["modelV2"]
       frame_drop = float(model.frameDropPerc)
-      if len(model.modelExecutionTime) > 0:
-        exec_time = max(float(v) for v in model.modelExecutionTime)
+      exec_time = _as_float(model.modelExecutionTime)
     if self.sm.updated["deviceState"]:
-      thermal = int(self.sm["deviceState"].thermalStatus)
+      thermal = _enum_ordinal(self.sm["deviceState"].thermalStatus)
     if self.sm.seen["controlsState"] and self.sm.updated["controlsState"]:
       mono_ns = int(self.sm.logMonoTime["controlsState"])
       if self._prev_controls_mono is not None and mono_ns > self._prev_controls_mono:
