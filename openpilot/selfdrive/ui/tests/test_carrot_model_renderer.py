@@ -518,6 +518,8 @@ def lead_renderer(**overrides):
     "_carrot_lead_status": False,
     "_carrot_lead_speed": 0.0,
     "_carrot_lead_closing": False,
+    "_carrot_lead_vrel": 0.0,
+    "_carrot_lead_trend": 0,
   }
   for key, value in {**defaults, **overrides}.items():
     setattr(renderer, key, value)
@@ -532,7 +534,7 @@ def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
     _carrot_radar_track_id=0,
     _carrot_lead_status=True,
     _carrot_lead_speed=30.0,
-    _carrot_lead_closing=True,
+    _carrot_lead_closing=False,
   )
 
   # No source dots, no vision cross-check and no relative-speed arrow: the lead speed leads, then the radar gap.
@@ -601,6 +603,54 @@ def test_lead_closing_needs_short_time_to_contact_and_holds_with_hysteresis():
   assert closing_next(True, 30.0, -8.0)
   # Beyond the release threshold it clears.
   assert not closing_next(True, 40.0, -8.0)
+
+
+@pytest.mark.parametrize("trend, v_rel, expected", [
+  (0, 0.84, 1),
+  (0, 0.80, 0),
+  (1, 0.50, 1),
+  (1, 0.40, 0),
+  (0, -0.84, -1),
+  (-1, -0.50, -1),
+  (-1, -0.40, 0),
+  (1, -0.84, -1),
+])
+def test_lead_trend_next_hysteresis_table(trend, v_rel, expected):
+  # Thresholds: ON 3/3.6 m/s, OFF 1.5/3.6 m/s (lead_tint design).
+  assert model_renderer.LEAD_TREND_ON == pytest.approx(3.0 / 3.6)
+  assert model_renderer.LEAD_TREND_OFF == pytest.approx(1.5 / 3.6)
+  assert model_renderer.ModelRenderer._lead_trend_next(trend, v_rel) == expected
+
+
+@pytest.mark.parametrize("trend, closing, colour", [
+  (0, True, model_renderer.LEAD_RED),
+  (1, True, model_renderer.LEAD_RED),
+  (-1, True, model_renderer.LEAD_RED),
+  (1, False, model_renderer.hs.GREEN),
+  (-1, False, model_renderer.hs.AMBER),
+  (0, False, model_renderer.hs.TEXT),
+])
+def test_lead_speed_color_closing_wins_then_trend(trend, closing, colour):
+  renderer = lead_renderer(_carrot_lead_closing=closing, _carrot_lead_trend=trend)
+
+  assert renderer._lead_speed_color_carrot() is colour
+
+
+def test_lead_runs_carrot_tints_speed_amber_when_slower(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  renderer = lead_renderer(
+    _carrot_radar_dist=12.5,
+    _carrot_radar_track_id=0,
+    _carrot_lead_status=True,
+    _carrot_lead_speed=30.0,
+    _carrot_lead_trend=-1,
+  )
+
+  runs = renderer._lead_runs_carrot()
+
+  # The lead speed run carries the amber tint; the gap run is unchanged.
+  assert runs[0] == ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.AMBER)
+  assert ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT) in runs
 
 
 def speed_tag_renderer():

@@ -64,6 +64,11 @@ LEAD_RED = rl.Color(255, 69, 58, 255)
 LEAD_CLOSE_TTC_ON = 3.0  # s to contact before the crescent turns red
 LEAD_CLOSE_TTC_OFF = 4.0  # s to contact before it returns to the source colour (hysteresis)
 LEAD_CLOSE_MIN_VREL = 1.0  # m/s closing speed below which time-to-contact is not meaningful
+# The lead's speed figure is tinted by where it is heading relative to us: green pulling away, amber slower than us
+# (we are catching up), white while matched, red while closing in fast. Hysteresis keeps it from flickering.
+LEAD_TREND_ON = 3.0 / 3.6  # m/s relative speed that switches the tint on
+LEAD_TREND_OFF = 1.5 / 3.6  # m/s relative speed below which it returns to white
+LEAD_TREND_EMA = 0.85  # per-frame smoothing of the relative speed
 LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at a glance
 LEAD_DROP = 0.11  # crescent drop below the projected road point, in lead widths
 LEAD_DROP_MIN = 14.0
@@ -485,6 +490,8 @@ class ModelRenderer(Widget):
     self._carrot_vision_dist = 0.0
     self._carrot_lead_speed = 0.0
     self._carrot_lead_closing = False
+    self._carrot_lead_vrel = 0.0
+    self._carrot_lead_trend = 0
     self._lead_w = 0.0
     self._lead_w2 = 0.0
     self._float_boxes: list[tuple[float, float, float, float]] = []
@@ -823,9 +830,15 @@ class ModelRenderer(Widget):
       self._carrot_radar_dist = float(lead_one.dRel) if lead_one.radar else 0.0
       self._carrot_lead_speed = float(lead_one.vLead) * (3.6 if ui_state.is_metric else 2.2369363)
       self._carrot_lead_closing = self._lead_closing_next(self._carrot_lead_closing, float(lead_one.dRel), float(lead_one.vRel))
+      v_rel = float(lead_one.vRel)
+      if not self._carrot_lead_status_prev:
+        self._carrot_lead_vrel = v_rel
+      self._carrot_lead_vrel = self._carrot_lead_vrel * LEAD_TREND_EMA + v_rel * (1.0 - LEAD_TREND_EMA)
+      self._carrot_lead_trend = self._lead_trend_next(self._carrot_lead_trend, self._carrot_lead_vrel)
       self._carrot_lead_status = True
     else:
       self._carrot_lead_closing = False
+      self._carrot_lead_trend = 0
 
     left_pt = self._map_to_screen(max_distance, y - 1.2, z + 1.22)
     right_pt = self._map_to_screen(max_distance, y + 1.2, z + 1.22)
@@ -902,7 +915,7 @@ class ModelRenderer(Widget):
     # Two readings, nothing else: the lead's speed first and loudest, then the gap a step quieter.
     # The source colour lives on the crescent under the car, not in the capsule.
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
-      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, hs.TEXT),
+      runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, self._lead_speed_color_carrot()),
                ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
     dist = self._carrot_radar_dist if self._carrot_radar_dist > 0.0 else self._carrot_vision_dist
     if dist > 0.0:
@@ -1021,6 +1034,20 @@ class ModelRenderer(Widget):
     """Closing-in-fast state with hysteresis: on below LEAD_CLOSE_TTC_ON s to contact, off above LEAD_CLOSE_TTC_OFF."""
     ttc = d_rel / -v_rel if v_rel < -LEAD_CLOSE_MIN_VREL else float("inf")
     return ttc < (LEAD_CLOSE_TTC_OFF if closing else LEAD_CLOSE_TTC_ON)
+
+  @staticmethod
+  def _lead_trend_next(trend: int, v_rel: float) -> int:
+    """+1 pulling away, -1 slower than us, 0 matched; on at LEAD_TREND_ON, off below LEAD_TREND_OFF."""
+    if trend > 0 and v_rel > LEAD_TREND_OFF or v_rel >= LEAD_TREND_ON:
+      return 1
+    if trend < 0 and v_rel < -LEAD_TREND_OFF or v_rel <= -LEAD_TREND_ON:
+      return -1
+    return 0
+
+  def _lead_speed_color_carrot(self) -> rl.Color:
+    if self._carrot_lead_closing:
+      return LEAD_RED
+    return hs.GREEN if self._carrot_lead_trend > 0 else (hs.AMBER if self._carrot_lead_trend < 0 else hs.TEXT)
 
   def _lead_stroke_carrot(self) -> rl.Color:
     if self._carrot_lead_closing:

@@ -77,13 +77,13 @@ NEXT_UNIT_SIZE = 34
 CLOCK_SIZE = 86
 DATE_SIZE = 54
 CLOCK_H = 116
-BADGE_SIZE = 34
-BADGE_H = 62
+BADGE_SIZE = 44
+BADGE_H = 80
 TPMS_W = 340
 TPMS_H = 250
 TPMS_SIZE = 62
-DEVICE_LABEL_SIZE = 28
-DEVICE_SIZE = 40
+DEVICE_LABEL_SIZE = 34
+DEVICE_SIZE = 54
 TRIP_STATS_H = 172     # three-column stats row
 TRIP_HEAD_H = 74       # road-name header above it
 TRIP_COL_MIN = 224
@@ -419,12 +419,12 @@ class HudRenderer(Widget):
     # A capsule under the tyre card (or in its place), with a status dot. hs.Type swaps in the
     # Hangul atlas for non-Latin badge text (e.g. Jetlink states), so mixed-script labels render.
     t = self._type
-    w = t.width(text, BADGE_SIZE, hs.BOLD, 1.0) + 84
+    w = t.width(text, BADGE_SIZE, hs.BOLD, 1.0) + 100
     right = rect.x + rect.width - M_X
     y = self._right_column_top(rect)
     hs.chip(right - w, y, w, BADGE_H)
-    hs.dot(right - w + 34, y + BADGE_H / 2, 10, color)
-    t.draw_mid(text, right - w + 58, y + BADGE_H / 2, BADGE_SIZE, color, hs.BOLD, spacing=1.0)
+    hs.dot(right - w + 38, y + BADGE_H / 2, 13, color)
+    t.draw_mid(text, right - w + 66, y + BADGE_H / 2, BADGE_SIZE, color, hs.BOLD, spacing=1.0)
     hs.top_boxes.append((right - w, y, w, BADGE_H))
     hs.zones["egpu"] = (right - w, y, w, BADGE_H)
 
@@ -905,18 +905,18 @@ class HudRenderer(Widget):
     t = self._type
     width = 0.0
     for label, value, _hot in items:
-      width += t.width(label, DEVICE_LABEL_SIZE, hs.BOLD, 1.5) + 10 + t.width(value, DEVICE_SIZE, hs.SEMI) + 28
-    w, h = width + 28, BADGE_H
+      width += t.width(label, DEVICE_LABEL_SIZE, hs.BOLD, 1.5) + 12 + t.width(value, DEVICE_SIZE, hs.SEMI) + 32
+    w, h = width + 32, BADGE_H
     right = rect.x + rect.width - M_X
     top = self._right_column_top(rect)
     hs.chip(right - w, top, w, h)
     hs.top_boxes.append((right - w, top, w, h))
     hs.zones["device"] = (right - w, top, w, h)
-    x = right - w + 28
+    x = right - w + 32
     mid = top + h / 2
     for label, value, hot in items:
-      x += t.draw_mid(label, x, mid, DEVICE_LABEL_SIZE, hs.TEXT_3, hs.BOLD, spacing=1.5) + 10
-      x += t.draw_mid(value, x, mid, DEVICE_SIZE, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 28
+      x += t.draw_mid(label, x, mid, DEVICE_LABEL_SIZE, hs.TEXT_3, hs.BOLD, spacing=1.5) + 12
+      x += t.draw_mid(value, x, mid, DEVICE_SIZE, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 32
 
   # ---- clock and link badges (top-centre) -------------------------------------------------------
 
@@ -977,7 +977,7 @@ class HudRenderer(Widget):
       return None
 
     t = self._type
-    dot, pad, sep = 10.0, 28.0, 22.0
+    dot, pad, sep = 13.0, 32.0, 24.0
     widths = [2 * dot + 11 + t.width(label, BADGE_SIZE, hs.BOLD, 1.5) for label, _ in items]
     w = sum(widths) + 2 * pad + 2 * sep * (len(items) - 1)
     x = right - w
