@@ -172,19 +172,22 @@ def test_stopped_pair_below_point_three_still_freezes():
   assert state.floor == before
 
 
-def test_floor_tracks_speed_cap(monkeypatch):
+@pytest.mark.parametrize('offset', [0.0, 3.0])
+def test_floor_tracks_speed_cap(monkeypatch, offset):
   monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', 2.5)
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_CAP_OFFSET_V', offset)
   state = BrakingGapState()
   captured = capture(state)
-  assert 17.9 < captured <= 18.1  # captured at 5 m/s: stop_distance + 2.5 * 5 = 18
+  assert captured >= 5.5 + 5.0 * 2.0 - 1e-6  # the cap is never below the base distance
   for i in range(1, 81):
     ego = 5.0 - .05 * i  # 5 -> 1 m/s over 4 s
     lead = .8 - .00375 * i  # 0.8 -> 0.5 m/s, never below 0.3
     braking_pair(state, ego_speed=ego, lead_speed=lead, ego_accel=-.5, lead_accel=-.5,
                  relative_speed=lead - ego)
     base = 5.5 + ego * 2.0
-    assert state.floor <= max(base, 5.5 + 2.5 * ego) + 1e-6
-  assert state.floor <= 5.5 + 2.5 + 0.01
+    assert state.floor <= max(base, 5.5 + 2.5 * max(0.0, ego - offset)) + 1e-6
+    if offset > 0.0 and ego <= 3.0:
+      assert abs(state.floor - base) <= 1e-6
 
 
 def test_stopped_pair_freeze_beats_cap(monkeypatch):

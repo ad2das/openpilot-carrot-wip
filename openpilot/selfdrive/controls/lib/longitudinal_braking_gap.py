@@ -9,10 +9,12 @@ import numpy as np
 STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego still rolls
 # Speed-proportional cap on the remembered floor (s). The captured bound is
 # re-applied every step, so the memory shrinks with the speed instead of
-# lagging behind it on the 8 s decay. The real default is set after the sweep
-# (see the release sweep in test_butter_real_replay.py); inf keeps the
-# uncapped behavior until then.
+# lagging behind it on the 8 s decay. FLOOR_CAP_OFFSET_V shifts the cap so it
+# reaches the base distance early (full release above walking speed). The real
+# default is set after the sweep (see the cap sweep in
+# test_butter_real_replay.py); inf keeps the uncapped behavior until then.
 FLOOR_SPEED_CAP_S = float('inf')
+FLOOR_CAP_OFFSET_V = 0.0
 
 
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):
@@ -73,16 +75,17 @@ class BrakingGapState:
     self.stopped_pair = stopped_pair
     self.fast_release = fast_release
     self.speed_cap = None if not math.isfinite(FLOOR_SPEED_CAP_S) else \
-      max(base_distance, stop_distance + FLOOR_SPEED_CAP_S * ego_speed)
+      max(base_distance, stop_distance + FLOOR_SPEED_CAP_S * max(0.0, ego_speed - FLOOR_CAP_OFFSET_V))
     if self.floor is None:
       return
     if not stopped_pair or releasing:
       target = min(self.floor, base_distance)
       tau = 2.0 if releasing else (STOPPED_LEAD_RELEASE_S if fast_release else 8.0)
       self.floor += (target - self.floor) * -math.expm1(-dt / tau)
-      # The capture bound is re-applied every step with the current speed, so the
-      # remembered gap shrinks with the speed instead of lagging behind it on the
-      # 8 s decay. Never below the base distance; the stopped pair still freezes.
+      # The capture bound is re-applied every step and reaches the base
+      # distance at FLOOR_CAP_OFFSET_V, so the remembered gap is fully returned
+      # before walking speed instead of during the final metres. Never below
+      # the base distance; the stopped pair still freezes.
       if self.speed_cap is not None:
         self.floor = min(self.floor, self.speed_cap)
     requested = max(0.0, self.floor - desired_distance)
