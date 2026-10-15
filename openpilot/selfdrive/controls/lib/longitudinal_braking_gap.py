@@ -7,10 +7,12 @@ import numpy as np
 
 
 STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego still rolls
-# Rolling-approach release below this ego speed. 0.0 holds the previous
-# lead-stopped-only behavior until the swept value lands (see the release
-# sweep in test_butter_real_replay.py).
-LOW_SPEED_RELEASE_V = 0.0
+# Speed-proportional cap on the remembered floor (s). The captured bound is
+# re-applied every step, so the memory shrinks with the speed instead of
+# lagging behind it on the 8 s decay. The real default is set after the sweep
+# (see the release sweep in test_butter_real_replay.py); inf keeps the
+# uncapped behavior until then.
+FLOOR_SPEED_CAP_S = float('inf')
 
 
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):
@@ -32,6 +34,7 @@ class BrakingGapState:
     self.relief = 0.0
     self.stopped_pair = False
     self.fast_release = False
+    self.speed_cap = None
 
   def update(self, *, enabled, track_id, dt, distance, ego_speed, ego_accel, lead_speed,
              lead_accel, relative_speed, base_tf, stop_distance, desired_distance):
@@ -53,29 +56,35 @@ class BrakingGapState:
       # acquisition and do not carry one vehicle's gap into a replacement lead.
       self.floor = min(distance, base_distance + 10.0, stop_distance + 2.5 * ego_speed)
     self.distance, self.relative_speed = distance, relative_speed
-    self._advance(dt, base_distance, desired_distance, ego_speed, lead_speed,
+    self._advance(dt, base_distance, desired_distance, ego_speed, lead_speed, stop_distance,
                   releasing=(ego_accel > 0.1 or lead_accel > 0.3))
     return self.margin
 
-  def _advance(self, dt, base_distance, desired_distance, ego_speed, lead_speed, releasing=False):
+  def _advance(self, dt, base_distance, desired_distance, ego_speed, lead_speed, stop_distance, releasing=False):
     # A stopped pair must not slowly creep forward just because its reference
     # expires. Departure evidence releases this episode's distance preference.
     stopped_pair = ego_speed < 0.3 and lead_speed < 0.3
-    # The sim can come to rest before a still-crawling lead, so the release
-    # must already act during the low-speed approach, not only once the lead
-    # has stopped. A stopped pair still freezes, so nothing releases after
-    # both have come to rest. This memory only ever ADDS comfort distance in
-    # the cost reference; releasing it returns to the base stop distance, and
-    # the physical constraints / danger margins are untouched.
-    fast_release = lead_speed < 0.3 or ego_speed < LOW_SPEED_RELEASE_V
+    # A stopped lead ends the following episode. The release tau additionally
+    # applies once the ego itself has stopped before the lead. This memory only
+    # ever ADDS comfort distance in the cost reference; releasing it returns to
+    # the base stop distance, and the physical constraints / danger margins are
+    # untouched.
+    fast_release = lead_speed < 0.3
     self.stopped_pair = stopped_pair
     self.fast_release = fast_release
+    self.speed_cap = None if not math.isfinite(FLOOR_SPEED_CAP_S) else \
+      max(base_distance, stop_distance + FLOOR_SPEED_CAP_S * ego_speed)
     if self.floor is None:
       return
     if not stopped_pair or releasing:
       target = min(self.floor, base_distance)
       tau = 2.0 if releasing else (STOPPED_LEAD_RELEASE_S if fast_release else 8.0)
       self.floor += (target - self.floor) * -math.expm1(-dt / tau)
+      # The capture bound is re-applied every step with the current speed, so the
+      # remembered gap shrinks with the speed instead of lagging behind it on the
+      # 8 s decay. Never below the base distance; the stopped pair still freezes.
+      if self.speed_cap is not None:
+        self.floor = min(self.floor, self.speed_cap)
     requested = max(0.0, self.floor - desired_distance)
     self.margin = min(requested, self.margin + dt) if requested >= self.margin else max(requested, self.margin - dt)
     if releasing and self.margin < 0.01 and self.floor <= base_distance + 0.05:
@@ -88,7 +97,7 @@ class BrakingGapState:
     for i, time_s in enumerate(times):
       if time_s > previous:
         predicted._advance(float(time_s - previous), stop_distance + ego_speeds[i] * base_tf,
-                           desired_distances[i], ego_speeds[i], lead_speeds[i])
+                           desired_distances[i], ego_speeds[i], lead_speeds[i], stop_distance)
       result[i] = predicted.margin
       previous = time_s
     return result

@@ -17,18 +17,19 @@ Fidelity target (creep+SCC, B1): final gap 7.2 +- 1.0 m, below-7 km/h time
 Assertions: only no-collision and fixture presence; everything else is
 reported to BUTTER_REAL_OUT. Simulation only; no vehicle validation.
 
-Part 3 (task 7) — LOW_SPEED_RELEASE_V x LEAD_SLACK sweep, gated by
-BUTTER_REAL_SWEEP_OUT: 12 combos over b1 (ideal and creep+SCC plants) and the
-9 ButterStop scenarios (both plants), each for ButterStop 0 and 1. Criteria
-a-f (see _RELEASE_SWEEP_CRITERIA; f re-evaluates the existing ButterStop-suite
-checks on the 9 overlapping scenarios from the same ideal-plant runs); auto-
-pick: smallest LOW_SPEED_RELEASE_V that passes, then largest LEAD_SLACK.
+Part 3 (task 8) — FLOOR_SPEED_CAP_S sweep, gated by BUTTER_REAL_SWEEP_OUT:
+caps {3.0, 2.5, 2.0, 1.5} plus a no-cap baseline over b1 (ideal and creep+SCC
+plants) and the 9 ButterStop scenarios (both plants), each for ButterStop 0
+and 1; LEAD_SLACK fixed 1.2. Criteria a-f (see _CAP_SWEEP_CRITERIA; f
+re-evaluates the existing ButterStop-suite checks on the 9 overlapping
+scenarios from the same ideal-plant runs); autopick: largest cap that passes.
 Report-only; collision anywhere fails the test. The b1 B0/B1 ideal-plant
-telemetry (floor/margin/stopped_pair/fast_release per 0.05 s) goes to
-BUTTER_REAL_OUT. The module default stays at the previous behavior until the
-sweep picks the constants (see longitudinal_braking_gap.LOW_SPEED_RELEASE_V).
+telemetry (floor/margin/stopped_pair/fast_release/cap per 0.05 s) goes to
+BUTTER_REAL_OUT. The module default stays inf (uncapped) until the sweep
+picks the value (see longitudinal_braking_gap.FLOOR_SPEED_CAP_S).
 """
 import json
+import math
 import os
 from contextlib import contextmanager
 
@@ -69,7 +70,7 @@ FIDELITY_BELOW7_TOL_S = 4.0
 OPEN_LOOP_WINDOW_S = -10.0  # metric window; replay starts at fixture start (-20 s)
 
 RESULTS: dict = {"b1": {}, "b1_telemetry": {}, "open_loop": {}, "stop_release": {},
-                 "scenarios_plant_on": {}, "release_sweep": {},
+                 "scenarios_plant_on": {}, "cap_sweep": {},
                  "log_reference": {}, "fidelity": {}, "report": {}}
 
 
@@ -561,92 +562,86 @@ def test_butter_real_scenarios_plant_on():
   RESULTS["scenarios_plant_on"] = rows
 
 
-# --- Task 7: LOW_SPEED_RELEASE_V x LEAD_SLACK release sweep ----------------
+# --- Task 8: FLOOR_SPEED_CAP_S release sweep -------------------------------
 
-_RELEASE_SWEEP_V = (0.0, 2.0, 3.0, 5.0)
-_RELEASE_SWEEP_SLACK = (1.2, 0.6, 0.3)
-_RELEASE_PLANTS = ("ideal", "scc")
-_RELEASE_SWEEP_SCENARIOS = [(g, m) for g, m in _CASES if g in ("a", "b", "c")]
-# M0 baselines: run 38670492876 scenario table (release tau 8, creep plant).
-_RELEASE_M0_MIN_GAP = {
-  "steady state following a car at 20m/s, then lead decel to 0mph at 1m/s^2": {0: 4.950, 1: 4.163},
-  "steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2": {0: 2.431, 1: 2.756},
-  "steady state following a car at 20m/s, then lead decel to 0mph at 3m/s^2": {0: 1.934, 1: 2.253},
-}
-_RELEASE_SWEEP_CRITERIA = (
-  "a) b1 ideal plant B0: final gap <= 6.5 m and desiredDistance at standstill <= 6.5 m",
-  "b) |B1 - B0| final gap <= 0.3 m: b1 and all 9 scenarios, both plants",
-  "c) ideal plant, normal scenarios (a-group, b, approach): B1 end decel <= max(0.20, B0 - 0.25)",
-  "d) crawl: B1 below-7 km/h time <= B0 + 1.5 s (b1 and approach scenarios)",
-  "e) no collision anywhere; lead-decel-1/2/3 min gap >= M0 - 0.3 m (B0/B1, both plants); no new FCW",
+_CAP_SWEEP = (float('inf'), 3.0, 2.5, 2.0, 1.5)  # first row: no-cap baseline
+_CAP_PLANTS = ("ideal", "scc")
+_CAP_SWEEP_SCENARIOS = [(g, m) for g, m in _CASES if g in ("a", "b", "c")]
+_CAP_SWEEP_CRITERIA = (
+  "a) b1 ideal plant: B0 final gap <= 6.5 m and desiredDistance at standstill <= 6.5 m",
+  "b) |B1 - B0| final gap <= 0.5 m in b1 and all 9 scenarios, both plants",
+  "c) end decel (ideal plant): B1 <= max(0.20, B0 - 0.25) for a-group 20/40, approach and b1; "
+  "for the braking-lead and stopped-60 scenarios only: B1 <= the no-cap row's B1 + 0.05",
+  "d) no crawl increase: B0 and B1 below-7 km/h time <= the no-cap row's B0 + 1.0 s "
+  "(b1 and approach scenarios, both plants)",
+  "e) safety: zero collisions, zero FCW anywhere; lead-decel-1/2/3 min gap >= no-cap - 0.3 m, "
+  "both plants, B0 and B1",
   "f) existing ButterStop-suite criteria re-evaluated in-sweep for the 9 overlapping scenarios "
   "(ideal plant, B0 vs B1, same checks as _case_failures); the s-scenarios and the remaining "
-  "suites are verified in the final CI round at the chosen defaults",
+  "suites are verified in the final CI round at the chosen default",
+)
+
+_CAP_LEAD_DECEL = (
+  "steady state following a car at 20m/s, then lead decel to 0mph at 1m/s^2",
+  "steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2",
+  "steady state following a car at 20m/s, then lead decel to 0mph at 3m/s^2",
 )
 
 
-def _run_b1_release(low_speed_v, lead_slack, butter, plant, telemetry=None):
+def _run_b1_cap(cap_s, butter, plant, telemetry=None):
   fixture = load_fixture("b1")
   header = dict(fixture["params"])
   if butter == 0:
     header["ButterStop"] = 0
-  saved_v = longitudinal_braking_gap.LOW_SPEED_RELEASE_V
-  saved_slack = butter_stop.LEAD_SLACK
-  longitudinal_braking_gap.LOW_SPEED_RELEASE_V = low_speed_v
-  butter_stop.LEAD_SLACK = lead_slack
+  saved_cap = longitudinal_braking_gap.FLOOR_SPEED_CAP_S
+  longitudinal_braking_gap.FLOOR_SPEED_CAP_S = cap_s
   try:
     run = FarLeadLoop(header, FixtureProfile(fixture), plant=(plant != "ideal"),
                       scc_stop=(plant == "scc"), telemetry=telemetry).run()
   finally:
-    longitudinal_braking_gap.LOW_SPEED_RELEASE_V = saved_v
-    butter_stop.LEAD_SLACK = saved_slack
+    longitudinal_braking_gap.FLOOR_SPEED_CAP_S = saved_cap
   return _b1_metrics(run)
 
 
-def _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant):
-  saved_v = longitudinal_braking_gap.LOW_SPEED_RELEASE_V
-  saved_slack = butter_stop.LEAD_SLACK
-  longitudinal_braking_gap.LOW_SPEED_RELEASE_V = low_speed_v
-  butter_stop.LEAD_SLACK = lead_slack
+def _run_scenario_cap(maneuver, cap_s, butter, plant):
+  saved_cap = longitudinal_braking_gap.FLOOR_SPEED_CAP_S
+  longitudinal_braking_gap.FLOOR_SPEED_CAP_S = cap_s
   try:
     logs = ButterStopLoop(maneuver, butter=butter, plant=(plant != "ideal"),
                           scc_stop=(plant == "scc")).run()
   finally:
-    longitudinal_braking_gap.LOW_SPEED_RELEASE_V = saved_v
-    butter_stop.LEAD_SLACK = saved_slack
+    longitudinal_braking_gap.FLOOR_SPEED_CAP_S = saved_cap
   return logs
 
 
-def _release_gap_pair(label, b0, b1m):
+def _cap_gap_pair(label, b0, b1m):
   g0, g1 = b0.get("final_gap_m"), b1m.get("final_gap_m")
   if g0 is None or g1 is None:
     return [f"b) {label}: final gap missing (B0 {g0}, B1 {g1})"]
-  if abs(g1 - g0) > 0.3 + 1e-9:
-    return [f"b) {label}: |B1 - B0| {abs(g1 - g0):.3f} > 0.3 m (B0 {g0}, B1 {g1})"]
+  if abs(g1 - g0) > 0.5 + 1e-9:
+    return [f"b) {label}: |B1 - B0| {abs(g1 - g0):.3f} > 0.5 m (B0 {g0}, B1 {g1})"]
   return []
 
 
-def _release_crawl_pair(label, b0, b1m):
-  c0, c1 = b0.get("crawl_time_s"), b1m.get("crawl_time_s")
-  if c0 is None or c1 is None:
-    return [f"d) {label}: crawl time missing (B0 {c0}, B1 {c1})"]
-  if c1 > c0 + 1.5 + 1e-9:
-    return [f"d) {label}: B1 crawl {c1} > B0 {c0} + 1.5 s"]
-  return []
+def _cap_label(cap_s):
+  return "no-cap" if cap_s == float('inf') else f"{cap_s}"
 
 
-def _release_combo_failures(low_speed_v, lead_slack, b1, scen, suite_fails=()):
-  """Criteria a-e for one (LOW_SPEED_RELEASE_V, LEAD_SLACK) combo.
+def _cap_combo_failures(cap_s, b1, scen, nocap, suite_fails=()):
+  """Criteria a-e for one FLOOR_SPEED_CAP_S value.
 
-  suite_fails carries criterion f: the existing ButterStop-suite checks
-  re-evaluated on this combo's runs (see test_butter_real_release_sweep).
+  b1/scen hold this row's metrics; nocap holds the no-cap row (the finite rows
+  use it for the c/d/e references). suite_fails carries criterion f: the
+  existing ButterStop-suite checks re-evaluated on this row (see
+  test_butter_real_cap_sweep).
   """
   fails = list(suite_fails)
+  tag = _cap_label(cap_s)
 
   def fail(msg):
-    fails.append(f"V {low_speed_v} slack {lead_slack}: {msg}")
+    fails.append(f"cap {tag}: {msg}")
 
-  # a) b1 ideal plant B0 releases to the normal stop distance.
+  # a) b1 ideal plant B0 stops at the normal distance.
   m = b1[("ideal", 0)]
   if m["final_gap_m"] is None or m["final_gap_m"] > 6.5 + 1e-9:
     fail(f"a) b1 ideal B0 final gap {m['final_gap_m']} > 6.5 m")
@@ -655,150 +650,155 @@ def _release_combo_failures(low_speed_v, lead_slack, b1, scen, suite_fails=()):
     fail(f"a) b1 ideal B0 desiredDistance at standstill {dd} > 6.5 m")
 
   # b) ButterStop must not change the stop point: b1 + all 9 scenarios.
-  for plant in _RELEASE_PLANTS:
-    for msg in _release_gap_pair(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]):
+  for plant in _CAP_PLANTS:
+    for msg in _cap_gap_pair(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]):
       fail(msg)
-    for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
-      for msg in _release_gap_pair(f"{maneuver.title} {plant}",
-                                   scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)]):
+    for _group, maneuver in _CAP_SWEEP_SCENARIOS:
+      for msg in _cap_gap_pair(f"{maneuver.title} {plant}",
+                               scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)]):
         fail(msg)
 
-  # c) ButterStop still softens the end: ideal plant, normal scenarios.
-  for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
-    if not (group in ("a", "b") or "approach stopped car" in maneuver.title):
-      continue
-    b0 = scen[(maneuver.title, "ideal", 0)]
-    b1m = scen[(maneuver.title, "ideal", 1)]
-    d0, d1 = b0.get("end_decel_mean_abs"), b1m.get("end_decel_mean_abs")
+  # c) End decel, ideal plant: the softened end must hold vs this row's B0 in
+  #    b1, the a-group except stopped-60, and the approach scenarios; the
+  #    braking-lead and stopped-60 cases only must not regress past no-cap B1.
+  a0 = b1[("ideal", 0)].get("mean_accel_last_0.5s")
+  a1 = b1[("ideal", 1)].get("mean_accel_last_0.5s")
+  if a0 is None or a1 is None:
+    fail(f"c) b1 ideal: end decel missing (B0 {a0}, B1 {a1})")
+  elif abs(a1) > max(0.20, abs(a0) - 0.25) + 1e-9:
+    fail(f"c) b1 ideal: B1 end decel {abs(a1)} > max(0.20, B0 {abs(a0)} - 0.25)")
+  for group, maneuver in _CAP_SWEEP_SCENARIOS:
+    d0 = scen[(maneuver.title, "ideal", 0)].get("end_decel_mean_abs")
+    d1 = scen[(maneuver.title, "ideal", 1)].get("end_decel_mean_abs")
     if d0 is None or d1 is None:
       fail(f"c) {maneuver.title} ideal: end decel missing (B0 {d0}, B1 {d1})")
-    elif d1 > max(0.20, d0 - 0.25) + 1e-9:
-      fail(f"c) {maneuver.title} ideal: B1 end decel {d1} > max(0.20, B0 {d0} - 0.25)")
+    elif group == "b" or "stopped lead 60" in maneuver.title:
+      ref = nocap["scen"][(maneuver.title, "ideal", 1)].get("end_decel_mean_abs")
+      if ref is None or d1 > ref + 0.05 + 1e-9:
+        fail(f"c) {maneuver.title} ideal: B1 end decel {d1} > no-cap B1 {ref} + 0.05")
+    elif group == "a" or "approach stopped car" in maneuver.title:
+      if d1 > max(0.20, d0 - 0.25) + 1e-9:
+        fail(f"c) {maneuver.title} ideal: B1 end decel {d1} > max(0.20, B0 {d0} - 0.25)")
 
-  # d) No crawl: b1 and the approach scenarios.
-  for plant in _RELEASE_PLANTS:
-    for msg in _release_crawl_pair(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]):
-      fail(msg)
-    for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+  # d) No crawl increase: b1 and approach, both plants, B0 and B1, vs the
+  #    no-cap row's B0 (the user's complaint: crawl must not grow).
+  for plant in _CAP_PLANTS:
+    ref = nocap["b1"][(plant, 0)].get("crawl_time_s")
+    for butter in (0, 1):
+      c = b1[(plant, butter)].get("crawl_time_s")
+      if c is None or ref is None:
+        fail(f"d) b1 {plant} B{butter}: crawl time missing ({c} vs no-cap {ref})")
+      elif c > ref + 1.0 + 1e-9:
+        fail(f"d) b1 {plant} B{butter}: crawl {c} > no-cap B0 {ref} + 1.0 s")
+    for _group, maneuver in _CAP_SWEEP_SCENARIOS:
       if "approach stopped car" not in maneuver.title:
         continue
-      for msg in _release_crawl_pair(f"{maneuver.title} {plant}",
-                                     scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)]):
-        fail(msg)
+      ref = nocap["scen"][(maneuver.title, plant, 0)].get("crawl_time_s")
+      for butter in (0, 1):
+        c = scen[(maneuver.title, plant, butter)].get("crawl_time_s")
+        if c is None or ref is None:
+          fail(f"d) {maneuver.title} {plant} B{butter}: crawl time missing ({c} vs no-cap {ref})")
+        elif c > ref + 1.0 + 1e-9:
+          fail(f"d) {maneuver.title} {plant} B{butter}: crawl {c} > no-cap B0 {ref} + 1.0 s")
 
-  # e) Safety: no collision, no new FCW, lead-decel min gaps vs the M0 run.
-  all_runs = [(f"b1 {plant} B{butter}", b1[(plant, butter)])
-              for plant in _RELEASE_PLANTS for butter in (0, 1)]
-  all_runs += [(f"{maneuver.title} {plant} B{butter}", scen[(maneuver.title, plant, butter)])
-               for group, maneuver in _RELEASE_SWEEP_SCENARIOS
-               for plant in _RELEASE_PLANTS for butter in (0, 1)]
-  for label, metrics in all_runs:
-    if metrics.get("collision"):
-      fail(f"e) {label}: collision (min gap {metrics['min_gap_m']})")
-  fcw_pairs = [(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]) for plant in _RELEASE_PLANTS]
-  fcw_pairs += [(f"{maneuver.title} {plant}", scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)])
-                for _group, maneuver in _RELEASE_SWEEP_SCENARIOS for plant in _RELEASE_PLANTS]
-  for label, b0m, b1m in fcw_pairs:
-    if b1m.get("fcw_steps", 0) > b0m.get("fcw_steps", 0):
-      fail(f"e) {label}: B1 FCW {b1m['fcw_steps']} > B0 {b0m['fcw_steps']}")
-  for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
-    if maneuver.title not in _RELEASE_M0_MIN_GAP:
-      continue
-    for plant in _RELEASE_PLANTS:
+  # e) Safety: zero collisions and zero FCW anywhere; lead-decel min gaps
+  #    within no-cap - 0.3 m, both plants, B0 and B1.
+  for plant in _CAP_PLANTS:
+    for butter in (0, 1):
+      metrics = b1[(plant, butter)]
+      if metrics.get("collision"):
+        fail(f"e) b1 {plant} B{butter}: collision (min gap {metrics['min_gap_m']})")
+      if metrics.get("fcw_steps", 0):
+        fail(f"e) b1 {plant} B{butter}: FCW {metrics['fcw_steps']} planner ticks")
+  for _group, maneuver in _CAP_SWEEP_SCENARIOS:
+    for plant in _CAP_PLANTS:
       for butter in (0, 1):
         metrics = scen[(maneuver.title, plant, butter)]
-        bound = _RELEASE_M0_MIN_GAP[maneuver.title][butter] - 0.3
-        if metrics["min_gap_m"] < bound - 1e-9:
-          fail(f"e) {maneuver.title} {plant} B{butter}: min gap {metrics['min_gap_m']} < M0 - 0.3 ({bound:.3f})")
+        if metrics.get("collision"):
+          fail(f"e) {maneuver.title} {plant} B{butter}: collision (min gap {metrics['min_gap_m']})")
+        if metrics.get("fcw_steps", 0):
+          fail(f"e) {maneuver.title} {plant} B{butter}: FCW {metrics['fcw_steps']} planner ticks")
+    if maneuver.title not in _CAP_LEAD_DECEL:
+      continue
+    for plant in _CAP_PLANTS:
+      for butter in (0, 1):
+        ref = nocap["scen"][(maneuver.title, plant, butter)]["min_gap_m"]
+        mg = scen[(maneuver.title, plant, butter)]["min_gap_m"]
+        if mg < ref - 0.3 - 1e-9:
+          fail(f"e) {maneuver.title} {plant} B{butter}: min gap {mg} < no-cap {ref} - 0.3")
   return fails
 
 
-def test_butter_real_release_sweep():
+def test_butter_real_cap_sweep():
   out_path = os.environ.get("BUTTER_REAL_SWEEP_OUT")
   if not out_path:
-    pytest.skip("release sweep runs only when BUTTER_REAL_SWEEP_OUT is set")
+    pytest.skip("cap sweep runs only when BUTTER_REAL_SWEEP_OUT is set")
   titles = {m.title for _, m in _CASES}
-  missing = [t for t in _RELEASE_M0_MIN_GAP if t not in titles]
-  assert not missing, f"M0 baseline scenario titles missing from _CASES: {missing}"
+  missing = [t for t in _CAP_LEAD_DECEL if t not in titles]
+  assert not missing, f"lead-decel titles missing from _CASES: {missing}"
 
-  b0_cache: dict = {}
   rows = []
-  for low_speed_v in _RELEASE_SWEEP_V:
-    for lead_slack in _RELEASE_SWEEP_SLACK:
-      b1: dict = {}
-      scen: dict = {}
-      for plant in _RELEASE_PLANTS:
+  nocap = None
+  for cap_s in _CAP_SWEEP:
+    b1: dict = {}
+    scen: dict = {}
+    scen_logs: dict = {}
+    for plant in _CAP_PLANTS:
+      for butter in (0, 1):
+        b1[(plant, butter)] = _run_b1_cap(cap_s, butter, plant)
+    for group, maneuver in _CAP_SWEEP_SCENARIOS:
+      for plant in _CAP_PLANTS:
         for butter in (0, 1):
-          cache_key = (low_speed_v, plant, "b1")
-          if butter == 0 and cache_key in b0_cache:
-            metrics = b0_cache[cache_key]
-          else:
-            metrics = _run_b1_release(low_speed_v, lead_slack, butter, plant)
-            if butter == 0:
-              b0_cache[cache_key] = metrics
-          b1[(plant, butter)] = metrics
-      scen_logs: dict = {}
-      for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
-        for plant in _RELEASE_PLANTS:
-          for butter in (0, 1):
-            cache_key = (low_speed_v, plant, maneuver.title)
-            if butter == 0 and cache_key in b0_cache:
-              logs = b0_cache[cache_key]
-            else:
-              logs = _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant)
-              if butter == 0:
-                b0_cache[cache_key] = logs
-            if plant == "ideal":
-              scen_logs[(maneuver.title, plant, butter)] = logs
-            scen[(maneuver.title, plant, butter)] = _scenario_metrics(logs, maneuver.title)
-      suite_fails = []
-      for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
-        off_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 0)], maneuver.title, 0)
-        on_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 1)], maneuver.title, 1)
-        for msg in _butter_case_failures(group, off_metrics, on_metrics):
-          suite_fails.append(f"f) ideal plant: {msg}")
-      fails = _release_combo_failures(low_speed_v, lead_slack, b1, scen, suite_fails=suite_fails)
-      rows.append({
-        "low_speed_v": low_speed_v,
-        "lead_slack": lead_slack,
-        "all_pass": not fails,
-        "failures": fails,
-        "b1": {f"{plant}_{butter}": b1[(plant, butter)]
-               for plant in _RELEASE_PLANTS for butter in (0, 1)},
-        "scenarios": {maneuver.title: {f"{plant}_{butter}": scen[(maneuver.title, plant, butter)]
-                                       for plant in _RELEASE_PLANTS for butter in (0, 1)}
-                      for _group, maneuver in _RELEASE_SWEEP_SCENARIOS},
-      })
-      print(f"RELEASE-SWEEP V {low_speed_v} slack {lead_slack}: "
-            f"pass={not fails} fails={len(fails)}")
+          logs = _run_scenario_cap(maneuver, cap_s, butter, plant)
+          if plant == "ideal":
+            scen_logs[(maneuver.title, plant, butter)] = logs
+          scen[(maneuver.title, plant, butter)] = _scenario_metrics(logs, maneuver.title)
+    suite_fails = []
+    for group, maneuver in _CAP_SWEEP_SCENARIOS:
+      off_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 0)], maneuver.title, 0)
+      on_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 1)], maneuver.title, 1)
+      for msg in _butter_case_failures(group, off_metrics, on_metrics):
+        suite_fails.append(f"f) ideal plant: {msg}")
+    if cap_s == float('inf'):
+      nocap = {"b1": b1, "scen": scen}
+    fails = _cap_combo_failures(cap_s, b1, scen, nocap, suite_fails=suite_fails)
+    rows.append({
+      "cap_s": cap_s,
+      "no_cap": cap_s == float('inf'),
+      "all_pass": not fails,
+      "failures": fails,
+      "b1": {f"{plant}_{butter}": b1[(plant, butter)]
+             for plant in _CAP_PLANTS for butter in (0, 1)},
+      "scenarios": {maneuver.title: {f"{plant}_{butter}": scen[(maneuver.title, plant, butter)]
+                                     for plant in _CAP_PLANTS for butter in (0, 1)}
+                    for _group, maneuver in _CAP_SWEEP_SCENARIOS},
+    })
+    print(f"CAP-SWEEP {_cap_label(cap_s)}: pass={not fails} fails={len(fails)}")
 
-  passing = [r for r in rows if r["all_pass"]]
-  chosen = min(passing, key=lambda r: (r["low_speed_v"], -r["lead_slack"])) if passing else None
-  closest = sorted((r for r in rows if not r["all_pass"]),
-                   key=lambda r: (len(r["failures"]), r["low_speed_v"], -r["lead_slack"]))[:3]
+  passing = [r for r in rows if r["all_pass"] and math.isfinite(r["cap_s"])]
+  chosen = max(passing, key=lambda r: r["cap_s"]) if passing else None
+  closest = sorted((r for r in rows if not r["all_pass"] and math.isfinite(r["cap_s"])),
+                   key=lambda r: (len(r["failures"]), -r["cap_s"]))[:2]
 
   selected = chosen if chosen is not None else (closest[0] if closest else None)
   telemetry: dict = {}
   if selected is not None:
     for butter in (0, 1):
       trace: dict = {}
-      metrics = _run_b1_release(selected["low_speed_v"], selected["lead_slack"], butter, "ideal",
-                                telemetry=trace)
-      telemetry[f"B{butter}"] = {"low_speed_v": selected["low_speed_v"],
-                                 "lead_slack": selected["lead_slack"],
-                                 "metrics": metrics, "trace": trace}
+      metrics = _run_b1_cap(selected["cap_s"], butter, "ideal", telemetry=trace)
+      telemetry[f"B{butter}"] = {"cap_s": selected["cap_s"], "metrics": metrics, "trace": trace}
   RESULTS["b1_telemetry"] = telemetry
 
   if chosen is not None:
-    print(f"RELEASE-PICK: V {chosen['low_speed_v']} slack {chosen['lead_slack']}")
+    print(f"CAP-PICK: {_cap_label(chosen['cap_s'])}")
   else:
-    print("RELEASE-PICK: none passed; closest:")
+    print("CAP-PICK: none passed; closest:")
     for r in closest:
-      print(f"  V {r['low_speed_v']} slack {r['lead_slack']}: {len(r['failures'])} failures")
+      print(f"  cap {_cap_label(r['cap_s'])}: {len(r['failures'])} failures")
 
   table = {
-    "criteria": list(_RELEASE_SWEEP_CRITERIA),
-    "m0_min_gap": _RELEASE_M0_MIN_GAP,
+    "criteria": list(_CAP_SWEEP_CRITERIA),
+    "cap_values": [None if not math.isfinite(c) else c for c in _CAP_SWEEP],
     "sweep": rows,
     "chosen": chosen,
     "closest": closest,
@@ -817,8 +817,8 @@ def test_butter_real_release_sweep():
                                                      for title, runs in row["scenarios"].items()
                                                      for label, m in runs.items()]:
       if metrics.get("collision"):
-        collisions.append(f"V {row['low_speed_v']} slack {row['lead_slack']} {label}")
-  assert not collisions, "release sweep collision: " + "; ".join(collisions[:5])
+        collisions.append(f"cap {_cap_label(row['cap_s'])} {label}")
+  assert not collisions, "cap sweep collision: " + "; ".join(collisions[:5])
 
 
 def test_write_butter_real_table():

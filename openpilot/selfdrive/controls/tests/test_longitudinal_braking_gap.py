@@ -52,7 +52,7 @@ def test_prediction_does_not_mutate_live_state_and_matches_repeated_advances():
   assert vars(state) == before
   expected = [state.margin]
   for _ in range(20):
-    state._advance(.05, 11., 10., 10., 9.5)
+    state._advance(.05, 11., 10., 10., 9.5, 5.)
     expected.append(state.margin)
   np.testing.assert_allclose(actual, expected)
 
@@ -152,9 +152,9 @@ def test_old_eight_second_tau_would_not_release_within_three_seconds(monkeypatch
 
 
 def test_moving_lead_keeps_the_eight_second_tau(monkeypatch):
-  # Pin the low-speed trigger off: this test isolates the moving-lead tau
-  # selection; the low-speed release has dedicated coverage.
-  monkeypatch.setattr(longitudinal_braking_gap, 'LOW_SPEED_RELEASE_V', 0.0)
+  # Pin the speed cap off: this test isolates the moving-lead tau selection;
+  # the speed-proportional cap has dedicated coverage.
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', float('inf'))
   state = BrakingGapState()
   capture(state)
   for _ in range(60):
@@ -170,6 +170,53 @@ def test_stopped_pair_below_point_three_still_freezes():
   for _ in range(600):
     braking_pair(state, ego_speed=0.2, ego_accel=-.2, lead_speed=0.2, lead_accel=0., relative_speed=0.)
   assert state.floor == before
+
+
+def test_floor_tracks_speed_cap(monkeypatch):
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', 2.5)
+  state = BrakingGapState()
+  captured = capture(state)
+  assert 17.9 < captured <= 18.1  # captured at 5 m/s: stop_distance + 2.5 * 5 = 18
+  for i in range(1, 81):
+    ego = 5.0 - .05 * i  # 5 -> 1 m/s over 4 s
+    lead = .8 - .00375 * i  # 0.8 -> 0.5 m/s, never below 0.3
+    braking_pair(state, ego_speed=ego, lead_speed=lead, ego_accel=-.5, lead_accel=-.5,
+                 relative_speed=lead - ego)
+    base = 5.5 + ego * 2.0
+    assert state.floor <= max(base, 5.5 + 2.5 * ego) + 1e-6
+  assert state.floor <= 5.5 + 2.5 + 0.01
+
+
+def test_stopped_pair_freeze_beats_cap(monkeypatch):
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', 2.5)
+  state = BrakingGapState()
+  state.key, state.distance, state.relative_speed, state.age = 43, 20., 0., 1.
+  state.floor = 9.0
+  for _ in range(100):
+    braking_pair(state, ego_speed=0.2, ego_accel=-.2, lead_speed=0.2, lead_accel=0., relative_speed=0.)
+  assert state.floor == 9.0
+
+
+def test_margins_apply_cap_with_predicted_speeds(monkeypatch):
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', 2.5)
+  state = BrakingGapState()
+  capture(state)
+  t = np.arange(81) * .05
+  speeds = np.linspace(5., 1., 81)
+  leads = np.linspace(.8, .5, 81)
+  before = vars(state).copy()
+  actual = state.margins(t, speeds, leads, np.full(81, 10.), 2.0, 5.5)
+  assert vars(state) == before
+  expected = [state.margin]
+  floors = [state.floor]
+  for i in range(1, 81):
+    state._advance(.05, 5.5 + speeds[i] * 2.0, 10., speeds[i], leads[i], 5.5)
+    expected.append(state.margin)
+    floors.append(state.floor)
+  np.testing.assert_allclose(actual, expected)
+  for i, floor in enumerate(floors):
+    base = 5.5 + speeds[i] * 2.0
+    assert floor <= max(base, 5.5 + 2.5 * speeds[i]) + 1e-6
 
 
 def test_releasing_path_still_uses_the_two_second_tau():

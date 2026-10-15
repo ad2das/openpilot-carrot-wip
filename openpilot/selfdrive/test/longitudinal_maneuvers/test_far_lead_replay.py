@@ -294,7 +294,7 @@ class FarLeadLoop:
     self.telemetry = telemetry
     if telemetry is not None:
       for key in ("t", "v", "v_lead", "gap", "floor", "margin", "stopped_pair",
-                  "fast_release", "desired_distance", "a_target", "butter_floor", "lc_state"):
+                  "fast_release", "cap", "desired_distance", "a_target", "butter_floor", "lc_state"):
         telemetry.setdefault(key, [])
     self._plant_lag = float(profile.initial_accel)
     self.a_actual = float(profile.initial_accel)
@@ -319,6 +319,7 @@ class FarLeadLoop:
     tel["margin"].append(round(float(state.margin), 3))
     tel["stopped_pair"].append(bool(state.stopped_pair))
     tel["fast_release"].append(bool(state.fast_release))
+    tel["cap"].append(None if state.speed_cap is None else round(float(state.speed_cap), 3))
     tel["desired_distance"].append(round(float(plan_view.desiredDistance), 3))
     tel["a_target"].append(round(float(plan_view.aTarget), 3))
     tel["butter_floor"].append(None if bf is None else round(float(bf), 3))
