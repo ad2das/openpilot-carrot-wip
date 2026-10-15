@@ -201,11 +201,31 @@ def _track_with_votes(votes, cls=LampClass.RED, box=BOX):
 
 def test_classifier_votes_confirm_red_by_time():
   t, track = _track_with_votes([(0.0, LampClass.RED, 0.9), (0.2, LampClass.RED, 0.9)])
-  assert track.classifier_confirmed(0.2) is None  # only 2 votes inside 0.6 s
+  assert track.classifier_confirmed(0.2) is None  # two votes are not enough
   t.record_votes(0.4, [(track.track_id, int(LampClass.RED), 0.9)])
   assert track.classifier_confirmed(0.4) == (int(LampClass.RED), 1.0)
   # Votes age out of the red window: no fresh votes, no confirmation.
   assert track.classifier_confirmed(1.2) is None
+
+
+def test_classifier_red_confirm_uses_the_1_2s_window():
+  # W121 L1b: three red votes spread over 1.0 s (t=0, 0.5, 1.0) confirm at
+  # now=1.0; the 0.6 s window would have seen only the last vote.
+  t, track = _track_with_votes([(0.0, LampClass.RED, 0.9), (0.5, LampClass.RED, 0.9)])
+  t.record_votes(1.0, [(track.track_id, int(LampClass.RED), 0.9)])
+  assert track.classifier_confirmed(1.0) == (int(LampClass.RED), 1.0)
+  # At 1.25 the t=0 vote has aged out (strict >): only the 0.5 and 1.0 votes
+  # remain inside the window, so there is no confirmation.
+  assert track.classifier_confirmed(1.25) is None
+
+
+def test_classifier_green_veto_uses_the_confirm_window():
+  # One green vote anywhere inside the 1.2 s window blocks red confirmation
+  # even though three red votes are present (W121 L1b window change).
+  t, track = _track_with_votes([(0.0, LampClass.RED, 0.9), (0.5, LampClass.RED, 0.9)])
+  t.record_votes(0.3, [(track.track_id, int(LampClass.GREEN), 0.9)])
+  t.record_votes(1.0, [(track.track_id, int(LampClass.RED), 0.9)])
+  assert track.classifier_confirmed(1.0) is None
 
 
 def test_classifier_green_vote_blocks_red_confirmation():
@@ -217,13 +237,13 @@ def test_classifier_green_vote_blocks_red_confirmation():
   t.record_votes(0.2, [(track.track_id, red, 0.9)])
   t.record_votes(0.4, [(track.track_id, green, 0.8)])
   assert track.classifier_confirmed(0.4) is None
-  # Once the green ages out of the red window, three fresh reds confirm; two
-  # fresh reds are not enough.
-  t.record_votes(1.0, [(track.track_id, red, 0.9)])
+  # Once the green ages out of the 1.2 s confirm window (at now >= 1.6), three
+  # fresh reds confirm; two fresh reds are not enough.
   t.record_votes(1.2, [(track.track_id, red, 0.9)])
-  assert track.classifier_confirmed(1.2) is None
   t.record_votes(1.4, [(track.track_id, red, 0.9)])
-  assert track.classifier_confirmed(1.4) == (red, 1.0)
+  assert track.classifier_confirmed(1.6) is None
+  t.record_votes(1.7, [(track.track_id, red, 0.9)])
+  assert track.classifier_confirmed(1.7) == (red, 1.0)
 
 
 def test_classifier_green_needs_six_votes_in_1_2s():

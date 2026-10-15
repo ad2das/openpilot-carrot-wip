@@ -154,6 +154,18 @@ class FramePipeline:
   def single_class_detector(self) -> bool:
     return getattr(self.decoder, "num_classes", None) == 1
 
+  @property
+  def far_tracks_only(self) -> bool:
+    """True when every live track is beyond the near gate (W121 L2)."""
+    if not self.tracker.tracks:
+      return False
+    odo = self.ego.odo if self.ego is not None else None
+    for track in self.tracker.tracks:
+      d = tracker.track_distance_m(track, odo)
+      if not (math.isfinite(d) and d > tracker.RELEVANT_MAX_DISTANCE_M):
+        return False
+    return True
+
   def _confirmed(self, now: float) -> list[tuple[tracker.Track, int, float]]:
     """Per-track confirmation: classifier votes OR the detector M-of-N belt."""
     if self.single_class_detector:

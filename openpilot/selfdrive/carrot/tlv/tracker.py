@@ -57,6 +57,10 @@ CLASSIFIER_RED_WINDOW_S = 0.6
 CLASSIFIER_RED_VOTES = 3
 CLASSIFIER_SLOW_WINDOW_S = 1.2
 CLASSIFIER_SLOW_VOTES = 6
+# Red confirmation reads 3 red votes (and the green-family veto) in this
+# longer window (W121 L1b): far lights get votes every 0.1-0.25 s and the
+# 0.6 s window starved 100 km/h approaches (C3). red_likely keeps 0.6 s.
+CLASSIFIER_RED_CONFIRM_WINDOW_S = 1.2
 # Graded redLikely: one strong red vote (probability >= 0.6) is enough.
 RED_LIKELY_MIN_PROB = 0.6
 # Classifier votes keep a track alive this long after the last detection, so a
@@ -239,12 +243,13 @@ class Track:
   def classifier_confirmed(self, now: float) -> tuple[int, float] | None:
     """(cls, confidence) from classifier votes counted by TIME, else None.
 
-    Red family: >= 3 votes within the last 0.6 s and no green-family vote in
-    that window. Yellow/green/left: the stricter >= 6 votes in 1.2 s. Red is
-    evaluated first so a stale green cannot delay a safety stop.
+    Red family: >= 3 votes within the last 1.2 s (CLASSIFIER_RED_CONFIRM_WINDOW_S)
+    and no green-family vote in that window. Yellow/green/left: the stricter
+    >= 6 votes in 1.2 s. Red is evaluated first so a stale green cannot delay a
+    safety stop.
     """
-    red_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_WINDOW_S and c in RED_FAMILY]
-    green_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_WINDOW_S and c in GREEN_FAMILY]
+    red_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in RED_FAMILY]
+    green_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in GREEN_FAMILY]
     if len(red_votes) >= CLASSIFIER_RED_VOTES and not green_votes:
       return int(_most_common(red_votes)), min(1.0, len(red_votes) / CLASSIFIER_RED_VOTES)
     best: tuple[int, float] | None = None

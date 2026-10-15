@@ -258,6 +258,42 @@ def test_choose_frame_kind_skips_without_credit():
                                 classifier_enabled=True, budget=budget) is None
 
 
+def test_choose_frame_kind_far_tracks_only_uses_0_1s_classify():
+  budget, _clocks = make_budget()
+  budget.tick(0.0)  # seed the baselines
+  # With far_tracks_only the classify interval drops to 0.1 s (W121 L2)...
+  assert tlvd.choose_frame_kind(now=1.1, last_detect=1.0, last_classify=1.0, has_tracks=True,
+                                classifier_enabled=True, budget=budget,
+                                far_tracks_only=True) == "classify"
+  # ...while the same state without the flag is still inside 0.2 s -> skip.
+  assert tlvd.choose_frame_kind(now=1.1, last_detect=1.0, last_classify=1.0, has_tracks=True,
+                                classifier_enabled=True, budget=budget,
+                                far_tracks_only=False) is None
+  # Detector priority is unchanged: a due detector beats the faster classifier.
+  assert tlvd.choose_frame_kind(now=1.5, last_detect=1.0, last_classify=1.05, has_tracks=True,
+                                classifier_enabled=True, budget=budget,
+                                far_tracks_only=True) == "detect"
+
+
+def test_choose_frame_kind_far_only_still_saves_for_overdue_detector():
+  budget, clocks = make_budget()
+  budget.begin("detect", 0.0)  # expensive detect sets estimate ~2.4 > cap
+  clocks.cpu += 3.0
+  budget.end(0.0)
+  clocks.t = 9.0
+  budget.tick(9.0)
+  assert budget.credit == pytest.approx(1.0)
+  # Detector overdue (>= 3 s) and not affordable: even at the 0.1 s cadence the
+  # classifier is refused so the credit can rebuild for the detector.
+  assert tlvd.choose_frame_kind(now=9.0, last_detect=4.0, last_classify=8.5, has_tracks=True,
+                                classifier_enabled=True, budget=budget,
+                                far_tracks_only=True) is None
+  # With a recent detect the same credit state runs the cheap classifier.
+  assert tlvd.choose_frame_kind(now=9.0, last_detect=8.7, last_classify=8.5, has_tracks=True,
+                                classifier_enabled=True, budget=budget,
+                                far_tracks_only=True) == "classify"
+
+
 # ---------------------------------------------------------------------------
 # carrotTlv telemetry publish
 # ---------------------------------------------------------------------------

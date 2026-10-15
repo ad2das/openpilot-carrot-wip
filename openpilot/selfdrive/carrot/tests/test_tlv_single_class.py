@@ -113,6 +113,23 @@ def test_select_relevant_unchanged():
   assert select_relevant(entry, 0, **kwargs, max_distance_m=RELEVANT_MAX_DISTANCE_M) is None
 
 
+def test_pipeline_far_tracks_only():
+  # W121 L2: the far-tier 0.1 s classify cadence applies only while EVERY live
+  # track is beyond the 120 m near gate.
+  pipe = pipeline.FramePipeline(backends.NullBackend(""), decode.PlaceholderDecoder())
+  assert pipe.far_tracks_only is False  # no tracks
+  pipe.tracker.tracks.append(_track_at(150.0))  # ~150 m, beyond the gate
+  assert pipe.far_tracks_only is True
+  pipe.tracker.tracks.append(_track_at(100.0))  # a near track breaks it
+  assert pipe.far_tracks_only is False
+  # An unusable box (height < 0.5 px) gives a non-finite distance: the
+  # conservative reading is False, never a free faster cadence.
+  bad = _track_at(150.0)
+  bad.box = (900.0, 300.0, 940.0, 300.4)
+  pipe.tracker.tracks[1] = bad
+  assert pipe.far_tracks_only is False
+
+
 def test_decoder_num_classes():
   dec = RawHeadDecoder(R3B_NAMES)
   assert dec.num_classes is None
