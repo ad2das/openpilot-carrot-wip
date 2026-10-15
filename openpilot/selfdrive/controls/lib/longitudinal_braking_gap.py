@@ -7,7 +7,10 @@ import numpy as np
 
 
 STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego still rolls
-LOW_SPEED_RELEASE_V = 3.0  # ego speed below which a rolling approach releases the floor
+# Rolling-approach release below this ego speed. 0.0 holds the previous
+# lead-stopped-only behavior until the swept value lands (see the release
+# sweep in test_butter_real_replay.py).
+LOW_SPEED_RELEASE_V = 0.0
 
 
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):

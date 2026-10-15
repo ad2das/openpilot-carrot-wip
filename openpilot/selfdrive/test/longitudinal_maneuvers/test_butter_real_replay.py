@@ -20,10 +20,13 @@ reported to BUTTER_REAL_OUT. Simulation only; no vehicle validation.
 Part 3 (task 7) — LOW_SPEED_RELEASE_V x LEAD_SLACK sweep, gated by
 BUTTER_REAL_SWEEP_OUT: 12 combos over b1 (ideal and creep+SCC plants) and the
 9 ButterStop scenarios (both plants), each for ButterStop 0 and 1. Criteria
-a-f (see _RELEASE_SWEEP_CRITERIA); auto-pick: smallest LOW_SPEED_RELEASE_V
-that passes, then largest LEAD_SLACK. Report-only; collision anywhere fails
-the test. The b1 B0/B1 ideal-plant telemetry (floor/margin/stopped_pair/
-fast_release per 0.05 s) goes to BUTTER_REAL_OUT.
+a-f (see _RELEASE_SWEEP_CRITERIA; f re-evaluates the existing ButterStop-suite
+checks on the 9 overlapping scenarios from the same ideal-plant runs); auto-
+pick: smallest LOW_SPEED_RELEASE_V that passes, then largest LEAD_SLACK.
+Report-only; collision anywhere fails the test. The b1 B0/B1 ideal-plant
+telemetry (floor/margin/stopped_pair/fast_release per 0.05 s) goes to
+BUTTER_REAL_OUT. The module default stays at the previous behavior until the
+sweep picks the constants (see longitudinal_braking_gap.LOW_SPEED_RELEASE_V).
 """
 import json
 import os
@@ -43,7 +46,8 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
-  ButterStopLoop, _CASES,
+  ButterStopLoop, _CASES, _case_failures as _butter_case_failures,
+  compute_metrics as _butter_metrics,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
   CAR_MODEL, SENTINEL, FarLeadLoop, FixtureProfile, _FakeSM, _apply_header_params,
@@ -575,7 +579,9 @@ _RELEASE_SWEEP_CRITERIA = (
   "c) ideal plant, normal scenarios (a-group, b, approach): B1 end decel <= max(0.20, B0 - 0.25)",
   "d) crawl: B1 below-7 km/h time <= B0 + 1.5 s (b1 and approach scenarios)",
   "e) no collision anywhere; lead-decel-1/2/3 min gap >= M0 - 0.3 m (B0/B1, both plants); no new FCW",
-  "f) all existing suites green (verified outside this sweep)",
+  "f) existing ButterStop-suite criteria re-evaluated in-sweep for the 9 overlapping scenarios "
+  "(ideal plant, B0 vs B1, same checks as _case_failures); the s-scenarios and the remaining "
+  "suites are verified in the final CI round at the chosen defaults",
 )
 
 
@@ -608,7 +614,7 @@ def _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant):
   finally:
     longitudinal_braking_gap.LOW_SPEED_RELEASE_V = saved_v
     butter_stop.LEAD_SLACK = saved_slack
-  return _scenario_metrics(logs, maneuver.title)
+  return logs
 
 
 def _release_gap_pair(label, b0, b1m):
@@ -629,9 +635,13 @@ def _release_crawl_pair(label, b0, b1m):
   return []
 
 
-def _release_combo_failures(low_speed_v, lead_slack, b1, scen):
-  """Criteria a-e for one (LOW_SPEED_RELEASE_V, LEAD_SLACK) combo."""
-  fails = []
+def _release_combo_failures(low_speed_v, lead_slack, b1, scen, suite_fails=()):
+  """Criteria a-e for one (LOW_SPEED_RELEASE_V, LEAD_SLACK) combo.
+
+  suite_fails carries criterion f: the existing ButterStop-suite checks
+  re-evaluated on this combo's runs (see test_butter_real_release_sweep).
+  """
+  fails = list(suite_fails)
 
   def fail(msg):
     fails.append(f"V {low_speed_v} slack {lead_slack}: {msg}")
@@ -727,18 +737,27 @@ def test_butter_real_release_sweep():
             if butter == 0:
               b0_cache[cache_key] = metrics
           b1[(plant, butter)] = metrics
+      scen_logs: dict = {}
       for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
         for plant in _RELEASE_PLANTS:
           for butter in (0, 1):
             cache_key = (low_speed_v, plant, maneuver.title)
             if butter == 0 and cache_key in b0_cache:
-              metrics = b0_cache[cache_key]
+              logs = b0_cache[cache_key]
             else:
-              metrics = _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant)
+              logs = _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant)
               if butter == 0:
-                b0_cache[cache_key] = metrics
-            scen[(maneuver.title, plant, butter)] = metrics
-      fails = _release_combo_failures(low_speed_v, lead_slack, b1, scen)
+                b0_cache[cache_key] = logs
+            if plant == "ideal":
+              scen_logs[(maneuver.title, plant, butter)] = logs
+            scen[(maneuver.title, plant, butter)] = _scenario_metrics(logs, maneuver.title)
+      suite_fails = []
+      for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+        off_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 0)], maneuver.title, 0)
+        on_metrics = _butter_metrics(scen_logs[(maneuver.title, "ideal", 1)], maneuver.title, 1)
+        for msg in _butter_case_failures(group, off_metrics, on_metrics):
+          suite_fails.append(f"f) ideal plant: {msg}")
+      fails = _release_combo_failures(low_speed_v, lead_slack, b1, scen, suite_fails=suite_fails)
       rows.append({
         "low_speed_v": low_speed_v,
         "lead_slack": lead_slack,
