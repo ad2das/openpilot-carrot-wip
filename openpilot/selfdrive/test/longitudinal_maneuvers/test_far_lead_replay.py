@@ -47,7 +47,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from opendbc.car.hyundai.interface import CarInterface
@@ -58,6 +58,7 @@ PLANNER_PERIOD = 5  # 100 Hz loop, 20 Hz planner/model, as in the car
 SENTINEL = -32767
 PLANT_TAU = 0.3     # actuator first-order lag (s); automatic-transmission creep plant
 PLANT_A_GATE = 0.3  # creep torque adds only while the lagged command is below this
+PLANT_SCC_BRAKE = -0.6  # SCC StopReq braking ceiling in the stopping state (m/s^2)
 
 
 def plant_creep(v):
@@ -273,7 +274,7 @@ class SyntheticProfile:
 
 
 class FarLeadLoop:
-  def __init__(self, header, profile, speed_tf=None, plant=False):
+  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False):
     _seed_param_defaults()
     params = Params()
     _apply_header_params(params, header)
@@ -289,6 +290,7 @@ class FarLeadLoop:
     self.ego_v = float(profile.initial_speed)
     self.ego_x = 0.0
     self.plant = bool(plant)
+    self.scc_stop = bool(scc_stop)
     self._plant_lag = float(profile.initial_accel)
     self.a_actual = float(profile.initial_accel)
 
@@ -441,6 +443,10 @@ class FarLeadLoop:
           applied += plant_creep(self.ego_v)
       else:
         applied = accel
+      if self.scc_stop and self.long_control.long_control_state == LongCtrlState.stopping:
+        # SCC owns the stop in the stopping state: at least -0.6 m/s^2 until
+        # standstill, then hold.
+        applied = 0.0 if self.ego_v <= 0.01 else min(applied, PLANT_SCC_BRAKE)
       self.a_actual = applied
 
       gap = np.nan
