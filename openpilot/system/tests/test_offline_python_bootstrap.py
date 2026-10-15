@@ -322,3 +322,26 @@ def test_tinygrad_bounds_usbgpu_copy_staging_transfers() -> None:
 
   assert "USBGPU_COPY_BUFFER_SIZE = 256 * 1024" in source
   assert "size=USBGPU_COPY_BUFFER_SIZE" in source
+
+
+# -- W132: bundled onnxruntime wheel for the tlvd CPU backend ------------------
+
+ONNXRUNTIME_WHEEL = "onnxruntime-1.31.0-cp312-cp312-manylinux_2_28_aarch64.whl"
+ONNXRUNTIME_SHA256 = "35758d7606d578ec5b9d65f6e8a1f488013194c3f6097038a3223cb26d35ef9a"
+
+
+def test_tlvd_onnxruntime_wheel_is_available_offline() -> None:
+  wheel = Path(BASEDIR) / "third_party/wheels" / ONNXRUNTIME_WHEEL
+
+  assert wheel.is_file()
+  assert hashlib.sha256(wheel.read_bytes()).hexdigest() == ONNXRUNTIME_SHA256
+  assert "Name: onnxruntime" in _wheel_metadata(wheel)
+  assert "Version: 1.31.0" in _wheel_metadata(wheel)
+  assert _wheel_contains(wheel, "onnxruntime/capi/onnxruntime_pybind11_state.cpython-312-aarch64-linux-gnu.so")
+
+
+def test_launcher_bootstraps_onnxruntime_offline() -> None:
+  launcher = (Path(BASEDIR) / "launch_chffrplus.sh").read_text(encoding="utf-8")
+
+  assert "ensure_python_package \"onnxruntime; assert onnxruntime.__version__ == '1.31.0'\"" in launcher
+  assert '"onnxruntime==1.31.0" 0' in launcher

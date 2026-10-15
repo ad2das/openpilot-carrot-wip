@@ -1,0 +1,53 @@
+name: TLV ARM64 runtime check
+
+on:
+  push:
+    branches: [carrot-wip]
+    paths:
+      - 'third_party/wheels/onnxruntime-*'
+      - 'openpilot/selfdrive/carrot/tlv/**'
+      - 'openpilot/tools/carrot_tlv_bench.py'
+      - 'launch_chffrplus.sh'
+      - '.github/workflows/tlv-arm64-runtime.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  arm64:
+    name: onnxruntime vs tinygrad on arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      PYTHONPATH: ${{ runner.temp }}/pydeps:${{ github.workspace }}
+    steps:
+      - name: Check out candidate code
+        uses: actions/checkout@v6
+        with:
+          submodules: false
+      - name: Fetch only the tinygrad_repo submodule
+        # The CPU tinygrad backend is the only submodule this check needs.
+        run: git submodule update --init --recursive tinygrad_repo
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install numpy
+        run: python -m pip install "numpy>=2.5.3"
+      - name: Install the bundled onnxruntime wheel exactly as the device does
+        run: |
+          python -m pip install --no-index --no-deps \
+            --target "$RUNNER_TEMP/pydeps" \
+            third_party/wheels/onnxruntime-1.31.0-cp312-cp312-manylinux_2_28_aarch64.whl
+      - name: Confirm onnxruntime resolves from pydeps
+        run: |
+          python - <<'PY'
+          import os, sys
+          import onnxruntime
+          expected = os.path.join(os.environ["RUNNER_TEMP"], "pydeps")
+          assert onnxruntime.__file__.startswith(expected), onnxruntime.__file__
+          print("onnxruntime", onnxruntime.__version__, "from", onnxruntime.__file__)
+          PY
+      - name: Run the ARM64 runtime check
+        run: python openpilot/selfdrive/carrot/tlv/tools/arm64_runtime_check.py

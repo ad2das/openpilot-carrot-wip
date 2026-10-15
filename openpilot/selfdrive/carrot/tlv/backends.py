@@ -73,11 +73,16 @@ class NullBackend:
 
 
 class OnnxCpuBackend:
-  """onnxruntime CPU-only backend (intra_op 2 threads, inter_op 1)."""
+  """onnxruntime CPU-only backend (1 intra-op thread, 1 inter-op thread).
+
+  Threads are pinned to 1 with spinning disabled so the detector adds only one
+  core's worth of work next to modeld/controlsd on the C3X; graph
+  optimization is enabled for a one-time compile.
+  """
 
   name = "onnx"
 
-  def __init__(self, model_path: str, intra_op_threads: int = 2, inter_op_threads: int = 1,
+  def __init__(self, model_path: str, intra_op_threads: int = 1, inter_op_threads: int = 1,
                param_name: str = "CarrotTlvModelPath") -> None:
     reason = gpu_env_reason()
     if reason is not None:
@@ -95,6 +100,12 @@ class OnnxCpuBackend:
     options = ort.SessionOptions()
     options.intra_op_num_threads = int(intra_op_threads)
     options.inter_op_num_threads = int(inter_op_threads)
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+    # No busy-wait spinning: a spin loop burns a core next to modeld even when
+    # the detector is idle between frames.
+    options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+    options.add_session_config_entry("session.inter_op.allow_spinning", "0")
     self._session = ort.InferenceSession(model_path, sess_options=options, providers=["CPUExecutionProvider"])
     if self._session.get_providers() != ["CPUExecutionProvider"]:
       raise BackendError(f"unexpected execution providers: {self._session.get_providers()}")

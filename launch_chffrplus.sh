@@ -255,6 +255,11 @@ function bootstrap_runtime_dependencies {
   ensure_python_package "cv2; assert cv2.__version__ == '4.13.0'; assert hasattr(cv2.dnn, 'readNetFromONNX')" \
     "opencv-python-headless==4.13.0.92" 0
 
+  # tlvd onnxruntime CPU (tlvd 온디바이스 CPU) — optional; falls back to tinygrad
+  # (tinygrad 폴백). Offline wheel only; --no-deps keeps install_dependencies 0.
+  ensure_python_package "onnxruntime; assert onnxruntime.__version__ == '1.31.0'" \
+    "onnxruntime==1.31.0" 0
+
   # AGNOS 19 follows current comma, which no longer includes the legacy Eigen
   # and libjpeg wrappers used by this branch's rednose and JPEG encoder. Keep
   # those native headers/libraries available from official offline wheels.

@@ -148,12 +148,13 @@ def _enum_ordinal(value) -> int:
 
 
 def resolve_backend_name(value: str, is_tici: bool) -> str:
-  """Resolve CarrotTlvBackend. The param default 'onnx' means the onnxruntime
-  CPU backend on PC, but tinygrad on TICI where onnxruntime is not a device
-  dependency. 'null'/'dsp' and any explicit other name are untouched."""
+  """Resolve CarrotTlvBackend. "" and "onnx" mean the onnxruntime CPU backend
+  everywhere, TICI included (W132: the runtime now ships as a bundled offline
+  wheel; a failed import falls back to tinygrad in TlvRunner). 'null'/'dsp' and
+  any explicit other name are untouched."""
   name = (value or "").strip()
   if name in ("", "onnx"):
-    return "tinygrad" if is_tici else "onnx"
+    return "onnx"
   return name
 
 
@@ -188,33 +189,64 @@ class TlvRunner:
     self.backend_error = ""
     self.classifier = backends.NullClassifier()
     self.classifier_error = ""
+    self.runtime_name = ""
     # W129: vision is always on while tlvd runs (gated by TrafficLightDetectMode
     # in the manager); the mode toggle no longer exists.
     name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
     model_path = _param_text(params, "CarrotTlvModelPath", "") or backends.BUNDLED_DETECTOR
-    try:
-      self.backend, self.decoder = backends.make_backend(name, model_path)
-    except NotImplementedError as exc:
-      self.backend_error = str(exc)
-    except backends.BackendError as exc:
-      self.backend_error = str(exc)
-    if self.backend is not None:
-      # Lamp classifier: a bad/missing lamp model must never kill tlvd; fall
-      # back to the detector-only behavior (CONTRACT.md detect-then-track).
-      lamp_path = _param_text(params, "CarrotTlvLampModelPath", "") or backends.BUNDLED_LAMP
+    lamp_path = _param_text(params, "CarrotTlvLampModelPath", "") or backends.BUNDLED_LAMP
+    is_tici = _host_is_tici()
+
+    def _build_backend(backend_name: str):
+      """Build detector+classifier+warmups for one runtime name; raises on error."""
+      backend, decoder = backends.make_backend(backend_name, model_path)
+      classifier = backends.NullClassifier()
+      classifier_error = ""
       try:
-        self.classifier = backends.make_classifier(name, lamp_path)
-        self.classifier.warmup()
+        classifier = backends.make_classifier(backend_name, lamp_path)
+        classifier.warmup()
       except Exception as exc:
-        self.classifier_error = str(exc)
-        self.classifier = backends.NullClassifier()
+        # On TICI with the onnx runtime, the lamp classifier IS the colour
+        # source (the detector is single-class); swallowing its failure would
+        # silently lose all red/green, so raise to trigger the tinygrad
+        # fallback, which rebuilds BOTH models. tinygrad and PC keep the old
+        # swallow: a bad lamp model then costs only the classifier
+        # (CONTRACT.md detect-then-track).
+        if backend_name == "onnx" and is_tici:
+          raise backends.BackendError(f"onnx classifier failed: {exc!r}") from exc
+        classifier_error = str(exc)
+        classifier = backends.NullClassifier()
       # Detector warm-up BEFORE the run loop and before the budget exists:
       # the first real detect frame otherwise pays the one-time compile
       # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
       try:
-        self.backend.warmup()
+        backend.warmup()
       except Exception as exc:
-        self.backend_error = f"detector warmup failed: {exc!r}"
+        raise backends.BackendError(f"detector warmup failed: {exc!r}") from exc
+      return backend, decoder, classifier, classifier_error
+
+    def _fallback_to_tinygrad(reason) -> None:
+      """On TICI, rebuild BOTH models with tinygrad after an onnx failure."""
+      print(f"tlvd: onnxruntime unavailable ({reason}); falling back to tinygrad", flush=True)
+      try:
+        self.backend, self.decoder, self.classifier, self.classifier_error = _build_backend("tinygrad")
+        self.runtime_name = "tinygrad"
+        self.backend_error = ""
+      except Exception as fallback_exc:
+        self.backend_error = f"fallback failed after onnx error ({reason}): {fallback_exc!r}"
+
+    try:
+      self.backend, self.decoder, self.classifier, self.classifier_error = _build_backend(name)
+      self.runtime_name = name
+    except NotImplementedError as exc:
+      self.backend_error = str(exc)
+    except Exception as exc:
+      # BackendError and unexpected runtime errors (session/warmup) share one
+      # path. On TICI an onnx failure falls back to tinygrad; on PC it stays an
+      # error so the tests keep their meaning.
+      self.backend_error = str(exc) if isinstance(exc, backends.BackendError) else f"detector build failed: {exc!r}"
+      if name == "onnx" and is_tici:
+        _fallback_to_tinygrad(exc)
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
     # Training recorder: wanted whenever tlvd runs (W129: no mode gate).
@@ -618,6 +650,7 @@ class TlvRunner:
     decoder_nc = getattr(self.decoder, "num_classes", None)
     det_nc_text = "-" if decoder_nc is None else str(decoder_nc)
     parts = (
+      f"runtime={self.runtime_name or 'none'}",
       f"frames={self.processed}",
       f"dropped={self.dropped}",
       f"skipped_budget={self.skipped_budget}",
@@ -652,6 +685,9 @@ class TlvRunner:
 
     self.sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "carState", "carrotMan", "liveCalibration"])
     self.pub = messaging.PubMaster(["carrotTlv"])
+    # carrotTlv has no free text/enum field for the runtime, so it is printed
+    # once here and repeated in the periodic stats line.
+    print(f"tlvd: runtime={self.runtime_name or 'none'}", flush=True)
     if self.classifier_error:
       print(f"tlvd: lamp classifier disabled: {self.classifier_error}", flush=True)
     elif self.classifier.enabled:

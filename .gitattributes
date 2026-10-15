@@ -7,6 +7,7 @@ tools/jetlink/*.py text eol=lf
 # Keep their exact bytes on every platform. Larger external models stay on NAS.
 *.onnx -diff -merge -text
 openpilot/system/hardware/tici/updater -diff -merge -text
+*.whl -diff -merge -text
 
 # Image / font / sound types are shipped as REAL blobs in this fork. Declaring
 # them as LFS while the committed blob is real content made git-lfs report

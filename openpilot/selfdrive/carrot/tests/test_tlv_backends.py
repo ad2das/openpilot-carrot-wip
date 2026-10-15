@@ -3,6 +3,7 @@ import os
 import shutil
 import sys
 import time
+import types
 
 import numpy as np
 import pytest
@@ -248,10 +249,13 @@ def test_tinygrad_backend_overrides_inherited_gpu_dev(tmp_path, monkeypatch):
 
 def test_resolve_backend_name_defaults():
   from openpilot.selfdrive.carrot.tlv import tlvd
+  # W132: "" and "onnx" resolve to onnx on PC and on TICI (bundled offline
+  # wheel); the TICI->tinygrad fallback happens in TlvRunner, not here.
   assert tlvd.resolve_backend_name("", False) == "onnx"
   assert tlvd.resolve_backend_name("onnx", False) == "onnx"
-  assert tlvd.resolve_backend_name("", True) == "tinygrad"
-  assert tlvd.resolve_backend_name("onnx", True) == "tinygrad"
+  assert tlvd.resolve_backend_name("", True) == "onnx"
+  assert tlvd.resolve_backend_name("onnx", True) == "onnx"
+  assert tlvd.resolve_backend_name("tinygrad", True) == "tinygrad"
   assert tlvd.resolve_backend_name("null", True) == "null"
   assert tlvd.resolve_backend_name("dsp", False) == "dsp"
 
@@ -430,3 +434,178 @@ def test_tinygrad_classifier_warmup_is_two_calls_total(tmp_path, monkeypatch):
     assert jit.cnt == 3
   finally:
     classifier.close()
+
+
+# -- W132: onnxruntime session options + TICI fallback ------------------------
+
+class _FakeOrtSessionOptions:
+  def __init__(self):
+    self.intra_op_num_threads = 0
+    self.inter_op_num_threads = 0
+    self.execution_mode = None
+    self.graph_optimization_level = None
+    self.entries = {}
+
+  def add_session_config_entry(self, key, value):
+    self.entries[key] = value
+
+
+class _FakeOrtSession:
+  def __init__(self, path, sess_options=None, providers=None):
+    self.sess_options = sess_options
+    self.providers = list(providers or [])
+
+  def get_providers(self):
+    return self.providers
+
+  def get_inputs(self):
+    return [types.SimpleNamespace(name="img", shape=[1, 3, 320, 640])]
+
+  def get_outputs(self):
+    return [types.SimpleNamespace(name="out")]
+
+  def run(self, out_names, feed):
+    return [np.zeros((1, 1), dtype=np.float32)]
+
+
+def _install_fake_ort(monkeypatch):
+  import types as _types
+  fake = _types.ModuleType("onnxruntime")
+  fake.SessionOptions = _FakeOrtSessionOptions
+  fake.ExecutionMode = _types.SimpleNamespace(ORT_SEQUENTIAL=1, ORT_PARALLEL=0)
+  fake.GraphOptimizationLevel = _types.SimpleNamespace(ORT_ENABLE_ALL=99)
+  fake.InferenceSession = _FakeOrtSession
+  fake.get_available_providers = lambda: ["CPUExecutionProvider"]
+  monkeypatch.setitem(sys.modules, "onnxruntime", fake)
+  return fake
+
+
+def test_onnx_backend_session_options_single_thread_no_spinning(tmp_path, monkeypatch):
+  _install_fake_ort(monkeypatch)
+  model = tmp_path / "m.onnx"
+  model.write_bytes(b"x")
+  backend = backends.OnnxCpuBackend(str(model))
+  opts = backend._session.sess_options
+  assert opts.intra_op_num_threads == 1
+  assert opts.inter_op_num_threads == 1
+  assert opts.execution_mode == 1
+  assert opts.graph_optimization_level == 99
+  assert opts.entries["session.intra_op.allow_spinning"] == "0"
+  assert opts.entries["session.inter_op.allow_spinning"] == "0"
+
+
+def test_onnx_classifier_uses_single_thread_options(tmp_path, monkeypatch):
+  _install_fake_ort(monkeypatch)
+  model = tmp_path / "lamp.onnx"
+  model.write_bytes(b"x")
+  classifier = backends.OnnxCpuClassifier(str(model))
+  opts = classifier._session.sess_options
+  assert opts.intra_op_num_threads == 1 and opts.inter_op_num_threads == 1
+  assert opts.entries["session.intra_op.allow_spinning"] == "0"
+
+
+class _RunnerFakeParams:
+  def __init__(self, values):
+    self._values = dict(values)
+
+  def get(self, key, block=False, return_default=False):
+    return self._values.get(key)
+
+  def get_int(self, key, block=False):
+    value = self._values.get(key, 0)
+    return 0 if value is None else int(value)
+
+  def get_bool(self, key, block=False):
+    return bool(self._values.get(key, False))
+
+  def put(self, key, value, block=True):
+    self._values[key] = value
+
+
+def _runner_with_fake_backends(monkeypatch, tici, onnx_ok, tinygrad_ok, onnx_classifier_ok=True):
+  """Build a TlvRunner with stubbed backend factories; returns (runner, error)."""
+  from openpilot.selfdrive.carrot.tlv import tlvd
+  monkeypatch.setattr(tlvd, "_host_is_tici", lambda: tici)
+  calls = []
+
+  def fake_make_backend(name, model_path="", decoder=None):
+    calls.append(name)
+    if name == "onnx" and not onnx_ok:
+      raise backends.BackendError("onnxruntime is not available: boom")
+    if name == "tinygrad" and not tinygrad_ok:
+      raise backends.BackendError("tinygrad CPU warmup failed: boom")
+    return types.SimpleNamespace(name=name, warmup=lambda: None, output_names=()), None
+
+  def fake_make_classifier(name, model_path=""):
+    if name == "onnx" and (not onnx_ok or not onnx_classifier_ok):
+      raise backends.BackendError("onnxruntime lamp classifier failed: boom")
+    if name == "tinygrad" and not tinygrad_ok:
+      raise backends.BackendError("boom")
+    return types.SimpleNamespace(name=name, enabled=True, classify=lambda x: None, warmup=lambda: None)
+
+  monkeypatch.setattr(backends, "make_backend", fake_make_backend)
+  monkeypatch.setattr(backends, "make_classifier", fake_make_classifier)
+  params = _RunnerFakeParams({"CarrotTlvBackend": "onnx", "CarrotTlvModelPath": "x", "CarrotTlvLampModelPath": "y"})
+  try:
+    runner = tlvd.TlvRunner(params, recorder_root=None)
+    return runner, calls
+  except Exception as exc:  # noqa: BLE001
+    return exc, calls
+
+
+def test_runner_falls_back_to_tinygrad_for_both_models_on_tici(monkeypatch):
+  import types as _t
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=True, onnx_ok=False, tinygrad_ok=True)
+  assert not isinstance(runner, Exception), runner
+  assert runner.runtime_name == "tinygrad"
+  assert runner.backend.name == "tinygrad"
+  assert runner.classifier.name == "tinygrad"
+  assert runner.backend_error == ""
+
+
+def test_runner_no_fallback_on_pc(monkeypatch):
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=False, onnx_ok=False, tinygrad_ok=True)
+  assert not isinstance(runner, Exception), runner
+  assert runner.backend is None
+  assert "onnxruntime" in runner.backend_error
+  assert calls == ["onnx"]  # never tried tinygrad
+
+
+def test_runner_tici_onnx_classifier_failure_rebuilds_both_with_tinygrad(monkeypatch):
+  # The single-class detector needs the lamp classifier for colour, so on TICI
+  # an ORT classifier failure must fall back to tinygrad for BOTH models, not
+  # leave tlvd detector-only.
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=True, onnx_ok=True,
+                                             tinygrad_ok=True, onnx_classifier_ok=False)
+  assert not isinstance(runner, Exception), runner
+  assert runner.runtime_name == "tinygrad"
+  assert runner.backend.name == "tinygrad"
+  assert runner.classifier.name == "tinygrad"
+  # onnx backend built once (classifier failed), then both rebuilt as tinygrad.
+  assert calls == ["onnx", "tinygrad"]
+
+
+def test_runner_pc_onnx_classifier_failure_stays_detector_only(monkeypatch):
+  # PC keeps the old swallow: a failed onnx classifier leaves the onnx detector
+  # running detector-only (no tinygrad fallback).
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=False, onnx_ok=True,
+                                             tinygrad_ok=True, onnx_classifier_ok=False)
+  assert not isinstance(runner, Exception), runner
+  assert runner.runtime_name == "onnx"
+  assert runner.backend.name == "onnx"
+  assert runner.classifier.enabled is False
+  assert runner.classifier_error
+  assert calls == ["onnx"]
+
+
+def test_runner_uses_onnx_when_available_on_tici(monkeypatch):
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=True, onnx_ok=True, tinygrad_ok=True)
+  assert runner.runtime_name == "onnx"
+  assert runner.backend.name == "onnx" and runner.classifier.name == "onnx"
+
+
+def test_runner_reports_backend_error_when_both_fail_on_tici(monkeypatch):
+  runner, calls = _runner_with_fake_backends(monkeypatch, tici=True, onnx_ok=False, tinygrad_ok=False)
+  assert runner.backend is None
+  assert "fallback failed" in runner.backend_error
+  assert calls == ["onnx", "tinygrad"]

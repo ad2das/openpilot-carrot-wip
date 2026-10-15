@@ -677,6 +677,90 @@ def _put_raw(params, key: str, value) -> None:
     print(f"carrot_tlv_bench: failed to write {key}: {exc!r}", file=sys.stderr)
 
 
+def _quick_infer_runtime(build):
+  """Build the detector+classifier exactly as tlvd does: onnx first, then the
+  TICI tinygrad fallback. `build` is (name, model_path, lamp_path) injectable
+  for tests. Returns (runtime_name, detector, classifier, orinfo)."""
+  from openpilot.selfdrive.carrot.tlv import tlvd
+  name, model_path, lamp_path, is_tici = build
+  orinfo = ""
+  try:
+    detector, decoder = backends.make_backend(name, model_path)
+    classifier = backends.make_classifier(name, lamp_path)
+    classifier.warmup()
+    detector.warmup()
+    return name, detector, classifier, orinfo
+  except backends.BackendError as exc:
+    if name == "onnx" and is_tici:
+      detector, decoder = backends.make_backend("tinygrad", model_path)
+      classifier = backends.make_classifier("tinygrad", lamp_path)
+      classifier.warmup()
+      detector.warmup()
+      return "tinygrad", detector, classifier, f"fallback: {exc}"
+    raise
+
+
+def quick_infer(argv=None) -> int:
+  """One-shot on-device inference micro-bench (no params, no messaging).
+
+  Applies the tlvd CPU policy, builds the runtime (onnx with tinygrad
+  fallback), runs detector warmup + 60 detector inferences on a zeros input
+  and 60 lamp calls, then prints one compact block: runtime + onnxruntime
+  version/path (or fallback reason), detector CPU mean ms (os.times) and wall
+  p50/p95, lamp CPU mean, startup seconds and peak RSS MB.
+  """
+  from openpilot.selfdrive.carrot.tlv import tlvd
+  try:
+    import resource  # Unix-only; peak RSS is best-effort
+  except ImportError:
+    resource = None
+
+  t_start = time.monotonic()
+  tlvd.apply_cpu_policy()
+  name = tlvd.resolve_backend_name("", tlvd._host_is_tici())
+  build = (name, backends.BUNDLED_DETECTOR, backends.BUNDLED_LAMP, tlvd._host_is_tici())
+  runtime, detector, classifier, orinfo = _quick_infer_runtime(build)
+  startup_s = time.monotonic() - t_start
+
+  det_shape = tuple(detector._session.get_inputs()[0].shape) if runtime == "onnx" else (1, 3, 320, 640)
+  det_x = np.zeros(det_shape, dtype=np.uint8)
+  lamp_x = np.zeros(tuple(backends.LAMP_INPUT_SHAPE), dtype=np.uint8)
+  n = 60
+
+  det_wall = []
+  t0 = os.times()
+  for _ in range(n):
+    s = time.perf_counter()
+    detector.infer(det_x)
+    det_wall.append((time.perf_counter() - s) * 1000.0)
+  t1 = os.times()
+  det_cpu = 1000.0 * ((t1.user - t0.user) + (t1.system - t0.system)) / n
+
+  t2 = os.times()
+  for _ in range(n):
+    classifier.classify(lamp_x)
+  t3 = os.times()
+  lamp_cpu = 1000.0 * ((t3.user - t2.user) + (t3.system - t2.system)) / n
+
+  peak_rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0 if resource is not None else 0.0
+  version = ""
+  if runtime == "onnx":
+    try:
+      import onnxruntime as ort
+      version = f"{ort.__version__} {ort.__file__}"
+    except Exception as exc:  # pragma: no cover - diagnostics
+      version = f"<{exc!r}>"
+
+  print("carrot_tlv_bench: quick-infer")
+  print(f"  runtime={runtime} onnxruntime={version or '-'} {orinfo}".rstrip())
+  print(f"  detector cpu_mean={det_cpu:.1f}ms wall_p50={np.percentile(det_wall, 50):.1f}ms wall_p95={np.percentile(det_wall, 95):.1f}ms")
+  print(f"  lamp cpu_mean={lamp_cpu:.1f}ms")
+  print(f"  startup={startup_s:.2f}s peak_rss={peak_rss_mb:.0f}MB")
+  detector.close()
+  classifier.close()
+  return 0
+
+
 def main(argv=None) -> int:
   parser = argparse.ArgumentParser(description="carrotTlv bench (baseline vs tlvd vs soak), per RESOURCE_BUDGET.md")
   parser.add_argument("--baseline-s", type=float, default=60.0)
@@ -685,7 +769,12 @@ def main(argv=None) -> int:
   parser.add_argument("--backend", default="null", help="null/onnx/tinygrad (tlvd CarrotTlvBackend)")
   parser.add_argument("--model-path", default=backends.BUNDLED_DETECTOR, help="CarrotTlvModelPath override (default: bundled detector)")
   parser.add_argument("--startup-wait-s", type=float, default=20.0)
+  parser.add_argument("--quick-infer", action="store_true",
+                      help="one-shot inference micro-bench (no params); runtime as tlvd would")
   args = parser.parse_args(argv)
+
+  if args.quick_infer:
+    return quick_infer()
 
   from openpilot.common.params import Params
   import openpilot.cereal.messaging as messaging

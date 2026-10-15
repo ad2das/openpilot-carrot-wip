@@ -6,6 +6,7 @@ import sys
 import types
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 _MODULE_PATH = Path(__file__).resolve().parents[3] / "tools" / "carrot_tlv_bench.py"
@@ -360,3 +361,84 @@ def test_main_runs_phases_when_traffic_light_detect_enabled(monkeypatch, capsys)
   assert ("CarrotTlvDisabled", False) in params.writes  # tlvd phase released it
   assert all(key != "CarrotTlvMode" for key, _ in params.writes)
   assert params.values["CarrotTlvDisabled"] is True  # restore wrote the original back
+
+
+# -- --quick-infer (W132) -----------------------------------------------------
+
+class _FakeQuickDetector:
+  def __init__(self):
+    self.calls = 0
+    self.warmed = False
+    self._session = types.SimpleNamespace(get_inputs=lambda: [types.SimpleNamespace(shape=[1, 3, 320, 640])])
+
+  def warmup(self):
+    self.warmed = True
+
+  def infer(self, x):
+    self.calls += 1
+    return [np.zeros((1, 1), dtype=np.float32)]
+
+  def close(self):
+    pass
+
+
+class _FakeQuickClassifier:
+  def __init__(self):
+    self.calls = 0
+    self.warmed = False
+
+  def warmup(self):
+    self.warmed = True
+
+  def classify(self, x):
+    self.calls += 1
+    return np.zeros((4, 8), dtype=np.float32)
+
+  def close(self):
+    pass
+
+
+def test_quick_infer_never_touches_params_and_prints_runtime(monkeypatch, capsys):
+  import numpy as np
+  det = _FakeQuickDetector()
+  cls = _FakeQuickClassifier()
+  builds = []
+
+  def fake_build(build):
+    builds.append(build)
+    return "onnx", det, cls, ""
+
+  import openpilot.selfdrive.carrot.tlv.tlvd as tlvd
+  monkeypatch.setattr(bench, "_quick_infer_runtime", fake_build)
+  monkeypatch.setattr(tlvd, "apply_cpu_policy", lambda: ["affinity=1,2,3"])
+  monkeypatch.setattr(tlvd, "resolve_backend_name", lambda value, is_tici: "onnx")
+  monkeypatch.setattr(tlvd, "_host_is_tici", lambda: False)
+
+  rc = bench.quick_infer()
+  assert rc == 0
+  assert det.calls == 60 and cls.calls == 60
+  assert builds and builds[0][0] == "onnx"
+  out = capsys.readouterr().out
+  assert "quick-infer" in out
+  assert "runtime=onnx" in out
+  assert "detector cpu_mean=" in out
+  assert "lamp cpu_mean=" in out
+  assert "peak_rss=" in out
+
+
+def test_quick_infer_onnx_detector_shape_uses_session_when_onnx(monkeypatch, capsys):
+  """The onnx path reads the real input shape from the session; keep that path
+  exercised with a fake session so no model file is needed."""
+  import numpy as np
+  det = _FakeQuickDetector()
+  det._session = types.SimpleNamespace(get_inputs=lambda: [types.SimpleNamespace(shape=[1, 3, 320, 640])])
+  cls = _FakeQuickClassifier()
+
+  monkeypatch.setattr(bench, "_quick_infer_runtime", lambda build: ("onnx", det, cls, ""))
+  import openpilot.selfdrive.carrot.tlv.tlvd as tlvd
+  monkeypatch.setattr(tlvd, "apply_cpu_policy", lambda: [])
+  monkeypatch.setattr(tlvd, "resolve_backend_name", lambda value, is_tici: "onnx")
+  monkeypatch.setattr(tlvd, "_host_is_tici", lambda: False)
+
+  assert bench.quick_infer() == 0
+  assert det.calls == 60
