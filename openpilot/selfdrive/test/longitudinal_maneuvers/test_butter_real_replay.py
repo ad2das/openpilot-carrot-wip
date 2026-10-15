@@ -1,0 +1,526 @@
+"""ButterStop real-stop fidelity (W112 task 5, diagnostic only).
+
+Part 1 — open-loop planner replay: feed the LOGGED ego state (vEgo, aEgo,
+carState flags, controlsState/selfdriveState fields) and LOGGED radar leads to
+the real LongitudinalPlanner + CarrotPlanner over the b1 fixture (warm-up
+window [T-20, T+25], 10 s before the reported stop) and compare per step with
+the logged longitudinalPlan (aTarget, shouldStop, vTargetNow, tFollow,
+desiredDistance, source). The ego is NOT simulated here.
+
+Part 2 — closed-loop with three plants (ideal / creep / creep+SCC stop):
+B0/B1/B1d/B1f as in task 4, plus a Hyundai SCC stop model — while LongControl
+is in the stopping state the car brakes to standstill by itself
+(actual accel = min(a_cmd_lagged + creep(v), -0.6), hold 0 at v <= 0.01).
+Fidelity target (creep+SCC, B1): final gap 7.2 +- 1.0 m, below-7 km/h time
+13.6 +- 4 s.
+
+Assertions: only no-collision and fixture presence; everything else is
+reported to BUTTER_REAL_OUT. Simulation only; no vehicle validation.
+"""
+import json
+import os
+from contextlib import contextmanager
+
+import numpy as np
+
+import openpilot.cereal.messaging as messaging
+from openpilot.cereal import log
+from openpilot.common.params import Params
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.modeld.constants import ModelConstants
+from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
+from openpilot.selfdrive.controls.lib import butter_stop, longcontrol
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
+from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
+from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
+  ButterStopLoop, _CASES,
+)
+from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
+  CAR_MODEL, SENTINEL, FarLeadLoop, FixtureProfile, _FakeSM, _apply_header_params,
+  _seed_param_defaults, load_fixture,
+)
+from opendbc.car.hyundai.interface import CarInterface
+
+VARIANTS = ("B0", "B1", "B1d", "B1f")
+PLANT_MODES = ("ideal", "creep", "scc")
+LC_NAMES = {0: "off", 1: "pid", 2: "stopping", 3: "starting"}
+LC_ENUM = (LongCtrlState.off, LongCtrlState.pid, LongCtrlState.stopping, LongCtrlState.starting)
+SOURCE_IDS = {"cruise": 0, "lead0": 1, "lead1": 2, "lead2": 3, "e2e": 4}
+SOURCE_NAMES = {v: k for k, v in SOURCE_IDS.items()}
+COLLISION_GAP_M = 0.4  # same crash criterion as maneuver.py
+FIDELITY_FINAL_GAP_M = 7.2
+FIDELITY_FINAL_GAP_TOL_M = 1.0
+FIDELITY_BELOW7_S = 13.6
+FIDELITY_BELOW7_TOL_S = 4.0
+OPEN_LOOP_WINDOW_S = -10.0  # metric window; replay starts at fixture start (-20 s)
+
+RESULTS: dict = {"b1": {}, "open_loop": {}, "scenarios_plant_on": {}, "log_reference": {},
+                 "fidelity": {}, "report": {}}
+
+
+def _no_floor(*_args, **_kwargs):
+  return None
+
+
+@contextmanager
+def _butter_patch(*, d_extra=None, no_floor=False):
+  saved = (butter_stop.D_EXTRA, longcontrol.butter_floor)
+  try:
+    if d_extra is not None:
+      butter_stop.D_EXTRA = d_extra
+    if no_floor:
+      longcontrol.butter_floor = _no_floor
+    yield
+  finally:
+    butter_stop.D_EXTRA, longcontrol.butter_floor = saved
+
+
+def _unscale(values, scale):
+  arr = np.array(values, dtype=float)
+  arr[arr <= SENTINEL] = np.nan
+  return arr / scale
+
+
+def _log_reference(fixture):
+  data, scale = fixture["data"], fixture["scale"]
+  t = np.array(data["t_cs"], dtype=float) / scale["t"]
+  v = _unscale(data["vEgo"], scale["speed"])
+  x = _unscale(data["sEgo"], scale["dist"])
+  gap = _unscale(data["leadOne_dRel"], scale["dist"])
+  v_lead = _unscale(data["leadOne_vLead"], scale["speed"])
+  status = _unscale(data["leadOne_status"], 1)
+  stand = np.flatnonzero(v < 0.05)
+  below7 = np.flatnonzero(v < 7.0 / 3.6)
+  stopped = bool(stand.size)
+  ref = {
+    "final_gap_m": None if not stopped else round(float(gap[stand[0]]), 3),
+    "below7_time_s": None if not (stopped and below7.size) else round(float(t[stand[0]] - t[below7[0]]), 2),
+    "below7_dist_m": None if not (stopped and below7.size) else round(float(x[stand[0]] - x[below7[0]]), 2),
+    "vEgo_0_kph": round(float(v[0]) * 3.6, 2),
+    "vEgo_end_mps": round(float(v[-1]), 3),
+  }
+  lead_stop = np.flatnonzero((status > 0.5) & (v_lead < 0.3))
+  ref["lead_stop_t_s"] = None if not lead_stop.size else round(float(t[lead_stop[0]]), 2)
+  ref["lead_stop_gap_m"] = None if not lead_stop.size else round(float(gap[lead_stop[0]]), 2)
+  if lead_stop.size and stopped:
+    ref["lead_stop_to_standstill_s"] = round(float(t[stand[0]] - t[lead_stop[0]]), 2)
+  else:
+    ref["lead_stop_to_standstill_s"] = None
+  ss_log = np.flatnonzero(np.array(data["shouldStopLog"], dtype=float) > 0.5)
+  ref["should_stop_t_s"] = None if not ss_log.size else round(float(t[ss_log[0]]), 2)
+  ref["should_stop_gap_m"] = None if not ss_log.size else round(float(gap[ss_log[0]]), 3)
+  ref["should_stop_v_mps"] = None if not ss_log.size else round(float(v[ss_log[0]]), 3)
+  return ref
+
+
+def _state_timeline(t, lc_state):
+  out = []
+  prev = None
+  for ti, state in zip(t, lc_state, strict=True):
+    value = int(state)
+    if value != prev:
+      out.append({"t_s": round(float(ti), 2), "state": LC_NAMES.get(value, str(value))})
+      prev = value
+  return out
+
+
+class OpenLoopPlannerReplay:
+  """Logged inputs -> real planner; no ego simulation, no LongControl."""
+
+  def __init__(self, fixture):
+    _seed_param_defaults()
+    params = Params()
+    _apply_header_params(params, fixture["params"])
+    self.cp = CarInterface.get_non_essential_params(CAR_MODEL)
+    self.cp.openpilotLongitudinalControl = True
+
+    data, scale = fixture["data"], fixture["scale"]
+    self.t = np.array(data["t_cs"], dtype=float) / scale["t"]
+    self.v_ego = _unscale(data["vEgo"], scale["speed"])
+    self.a_ego = _unscale(data["aEgo"], scale["accel"])
+    self.v_ego_cluster = _unscale(data["vEgoCluster"], scale["speed"])
+    self.v_cruise_kph = _unscale(data["vCruiseKph"], scale["cruise"])
+    self.v_clu_ratio = _unscale(data["vCluRatio"], scale["ratio"])
+    self.gas = np.array(data["gasLog"], dtype=float)
+    self.brake = np.array(data["brakeLog"], dtype=float)
+    self.standstill = np.array(data["standstillLog"], dtype=float)
+    self.soft_hold = np.array(data["softHoldLog"], dtype=float)
+    self.carrot_cruise = np.array(data["carrotCruiseLog"], dtype=float)
+    self.force_decel = np.array(data["forceDecelLog"], dtype=float)
+    self.desired_curv = _unscale(data["desiredCurvatureLog"], scale["curv"])
+    self.curv = _unscale(data["curvatureLog"], scale["curv"])
+    self.exp_mode = np.array(data["experimentalModeLog"], dtype=float)
+    self.personality = np.array(data["personalityLog"], dtype=float)
+    self.lc_state = np.array(data["lcStateLog"], dtype=float)
+    self.leads = []
+    for name in ("leadOne", "leadTwo"):
+      self.leads.append({
+        "dRel": _unscale(data[f"{name}_dRel"], scale["dist"]),
+        "vRel": _unscale(data[f"{name}_vRel"], scale["speed"]),
+        "vLead": _unscale(data[f"{name}_vLead"], scale["speed"]),
+        "aLeadK": _unscale(data[f"{name}_aLeadK"], scale["accel"]),
+        "status": _unscale(data[f"{name}_status"], 1),
+        "radar": _unscale(data[f"{name}_radar"], 1),
+        "track": _unscale(data[f"{name}_radarTrackId"], 1),
+        "prob": _unscale(data[f"{name}_modelProb"], scale["prob"]),
+      })
+    self.log = {
+      "aTarget": _unscale(data["aTargetLog"], scale["a_target"]),
+      "shouldStop": np.array(data["shouldStopLog"], dtype=float),
+      "vTargetNow": _unscale(data["vTargetNowLog"], scale["speed"]),
+      "tFollow": _unscale(data["tFollow"], scale["tf"]),
+      "desiredDistance": _unscale(data["desiredDistanceLog"], scale["dist"]),
+      "source": np.array(data["sourceLog"], dtype=float),
+    }
+    self.planner = LongitudinalPlanner(self.cp, init_v=float(np.nan_to_num(self.v_ego[0])))
+    self.carrot = CarrotPlanner()
+
+  @staticmethod
+  def _num(value, default=0.0):
+    value = float(value)
+    return default if not np.isfinite(value) else value
+
+  def _messages(self, i):
+    ego_v = self._num(self.v_ego[i])
+    ego_a = self._num(self.a_ego[i])
+    model = messaging.new_message('modelV2')
+    pos = log.XYZTData.new_message()
+    pos.x = [float(x) for x in (ego_v + 0.5) * np.array(ModelConstants.T_IDXS)]
+    pos.y = [0.0] * len(ModelConstants.T_IDXS)
+    pos.z = [0.0] * len(ModelConstants.T_IDXS)
+    model.modelV2.position = pos
+    vel = log.XYZTData.new_message()
+    vel.x = [float(x) for x in (ego_v + 0.5) * np.ones_like(ModelConstants.T_IDXS)]
+    vel.x[0] = float(ego_v)
+    model.modelV2.velocity = vel
+    acc = log.XYZTData.new_message()
+    acc.x = [0.0] * len(ModelConstants.T_IDXS)
+    model.modelV2.acceleration = acc
+    model.modelV2.action.desiredAcceleration = float(ego_a)
+    model.modelV2.meta.disengagePredictions.gasPressProbs = [1.0] * 6
+
+    car_state = messaging.new_message('carState')
+    car_state.carState.vEgo = ego_v
+    car_state.carState.aEgo = ego_a
+    car_state.carState.vCluRatio = self._num(self.v_clu_ratio[i], 1.0)
+    car_state.carState.standstill = bool(self.standstill[i] > 0.5)
+    car_state.carState.vCruise = self._num(self.v_cruise_kph[i])
+    car_state.carState.vEgoCluster = self._num(self.v_ego_cluster[i])
+    car_state.carState.gasPressed = bool(self.gas[i] > 0.5)
+    car_state.carState.brakePressed = bool(self.brake[i] > 0.5)
+    car_state.carState.softHoldActive = int(round(self.soft_hold[i]))
+    car_state.carState.carrotCruise = int(round(self.carrot_cruise[i]))
+
+    ss = messaging.new_message('selfdriveState')
+    ss.selfdriveState.experimentalMode = bool(self.exp_mode[i] > 0.5)
+    ss.selfdriveState.personality = int(round(self.personality[i]))
+
+    control = messaging.new_message('controlsState')
+    raw_lc = int(round(self.lc_state[i]))
+    control.controlsState.longControlState = LC_ENUM[raw_lc] if 0 <= raw_lc < len(LC_ENUM) else LC_ENUM[0]
+    control.controlsState.forceDecel = bool(self.force_decel[i] > 0.5)
+    control.controlsState.desiredCurvature = self._num(self.desired_curv[i])
+    control.controlsState.curvature = self._num(self.curv[i])
+
+    car_control = messaging.new_message('carControl')
+    car_control.carControl.orientationNED = [0.0, 0.0, 0.0]
+
+    radar = messaging.new_message('radarState')
+    for name, lead in zip(("leadOne", "leadTwo"), self.leads, strict=True):
+      msg = log.RadarState.LeadData.new_message()
+      status = bool(lead["status"][i] > 0.5)
+      msg.status = status
+      msg.dRel = float(max(0.0, self._num(lead["dRel"][i], 200.0)))
+      msg.vRel = self._num(lead["vRel"][i])
+      msg.vLead = self._num(lead["vLead"][i])
+      msg.vLeadK = msg.vLead
+      msg.aLeadK = self._num(lead["aLeadK"][i])
+      msg.aRel = msg.aLeadK - ego_a
+      msg.modelProb = self._num(lead["prob"][i])
+      msg.radar = bool(lead["radar"][i] > 0.5)
+      track = lead["track"][i]
+      msg.radarTrackId = -1 if not np.isfinite(track) else int(round(track))
+      msg.aLeadTau = float(LEAD_ACCEL_TAU)
+      setattr(radar.radarState, name, msg)
+
+    msgs = {
+      "carState": car_state.carState,
+      "modelV2": model.modelV2,
+      "selfdriveState": ss.selfdriveState,
+      "controlsState": control.controlsState,
+      "carControl": car_control.carControl,
+      "radarState": radar.radarState,
+    }
+    return _FakeSM(msgs, int(i * DT_MDL * 1e9))
+
+  def run(self):
+    planner = self.planner
+    rows = []
+    n = len(self.t)
+    for i in range(n):
+      planner.update(self._messages(i), self.carrot)
+      margin_row = planner.mpc.lead_gap_margins[0]
+      rows.append({
+        "aTarget": float(planner.output_a_target),
+        "shouldStop": bool(planner.output_should_stop),
+        "vTargetNow": float(planner.output_v_target_now),
+        "tFollow": float(planner.mpc.t_follow),
+        "desiredDistance": float(planner.mpc.desired_distance),
+        "source": SOURCE_IDS.get(str(planner.mpc.source), -1),
+        "marginLead0": float(margin_row[0]),
+        "marginLead1": float(margin_row[1]),
+        "xObstacle0": float(planner.mpc.params[0, 2]),
+        "pTFollow0": float(planner.mpc.params[0, 4]),
+        "pStopDistance0": float(planner.mpc.params[0, 7]),
+        "pDangerTf0": float(planner.mpc.params[0, 8]),
+      })
+    return rows
+
+
+def _open_loop_metrics(fixture, replay, rows):
+  t = replay.t
+  log_at = replay.log["aTarget"]
+  log_ss = replay.log["shouldStop"]
+  sim_at = np.array([r["aTarget"] for r in rows], dtype=float)
+  sim_ss = np.array([r["shouldStop"] for r in rows], dtype=bool)
+  sim_src = np.array([r["source"] for r in rows], dtype=float)
+  sim_tf = np.array([r["tFollow"] for r in rows], dtype=float)
+  sim_dd = np.array([r["desiredDistance"] for r in rows], dtype=float)
+  log_src = replay.log["source"]
+  log_tf = replay.log["tFollow"]
+  log_dd = replay.log["desiredDistance"]
+
+  valid = np.isfinite(log_at) & np.isfinite(sim_at)
+  mask = valid & (t >= OPEN_LOOP_WINDOW_S)
+  delta = np.abs(sim_at - log_at)
+  rms = float(np.sqrt(np.mean(delta[mask] ** 2)))
+  dmax = float(np.max(delta[mask]))
+  imax = int(np.flatnonzero(mask)[int(np.argmax(delta[mask]))])
+  order = np.argsort(np.where(mask, delta, -1.0))[::-1][:3]
+
+  def divergence(i):
+    i = int(i)
+    return {
+      "t_s": round(float(t[i]), 2),
+      "aTarget_sim": round(float(sim_at[i]), 4),
+      "aTarget_log": round(float(log_at[i]), 4),
+      "tFollow_sim": round(float(sim_tf[i]), 4),
+      "tFollow_log": round(float(log_tf[i]), 4),
+      "desiredDistance_sim": round(float(sim_dd[i]), 3),
+      "desiredDistance_log": round(float(log_dd[i]), 3),
+      "source_sim": SOURCE_NAMES.get(int(sim_src[i]), str(sim_src[i])),
+      "source_log": SOURCE_NAMES.get(int(log_src[i]), str(log_src[i])),
+      "marginLead0": round(rows[i]["marginLead0"], 3),
+      "marginLead1": round(rows[i]["marginLead1"], 3),
+      "xObstacle0": round(rows[i]["xObstacle0"], 3),
+      "pTFollow0": round(rows[i]["pTFollow0"], 4),
+      "pStopDistance0": round(rows[i]["pStopDistance0"], 3),
+      "pDangerTf0": round(rows[i]["pDangerTf0"], 4),
+    }
+
+  sim_fire = np.flatnonzero(sim_ss)
+  log_fire = np.flatnonzero(log_ss > 0.5)
+  gap_log = _unscale(fixture["data"]["leadOne_dRel"], fixture["scale"]["dist"])
+  v_log = _unscale(fixture["data"]["vEgo"], fixture["scale"]["speed"])
+  metrics: dict = {
+    "n_steps": int(len(t)),
+    "window_s": [float(OPEN_LOOP_WINDOW_S), round(float(t[-1]), 2)],
+    "rms_delta_aTarget": round(rms, 4),
+    "max_delta_aTarget": round(dmax, 4),
+    "max_delta_t_s": round(float(t[imax]), 2),
+    "shouldStop_first_sim_s": None if not sim_fire.size else round(float(t[sim_fire[0]]), 2),
+    "shouldStop_first_log_s": None if not log_fire.size else round(float(t[log_fire[0]]), 2),
+    "shouldStop_sim_gap_m": None if not sim_fire.size else round(float(gap_log[sim_fire[0]]), 3),
+    "shouldStop_sim_v_mps": None if not sim_fire.size else round(float(v_log[sim_fire[0]]), 3),
+    "shouldStop_mismatch_steps": int(np.sum(sim_ss != (log_ss > 0.5))),
+    "source_match_frac": round(float(np.mean(sim_src[mask] == log_src[mask])), 4),
+    "tFollow_match_frac_0_05": round(float(np.mean(np.abs(sim_tf[mask] - log_tf[mask]) <= 0.05)), 4),
+    "desiredDistance_rms": round(float(np.sqrt(np.mean((sim_dd[mask] - log_dd[mask]) ** 2))), 3),
+    "top_divergences": [divergence(i) for i in order],
+    "final_sim": {
+      "tFollow": round(float(sim_tf[-1]), 4),
+      "desiredDistance": round(float(sim_dd[-1]), 3),
+      "source": SOURCE_NAMES.get(int(sim_src[-1]), str(sim_src[-1])),
+      "pStopDistance0": round(rows[-1]["pStopDistance0"], 3),
+    },
+    "carrot_end": {
+      "butter_stop": bool(getattr(replay.carrot, "butter_stop", False)),
+      "stop_distance": round(float(getattr(replay.carrot, "stop_distance", -1.0)), 3),
+      "myDrivingMode": int(getattr(replay.carrot, "myDrivingMode", -1).value
+                          if hasattr(getattr(replay.carrot, "myDrivingMode", None), "value")
+                          else getattr(replay.carrot, "myDrivingMode", -1)),
+      "t_follow_last": round(float(getattr(replay.carrot, "t_follow_last", -1.0)), 4),
+      "t_follow_danger": round(float(getattr(replay.carrot, "t_follow_danger", -1.0)), 4),
+    },
+  }
+  return metrics
+
+
+def _b1_metrics(run):
+  t = np.array(run["t"], dtype=float)
+  v = np.array(run["v"], dtype=float)
+  a = np.array(run["a_actual"], dtype=float)
+  x = np.array(run["x"], dtype=float)
+  gap = np.array(run["gap"], dtype=float)
+  active = np.array(run["active"], dtype=bool)
+  v_lead = np.array(run["v_lead"], dtype=float)
+  a_target = np.array(run["a_target"], dtype=float)
+  should_stop = np.array(run["should_stop"], dtype=bool)
+
+  stand = np.flatnonzero(v < 0.05)
+  below7 = np.flatnonzero(v < 7.0 / 3.6)
+  stopped = bool(stand.size)
+  metrics: dict = {
+    "stopped": stopped,
+    "min_gap_m": None if not active.any() else round(float(np.min(gap[active])), 3),
+    "collision": bool(np.any(gap[active] <= 0.0)),
+  }
+  if stopped and below7.size and below7[0] < stand[0]:
+    i_stop, i_b7 = int(stand[0]), int(below7[0])
+    metrics["final_gap_m"] = round(float(gap[i_stop]), 3)
+    metrics["crawl_time_s"] = round(float(t[i_stop] - t[i_b7]), 2)
+    metrics["crawl_dist_m"] = round(float(x[i_stop] - x[i_b7]), 2)
+    window = (t >= t[i_stop] - 0.5) & (t <= t[i_stop])
+    metrics["mean_accel_last_0.5s"] = round(float(np.mean(a[window])), 4) if window.any() else None
+    jerk = np.gradient(a, t)
+    jwindow = (t >= max(0.0, t[i_stop] - 1.5)) & (t <= t[i_stop])
+    metrics["peak_jerk_last_1.5s"] = round(float(np.max(np.abs(jerk[jwindow]))), 4) if jwindow.any() else None
+    metrics["max_abs_a_target_crawl"] = round(float(np.max(np.abs(a_target[i_b7:i_stop + 1]))), 4)
+  else:
+    metrics.update({"final_gap_m": None, "crawl_time_s": None, "crawl_dist_m": None,
+                    "mean_accel_last_0.5s": None, "peak_jerk_last_1.5s": None,
+                    "max_abs_a_target_crawl": None})
+
+  lead_stop = np.flatnonzero(active & (v_lead < 0.3))
+  if lead_stop.size and stopped:
+    metrics["lead_stop_to_standstill_s"] = round(float(t[stand[0]] - t[lead_stop[0]]), 2)
+  else:
+    metrics["lead_stop_to_standstill_s"] = None
+  fire = np.flatnonzero(should_stop)
+  if fire.size:
+    metrics["should_stop_gap_m"] = round(float(gap[fire[0]]), 3)
+    metrics["should_stop_v_mps"] = round(float(v[fire[0]]), 3)
+  else:
+    metrics["should_stop_gap_m"] = None
+    metrics["should_stop_v_mps"] = None
+  metrics["lc_timeline"] = _state_timeline(t, run["lc_state"])
+  metrics["fcw_steps"] = int(run["fcw_steps"])
+  return metrics
+
+
+def _run_b1(variant, mode):
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  patch_kwargs: dict = {}
+  if variant == "B0":
+    header["ButterStop"] = 0
+  elif variant == "B1d":
+    patch_kwargs["d_extra"] = 0.0
+  elif variant == "B1f":
+    patch_kwargs["no_floor"] = True
+  with _butter_patch(**patch_kwargs):
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(mode != "ideal"),
+                      scc_stop=(mode == "scc")).run()
+  return _b1_metrics(run)
+
+
+def test_butter_real_b1():
+  fixture = load_fixture("b1")
+  assert fixture["grid"]["n"] > 100
+  RESULTS["log_reference"] = _log_reference(fixture)
+  for variant in VARIANTS:
+    for mode in PLANT_MODES:
+      key = f"{variant}_plant_{mode}"
+      metrics = _run_b1(variant, mode)
+      RESULTS["b1"][key] = metrics
+      assert not metrics["collision"], f"{key} collides (min gap {metrics['min_gap_m']})"
+
+  sim = RESULTS["b1"]["B1_plant_scc"]
+  fidelity = {
+    "final_gap_sim_m": sim["final_gap_m"],
+    "final_gap_target_m": FIDELITY_FINAL_GAP_M,
+    "final_gap_pass": sim["final_gap_m"] is not None
+                      and abs(sim["final_gap_m"] - FIDELITY_FINAL_GAP_M) <= FIDELITY_FINAL_GAP_TOL_M,
+    "below7_time_sim_s": sim["crawl_time_s"],
+    "below7_time_target_s": FIDELITY_BELOW7_S,
+    "below7_time_pass": sim["crawl_time_s"] is not None
+                        and abs(sim["crawl_time_s"] - FIDELITY_BELOW7_S) <= FIDELITY_BELOW7_TOL_S,
+  }
+  RESULTS["fidelity"] = fidelity
+  gap_ok = "pass" if fidelity["final_gap_pass"] else "FAIL"
+  time_ok = "pass" if fidelity["below7_time_pass"] else "FAIL"
+  print(f"BUTTER-REAL fidelity (B1 scc): final gap {fidelity['final_gap_sim_m']} ({gap_ok}), below-7 time {fidelity['below7_time_sim_s']} ({time_ok})")
+
+
+def test_butter_real_open_loop_planner():
+  fixture = load_fixture("b1")
+  replay = OpenLoopPlannerReplay(fixture)
+  rows = replay.run()
+  metrics = _open_loop_metrics(fixture, replay, rows)
+  metrics["fixture_params"] = {k: fixture["params"][k] for k in (
+    "LongActuatorDelay", "VEgoStopping", "StopDistanceCarrot", "ButterStop", "SpeedTFFactor",
+    "TFollowGap3", "TFollowDecelBoost", "MyDrivingMode", "LongitudinalPersonality",
+    "TrafficStopDistanceAdjust", "DynamicTFollowCL", "DynamicTFollowLC", "CruiseCoastingPercent",
+  ) if k in fixture["params"]}
+  RESULTS["open_loop"] = metrics
+  ol1 = f"BUTTER-REAL open-loop: RMS |d aTarget| {metrics['rms_delta_aTarget']} m/s^2, max {metrics['max_delta_aTarget']} at t={metrics['max_delta_t_s']} s"
+  ol2 = f"BUTTER-REAL open-loop shouldStop: sim {metrics['shouldStop_first_sim_s']} s vs log {metrics['shouldStop_first_log_s']} s"
+  print(ol1)
+  print(ol2)
+
+
+def _scenario_metrics(logs, name):
+  t, v = logs[:, 0], logs[:, 1]
+  a = logs[:, 10]
+  gaps = logs[:, 4] - logs[:, 3]
+  stand = np.flatnonzero(v < 0.05)
+  stopped = bool(stand.size)
+  entry = {
+    "scenario": name,
+    "stopped": stopped,
+    "final_gap_m": round(float(gaps[stand[0]]), 3) if stopped else None,
+    "min_gap_m": round(float(np.min(gaps)), 3),
+    "collision": bool(np.min(gaps) < COLLISION_GAP_M),
+  }
+  if stopped:
+    i = int(stand[0])
+    window = (t >= t[i] - 0.5) & (t <= t[i])
+    entry["end_decel_mean_abs"] = round(float(np.mean(np.abs(a[window]))), 4) if window.any() else None
+  else:
+    entry["end_decel_mean_abs"] = None
+  return entry
+
+
+def test_butter_real_scenarios_plant_on():
+  rows = []
+  for group, maneuver in _CASES:
+    if group not in ("a", "b", "c"):
+      continue
+    for butter in (0, 1):
+      logs = ButterStopLoop(maneuver, butter=butter, plant=True).run()
+      entry = _scenario_metrics(logs, maneuver.title)
+      entry["group"] = group
+      entry["butter"] = butter
+      rows.append(entry)
+      assert not entry["collision"], f"{maneuver.title} butter={butter} collides (min gap {entry['min_gap_m']})"
+  RESULTS["scenarios_plant_on"] = rows
+
+
+def test_write_butter_real_table():
+  out_path = os.environ.get("BUTTER_REAL_OUT", "/tmp/butter_real.json")
+  table = {
+    "log_reference": RESULTS["log_reference"],
+    "b1": RESULTS["b1"],
+    "open_loop": RESULTS["open_loop"],
+    "fidelity": RESULTS["fidelity"],
+    "scenarios_plant_on": RESULTS["scenarios_plant_on"],
+    "note": "desktop closed-loop simulation only; no vehicle validation",
+  }
+  text = json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False)
+  print(text)
+  out_dir = os.path.dirname(out_path)
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(text + "\n")

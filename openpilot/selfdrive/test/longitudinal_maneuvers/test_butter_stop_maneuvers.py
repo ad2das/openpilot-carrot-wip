@@ -54,6 +54,9 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.test.longitudinal_maneuvers.maneuver import Maneuver
+from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
+  PLANT_A_GATE, PLANT_TAU, plant_creep,
+)
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
@@ -124,13 +127,15 @@ def _no_floor(*_args, **_kwargs):
 
 
 class ButterStopLoop:
-  def __init__(self, maneuver, butter, neutralize=False):
+  def __init__(self, maneuver, butter, neutralize=False, plant=False):
     _seed_param_defaults()
     params = Params()
     params.put_int("ButterStop", int(butter))
 
     self.maneuver = maneuver
     self.neutralize = neutralize
+    self.plant = bool(plant)
+    self._plant_lag = 0.0
     self.radar_noise_std = float(getattr(maneuver, "radar_noise_std", 0.0))
     self._radar_rng = np.random.default_rng(int(getattr(maneuver, "radar_noise_seed", 0)))
     cp = CarInterface.get_non_essential_params(CAR_MODEL)
@@ -269,7 +274,7 @@ class ButterStopLoop:
     maneuver = self.maneuver
     dt = DT_CTRL
     frames = int(round(maneuver.duration / dt))
-    logs = np.zeros((frames + 1, 10))
+    logs = np.zeros((frames + 1, 12))
     msgs = None
     plan_view = None
     for frame in range(frames + 1):
@@ -313,6 +318,13 @@ class ButterStopLoop:
         bool(maneuver.enabled), self._cs_view(v_cruise_ms, standstill), plan_view,
         limits, t_since_plan, radar_view)
       accel = float(accel)
+      if self.plant:
+        self._plant_lag += (dt / PLANT_TAU) * (accel - self._plant_lag)
+        applied = self._plant_lag
+        if accel < PLANT_A_GATE and self.ego_v > 0.01:
+          applied += plant_creep(self.ego_v)
+      else:
+        applied = accel
       floor_active = 1.0 if self.long_control.butter_floor_last is not None else 0.0
       floor_val = self.long_control.butter_floor_last
       floor_raw = self.long_control.butter_floor_raw_last
@@ -323,8 +335,9 @@ class ButterStopLoop:
       logs[frame] = (t, self.ego_v, accel, self.ego_x, self.lead_x, floor_active,
                      floor_val if floor_val is not None else 0.0, bound_code,
                      floor_raw if floor_raw is not None else 0.0,
-                     a_end if a_end is not None else 0.0)
-      self.ego_v = max(0.0, self.ego_v + accel * dt)
+                     a_end if a_end is not None else 0.0,
+                     applied, float(self.long_control.long_control_state))
+      self.ego_v = max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       self.lead_x = self.lead_x + v_lead * dt
     return logs

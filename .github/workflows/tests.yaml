@@ -148,6 +148,18 @@ jobs:
           name: far-lead-sim
           path: ${{ runner.temp }}/far_lead_sim.json
           if-no-files-found: warn
+      - name: Check ButterStop real-stop replay
+        env:
+          BUTTER_REAL_OUT: ${{ runner.temp }}/butter_real.json
+        run: |
+          python -m pytest -o addopts='' -q -s openpilot/selfdrive/test/longitudinal_maneuvers/test_butter_real_replay.py
+      - name: Upload ButterStop real-stop table
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: butter-real
+          path: ${{ runner.temp }}/butter_real.json
+          if-no-files-found: warn
       - name: Check model, monitoring and Bluetooth integration
         run: |
           python -m pytest -o addopts='' -q \

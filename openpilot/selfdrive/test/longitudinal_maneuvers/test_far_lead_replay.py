@@ -47,7 +47,7 @@ from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from opendbc.car.hyundai.interface import CarInterface
@@ -56,6 +56,20 @@ from opendbc.car.hyundai.values import CAR
 CAR_MODEL = CAR.HYUNDAI_PALISADE
 PLANNER_PERIOD = 5  # 100 Hz loop, 20 Hz planner/model, as in the car
 SENTINEL = -32767
+PLANT_TAU = 0.3     # actuator first-order lag (s); automatic-transmission creep plant
+PLANT_A_GATE = 0.3  # creep torque adds only while the lagged command is below this
+PLANT_SCC_BRAKE = -0.6  # SCC StopReq braking ceiling in the stopping state (m/s^2)
+
+
+def plant_creep(v):
+  """Automatic-transmission creep torque vs speed (fit from the b1 log, W112 task 4)."""
+  if v < 1.5:
+    return 0.25
+  if v < 3.0:
+    return 0.25 * (3.0 - v) / 1.5
+  return 0.0
+
+
 EPISODES = ("e1", "e2", "e3", "e4", "e5", "e6")
 ALL_EPISODES = EPISODES + ("s1",)
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "far_lead")
@@ -260,7 +274,7 @@ class SyntheticProfile:
 
 
 class FarLeadLoop:
-  def __init__(self, header, profile, speed_tf=None):
+  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False):
     _seed_param_defaults()
     params = Params()
     _apply_header_params(params, header)
@@ -275,6 +289,10 @@ class FarLeadLoop:
 
     self.ego_v = float(profile.initial_speed)
     self.ego_x = 0.0
+    self.plant = bool(plant)
+    self.scc_stop = bool(scc_stop)
+    self._plant_lag = float(profile.initial_accel)
+    self.a_actual = float(profile.initial_accel)
 
     self.planner = LongitudinalPlanner(cp, init_v=self.ego_v)
     self.long_control = LongControl(cp)
@@ -386,6 +404,7 @@ class FarLeadLoop:
     max_frames = profile.n_steps * PLANNER_PERIOD
     log_t, log_v, log_accel, log_x = [], [], [], []
     log_gap, log_active, log_vlead, log_atarget = [], [], [], []
+    log_a_actual, log_should_stop, log_lc_state = [], [], []
     fcw_steps = 0
     msgs = None
     plan_view = None
@@ -417,6 +436,19 @@ class FarLeadLoop:
         limits, t_since_plan, radar_view)
       accel = float(accel)
 
+      if self.plant:
+        self._plant_lag += (dt / PLANT_TAU) * (accel - self._plant_lag)
+        applied = self._plant_lag
+        if accel < PLANT_A_GATE and self.ego_v > 0.01:
+          applied += plant_creep(self.ego_v)
+      else:
+        applied = accel
+      if self.scc_stop and self.long_control.long_control_state == LongCtrlState.stopping:
+        # SCC owns the stop in the stopping state: at least -0.6 m/s^2 until
+        # standstill, then hold.
+        applied = 0.0 if self.ego_v <= 0.01 else min(applied, PLANT_SCC_BRAKE)
+      self.a_actual = applied
+
       gap = np.nan
       v_lead = np.nan
       active = False
@@ -433,8 +465,11 @@ class FarLeadLoop:
       log_active.append(active)
       log_vlead.append(v_lead)
       log_atarget.append(float(plan_view.aTarget))
+      log_a_actual.append(applied)
+      log_should_stop.append(bool(plan_view.shouldStop))
+      log_lc_state.append(int(self.long_control.long_control_state))
 
-      self.ego_v = max(0.0, self.ego_v + accel * dt)
+      self.ego_v = max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       if self.ego_v < 0.05:
         standstill_frames += 1
@@ -446,6 +481,7 @@ class FarLeadLoop:
     return {
       "t": log_t, "v": log_v, "accel": log_accel, "x": log_x,
       "gap": log_gap, "active": log_active, "v_lead": log_vlead, "a_target": log_atarget,
+      "a_actual": log_a_actual, "should_stop": log_should_stop, "lc_state": log_lc_state,
       "fcw_steps": fcw_steps, "stopped": bool(stopped or self.ego_v < 0.05),
     }
 
