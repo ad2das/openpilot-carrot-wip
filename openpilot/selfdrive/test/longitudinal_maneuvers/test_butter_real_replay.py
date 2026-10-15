@@ -44,12 +44,13 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
-from openpilot.selfdrive.controls.lib import butter_stop, longcontrol, longitudinal_braking_gap
+from openpilot.selfdrive.controls.lib import butter_stop, drive_helpers, longcontrol, longitudinal_braking_gap
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
-  ButterStopLoop, _CASES, _case_failures as _butter_case_failures,
+  ButterStopLoop, _B2_PROXY, _CASES, _START_SCENARIOS,
+  _case_failures as _butter_case_failures,
   compute_metrics as _butter_metrics,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
@@ -404,14 +405,18 @@ def _b1_metrics(run):
     metrics["crawl_dist_m"] = round(float(x[i_stop] - x[i_b7]), 2)
     window = (t >= t[i_stop] - 0.5) & (t <= t[i_stop])
     metrics["mean_accel_last_0.5s"] = round(float(np.mean(a[window])), 4) if window.any() else None
+    metrics["end_net"] = round(float(np.mean(np.abs(a[window]))), 4) if window.any() else None
+    step = float(t[1] - t[0]) if t.size > 1 else 0.01
+    tail_window = (t >= max(0.0, t[i_stop] - 6.0)) & (t <= t[i_stop])
+    metrics["tail_s"] = round(float(np.sum((v > 0.05) & (v < 0.5) & tail_window)) * step, 3)
     jerk = np.gradient(a, t)
     jwindow = (t >= max(0.0, t[i_stop] - 1.5)) & (t <= t[i_stop])
     metrics["peak_jerk_last_1.5s"] = round(float(np.max(np.abs(jerk[jwindow]))), 4) if jwindow.any() else None
     metrics["max_abs_a_target_crawl"] = round(float(np.max(np.abs(a_target[i_b7:i_stop + 1]))), 4)
   else:
     metrics.update({"final_gap_m": None, "crawl_time_s": None, "crawl_dist_m": None,
-                    "mean_accel_last_0.5s": None, "peak_jerk_last_1.5s": None,
-                    "max_abs_a_target_crawl": None})
+                    "mean_accel_last_0.5s": None, "end_net": None, "tail_s": None,
+                    "peak_jerk_last_1.5s": None, "max_abs_a_target_crawl": None})
 
   lead_stop = np.flatnonzero(active & (v_lead < 0.3))
   if lead_stop.size and stopped:
@@ -884,6 +889,291 @@ def test_butter_real_offset_sweep():
       if metrics.get("collision"):
         collisions.append(f"{row['label']} {label}")
   assert not collisions, "offset sweep collision: " + "; ".join(collisions[:5])
+
+
+# --- Task 13: shouldStop entry/release hysteresis sweep --------------------
+
+# (label, STOP_ENTER_V); "off" leaves the module value 0.0 (disabled).
+_HYST_SWEEP = (
+  ("off", 0.0),
+  ("enter0.20", 0.20),
+  ("enter0.30", 0.30),
+  ("enter0.40", 0.40),
+)
+_HYST_PLANTS = ("ideal", "scc")
+_HYST_STOP_SCENARIOS = [(g, m) for g, m in _CASES if g in ("a", "b", "c")] + [("b2", _B2_PROXY)]
+_HYST_CRITERIA = (
+  "a) creep+SCC: b1 tail_s <= 0.8 s and <= off-row - 0.3 s; every stop scenario tail_s <= off-row + 0.1",
+  "b) end_net <= off-row + 0.05 everywhere (both plants)",
+  "c) final gap within [off - 0.3, off + 0.8] m everywhere",
+  "d) start_delay_s <= off-row + 0.05 s in both start scenarios, both plants",
+  "e) 0 collisions, 0 FCW; lead-decel min gaps >= off-row - 0.3 m",
+  "f) VEgoStopping 50 (default) run: every metric byte-identical to off (rule bypassed)",
+  "g) existing suites green; ButterStop units in their own process; test_longitudinal.py pre-existing broken",
+)
+
+
+def _run_start_creep(enter_v, maneuver, plant):
+  saved_enter = drive_helpers.STOP_ENTER_V
+  drive_helpers.STOP_ENTER_V = float(enter_v)
+  try:
+    logs = ButterStopLoop(maneuver, butter=1, plant=(plant != "ideal"),
+                          scc_stop=(plant == "scc")).run()
+  finally:
+    drive_helpers.STOP_ENTER_V = saved_enter
+  return logs
+
+
+def _start_metrics(logs, name):
+  t, v = logs[:, 0], logs[:, 1]
+  moving = np.flatnonzero(v > 0.3)
+  entry = {
+    "name": name,
+    "collision": bool(np.min(logs[:, 4] - logs[:, 3]) < COLLISION_GAP_M),
+    "fcw_steps": int(np.sum(logs[:, 12] > 0.5)),
+    "final_gap_m": round(float(logs[np.flatnonzero(v < 0.05)[0], 4] - logs[np.flatnonzero(v < 0.05)[0], 3]), 3)
+                  if np.flatnonzero(v < 0.05).size else None,
+  }
+  entry["start_delay_s"] = round(float(t[moving[0]] - 5.0), 3) if moving.size else None
+  return entry
+
+
+def _run_b1_hyst(enter_v, plant, telemetry=None):
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  header["VEgoStopping"] = 10
+  saved_enter = drive_helpers.STOP_ENTER_V
+  drive_helpers.STOP_ENTER_V = float(enter_v)
+  try:
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(plant != "ideal"),
+                      scc_stop=(plant == "scc"), telemetry=telemetry).run()
+  finally:
+    drive_helpers.STOP_ENTER_V = saved_enter
+  return _b1_metrics(run)
+
+
+def _run_scenario_hyst(enter_v, maneuver, plant):
+  saved_enter = drive_helpers.STOP_ENTER_V
+  drive_helpers.STOP_ENTER_V = float(enter_v)
+  try:
+    logs = ButterStopLoop(maneuver, butter=1, plant=(plant != "ideal"),
+                          scc_stop=(plant == "scc")).run()
+  finally:
+    drive_helpers.STOP_ENTER_V = saved_enter
+  return logs
+
+
+def _collect_hyst_row(enter_v):
+  b1 = {plant: _run_b1_hyst(enter_v, plant) for plant in _HYST_PLANTS}
+  scen = {}
+  for _group, maneuver in _HYST_STOP_SCENARIOS:
+    for plant in _HYST_PLANTS:
+      logs = _run_scenario_hyst(enter_v, maneuver, plant)
+      scen[(maneuver.title, plant)] = _butter_metrics(logs, maneuver.title, 1)
+  starts = {}
+  for maneuver in _START_SCENARIOS:
+    for plant in _HYST_PLANTS:
+      logs = _run_start_creep(enter_v, maneuver, plant)
+      starts[(maneuver.title, plant)] = _start_metrics(logs, maneuver.title)
+  return {"b1": b1, "scen": scen, "starts": starts}
+
+
+def _hyst_failures(label, row, off):
+  fails = []
+
+  def fail(msg):
+    fails.append(f"{label}: {msg}")
+
+  # a) no extra slow roll vs the off row; b1 and every stop scenario.
+  m = row["b1"]["scc"]
+  o = off["b1"]["scc"]
+  if m.get("tail_s") is None or o.get("tail_s") is None:
+    fail(f"a) b1 scc: tail_s missing ({m.get('tail_s')} vs off {o.get('tail_s')})")
+  else:
+    if m["tail_s"] > 0.8 + 1e-9:
+      fail(f"a) b1 scc: tail_s {m['tail_s']} > 0.8 s")
+    if m["tail_s"] > o["tail_s"] - 0.3 + 1e-9:
+      fail(f"a) b1 scc: tail_s {m['tail_s']} > off {o['tail_s']} - 0.3")
+  for (title, plant), metrics in row["scen"].items():
+    ref = off["scen"][(title, plant)]
+    mt, rt = metrics.get("tail_s"), ref.get("tail_s")
+    if mt is None and rt is None:
+      continue
+    if mt is None:
+      fail(f"a) {title} {plant}: never stops (off tail_s {rt})")
+    elif rt is not None and mt > rt + 0.1 + 1e-9:
+      fail(f"a) {title} {plant}: tail_s {mt} > off {rt} + 0.1")
+
+  # b) end_net <= off + 0.05 everywhere (both plants).
+  for plant in _HYST_PLANTS:
+    mn, on = row["b1"][plant].get("end_net"), off["b1"][plant].get("end_net")
+    if mn is not None and on is not None and mn > on + 0.05 + 1e-9:
+      fail(f"b) b1 {plant}: end_net {mn} > off {on} + 0.05")
+  for (title, plant), metrics in row["scen"].items():
+    on = off["scen"][(title, plant)].get("end_net")
+    mn = metrics.get("end_net")
+    if mn is not None and on is not None and mn > on + 0.05 + 1e-9:
+      fail(f"b) {title} {plant}: end_net {mn} > off {on} + 0.05")
+
+  # c) final gap within [off - 0.3, off + 0.8] m everywhere.
+  for plant in _HYST_PLANTS:
+    g1, g0 = row["b1"][plant].get("final_gap_m"), off["b1"][plant].get("final_gap_m")
+    if g1 is None or g0 is None:
+      fail(f"c) b1 {plant}: final gap missing ({g1} vs off {g0})")
+    elif g1 < g0 - 0.3 - 1e-9 or g1 > g0 + 0.8 + 1e-9:
+      fail(f"c) b1 {plant}: final gap {g1} outside [off {g0} - 0.3, +0.8]")
+  for (title, plant), metrics in row["scen"].items():
+    g1 = metrics.get("final_gap_m")
+    g0 = off["scen"][(title, plant)].get("final_gap_m")
+    if g1 is None or g0 is None:
+      fail(f"c) {title} {plant}: final gap missing ({g1} vs off {g0})")
+    elif g1 < g0 - 0.3 - 1e-9 or g1 > g0 + 0.8 + 1e-9:
+      fail(f"c) {title} {plant}: final gap {g1} outside [off {g0} - 0.3, +0.8]")
+
+  # d) departure must stay snappy: start_delay_s <= off + 0.05, both plants.
+  for (title, plant), metrics in row["starts"].items():
+    d1 = metrics.get("start_delay_s")
+    d0 = off["starts"][(title, plant)].get("start_delay_s")
+    if d1 is None or d0 is None:
+      fail(f"d) {title} {plant}: start_delay missing ({d1} vs off {d0})")
+    elif d1 > d0 + 0.05 + 1e-9:
+      fail(f"d) {title} {plant}: start_delay {d1} > off {d0} + 0.05")
+
+  # e) safety everywhere; lead-decel min gaps >= off - 0.3.
+  for plant in _HYST_PLANTS:
+    if row["b1"][plant].get("collision"):
+      fail(f"e) b1 {plant}: collision (min gap {row['b1'][plant].get('min_gap_m')})")
+    if row["b1"][plant].get("fcw_steps", 0):
+      fail(f"e) b1 {plant}: FCW {row['b1'][plant]['fcw_steps']}")
+  for (title, plant), metrics in row["scen"].items():
+    if metrics.get("collision"):
+      fail(f"e) {title} {plant}: collision (min gap {metrics.get('min_gap_m')})")
+    if metrics.get("fcw_steps", 0):
+      fail(f"e) {title} {plant}: FCW {metrics['fcw_steps']}")
+  for (title, plant), metrics in row["starts"].items():
+    if metrics.get("collision"):
+      fail(f"e) {title} {plant}: collision")
+    if metrics.get("fcw_steps", 0):
+      fail(f"e) {title} {plant}: FCW {metrics['fcw_steps']}")
+  for (title, plant), metrics in row["scen"].items():
+    if title not in _CAP_LEAD_DECEL:
+      continue
+    mg = metrics.get("min_gap_m")
+    mg0 = off["scen"][(title, plant)].get("min_gap_m")
+    if mg is not None and mg0 is not None and mg < mg0 - 0.3 - 1e-9:
+      fail(f"e) {title} {plant}: min gap {mg} < off {mg0} - 0.3")
+  return fails
+
+
+def _hyst_identity_failures(label, default_row, off_row):
+  """f) VEgoStopping >= STOP_ENTER_V bypasses the rule: check the default-50 b1
+  and one scenario are byte-identical to the off row (entry rule not applied)."""
+  fails = []
+  for plant in _HYST_PLANTS:
+    a = default_row["b1"][plant]
+    b = off_row["b1"][plant]
+    for key in ("final_gap_m", "end_net", "tail_s", "crawl_time_s", "min_gap_m"):
+      if a.get(key) != b.get(key):
+        fails.append(f"{label}: f) b1 {plant} {key} {a.get(key)} != off {b.get(key)}")
+  for (title, plant) in list(default_row["scen"].keys())[:1]:
+    a = default_row["scen"][(title, plant)]
+    b = off_row["scen"][(title, plant)]
+    for key in ("final_gap_m", "end_net", "tail_s", "min_gap_m"):
+      if a.get(key) != b.get(key):
+        fails.append(f"{label}: f) {title} {plant} {key} {a.get(key)} != off {b.get(key)}")
+  return fails
+
+
+def _run_default_vego50(enter_v, plant):
+  """Same as _run_b1_hyst but with the default VEgoStopping (50, i.e. 0.5 m/s):
+  >= STOP_ENTER_V, so the latched path must be bypassed entirely."""
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  header["VEgoStopping"] = 50
+  saved_enter = drive_helpers.STOP_ENTER_V
+  drive_helpers.STOP_ENTER_V = float(enter_v)
+  try:
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(plant != "ideal"),
+                      scc_stop=(plant == "scc")).run()
+  finally:
+    drive_helpers.STOP_ENTER_V = saved_enter
+  return _b1_metrics(run)
+
+
+def test_butter_hyst_sweep():
+  out_path = os.environ.get("BUTTER_HYST_SWEEP_OUT")
+  if not out_path:
+    pytest.skip("hysteresis sweep runs only when BUTTER_HYST_SWEEP_OUT is set")
+
+  row_data: dict = {}
+  for label, enter_v in _HYST_SWEEP:
+    row_data[label] = _collect_hyst_row(enter_v)
+    print(f"HYST-SWEEP {label}: collected")
+  off = row_data["off"]
+
+  rows = []
+  for label, enter_v in _HYST_SWEEP:
+    data = row_data[label]
+    fails = [] if label == "off" else _hyst_failures(label, data, off)
+    rows.append({
+      "label": label, "enter_v": enter_v,
+      "all_pass": not fails, "failures": fails,
+      "b1": data["b1"],
+      "scenarios": {m.title: {plant: data["scen"][(m.title, plant)] for plant in _HYST_PLANTS}
+                    for _g, m in _HYST_STOP_SCENARIOS},
+      "starts": {m.title: {plant: data["starts"][(m.title, plant)] for plant in _HYST_PLANTS}
+                 for m in _START_SCENARIOS},
+    })
+    line = f"HYST-SWEEP {label}: pass={not fails} fails={len(fails)}"
+    if fails:
+      line += f" first={fails[0]}"
+    print(line)
+    b1s = data["b1"]["scc"]
+    print(f"  scc b1 tail={b1s.get('tail_s')} end={b1s.get('end_net')} gap={b1s.get('final_gap_m')} crawl={b1s.get('crawl_time_s')}")
+    for m in _START_SCENARIOS:
+      s = data["starts"][(m.title, "scc")]
+      print(f"  scc {m.title:20s} start_delay={s.get('start_delay_s')}")
+
+  # f) default VEgoStopping=50 must be byte-identical to off (rule bypassed).
+  default50 = _run_default_vego50(0.30, "scc")
+  identity_fails = []
+  for key in ("final_gap_m", "end_net", "tail_s", "crawl_time_s", "min_gap_m"):
+    if default50.get(key) != off["b1"]["scc"].get(key):
+      identity_fails.append(f"f) VEgoStopping 50 {key} {default50.get(key)} != off {off['b1']['scc'].get(key)}")
+  print(f"HYST-IDENTITY-F vego50: pass={not identity_fails} fails={len(identity_fails)}")
+
+  passing = [r for r in rows if r["label"] != "off" and r["all_pass"] and not identity_fails]
+  chosen = min(passing, key=lambda r: abs(r["enter_v"] - 0.30)) if passing else None
+  if chosen is not None:
+    print(f"HYST-PICK: {chosen['label']}")
+  else:
+    print("HYST-PICK: none passed; per-candidate failure counts:")
+    for r in sorted((r for r in rows if r["label"] != "off"), key=lambda r: len(r["failures"])):
+      print(f"  {r['label']}: {len(r['failures'])} failures")
+
+  table = {
+    "criteria": list(_HYST_CRITERIA),
+    "rows": rows,
+    "chosen": chosen,
+    "identity_f": {"pass": not identity_fails, "failures": identity_fails, "vego50_b1_scc": default50},
+    "b2_proxy": _B2_PROXY.title,
+    "note": "desktop closed-loop simulation only; end_net is the actual plant accel; no vehicle validation",
+  }
+  out_dir = os.path.dirname(out_path)
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
+
+  collisions = [f'{r["label"]} {title} {plant}'
+                for r in rows for title, runs in r["scenarios"].items()
+                for plant, metrics in runs.items() if metrics.get("collision")]
+  collisions += [f'{r["label"]} b1 {plant}' for r in rows for plant in _HYST_PLANTS
+                 if r["b1"][plant].get("collision")]
+  collisions += [f'{r["label"]} {title} {plant}'
+                 for r in rows for title, runs in r["starts"].items()
+                 for plant, metrics in runs.items() if metrics.get("collision")]
+  assert not collisions, "hysteresis sweep collision: " + "; ".join(collisions[:5])
 
 
 def test_write_butter_real_table():

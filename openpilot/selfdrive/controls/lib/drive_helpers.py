@@ -106,6 +106,34 @@ def clip_curvature(v_ego, prev_curvature, new_curvature, roll):
   return float(new_curvature), limited_accel or limited_max_curv
 
 
+STOP_ENTER_V = 0.30        # m/s, plan speed below which a stop is entered (if above VEgoStopping)
+STOP_RELEASE_RISE = 0.02   # m/s, plan must be rising by this much (1 s ahead vs now) to release below STOP_ENTER_V
+STOP_LATCH_V_MAX = 1.0     # m/s, never keep a latched stop above this real speed
+
+
+def plan_stop_speeds(speeds, t_idxs, action_t):
+  """(v_target, v_target_1sec) exactly as get_accel_from_plan interpolates them; (0.0, 0.0) if lengths differ."""
+  if len(speeds) != len(t_idxs):
+    return 0.0, 0.0
+  v_target = np.interp(action_t, t_idxs, speeds)
+  v_target_1sec = np.interp(action_t + 1.0, t_idxs, speeds)
+  return v_target, v_target_1sec
+
+
+def stop_latch(prev, v_target, v_target_1sec, v_ego, release_v):
+  """Stop request with separate entry and release speeds.
+  release_v >= STOP_ENTER_V -> today's stateless rule (both below release_v), byte-identical."""
+  if release_v >= STOP_ENTER_V:
+    return v_target < release_v and v_target_1sec < release_v
+  if not prev:
+    return v_target < STOP_ENTER_V and v_target_1sec < STOP_ENTER_V
+  if not (v_ego < STOP_LATCH_V_MAX):          # also False for NaN
+    return False
+  clearly_going = v_target_1sec >= STOP_ENTER_V
+  starting = (v_target >= release_v or v_target_1sec >= release_v) and v_target_1sec > v_target + STOP_RELEASE_RISE
+  return not (clearly_going or starting)
+
+
 def get_accel_from_plan(speeds, accels, t_idxs, action_t=DT_MDL, vEgoStopping=0.05):
   if len(speeds) == len(t_idxs):
     v_now = speeds[0]

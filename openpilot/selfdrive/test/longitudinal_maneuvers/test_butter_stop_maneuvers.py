@@ -368,21 +368,28 @@ def compute_metrics(logs, name, butter):
   floor_raw_switches = int(np.sum(np.abs(np.diff(floor_raw_seq)) > 0.01)) if floor_raw_seq.size > 1 else 0
   bound_seq = logs[:, 7][logs[:, 5] > 0.5]
   bound_switches = int(np.sum(np.diff(bound_seq.astype(int)) != 0)) if bound_seq.size > 1 else 0
+  applied = logs[:, 10]
   if stopped:
     ts = t[stop_i]
     window = (t >= ts - 0.5) & (t <= ts)
     accel_last = float(np.mean(np.abs(a[window]))) if window.any() else None
+    end_net = float(np.mean(np.abs(applied[window]))) if window.any() else None
+    step = float(t[1] - t[0]) if t.size > 1 else 0.01
+    tail_window = (t >= max(0.0, ts - 6.0)) & (t <= ts)
+    tail_s = float(np.sum((v > 0.05) & (v < 0.5) & tail_window)) * step
     jerk_window = (t >= max(0.0, ts - 1.5)) & (t <= ts)
     peak_jerk = float(np.max(np.abs(jerk[jerk_window]))) if jerk_window.any() else None
     below3 = np.flatnonzero(v < 3.0)
     time_3 = float(ts - t[below3[0]]) if below3.size else None
   else:
-    accel_last = peak_jerk = time_3 = None
+    accel_last = peak_jerk = time_3 = end_net = tail_s = None
   return {
     "name": name, "butter": int(butter),
     "final_gap_m": round(final_gap, 3), "min_gap_m": round(min_gap, 3),
     "collision": bool(min_gap < COLLISION_GAP_M), "stopped": stopped,
     "accel_last_0.5s_mean_abs": None if accel_last is None else round(accel_last, 4),
+    "end_net": None if end_net is None else round(end_net, 4),
+    "tail_s": None if tail_s is None else round(tail_s, 3),
     "peak_jerk_last_1.5s_abs": None if peak_jerk is None else round(peak_jerk, 4),
     "peak_jerk_run_abs": round(peak_jerk_run, 4),
     "time_3ms_to_standstill_s": None if time_3 is None else round(time_3, 3),
@@ -455,6 +462,34 @@ _S3B.radar_noise_seed = 1
 _S3C = _stopped_lead(40, 60, 25.0, title="s3c noisy radar std 0.15 seed 2 stopped lead 40 km/h gap 60 m")
 _S3C.radar_noise_std = 0.15
 _S3C.radar_noise_seed = 2
+
+# b2 proxy for the no-lead (traffic-light style) stop: the harness can only
+# stop the car on a lead, so this places a stationary lead at the a-group's
+# 5.4 s approach spacing (50 km/h -> 75 m) so the taper budget comes from the
+# plan rather than the lead bound.
+_B2_PROXY = _stopped_lead(50, 75, 35.0, title="b2 proxy no-lead 50 km/h stationary lead gap 75 m")
+
+
+def _start_lead(accel, title, duration=30.0):
+  """Ego holds at standstill 6 m behind a stopped lead; the lead pulls away at
+  `accel` m/s^2 up to 15 m/s starting at t = 5 s (stop-release departure)."""
+  v_pull = 15.0
+  t_full = 5.0 + v_pull / accel
+  return Maneuver(
+    title,
+    duration=duration,
+    initial_speed=0.0,
+    lead_relevancy=1,
+    initial_distance_lead=6.0,
+    speed_lead_values=[0.0, 0.0, v_pull, v_pull],
+    breakpoints=[0.0, 5.0, t_full, duration],
+  )
+
+
+_START_SCENARIOS = [
+  _start_lead(1.5, "start-lead-1.5"),
+  _start_lead(0.8, "start-lead-0.8"),
+]
 
 _CASES = ([("a", m) for m in _A_SCENARIOS] + [("b", _B_SCENARIO)]
           + [("c", m) for m in _C_SCENARIOS]

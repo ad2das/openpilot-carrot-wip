@@ -152,6 +152,7 @@ jobs:
         env:
           BUTTER_REAL_OUT: ${{ runner.temp }}/butter_real.json
           BUTTER_REAL_SWEEP_OUT: ${{ runner.temp }}/butter_real_sweep.json
+          BUTTER_HYST_SWEEP_OUT: ${{ runner.temp }}/butter_hyst_sweep.json
         run: |
           python -m pytest -o addopts='' -q -s openpilot/selfdrive/test/longitudinal_maneuvers/test_butter_real_replay.py
       - name: Upload ButterStop real-stop table
@@ -162,6 +163,7 @@ jobs:
           path: |
             ${{ runner.temp }}/butter_real.json
             ${{ runner.temp }}/butter_real_sweep.json
+            ${{ runner.temp }}/butter_hyst_sweep.json
           if-no-files-found: warn
       - name: Check model, monitoring and Bluetooth integration
         run: |

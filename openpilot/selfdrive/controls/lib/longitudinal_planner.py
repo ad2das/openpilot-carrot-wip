@@ -10,7 +10,7 @@ from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import LongitudinalMpc, N
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.long_mpc import T_IDXS as T_IDXS_MPC
-from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, is_volkswagen_meb
+from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N, get_accel_from_plan, is_volkswagen_meb, plan_stop_speeds, stop_latch
 from openpilot.selfdrive.controls.lib.cutin_predecel import (
   apply_cutin_predecel_accel_limit,
   get_cutin_predecel_accel_limit,
@@ -65,6 +65,7 @@ class LongitudinalPlanner:
     self.output_v_target_now = 0.0
     self.output_j_target_now = 0.0
     self.output_should_stop = False
+    self._stop_latched = False
     self.lead_preview = 0.0
     self.lead_preview_action_time = 0.0
     self.lead_preview_accel = 0.0
@@ -183,6 +184,7 @@ class LongitudinalPlanner:
 
       self.reset_decel_timer = int(RESET_DECEL_RAMP_TIME / self.dt)
       self.reset_decel_start_a = self.a_desired
+      self._stop_latched = False
 
     elif self.reset_decel_timer > 0:
       ramp_steps = max(1, int(RESET_DECEL_RAMP_TIME / self.dt))
@@ -292,6 +294,13 @@ class LongitudinalPlanner:
       action_t=action_t,
       vEgoStopping=vEgoStopping,
     )
+
+    # Separate stop entry/release speeds: enter at STOP_ENTER_V so the car does not crawl on idle creep
+    # while the plan lingers just above VEgoStopping; release only when the plan rises past VEgoStopping
+    # (unchanged departure). VEgoStopping >= STOP_ENTER_V keeps the original single-threshold rule.
+    v_t, v_t1 = plan_stop_speeds(self.v_desired_trajectory, CONTROL_N_T_IDX, action_t)
+    self._stop_latched = stop_latch(self._stop_latched, v_t, v_t1, float(sm['carState'].vEgo), vEgoStopping)
+    output_should_stop_mpc = self._stop_latched
 
     lead_index = 1 if self.mpc.source == 'lead1' else 0
     leads = (sm['radarState'].leadOne, sm['radarState'].leadTwo)
