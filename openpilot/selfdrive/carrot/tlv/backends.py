@@ -302,12 +302,22 @@ class TinygradCpuBackend:
       result.append(out.numpy())
     return result
 
+  def _spec_np_dtype(self):
+    """Numpy zeros dtype for warm-up, mapped exactly like _make_tensor maps it."""
+    spec_dtype = getattr(self._input_spec, "dtype", None)
+    if spec_dtype is None:
+      return np.float32
+    return TINYGRAD_NP_DTYPES.get(str(spec_dtype).rsplit(".", 1)[-1], np.float32)
+
   def _warmup(self) -> None:
     shape = tuple(self._input_spec.shape)
     if not all(isinstance(d, int) for d in shape):
       return  # dynamic dims: the first real frame compiles once
+    np_dtype = self._spec_np_dtype()
     try:
-      self._call(np.zeros(shape, dtype=np.float32))
+      # TinyJit: 1st call runs, 2nd captures, 3rd+ replays (engine/jit.py); warm both so the first real frame replays.
+      self._call(np.zeros(shape, dtype=np_dtype))
+      self._call(np.zeros(shape, dtype=np_dtype))
     except BackendError:
       raise
     except Exception as exc:
@@ -315,7 +325,7 @@ class TinygradCpuBackend:
     self._warmed = True
 
   def warmup(self) -> None:
-    """Public warm-up hook; the constructor already warmed fixed shapes."""
+    """Public warm-up hook; the constructor already ran the run+capture pair."""
     if not getattr(self, "_warmed", False):
       self._warmup()
 
@@ -418,7 +428,10 @@ class TinygradCpuClassifier(TinygradCpuBackend):
     return outs[0] if outs else None
 
   def warmup(self) -> None:
-    self.classify(np.zeros(LAMP_INPUT_SHAPE, dtype=np.uint8))
+    """No-op when the constructor already ran the run+capture pair: the
+    classifier must not pay a third pointless JIT call."""
+    if not getattr(self, "_warmed", False):
+      self._warmup()
 
 
 def make_backend(name: str, model_path: str = "", decoder: Decoder | None = None):

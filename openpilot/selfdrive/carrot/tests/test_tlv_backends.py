@@ -388,3 +388,45 @@ def test_tinygrad_classifier_end_to_end(tmp_path, monkeypatch):
   out = classifier.classify(np.zeros(backends.LAMP_INPUT_SHAPE, dtype=np.uint8))
   assert out.shape == (4, 8)
   classifier.close()
+
+
+# -- detector warm-up runs the JIT capture too (W128) -------------------------
+
+def test_tinygrad_detector_warmup_runs_the_capture_call(tmp_path, monkeypatch):
+  """Construction must leave the detector JIT at cnt==2 (run + capture), so
+  the first real infer() is the replay path, not the one-time capture."""
+  onnx = pytest.importorskip("onnx")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  path = _tiny_conv_onnx_model(onnx, tmp_path)
+  backend, _decoder = backends.make_backend("tinygrad", str(path))
+  try:
+    key = (1, 3, 8, 8)
+    jit = backend._jits[key]
+    assert jit.cnt == 2, "1st call runs, 2nd captures (engine/jit.py)"
+    assert jit.captured is not None
+    backend.warmup()  # public hook stays a no-op once warmed
+    assert jit.cnt == 2
+    backend.infer(np.zeros(key, dtype=np.float32))  # 3rd call: replay
+    assert jit.cnt == 3
+  finally:
+    backend.close()
+
+
+def test_tinygrad_classifier_warmup_is_two_calls_total(tmp_path, monkeypatch):
+  """The classifier must not add a third pointless call: constructor run +
+  capture only, and the public warmup() is a no-op afterwards."""
+  onnx = pytest.importorskip("onnx")
+  if not _ensure_cc(monkeypatch, tmp_path):
+    pytest.skip("no clang-compatible C compiler available for tinygrad CPU kernels")
+  path = _tiny_classifier_onnx_model(onnx, tmp_path)
+  classifier = backends.make_classifier("tinygrad", str(path))
+  try:
+    jit = classifier._jits[tuple(backends.LAMP_INPUT_SHAPE)]
+    assert jit.cnt == 2
+    classifier.warmup()
+    assert jit.cnt == 2
+    classifier.classify(np.zeros(backends.LAMP_INPUT_SHAPE, dtype=np.uint8))
+    assert jit.cnt == 3
+  finally:
+    classifier.close()
