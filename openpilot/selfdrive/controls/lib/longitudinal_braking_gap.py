@@ -10,11 +10,11 @@ STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego sti
 # Speed-proportional cap on the remembered floor (s). The captured bound is
 # re-applied every step, so the memory shrinks with the speed instead of
 # lagging behind it on the 8 s decay. FLOOR_CAP_OFFSET_V shifts the cap so it
-# reaches the base distance early (full release above walking speed). The real
-# default is set after the sweep (see the cap sweep in
-# test_butter_real_replay.py); inf keeps the uncapped behavior until then.
-FLOOR_SPEED_CAP_S = float('inf')
-FLOOR_CAP_OFFSET_V = 0.0
+# reaches the base distance early: with the chosen pair (2.0, 3.0) the
+# remembered gap is fully released below 3 m/s (about 11 km/h), before the
+# final metres. Chosen by the offset sweep (task 9 review; row K2.0/V3).
+FLOOR_SPEED_CAP_S = 2.0
+FLOOR_CAP_OFFSET_V = 3.0
 
 
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):

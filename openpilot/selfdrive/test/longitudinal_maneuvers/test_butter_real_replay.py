@@ -24,10 +24,11 @@ K2.0/V8, K1.5/V5 (FLOOR_SPEED_CAP_S / FLOOR_CAP_OFFSET_V) over b1 (ideal and
 creep+SCC plants) and the 9 ButterStop scenarios (both plants), each for
 ButterStop 0 and 1. Criteria a-f are judged against the OFF row (see
 _OFFSET_SWEEP_CRITERIA); references (OFF/NOCAP) are judged but not gated.
-Autopick: smallest b1 ideal B1 crawl, then smallest FLOOR_CAP_OFFSET_V.
-Report-only; collision anywhere fails the test. The b1 B0/B1 ideal-plant
-telemetry (floor/margin/stopped_pair/fast_release/cap per 0.05 s) goes to
-BUTTER_REAL_OUT.
+Autopick: smallest b1 ideal B1 crawl, then smallest FLOOR_CAP_OFFSET_V. The
+sweep asserts that the current default pair passes a-f, so CI guards the
+shipped defaults; collision anywhere also fails the test. The b1 B0/B1
+ideal-plant telemetry (floor/margin/stopped_pair/fast_release/cap per 0.05 s)
+goes to BUTTER_REAL_OUT.
 """
 import json
 import math
@@ -588,7 +589,7 @@ _OFFSET_SWEEP_CRITERIA = (
   "c) end decel (ideal): B1 <= max(0.20, B0 - 0.25) for a-group (except stopped-60), "
   "approach and b1; for braking-lead and stopped-60: B1 <= OFF-row B1 + 0.05",
   "d) crawl (below-7 km/h time before standstill) in b1 and approach-25/20, both plants, "
-  "B0 and B1: <= OFF-row B0 + 1.0 s",
+  "B0 and B1: <= OFF-row of the same ButterStop setting + 1.0 s",
   "e) safety: 0 collisions, 0 FCW anywhere; lead-decel-1/2/3 min gap >= OFF-row value - 0.3 m, "
   "both plants, B0 and B1",
   "f) existing ButterStop-suite criteria re-evaluated in-sweep for the 9 overlapping scenarios "
@@ -735,25 +736,27 @@ def _offset_combo_failures(row, data, off):
       elif d1 > max(0.20, d0 - 0.25) + 1e-9:
         fail(f"c) {maneuver.title} ideal: B1 end decel {d1} > max(0.20, B0 {d0} - 0.25)")
 
-  # d) No crawl increase vs the OFF row: b1 and the approach scenarios.
+  # d) No crawl increase vs the OFF row OF THE SAME ButterStop setting: the
+  #    taper itself adds B1 crawl vs B0 even memory-off, so B0 is judged
+  #    against OFF B0 and B1 against OFF B1 (task-9 review ruling).
   for plant in _CAP_PLANTS:
-    ref = off_b1[(plant, 0)].get("crawl_time_s")
     for butter in (0, 1):
+      ref = off_b1[(plant, butter)].get("crawl_time_s")
       c = b1[(plant, butter)].get("crawl_time_s")
       if c is None or ref is None:
         fail(f"d) b1 {plant} B{butter}: crawl time missing ({c} vs OFF {ref})")
       elif c > ref + 1.0 + 1e-9:
-        fail(f"d) b1 {plant} B{butter}: crawl {c} > OFF B0 {ref} + 1.0 s")
+        fail(f"d) b1 {plant} B{butter}: crawl {c} > OFF B{butter} {ref} + 1.0 s")
     for _group, maneuver in _CAP_SWEEP_SCENARIOS:
       if "approach stopped car" not in maneuver.title:
         continue
-      ref = off_scen[(maneuver.title, plant, 0)].get("crawl_time_s")
       for butter in (0, 1):
+        ref = off_scen[(maneuver.title, plant, butter)].get("crawl_time_s")
         c = scen[(maneuver.title, plant, butter)].get("crawl_time_s")
         if c is None or ref is None:
           fail(f"d) {maneuver.title} {plant} B{butter}: crawl time missing ({c} vs OFF {ref})")
         elif c > ref + 1.0 + 1e-9:
-          fail(f"d) {maneuver.title} {plant} B{butter}: crawl {c} > OFF B0 {ref} + 1.0 s")
+          fail(f"d) {maneuver.title} {plant} B{butter}: crawl {c} > OFF B{butter} {ref} + 1.0 s")
 
   # e) Safety: zero collisions and zero FCW anywhere; lead-decel min gaps
   #    within OFF - 0.3 m, both plants, B0 and B1.
@@ -821,6 +824,15 @@ def test_butter_real_offset_sweep():
     fails = _offset_combo_failures(row, row_data[row[0]], off)
     rows.append(_row_payload(row, row_data[row[0]], fails))
     print(f"OFFSET-SWEEP {row[0]}: pass={not fails} fails={len(fails)}")
+
+  default_row = next((r for r in rows if not r["reference"]
+                      and r["cap_s"] == longitudinal_braking_gap.FLOOR_SPEED_CAP_S
+                      and r["offset_v"] == longitudinal_braking_gap.FLOOR_CAP_OFFSET_V), None)
+  assert default_row is not None, "default pair row missing from the sweep"
+  assert default_row["all_pass"], (
+    f"default pair (FLOOR_SPEED_CAP_S {longitudinal_braking_gap.FLOOR_SPEED_CAP_S}, "
+    f"FLOOR_CAP_OFFSET_V {longitudinal_braking_gap.FLOOR_CAP_OFFSET_V}) must pass a-f: "
+    + "; ".join(default_row["failures"][:5]))
 
   candidates = [r for r in rows if not r["reference"]]
 

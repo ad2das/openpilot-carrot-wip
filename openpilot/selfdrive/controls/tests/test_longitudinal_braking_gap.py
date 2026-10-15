@@ -14,7 +14,10 @@ def update(state, **kwargs):
   return state.update(**args)
 
 
-def test_distance_memory_survives_falling_speed_without_accumulating_each_frame():
+def test_distance_memory_survives_falling_speed_without_accumulating_each_frame(monkeypatch):
+  # Pin the speed cap off: this test isolates the falling-speed memory mechanic;
+  # the speed-proportional cap has dedicated coverage below.
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', float('inf'))
   state = BrakingGapState()
   for _ in range(20):
     update(state)
@@ -131,7 +134,9 @@ def capture(state):
   return state.floor
 
 
-def test_stopped_lead_releases_the_braking_gap_memory_over_about_one_second():
+def test_stopped_lead_releases_the_braking_gap_memory_over_about_one_second(monkeypatch):
+  # Pin the speed cap off: this test isolates the stopped-lead release tau.
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', float('inf'))
   state = BrakingGapState()
   captured = capture(state)
   assert 16.0 < captured <= 18.0  # bounded capture: min(20, base+10, sd+2.5*v) = 18
@@ -143,6 +148,7 @@ def test_stopped_lead_releases_the_braking_gap_memory_over_about_one_second():
 
 def test_old_eight_second_tau_would_not_release_within_three_seconds(monkeypatch):
   monkeypatch.setattr(longitudinal_braking_gap, 'STOPPED_LEAD_RELEASE_S', 8.0)
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', float('inf'))
   state = BrakingGapState()
   capture(state)
   for _ in range(60):
@@ -202,6 +208,9 @@ def test_stopped_pair_freeze_beats_cap(monkeypatch):
 
 def test_margins_apply_cap_with_predicted_speeds(monkeypatch):
   monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', 2.5)
+  # Offset stays 0.0 here: this test isolates the cap tracking against the
+  # un-shifted capture bound; the offset has dedicated coverage above.
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_CAP_OFFSET_V', 0.0)
   state = BrakingGapState()
   capture(state)
   t = np.arange(81) * .05
@@ -222,7 +231,9 @@ def test_margins_apply_cap_with_predicted_speeds(monkeypatch):
     assert floor <= max(base, 5.5 + 2.5 * speeds[i]) + 1e-6
 
 
-def test_releasing_path_still_uses_the_two_second_tau():
+def test_releasing_path_still_uses_the_two_second_tau(monkeypatch):
+  # Pin the speed cap off: this test isolates the releasing-path two-second tau.
+  monkeypatch.setattr(longitudinal_braking_gap, 'FLOOR_SPEED_CAP_S', float('inf'))
   state = BrakingGapState()
   before = capture(state)
   base = 5.5 + 1.5 * 2.0
