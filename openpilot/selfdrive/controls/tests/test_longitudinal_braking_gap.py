@@ -151,7 +151,10 @@ def test_old_eight_second_tau_would_not_release_within_three_seconds(monkeypatch
   assert state.floor - base > 4.0
 
 
-def test_moving_lead_keeps_the_eight_second_tau():
+def test_moving_lead_keeps_the_eight_second_tau(monkeypatch):
+  # Pin the low-speed trigger off: this test isolates the moving-lead tau
+  # selection; the low-speed release has dedicated coverage.
+  monkeypatch.setattr(longitudinal_braking_gap, 'LOW_SPEED_RELEASE_V', 0.0)
   state = BrakingGapState()
   capture(state)
   for _ in range(60):

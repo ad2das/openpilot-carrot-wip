@@ -16,12 +16,21 @@ Fidelity target (creep+SCC, B1): final gap 7.2 +- 1.0 m, below-7 km/h time
 
 Assertions: only no-collision and fixture presence; everything else is
 reported to BUTTER_REAL_OUT. Simulation only; no vehicle validation.
+
+Part 3 (task 7) — LOW_SPEED_RELEASE_V x LEAD_SLACK sweep, gated by
+BUTTER_REAL_SWEEP_OUT: 12 combos over b1 (ideal and creep+SCC plants) and the
+9 ButterStop scenarios (both plants), each for ButterStop 0 and 1. Criteria
+a-f (see _RELEASE_SWEEP_CRITERIA); auto-pick: smallest LOW_SPEED_RELEASE_V
+that passes, then largest LEAD_SLACK. Report-only; collision anywhere fails
+the test. The b1 B0/B1 ideal-plant telemetry (floor/margin/stopped_pair/
+fast_release per 0.05 s) goes to BUTTER_REAL_OUT.
 """
 import json
 import os
 from contextlib import contextmanager
 
 import numpy as np
+import pytest
 
 import openpilot.cereal.messaging as messaging
 from openpilot.cereal import log
@@ -55,7 +64,8 @@ FIDELITY_BELOW7_S = 13.6
 FIDELITY_BELOW7_TOL_S = 4.0
 OPEN_LOOP_WINDOW_S = -10.0  # metric window; replay starts at fixture start (-20 s)
 
-RESULTS: dict = {"b1": {}, "open_loop": {}, "stop_release": {}, "scenarios_plant_on": {},
+RESULTS: dict = {"b1": {}, "b1_telemetry": {}, "open_loop": {}, "stop_release": {},
+                 "scenarios_plant_on": {}, "release_sweep": {},
                  "log_reference": {}, "fidelity": {}, "report": {}}
 
 
@@ -504,6 +514,7 @@ def _scenario_metrics(logs, name):
   a = logs[:, 10]
   gaps = logs[:, 4] - logs[:, 3]
   stand = np.flatnonzero(v < 0.05)
+  below7 = np.flatnonzero(v < 7.0 / 3.6)
   stopped = bool(stand.size)
   entry = {
     "scenario": name,
@@ -511,13 +522,16 @@ def _scenario_metrics(logs, name):
     "final_gap_m": round(float(gaps[stand[0]]), 3) if stopped else None,
     "min_gap_m": round(float(np.min(gaps)), 3),
     "collision": bool(np.min(gaps) < COLLISION_GAP_M),
+    "fcw_steps": int(np.sum(logs[:, 12] > 0.5)),
   }
   if stopped:
     i = int(stand[0])
     window = (t >= t[i] - 0.5) & (t <= t[i])
     entry["end_decel_mean_abs"] = round(float(np.mean(np.abs(a[window]))), 4) if window.any() else None
+    entry["crawl_time_s"] = round(float(t[i] - t[below7[0]]), 2) if below7.size and below7[0] < i else None
   else:
     entry["end_decel_mean_abs"] = None
+    entry["crawl_time_s"] = None
   return entry
 
 
@@ -543,11 +557,257 @@ def test_butter_real_scenarios_plant_on():
   RESULTS["scenarios_plant_on"] = rows
 
 
+# --- Task 7: LOW_SPEED_RELEASE_V x LEAD_SLACK release sweep ----------------
+
+_RELEASE_SWEEP_V = (0.0, 2.0, 3.0, 5.0)
+_RELEASE_SWEEP_SLACK = (1.2, 0.6, 0.3)
+_RELEASE_PLANTS = ("ideal", "scc")
+_RELEASE_SWEEP_SCENARIOS = [(g, m) for g, m in _CASES if g in ("a", "b", "c")]
+# M0 baselines: run 38670492876 scenario table (release tau 8, creep plant).
+_RELEASE_M0_MIN_GAP = {
+  "steady state following a car at 20m/s, then lead decel to 0mph at 1m/s^2": {0: 4.950, 1: 4.163},
+  "steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2": {0: 2.431, 1: 2.756},
+  "steady state following a car at 20m/s, then lead decel to 0mph at 3m/s^2": {0: 1.934, 1: 2.253},
+}
+_RELEASE_SWEEP_CRITERIA = (
+  "a) b1 ideal plant B0: final gap <= 6.5 m and desiredDistance at standstill <= 6.5 m",
+  "b) |B1 - B0| final gap <= 0.3 m: b1 and all 9 scenarios, both plants",
+  "c) ideal plant, normal scenarios (a-group, b, approach): B1 end decel <= max(0.20, B0 - 0.25)",
+  "d) crawl: B1 below-7 km/h time <= B0 + 1.5 s (b1 and approach scenarios)",
+  "e) no collision anywhere; lead-decel-1/2/3 min gap >= M0 - 0.3 m (B0/B1, both plants); no new FCW",
+  "f) all existing suites green (verified outside this sweep)",
+)
+
+
+def _run_b1_release(low_speed_v, lead_slack, butter, plant, telemetry=None):
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  if butter == 0:
+    header["ButterStop"] = 0
+  saved_v = longitudinal_braking_gap.LOW_SPEED_RELEASE_V
+  saved_slack = butter_stop.LEAD_SLACK
+  longitudinal_braking_gap.LOW_SPEED_RELEASE_V = low_speed_v
+  butter_stop.LEAD_SLACK = lead_slack
+  try:
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(plant != "ideal"),
+                      scc_stop=(plant == "scc"), telemetry=telemetry).run()
+  finally:
+    longitudinal_braking_gap.LOW_SPEED_RELEASE_V = saved_v
+    butter_stop.LEAD_SLACK = saved_slack
+  return _b1_metrics(run)
+
+
+def _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant):
+  saved_v = longitudinal_braking_gap.LOW_SPEED_RELEASE_V
+  saved_slack = butter_stop.LEAD_SLACK
+  longitudinal_braking_gap.LOW_SPEED_RELEASE_V = low_speed_v
+  butter_stop.LEAD_SLACK = lead_slack
+  try:
+    logs = ButterStopLoop(maneuver, butter=butter, plant=(plant != "ideal"),
+                          scc_stop=(plant == "scc")).run()
+  finally:
+    longitudinal_braking_gap.LOW_SPEED_RELEASE_V = saved_v
+    butter_stop.LEAD_SLACK = saved_slack
+  return _scenario_metrics(logs, maneuver.title)
+
+
+def _release_gap_pair(label, b0, b1m):
+  g0, g1 = b0.get("final_gap_m"), b1m.get("final_gap_m")
+  if g0 is None or g1 is None:
+    return [f"b) {label}: final gap missing (B0 {g0}, B1 {g1})"]
+  if abs(g1 - g0) > 0.3 + 1e-9:
+    return [f"b) {label}: |B1 - B0| {abs(g1 - g0):.3f} > 0.3 m (B0 {g0}, B1 {g1})"]
+  return []
+
+
+def _release_crawl_pair(label, b0, b1m):
+  c0, c1 = b0.get("crawl_time_s"), b1m.get("crawl_time_s")
+  if c0 is None or c1 is None:
+    return [f"d) {label}: crawl time missing (B0 {c0}, B1 {c1})"]
+  if c1 > c0 + 1.5 + 1e-9:
+    return [f"d) {label}: B1 crawl {c1} > B0 {c0} + 1.5 s"]
+  return []
+
+
+def _release_combo_failures(low_speed_v, lead_slack, b1, scen):
+  """Criteria a-e for one (LOW_SPEED_RELEASE_V, LEAD_SLACK) combo."""
+  fails = []
+
+  def fail(msg):
+    fails.append(f"V {low_speed_v} slack {lead_slack}: {msg}")
+
+  # a) b1 ideal plant B0 releases to the normal stop distance.
+  m = b1[("ideal", 0)]
+  if m["final_gap_m"] is None or m["final_gap_m"] > 6.5 + 1e-9:
+    fail(f"a) b1 ideal B0 final gap {m['final_gap_m']} > 6.5 m")
+  dd = m["desired_distance_standstill_m"]
+  if dd is None or dd > 6.5 + 1e-9:
+    fail(f"a) b1 ideal B0 desiredDistance at standstill {dd} > 6.5 m")
+
+  # b) ButterStop must not change the stop point: b1 + all 9 scenarios.
+  for plant in _RELEASE_PLANTS:
+    for msg in _release_gap_pair(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]):
+      fail(msg)
+    for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+      for msg in _release_gap_pair(f"{maneuver.title} {plant}",
+                                   scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)]):
+        fail(msg)
+
+  # c) ButterStop still softens the end: ideal plant, normal scenarios.
+  for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+    if not (group in ("a", "b") or "approach stopped car" in maneuver.title):
+      continue
+    b0 = scen[(maneuver.title, "ideal", 0)]
+    b1m = scen[(maneuver.title, "ideal", 1)]
+    d0, d1 = b0.get("end_decel_mean_abs"), b1m.get("end_decel_mean_abs")
+    if d0 is None or d1 is None:
+      fail(f"c) {maneuver.title} ideal: end decel missing (B0 {d0}, B1 {d1})")
+    elif d1 > max(0.20, d0 - 0.25) + 1e-9:
+      fail(f"c) {maneuver.title} ideal: B1 end decel {d1} > max(0.20, B0 {d0} - 0.25)")
+
+  # d) No crawl: b1 and the approach scenarios.
+  for plant in _RELEASE_PLANTS:
+    for msg in _release_crawl_pair(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]):
+      fail(msg)
+    for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+      if "approach stopped car" not in maneuver.title:
+        continue
+      for msg in _release_crawl_pair(f"{maneuver.title} {plant}",
+                                     scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)]):
+        fail(msg)
+
+  # e) Safety: no collision, no new FCW, lead-decel min gaps vs the M0 run.
+  all_runs = [(f"b1 {plant} B{butter}", b1[(plant, butter)])
+              for plant in _RELEASE_PLANTS for butter in (0, 1)]
+  all_runs += [(f"{maneuver.title} {plant} B{butter}", scen[(maneuver.title, plant, butter)])
+               for group, maneuver in _RELEASE_SWEEP_SCENARIOS
+               for plant in _RELEASE_PLANTS for butter in (0, 1)]
+  for label, metrics in all_runs:
+    if metrics.get("collision"):
+      fail(f"e) {label}: collision (min gap {metrics['min_gap_m']})")
+  fcw_pairs = [(f"b1 {plant}", b1[(plant, 0)], b1[(plant, 1)]) for plant in _RELEASE_PLANTS]
+  fcw_pairs += [(f"{maneuver.title} {plant}", scen[(maneuver.title, plant, 0)], scen[(maneuver.title, plant, 1)])
+                for _group, maneuver in _RELEASE_SWEEP_SCENARIOS for plant in _RELEASE_PLANTS]
+  for label, b0m, b1m in fcw_pairs:
+    if b1m.get("fcw_steps", 0) > b0m.get("fcw_steps", 0):
+      fail(f"e) {label}: B1 FCW {b1m['fcw_steps']} > B0 {b0m['fcw_steps']}")
+  for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+    if maneuver.title not in _RELEASE_M0_MIN_GAP:
+      continue
+    for plant in _RELEASE_PLANTS:
+      for butter in (0, 1):
+        metrics = scen[(maneuver.title, plant, butter)]
+        bound = _RELEASE_M0_MIN_GAP[maneuver.title][butter] - 0.3
+        if metrics["min_gap_m"] < bound - 1e-9:
+          fail(f"e) {maneuver.title} {plant} B{butter}: min gap {metrics['min_gap_m']} < M0 - 0.3 ({bound:.3f})")
+  return fails
+
+
+def test_butter_real_release_sweep():
+  out_path = os.environ.get("BUTTER_REAL_SWEEP_OUT")
+  if not out_path:
+    pytest.skip("release sweep runs only when BUTTER_REAL_SWEEP_OUT is set")
+  titles = {m.title for _, m in _CASES}
+  missing = [t for t in _RELEASE_M0_MIN_GAP if t not in titles]
+  assert not missing, f"M0 baseline scenario titles missing from _CASES: {missing}"
+
+  b0_cache: dict = {}
+  rows = []
+  for low_speed_v in _RELEASE_SWEEP_V:
+    for lead_slack in _RELEASE_SWEEP_SLACK:
+      b1: dict = {}
+      scen: dict = {}
+      for plant in _RELEASE_PLANTS:
+        for butter in (0, 1):
+          cache_key = (low_speed_v, plant, "b1")
+          if butter == 0 and cache_key in b0_cache:
+            metrics = b0_cache[cache_key]
+          else:
+            metrics = _run_b1_release(low_speed_v, lead_slack, butter, plant)
+            if butter == 0:
+              b0_cache[cache_key] = metrics
+          b1[(plant, butter)] = metrics
+      for group, maneuver in _RELEASE_SWEEP_SCENARIOS:
+        for plant in _RELEASE_PLANTS:
+          for butter in (0, 1):
+            cache_key = (low_speed_v, plant, maneuver.title)
+            if butter == 0 and cache_key in b0_cache:
+              metrics = b0_cache[cache_key]
+            else:
+              metrics = _run_scenario_release(maneuver, low_speed_v, lead_slack, butter, plant)
+              if butter == 0:
+                b0_cache[cache_key] = metrics
+            scen[(maneuver.title, plant, butter)] = metrics
+      fails = _release_combo_failures(low_speed_v, lead_slack, b1, scen)
+      rows.append({
+        "low_speed_v": low_speed_v,
+        "lead_slack": lead_slack,
+        "all_pass": not fails,
+        "failures": fails,
+        "b1": {f"{plant}_{butter}": b1[(plant, butter)]
+               for plant in _RELEASE_PLANTS for butter in (0, 1)},
+        "scenarios": {maneuver.title: {f"{plant}_{butter}": scen[(maneuver.title, plant, butter)]
+                                       for plant in _RELEASE_PLANTS for butter in (0, 1)}
+                      for _group, maneuver in _RELEASE_SWEEP_SCENARIOS},
+      })
+      print(f"RELEASE-SWEEP V {low_speed_v} slack {lead_slack}: "
+            f"pass={not fails} fails={len(fails)}")
+
+  passing = [r for r in rows if r["all_pass"]]
+  chosen = min(passing, key=lambda r: (r["low_speed_v"], -r["lead_slack"])) if passing else None
+  closest = sorted((r for r in rows if not r["all_pass"]),
+                   key=lambda r: (len(r["failures"]), r["low_speed_v"], -r["lead_slack"]))[:3]
+
+  selected = chosen if chosen is not None else (closest[0] if closest else None)
+  telemetry: dict = {}
+  if selected is not None:
+    for butter in (0, 1):
+      trace: dict = {}
+      metrics = _run_b1_release(selected["low_speed_v"], selected["lead_slack"], butter, "ideal",
+                                telemetry=trace)
+      telemetry[f"B{butter}"] = {"low_speed_v": selected["low_speed_v"],
+                                 "lead_slack": selected["lead_slack"],
+                                 "metrics": metrics, "trace": trace}
+  RESULTS["b1_telemetry"] = telemetry
+
+  if chosen is not None:
+    print(f"RELEASE-PICK: V {chosen['low_speed_v']} slack {chosen['lead_slack']}")
+  else:
+    print("RELEASE-PICK: none passed; closest:")
+    for r in closest:
+      print(f"  V {r['low_speed_v']} slack {r['lead_slack']}: {len(r['failures'])} failures")
+
+  table = {
+    "criteria": list(_RELEASE_SWEEP_CRITERIA),
+    "m0_min_gap": _RELEASE_M0_MIN_GAP,
+    "sweep": rows,
+    "chosen": chosen,
+    "closest": closest,
+    "b1_telemetry": telemetry,
+    "note": "desktop closed-loop simulation only; no vehicle validation",
+  }
+  out_dir = os.path.dirname(out_path)
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
+
+  collisions = []
+  for row in rows:
+    for label, metrics in list(row["b1"].items()) + [(f"{title} {label}", m)
+                                                     for title, runs in row["scenarios"].items()
+                                                     for label, m in runs.items()]:
+      if metrics.get("collision"):
+        collisions.append(f"V {row['low_speed_v']} slack {row['lead_slack']} {label}")
+  assert not collisions, "release sweep collision: " + "; ".join(collisions[:5])
+
+
 def test_write_butter_real_table():
   out_path = os.environ.get("BUTTER_REAL_OUT", "/tmp/butter_real.json")
   table = {
     "log_reference": RESULTS["log_reference"],
     "b1": RESULTS["b1"],
+    "b1_telemetry": RESULTS["b1_telemetry"],
     "stop_release": RESULTS["stop_release"],
     "open_loop": RESULTS["open_loop"],
     "fidelity": RESULTS["fidelity"],

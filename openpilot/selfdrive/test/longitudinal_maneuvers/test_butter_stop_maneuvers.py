@@ -51,11 +51,11 @@ from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
 from openpilot.selfdrive.controls.lib import longcontrol
 from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
-from openpilot.selfdrive.controls.lib.longcontrol import LongControl
+from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.test.longitudinal_maneuvers.maneuver import Maneuver
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
-  PLANT_A_GATE, PLANT_TAU, plant_creep,
+  PLANT_A_GATE, PLANT_SCC_BRAKE, PLANT_TAU, plant_creep,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 from opendbc.car.hyundai.interface import CarInterface
@@ -127,7 +127,7 @@ def _no_floor(*_args, **_kwargs):
 
 
 class ButterStopLoop:
-  def __init__(self, maneuver, butter, neutralize=False, plant=False):
+  def __init__(self, maneuver, butter, neutralize=False, plant=False, scc_stop=False):
     _seed_param_defaults()
     params = Params()
     params.put_int("ButterStop", int(butter))
@@ -135,6 +135,7 @@ class ButterStopLoop:
     self.maneuver = maneuver
     self.neutralize = neutralize
     self.plant = bool(plant)
+    self.scc_stop = bool(scc_stop)
     self._plant_lag = 0.0
     self.radar_noise_std = float(getattr(maneuver, "radar_noise_std", 0.0))
     self._radar_rng = np.random.default_rng(int(getattr(maneuver, "radar_noise_seed", 0)))
@@ -274,9 +275,10 @@ class ButterStopLoop:
     maneuver = self.maneuver
     dt = DT_CTRL
     frames = int(round(maneuver.duration / dt))
-    logs = np.zeros((frames + 1, 12))
+    logs = np.zeros((frames + 1, 13))
     msgs = None
     plan_view = None
+    fcw = 0.0
     for frame in range(frames + 1):
       t = frame * dt
       v_lead = float(np.interp(t, maneuver.breakpoints, maneuver.speed_lead_values))
@@ -309,6 +311,7 @@ class ButterStopLoop:
         msgs.update(self._sm_messages(v_cruise_ms, pitch, prob_throttle, standstill))
         self.planner.update(_FakeSM(msgs, frame), self.carrot)
         plan_view = self._plan_view()
+        fcw = 1.0 if self.planner.mpc.crash_cnt > 0 else 0.0
 
       t_since_plan = (frame % PLANNER_PERIOD) * dt
       limits = CarInterface.get_pid_accel_limits(self.cp, self.ego_v, v_cruise_ms)
@@ -325,6 +328,10 @@ class ButterStopLoop:
           applied += plant_creep(self.ego_v)
       else:
         applied = accel
+      if self.scc_stop and self.long_control.long_control_state == LongCtrlState.stopping:
+        # SCC owns the stop in the stopping state: at least -0.6 m/s^2 until
+        # standstill, then hold.
+        applied = 0.0 if self.ego_v <= 0.01 else min(applied, PLANT_SCC_BRAKE)
       floor_active = 1.0 if self.long_control.butter_floor_last is not None else 0.0
       floor_val = self.long_control.butter_floor_last
       floor_raw = self.long_control.butter_floor_raw_last
@@ -336,7 +343,7 @@ class ButterStopLoop:
                      floor_val if floor_val is not None else 0.0, bound_code,
                      floor_raw if floor_raw is not None else 0.0,
                      a_end if a_end is not None else 0.0,
-                     applied, float(self.long_control.long_control_state))
+                     applied, float(self.long_control.long_control_state), fcw)
       self.ego_v = max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       self.lead_x = self.lead_x + v_lead * dt

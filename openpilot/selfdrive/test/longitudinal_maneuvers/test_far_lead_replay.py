@@ -274,7 +274,7 @@ class SyntheticProfile:
 
 
 class FarLeadLoop:
-  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False):
+  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False, telemetry=None):
     _seed_param_defaults()
     params = Params()
     _apply_header_params(params, header)
@@ -291,6 +291,11 @@ class FarLeadLoop:
     self.ego_x = 0.0
     self.plant = bool(plant)
     self.scc_stop = bool(scc_stop)
+    self.telemetry = telemetry
+    if telemetry is not None:
+      for key in ("t", "v", "v_lead", "gap", "floor", "margin", "stopped_pair",
+                  "fast_release", "desired_distance", "a_target", "butter_floor", "lc_state"):
+        telemetry.setdefault(key, [])
     self._plant_lag = float(profile.initial_accel)
     self.a_actual = float(profile.initial_accel)
 
@@ -298,6 +303,26 @@ class FarLeadLoop:
     self.long_control = LongControl(cp)
     self.long_control.last_output_accel = float(profile.initial_accel)
     self.carrot = CarrotPlanner()
+
+  def _record_telemetry(self, t, specs, plan_view):
+    """Per-planner-tick trace: ego/lead v, gap, BrakingGapState (lead 0), plan, floor."""
+    state = self.planner.mpc.braking_gap_states[0]
+    spec0 = specs[0] if specs else None
+    floor = state.floor
+    bf = self.long_control.butter_floor_last
+    tel = self.telemetry
+    tel["t"].append(round(float(t), 2))
+    tel["v"].append(round(float(self.ego_v), 3))
+    tel["v_lead"].append(None if spec0 is None or not np.isfinite(spec0[1]) else round(float(spec0[1]), 3))
+    tel["gap"].append(None if spec0 is None or not np.isfinite(spec0[0]) else round(float(spec0[0]) - self.ego_x, 3))
+    tel["floor"].append(None if floor is None else round(float(floor), 3))
+    tel["margin"].append(round(float(state.margin), 3))
+    tel["stopped_pair"].append(bool(state.stopped_pair))
+    tel["fast_release"].append(bool(state.fast_release))
+    tel["desired_distance"].append(round(float(plan_view.desiredDistance), 3))
+    tel["a_target"].append(round(float(plan_view.aTarget), 3))
+    tel["butter_floor"].append(None if bf is None else round(float(bf), 3))
+    tel["lc_state"].append(int(self.long_control.long_control_state))
 
   def _radar_message(self, specs):
     radar = messaging.new_message('radarState')
@@ -428,6 +453,8 @@ class FarLeadLoop:
         plan_view = self._plan_view()
         if self.planner.mpc.crash_cnt > 0:
           fcw_steps += 1
+        if self.telemetry is not None:
+          self._record_telemetry(t, specs, plan_view)
 
       t_since_plan = (frame % PLANNER_PERIOD) * dt
       limits = CarInterface.get_pid_accel_limits(self.cp, self.ego_v, v_cruise_ms)

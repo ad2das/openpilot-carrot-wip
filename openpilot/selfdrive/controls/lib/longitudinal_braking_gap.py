@@ -7,6 +7,7 @@ import numpy as np
 
 
 STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego still rolls
+LOW_SPEED_RELEASE_V = 3.0  # ego speed below which a rolling approach releases the floor
 
 
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):
@@ -26,6 +27,8 @@ class BrakingGapState:
     self.floor = None
     self.margin = 0.0
     self.relief = 0.0
+    self.stopped_pair = False
+    self.fast_release = False
 
   def update(self, *, enabled, track_id, dt, distance, ego_speed, ego_accel, lead_speed,
              lead_accel, relative_speed, base_tf, stop_distance, desired_distance):
@@ -52,20 +55,23 @@ class BrakingGapState:
     return self.margin
 
   def _advance(self, dt, base_distance, desired_distance, ego_speed, lead_speed, releasing=False):
-    if self.floor is None:
-      return
     # A stopped pair must not slowly creep forward just because its reference
     # expires. Departure evidence releases this episode's distance preference.
     stopped_pair = ego_speed < 0.3 and lead_speed < 0.3
-    lead_stopped = lead_speed < 0.3
+    # The sim can come to rest before a still-crawling lead, so the release
+    # must already act during the low-speed approach, not only once the lead
+    # has stopped. A stopped pair still freezes, so nothing releases after
+    # both have come to rest. This memory only ever ADDS comfort distance in
+    # the cost reference; releasing it returns to the base stop distance, and
+    # the physical constraints / danger margins are untouched.
+    fast_release = lead_speed < 0.3 or ego_speed < LOW_SPEED_RELEASE_V
+    self.stopped_pair = stopped_pair
+    self.fast_release = fast_release
+    if self.floor is None:
+      return
     if not stopped_pair or releasing:
       target = min(self.floor, base_distance)
-      # A stopped lead ends the following episode: approach the user's stop
-      # distance instead of carrying the braking-gap memory into the stop.
-      # This memory only ever ADDS comfort distance in the cost reference;
-      # releasing it returns to the base stop distance, and the physical
-      # constraints / danger margins are untouched.
-      tau = 2.0 if releasing else (STOPPED_LEAD_RELEASE_S if lead_stopped else 8.0)
+      tau = 2.0 if releasing else (STOPPED_LEAD_RELEASE_S if fast_release else 8.0)
       self.floor += (target - self.floor) * -math.expm1(-dt / tau)
     requested = max(0.0, self.floor - desired_distance)
     self.margin = min(requested, self.margin + dt) if requested >= self.margin else max(requested, self.margin - dt)
