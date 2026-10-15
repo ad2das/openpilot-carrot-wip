@@ -37,6 +37,9 @@ STANDSTILL_T = 0.2
 HOLD_RAMP = 2.0
 CREEP_V = 0.15
 CREEP_ACCEL = -1.5
+CREEP_COMP_ACCEL = 0.0   # extra braking canceling idle creep below walking speed (m/s^2, swept)
+CREEP_COMP_V = 1.5       # full compensation at or below this speed
+CREEP_COMP_FADE_V = 2.0  # linear fade to zero at this speed
 PLAN_STOP_V = 0.05
 AVAIL_MIN = 0.05
 LEAD_ACCEL_MIN = -1.5
@@ -237,3 +240,12 @@ def butter_eligible(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan
     if v_lead < v_ego and d_rel / (v_ego - v_lead) < LEAD_CLOSING_TIME_MIN:
       return False
   return True
+
+
+def creep_comp(v_ego):
+  """Extra braking that cancels idle creep at walking speed (m/s^2, >= 0)."""
+  if not math.isfinite(v_ego) or v_ego >= CREEP_COMP_FADE_V or CREEP_COMP_ACCEL <= 0.0:
+    return 0.0
+  if v_ego <= CREEP_COMP_V:
+    return CREEP_COMP_ACCEL
+  return CREEP_COMP_ACCEL * (CREEP_COMP_FADE_V - v_ego) / (CREEP_COMP_FADE_V - CREEP_COMP_V)

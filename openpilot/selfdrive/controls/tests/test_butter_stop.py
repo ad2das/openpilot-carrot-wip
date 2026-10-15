@@ -93,7 +93,7 @@ from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.controls.lib.butter_stop import (
   A_MAX, A_MIN, CREEP_ACCEL, D_EXTRA, FLOOR_RELAX_JERK, HOLD_RAMP, K_TAPER,
   LEAD_JUMP_M, LEAD_RAW_ALLOW, LEAD_SLACK, MARGIN, MIN_FINAL_GAP_ABS, STANDSTILL_T,
-  STANDSTILL_V, V_TAPER, LeadPosFilter, butter_eligible, butter_floor,
+  STANDSTILL_V, V_TAPER, LeadPosFilter, butter_eligible, butter_floor, creep_comp,
   plan_stop_distance, slew_floor, solve_taper_a_end, taper_stop_distance,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
@@ -459,6 +459,26 @@ def test_slew_floor_reads_constant_at_call_time(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# creep compensation (idle-creep cancel)
+# ---------------------------------------------------------------------------
+
+def test_creep_comp_table(monkeypatch):
+  assert butter_stop.CREEP_COMP_V == 1.5
+  assert butter_stop.CREEP_COMP_FADE_V == 2.0
+  monkeypatch.setattr(butter_stop, "CREEP_COMP_ACCEL", 0.0)
+  assert creep_comp(0.5) == 0.0
+  assert creep_comp(1.75) == 0.0
+  monkeypatch.setattr(butter_stop, "CREEP_COMP_ACCEL", 0.25)
+  assert creep_comp(0.0) == pytest.approx(0.25)
+  assert creep_comp(1.5) == pytest.approx(0.25)
+  assert creep_comp(1.75) == pytest.approx(0.125)
+  assert creep_comp(2.0) == 0.0
+  assert creep_comp(3.0) == 0.0
+  assert creep_comp(float("nan")) == 0.0
+  assert creep_comp(float("inf")) == 0.0
+
+
+# ---------------------------------------------------------------------------
 # eligibility gates
 # ---------------------------------------------------------------------------
 
@@ -664,6 +684,72 @@ def test_creep_guard_does_not_fight_gas_before_latch(monkeypatch):
   accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
   assert not control._butter_creep_latched
   assert accel == pytest.approx(-0.1 - HOLD_RAMP * lc.DT_CTRL)
+
+
+def test_creep_comp_applied_in_stopping_branch(monkeypatch):
+  # v 0.5, pid-class output -0.2: the comp is subtracted from the applied
+  # output only (the PID integrator itself stays untouched) - in the stopping
+  # branch this is the one-way ramp output.
+  monkeypatch.setattr(butter_stop, "CREEP_COMP_ACCEL", 0.25)
+  control, _ = make_control(monkeypatch)
+  control.long_control_state = LongCtrlState.stopping
+  control.last_output_accel = -0.2
+  flat_speeds = np.full(len(PLAN_T), 5.0)  # no planned stop -> no floor
+  cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=flat_speeds)
+  accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  base = -0.2 - control.CP.stoppingDecelRate * lc.DT_CTRL
+  assert accel == pytest.approx(base - 0.25)
+
+
+def test_creep_comp_applied_in_pid_branch(monkeypatch):
+  monkeypatch.setattr(butter_stop, "CREEP_COMP_ACCEL", 0.25)
+  control, _ = make_control(monkeypatch)
+  flat_speeds = np.full(len(PLAN_T), 5.0)
+  cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=flat_speeds)
+  plan.shouldStop = False
+  plan.aTarget = 0.0
+  plan.vTargetNow = 0.3  # speed error -0.2 -> PID output -0.2
+  accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control.long_control_state == LongCtrlState.pid
+  assert accel == pytest.approx(-0.2 - 0.25)
+
+
+@pytest.mark.parametrize("variant", ["gas", "positive_output", "standstill_confirmed", "butter_off"])
+def test_creep_comp_variants_unchanged(monkeypatch, variant):
+  monkeypatch.setattr(butter_stop, "CREEP_COMP_ACCEL", 0.25)
+  flat_speeds = np.full(len(PLAN_T), 5.0)
+  if variant == "gas":
+    control, _ = make_control(monkeypatch)
+    control.long_control_state = LongCtrlState.stopping
+    control.last_output_accel = -0.2
+    cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=flat_speeds)
+    cs.gasPressed = True
+    accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+    assert accel == pytest.approx(-0.2 - control.CP.stoppingDecelRate * lc.DT_CTRL)
+  elif variant == "positive_output":
+    control, _ = make_control(monkeypatch)
+    cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=flat_speeds)
+    plan.shouldStop = False
+    plan.aTarget = 0.0
+    plan.vTargetNow = 1.0  # speed error +0.5 -> positive output
+    accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+    assert accel == pytest.approx(0.5)
+  elif variant == "standstill_confirmed":
+    control, _ = make_control(monkeypatch)
+    control.long_control_state = LongCtrlState.stopping
+    control.last_output_accel = -0.2
+    cs, plan, radar = stopping_inputs(v_ego=0.03, standstill=True, plan_speeds=flat_speeds)
+    accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+    assert control._butter_standstill_confirmed
+    assert accel == pytest.approx(-0.2 - HOLD_RAMP * lc.DT_CTRL)
+  else:  # butter_off
+    control, _ = make_control(monkeypatch, values={"ButterStop": 0})
+    control.long_control_state = LongCtrlState.stopping
+    control.last_output_accel = -0.2
+    cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=flat_speeds)
+    accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+    assert not control.butter_stop
+    assert accel == pytest.approx(-0.2 - control.CP.stoppingDecelRate * lc.DT_CTRL)
 
 
 def test_pid_state_floor_limits_without_adding_braking(monkeypatch):

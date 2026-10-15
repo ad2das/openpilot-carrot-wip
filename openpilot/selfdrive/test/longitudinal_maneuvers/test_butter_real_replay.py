@@ -49,7 +49,7 @@ from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
-  ButterStopLoop, _CASES, _case_failures as _butter_case_failures,
+  ButterStopLoop, _B2_PROXY, _CASES, _case_failures as _butter_case_failures,
   compute_metrics as _butter_metrics,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
@@ -404,6 +404,12 @@ def _b1_metrics(run):
     metrics["crawl_dist_m"] = round(float(x[i_stop] - x[i_b7]), 2)
     window = (t >= t[i_stop] - 0.5) & (t <= t[i_stop])
     metrics["mean_accel_last_0.5s"] = round(float(np.mean(a[window])), 4) if window.any() else None
+    a_pre = np.array(run["a_actual_pre"], dtype=float)
+    metrics["end_net"] = round(float(np.mean(np.abs(a[window]))), 4) if window.any() else None
+    metrics["end_net_pre"] = round(float(np.mean(np.abs(a_pre[window]))), 4) if window.any() else None
+    dt_log = float(t[1] - t[0]) if t.size > 1 else 0.01
+    tail_window = (t >= max(0.0, t[i_stop] - 6.0)) & (t <= t[i_stop])
+    metrics["tail_s"] = round(float(np.sum((v > 0.05) & (v < 0.5) & tail_window)) * dt_log, 3)
     jerk = np.gradient(a, t)
     jwindow = (t >= max(0.0, t[i_stop] - 1.5)) & (t <= t[i_stop])
     metrics["peak_jerk_last_1.5s"] = round(float(np.max(np.abs(jerk[jwindow]))), 4) if jwindow.any() else None
@@ -411,7 +417,8 @@ def _b1_metrics(run):
   else:
     metrics.update({"final_gap_m": None, "crawl_time_s": None, "crawl_dist_m": None,
                     "mean_accel_last_0.5s": None, "peak_jerk_last_1.5s": None,
-                    "max_abs_a_target_crawl": None})
+                    "max_abs_a_target_crawl": None, "end_net": None, "end_net_pre": None,
+                    "tail_s": None})
 
   lead_stop = np.flatnonzero(active & (v_lead < 0.3))
   if lead_stop.size and stopped:
@@ -884,6 +891,211 @@ def test_butter_real_offset_sweep():
       if metrics.get("collision"):
         collisions.append(f"{row['label']} {label}")
   assert not collisions, "offset sweep collision: " + "; ".join(collisions[:5])
+
+
+# --- Task 11: creep-compensation sweep --------------------------------------
+
+_CREEP_SWEEP_SPEC = (
+  ("B0", 0.0, 0),
+  ("comp0", 0.0, 1),
+  ("comp0.15", 0.15, 1),
+  ("comp0.25", 0.25, 1),
+  ("comp0.30", 0.30, 1),
+)
+_CREEP_PLANTS = ("ideal", "scc")
+# The 9 ButterStop scenarios (a/b/c) + the b2 no-lead proxy; the s-scenarios
+# stay in their own suites (criterion e).
+_CREEP_SCENARIOS = list(_CAP_SWEEP_SCENARIOS) + [("b2", _B2_PROXY)]
+_CREEP_SWEEP_CRITERIA = (
+  "a) creep+SCC: B1 tail_s <= B0 tail_s + 0.3 s in every scenario (incl the b2 proxy), and B1 tail_s <= 1.0 s in b1 and b2",
+  "b) creep+SCC: B1 end_net <= comp-0 B1 end_net + 0.05 in every scenario (the comp must not add jolt); ideal plant: B1 end_net <= max(0.25, B0 end_net - 0.2) (the jolt removal must survive); end_net = mean |actual plant accel| over the last 0.5 s before standstill after all plant layers (lag + creep + SCC stop assist); end_net_pre is reported before the SCC layer",
+  "c) final gap |B1 - B0| <= 0.5 m in b1 and all scenarios, both plants; ideal-plant B1 final gap within +/-0.2 m and end_net within +/-0.05 m/s^2 of the comp-0 row",
+  "d) safety: 0 collisions and 0 FCW anywhere (both plants); lead-decel min gaps >= comp-0 row - 0.3 m",
+  "e) existing suites green in the same round (butter maneuvers, braking-gap units, far-lead replay, test_longitudinal, butter-real, ButterStop units)",
+)
+
+
+def _creep_flat(row):
+  flat = {("b1", plant): row["b1"][plant] for plant in _CREEP_PLANTS}
+  for (title, plant), metrics in row["scen"].items():
+    flat[(title, plant)] = metrics
+  return flat
+
+
+def _run_b1_creep(comp, butter, plant, telemetry=None):
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  if butter == 0:
+    header["ButterStop"] = 0
+  saved = butter_stop.CREEP_COMP_ACCEL
+  butter_stop.CREEP_COMP_ACCEL = float(comp)
+  try:
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(plant != "ideal"),
+                      scc_stop=(plant == "scc"), telemetry=telemetry).run()
+  finally:
+    butter_stop.CREEP_COMP_ACCEL = saved
+  return _b1_metrics(run)
+
+
+def _run_scenario_creep(comp, maneuver, butter, plant):
+  saved = butter_stop.CREEP_COMP_ACCEL
+  butter_stop.CREEP_COMP_ACCEL = float(comp)
+  try:
+    logs = ButterStopLoop(maneuver, butter=butter, plant=(plant != "ideal"),
+                          scc_stop=(plant == "scc")).run()
+  finally:
+    butter_stop.CREEP_COMP_ACCEL = saved
+  return logs
+
+
+def _collect_creep_row(comp, butter):
+  row = {"b1": {}, "scen": {}}
+  for plant in _CREEP_PLANTS:
+    row["b1"][plant] = _run_b1_creep(comp, butter, plant)
+  for _group, maneuver in _CREEP_SCENARIOS:
+    for plant in _CREEP_PLANTS:
+      logs = _run_scenario_creep(comp, maneuver, butter, plant)
+      row["scen"][(maneuver.title, plant)] = _butter_metrics(logs, maneuver.title, butter)
+  return row
+
+
+def _creep_failures(label, row, b0, comp0):
+  """Criteria a-d for one sweep row (label; B0 is the reference and is skipped)."""
+  fails = []
+  cur, ref, c0 = _creep_flat(row), _creep_flat(b0), _creep_flat(comp0)
+
+  def fail(msg):
+    fails.append(f"{label}: {msg}")
+
+  for (title, plant), m in sorted(cur.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+    r, z = ref[(title, plant)], c0[(title, plant)]
+
+    if plant == "scc":
+      # a) no extra slow roll vs B0; b1 and the b2 proxy must stay <= 1.0 s.
+      # A scenario where neither run stops (s2: the lead pulls away) has no
+      # tail metrics and is skipped.
+      r_tail, m_tail = r.get("tail_s"), m.get("tail_s")
+      if m_tail is None and r_tail is None:
+        pass
+      elif m_tail is None:
+        fail(f"a) {title} {plant}: B1 never stops (B0 tail_s {r_tail})")
+      elif r_tail is not None and m_tail > r_tail + 0.3 + 1e-9:
+        fail(f"a) {title} {plant}: B1 tail_s {m_tail} > B0 {r_tail} + 0.3")
+      if title in ("b1", _B2_PROXY.title) and m_tail is not None and m_tail > 1.0 + 1e-9:
+        fail(f"a) {title} {plant}: tail_s {m_tail} > 1.0 s")
+
+      # b) the comp must not add jolt vs the comp-0 row (the SCC stop assist
+      # pins the end decel, so the raw B0 baseline would test the plant).
+      z_net, m_net = z.get("end_net"), m.get("end_net")
+      if m_net is None and z_net is None:
+        pass
+      elif m_net is None:
+        fail(f"b) {title} {plant}: B1 end_net missing (comp 0 {z_net})")
+      elif z_net is not None and m_net > z_net + 0.05 + 1e-9:
+        fail(f"b) {title} {plant}: B1 end_net {m_net} > comp 0 {z_net} + 0.05")
+
+    if plant == "ideal":
+      # b) the jolt removal must survive vs the B0 baseline.
+      r_net, m_net = r.get("end_net"), m.get("end_net")
+      if m_net is None and r_net is None:
+        pass
+      elif m_net is None:
+        fail(f"b) {title} {plant}: B1 end_net missing (B0 {r_net})")
+      elif r_net is not None and m_net > max(0.25, r_net - 0.2) + 1e-9:
+        fail(f"b) {title} {plant}: B1 end_net {m_net} > max(0.25, B0 {r_net} - 0.2)")
+
+    # c) the stop point must not move.
+    g1, g0 = m.get("final_gap_m"), r.get("final_gap_m")
+    if g1 is None or g0 is None:
+      fail(f"c) {title} {plant}: final gap missing ({g1} vs B0 {g0})")
+    elif abs(g1 - g0) > 0.5 + 1e-9:
+      fail(f"c) {title} {plant}: |B1 {g1} - B0 {g0}| > 0.5 m")
+    if plant == "ideal":
+      z_gap, z_net = z.get("final_gap_m"), z.get("end_net")
+      if z_gap is not None and g1 is not None and abs(g1 - z_gap) > 0.2 + 1e-9:
+        fail(f"c) {title} {plant}: B1 final gap {g1} differs from comp 0 {z_gap} by > 0.2 m")
+      if z_net is not None and m.get("end_net") is not None and abs(m["end_net"] - z_net) > 0.05 + 1e-9:
+        fail(f"c) {title} {plant}: B1 end_net {m['end_net']} differs from comp 0 {z_net} by > 0.05 m/s^2")
+
+    # d) safety everywhere; lead-decel min gap vs the comp-0 row.
+    if m.get("collision"):
+      fail(f"d) {title} {plant}: collision (min gap {m.get('min_gap_m')})")
+    if m.get("fcw_steps", 0):
+      fail(f"d) {title} {plant}: FCW {m['fcw_steps']} planner ticks")
+    if title in _CAP_LEAD_DECEL:
+      mg, zg = m.get("min_gap_m"), z.get("min_gap_m")
+      if mg is None or zg is None:
+        fail(f"d) {title} {plant}: min gap missing ({mg} vs comp 0 {zg})")
+      elif mg < zg - 0.3 - 1e-9:
+        fail(f"d) {title} {plant}: min gap {mg} < comp 0 {zg} - 0.3")
+  return fails
+
+
+def test_butter_creep_sweep():
+  out_path = os.environ.get("BUTTER_CREEP_SWEEP_OUT")
+  if not out_path:
+    pytest.skip("creep sweep runs only when BUTTER_CREEP_SWEEP_OUT is set")
+  assert len(_CREEP_SCENARIOS) == len(_CAP_SWEEP_SCENARIOS) + 1, "b2 proxy missing from the sweep scenarios"
+
+  data = {}
+  for label, comp, butter in _CREEP_SWEEP_SPEC:
+    data[label] = _collect_creep_row(comp, butter)
+    print(f"CREEP-SWEEP {label}: collected")
+  b0, comp0 = data["B0"], data["comp0"]
+
+  rows = []
+  for label, comp, butter in _CREEP_SWEEP_SPEC:
+    fails = [] if label == "B0" else _creep_failures(label, data[label], b0, comp0)
+    rows.append({
+      "label": label, "comp": comp, "butter": butter,
+      "all_pass": not fails, "failures": fails,
+      "b1": {plant: data[label]["b1"][plant] for plant in _CREEP_PLANTS},
+      "scenarios": {m.title: {plant: data[label]["scen"][(m.title, plant)]
+                              for plant in _CREEP_PLANTS}
+                    for _g, m in _CREEP_SCENARIOS},
+    })
+    line = f"CREEP-SWEEP {label}: pass={not fails} fails={len(fails)}"
+    if fails:
+      line += f" first={fails[0]}"
+    print(line)
+    for title, runs in rows[-1]["scenarios"].items():
+      m = runs["scc"]
+      print(f'  scc {title[:46]:46s} tail={m.get("tail_s")} end={m.get("end_net")} pre={m.get("end_net_pre")} gap={m.get("final_gap_m")}')
+    m = rows[-1]["b1"]["scc"]
+    print(f'  scc b1 tail={m.get("tail_s")} end={m.get("end_net")} pre={m.get("end_net_pre")} gap={m.get("final_gap_m")} crawl={m.get("crawl_time_s")}')
+
+  candidates = [r for r in rows if r["label"] != "B0"]
+  passing = [r for r in candidates if r["all_pass"]]
+  chosen = min(passing, key=lambda r: r["comp"]) if passing else None
+  closest = sorted((r for r in candidates if not r["all_pass"]), key=lambda r: len(r["failures"]))[:3]
+  if chosen is not None:
+    print(f"CREEP-PICK: {chosen['label']}")
+  else:
+    print("CREEP-PICK: none passed; per-candidate failure counts:")
+    for r in closest:
+      print(f"  {r['label']}: {len(r['failures'])} failures")
+
+  table = {
+    "criteria": list(_CREEP_SWEEP_CRITERIA),
+    "rows": rows,
+    "chosen": chosen,
+    "closest": closest,
+    "b2_proxy": _B2_PROXY.title,
+    "note": ("desktop closed-loop simulation only; end_net is the actual plant accel after "
+             "lag+creep+SCC; no vehicle validation"),
+  }
+  out_dir = os.path.dirname(out_path)
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
+
+  collisions = [f'{r["label"]} {title} {plant}'
+                for r in rows for title, runs in r["scenarios"].items()
+                for plant, metrics in runs.items() if metrics.get("collision")]
+  collisions += [f'{r["label"]} b1 {plant}' for r in rows for plant in _CREEP_PLANTS
+                 if r["b1"][plant].get("collision")]
+  assert not collisions, "creep sweep collision: " + "; ".join(collisions[:5])
 
 
 def test_write_butter_real_table():

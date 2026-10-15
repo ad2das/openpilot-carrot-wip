@@ -320,6 +320,11 @@ class LongControl:
       if self.butter_stop and not self._butter_standstill_confirmed and butter_floor_value is not None:
         # The taper only limits braking while the car is still rolling.
         output_accel = max(output_accel, butter_floor_value)
+      if self.butter_stop and not self._butter_standstill_confirmed and active and \
+          not CS.gasPressed and output_accel < 0.0:
+        # Same Palisade idle-creep compensation as the pid branch: only while
+        # rolling toward the stop, never after standstill is confirmed.
+        output_accel = max(output_accel - butter_stop_module.creep_comp(float(CS.vEgo)), accel_limits[0])
       if self.butter_stop and self._butter_standstill_confirmed:
         # Creep guard: while holding, never let the car creep toward the lead.
         if float(CS.vEgo) > CREEP_V and not bool(getattr(CS, "gasPressed", False)):
@@ -370,6 +375,12 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
         output_accel = min(0.0, max(output_accel, butter_floor_value))
+
+      if self.butter_stop and active and not CS.gasPressed and output_accel < 0.0:
+        # Palisade idle creep (~+0.25 m/s^2 below ~1.5 m/s) cancels weak brake
+        # requests; compensate so the net deceleration follows the plan / taper.
+        # Only adds braking, only while rolling, only with ButterStop.
+        output_accel = max(output_accel - butter_stop_module.creep_comp(float(CS.vEgo)), accel_limits[0])
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel, a_target_ff, j_target_now

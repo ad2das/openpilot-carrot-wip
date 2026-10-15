@@ -261,21 +261,24 @@ class ButterStopLoop:
       # "ButterStop code path absent": neutralize every ON-only primitive the
       # real loop reaches so the controller behaves exactly like the OFF one.
       # The _NeutralCarrot wrapper also suppresses the v3 long_mpc stop shift.
-      saved = (longcontrol.butter_floor, longcontrol.CREEP_V, longcontrol.HOLD_RAMP)
+      saved = (longcontrol.butter_floor, longcontrol.CREEP_V, longcontrol.HOLD_RAMP,
+               butter_stop.CREEP_COMP_ACCEL)
       longcontrol.butter_floor = _no_floor
       longcontrol.CREEP_V = float("inf")
       longcontrol.HOLD_RAMP = self.cp.stoppingDecelRate
+      butter_stop.CREEP_COMP_ACCEL = 0.0
     try:
       return self._run_loop()
     finally:
       if self.neutralize:
-        longcontrol.butter_floor, longcontrol.CREEP_V, longcontrol.HOLD_RAMP = saved
+        (longcontrol.butter_floor, longcontrol.CREEP_V, longcontrol.HOLD_RAMP,
+         butter_stop.CREEP_COMP_ACCEL) = saved
 
   def _run_loop(self):
     maneuver = self.maneuver
     dt = DT_CTRL
     frames = int(round(maneuver.duration / dt))
-    logs = np.zeros((frames + 1, 13))
+    logs = np.zeros((frames + 1, 14))
     msgs = None
     plan_view = None
     fcw = 0.0
@@ -328,6 +331,7 @@ class ButterStopLoop:
           applied += plant_creep(self.ego_v)
       else:
         applied = accel
+      applied_pre_scc = applied
       if self.scc_stop and self.long_control.long_control_state == LongCtrlState.stopping:
         # SCC owns the stop in the stopping state: at least -0.6 m/s^2 until
         # standstill, then hold.
@@ -343,7 +347,7 @@ class ButterStopLoop:
                      floor_val if floor_val is not None else 0.0, bound_code,
                      floor_raw if floor_raw is not None else 0.0,
                      a_end if a_end is not None else 0.0,
-                     applied, float(self.long_control.long_control_state), fcw)
+                     applied, float(self.long_control.long_control_state), fcw, applied_pre_scc)
       self.ego_v = max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       self.lead_x = self.lead_x + v_lead * dt
@@ -368,21 +372,33 @@ def compute_metrics(logs, name, butter):
   floor_raw_switches = int(np.sum(np.abs(np.diff(floor_raw_seq)) > 0.01)) if floor_raw_seq.size > 1 else 0
   bound_seq = logs[:, 7][logs[:, 5] > 0.5]
   bound_switches = int(np.sum(np.diff(bound_seq.astype(int)) != 0)) if bound_seq.size > 1 else 0
+  bound_lead_frac = float(np.mean(bound_seq > 0.5)) if bound_seq.size else None
   if stopped:
     ts = t[stop_i]
     window = (t >= ts - 0.5) & (t <= ts)
     accel_last = float(np.mean(np.abs(a[window]))) if window.any() else None
+    applied = logs[:, 10]
+    applied_pre = logs[:, 13]
+    end_net = float(np.mean(np.abs(applied[window]))) if window.any() else None
+    end_net_pre = float(np.mean(np.abs(applied_pre[window]))) if window.any() else None
+    tail_window = (t >= max(0.0, ts - 6.0)) & (t <= ts)
+    step = float(t[1] - t[0]) if t.size > 1 else 0.01
+    tail_s = float(np.sum((v > 0.05) & (v < 0.5) & tail_window)) * step
     jerk_window = (t >= max(0.0, ts - 1.5)) & (t <= ts)
     peak_jerk = float(np.max(np.abs(jerk[jerk_window]))) if jerk_window.any() else None
     below3 = np.flatnonzero(v < 3.0)
     time_3 = float(ts - t[below3[0]]) if below3.size else None
   else:
     accel_last = peak_jerk = time_3 = None
+    end_net = end_net_pre = tail_s = None
   return {
     "name": name, "butter": int(butter),
     "final_gap_m": round(final_gap, 3), "min_gap_m": round(min_gap, 3),
     "collision": bool(min_gap < COLLISION_GAP_M), "stopped": stopped,
     "accel_last_0.5s_mean_abs": None if accel_last is None else round(accel_last, 4),
+    "end_net": None if end_net is None else round(end_net, 4),
+    "end_net_pre": None if end_net_pre is None else round(end_net_pre, 4),
+    "tail_s": None if tail_s is None else round(tail_s, 3),
     "peak_jerk_last_1.5s_abs": None if peak_jerk is None else round(peak_jerk, 4),
     "peak_jerk_run_abs": round(peak_jerk_run, 4),
     "time_3ms_to_standstill_s": None if time_3 is None else round(time_3, 3),
@@ -391,6 +407,8 @@ def compute_metrics(logs, name, butter):
     "floor_relax_switches": floor_switches,
     "floor_raw_switches": floor_raw_switches,
     "bound_switches": bound_switches,
+    "bound_lead_frac": None if bound_lead_frac is None else round(bound_lead_frac, 3),
+    "fcw_steps": int(np.sum(logs[:, 12] > 0.5)),
   }
 
 
@@ -455,6 +473,13 @@ _S3B.radar_noise_seed = 1
 _S3C = _stopped_lead(40, 60, 25.0, title="s3c noisy radar std 0.15 seed 2 stopped lead 40 km/h gap 60 m")
 _S3C.radar_noise_std = 0.15
 _S3C.radar_noise_seed = 2
+
+# b2 proxy for the no-lead (traffic-light style) stop: the harness can only
+# stop the car on a lead, so this places a stationary lead at the a-group's
+# 5.4 s approach spacing (50 km/h -> 75 m) so the taper budget comes from the
+# plan rather than the lead bound. Bound usage is recorded per step as
+# bound_lead_frac so the sweep can state which bound actually applied.
+_B2_PROXY = _stopped_lead(50, 75, 35.0, title="b2 proxy no-lead 50 km/h stationary lead gap 75 m")
 
 _CASES = ([("a", m) for m in _A_SCENARIOS] + [("b", _B_SCENARIO)]
           + [("c", m) for m in _C_SCENARIOS]

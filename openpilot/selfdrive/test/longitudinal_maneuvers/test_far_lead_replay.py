@@ -431,7 +431,7 @@ class FarLeadLoop:
     max_frames = profile.n_steps * PLANNER_PERIOD
     log_t, log_v, log_accel, log_x = [], [], [], []
     log_gap, log_active, log_vlead, log_atarget = [], [], [], []
-    log_a_actual, log_should_stop, log_lc_state = [], [], []
+    log_a_actual, log_a_actual_pre, log_should_stop, log_lc_state = [], [], [], []
     log_desired_distance = []
     fcw_steps = 0
     msgs = None
@@ -473,6 +473,7 @@ class FarLeadLoop:
           applied += plant_creep(self.ego_v)
       else:
         applied = accel
+      applied_pre_scc = applied
       if self.scc_stop and self.long_control.long_control_state == LongCtrlState.stopping:
         # SCC owns the stop in the stopping state: at least -0.6 m/s^2 until
         # standstill, then hold.
@@ -496,6 +497,7 @@ class FarLeadLoop:
       log_vlead.append(v_lead)
       log_atarget.append(float(plan_view.aTarget))
       log_a_actual.append(applied)
+      log_a_actual_pre.append(applied_pre_scc)
       log_should_stop.append(bool(plan_view.shouldStop))
       log_lc_state.append(int(self.long_control.long_control_state))
       log_desired_distance.append(float(plan_view.desiredDistance))
@@ -512,7 +514,8 @@ class FarLeadLoop:
     return {
       "t": log_t, "v": log_v, "accel": log_accel, "x": log_x,
       "gap": log_gap, "active": log_active, "v_lead": log_vlead, "a_target": log_atarget,
-      "a_actual": log_a_actual, "should_stop": log_should_stop, "lc_state": log_lc_state,
+      "a_actual": log_a_actual, "a_actual_pre": log_a_actual_pre,
+      "should_stop": log_should_stop, "lc_state": log_lc_state,
       "desired_distance": log_desired_distance,
       "fcw_steps": fcw_steps, "stopped": bool(stopped or self.ego_v < 0.05),
     }
