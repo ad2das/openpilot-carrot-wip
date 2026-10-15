@@ -147,6 +147,18 @@ def test_obsolete_lead_response_settings_are_removed(settings, params):
   assert all(name not in params_keys for name in removed)
 
 
+def test_obsolete_carrot_tlv_mode_setting_is_removed(settings, params):
+  removed = "CarrotTlvMode"
+  by_name = {p["name"] for p in params}
+  assert removed not in by_name
+  assert all(
+    removed not in group.get("params", [])
+    for category in settings["menu"]
+    for section in category.get("groups", [])
+    for group in section.get("groups", [])
+  )
+
+
 def test_automatic_driving_mode_exposes_manual_normal_and_eco_choices(params):
   by_name = {p["name"]: p for p in params}
   automatic = by_name["MyDrivingModeAuto"]

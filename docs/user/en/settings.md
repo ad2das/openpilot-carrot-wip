@@ -39,7 +39,7 @@ On a fresh install, `Tools > Web Settings > Layout` starts with **Area 1 full sc
 
 Automatic drive-log upload is an off-by-default toggle in `Tools > Web Settings > Upload`; when enabled, it sends rlog and qcamera of every finished 1-minute segment to the automatic upload server, also while driving. The automatic upload server field defaults to the owner's receiver and can be edited. If it is set to the shared default upload server, nothing is sent. Manual `Logs > Dashcam` upload keeps using the normal upload server setting.
 
-When `CarrotTlvMode` (Vision traffic lights, experimental) is `1`, the recorder's traffic-light photos (640x320 JPEG and index.jsonl, no location data) are sent to the same automatic upload server as folder `tlvrec--<session>`, after drive segments. A session starts every 10 minutes and is uploaded once it has been quiet for 2 minutes, and a completely uploaded session is deleted from the device. The drive logs themselves are not deleted. Nothing is sent or deleted while the toggle is off or the URL is the shared default server.
+When `TrafficLightDetectMode` (traffic light detection) is `1` or more (C3X), the recorder's traffic-light photos (640x320 JPEG and index.jsonl, no location data) are sent to the same automatic upload server as folder `tlvrec--<session>`, after drive segments. A session starts every 10 minutes and is uploaded once it has been quiet for 2 minutes, and a completely uploaded session is deleted from the device. The drive logs themselves are not deleted. Nothing is sent or deleted while the signal detection is off or the URL is the shared default server.
 
 ## Using the Settings screen
 
@@ -200,7 +200,7 @@ Force-sensor trends do not establish loss of hand contact or driver consent to h
 | [Road speed limit](speed-deceleration.md#road-speed-limit) | `AutoRoadSpeedLimitOffset`, `AutoRoadSpeedAdjust`, `AutoSpeedUptoRoadSpeedLimit` | Desired-speed adjustment from the road limit |
 | [Speed bumps](speed-deceleration.md#speed-bump) | `AutoNaviSpeedBumpTime`, `AutoNaviSpeedBumpSpeed`, `AutoNaviSpeedBumpEndDistance` | Completion time, crossing speed, and early-release distance |
 | [Curves and turns](speed-deceleration.md#curve-turn) | `AutoCurveSpeedFactor`, `AutoCurveSpeedLowerLimit`, `TurnSpeedControlMode`, `MapTurnSpeedFactor`, `ApplyModelSpeed` | Curve slowing from curvature and distance, prompt recovery after confirmed easing, and route-turn speed |
-| [Traffic lights](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust`, `CarrotTlvMode` | Stop/go detection, stop-position adjustment, and automatic stopped-vehicle alignment |
+| [Traffic lights](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust` | Stop/go detection, stop-position adjustment, and automatic stopped-vehicle alignment |
 
 `AutoNaviSpeedCtrlMode` is `0` off, `1` fixed speed cameras, `2` cameras plus speed bumps, or `3` those events plus mobile-camera events.
 
@@ -212,7 +212,7 @@ While external navigation is connected, deceleration, countdowns, and navigation
 
 `TrafficLightDetectMode` is `0` off, `1` stop detection, or `2` stop and go detection. This is model-based assistance; the driver must always verify the signal.
 
-`CarrotTlvMode` is `0` off or `1` record and DSP test. It has no effect on driving control.
+When TrafficLightDetectMode is 1 or more, the C3X camera traffic-light vision runs automatically and feeds stops (1) or stops and starts (2). Set TrafficLightDetectMode to 0 to turn it off.
 
 ### Cruise and following gap — 29 settings overall, 26 on Hyundai/Kia/Genesis
 

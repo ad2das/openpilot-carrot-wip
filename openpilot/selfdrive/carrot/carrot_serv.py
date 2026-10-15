@@ -218,8 +218,8 @@ class CarrotServ:
     self.traffic_light_count = -1
     self.traffic_state = 0
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
-    self.tlv_mode = 0           # CarrotTlvMode cached; refreshed at most 1/s
-    self.tlv_mode_poll = 0.0
+    self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
+    self.tlv_detect_mode_poll = 0.0
 
     self.left_spd_sec = 100
     self.left_tbt_sec = 100
@@ -391,16 +391,19 @@ class CarrotServ:
 
   def _update_tlv_fusion(self, sm):
     """Feed the confirmed carrotTlv relevant track into the existing traffic_light()
-    path (only when CarrotTlvMode == 2). The tlvd process publishes the relevant
-    track's current detection as dets[0]; coordinates are full-frame pixels."""
+    path (only when TrafficLightDetectMode >= 1; W129: vision is automatic while
+    tlvd runs). Downstream, carrot_functions enforces mode 1 = stop only
+    (trafficLightDetectMode != 1 gate there). The tlvd process publishes the
+    relevant track's current detection as dets[0]; coordinates are full-frame
+    pixels."""
     now = time.monotonic()
-    if now - self.tlv_mode_poll >= 1.0:
-      self.tlv_mode_poll = now
+    if now - self.tlv_detect_mode_poll >= 1.0:
+      self.tlv_detect_mode_poll = now
       try:
-        self.tlv_mode = self.params.get_int("CarrotTlvMode")
+        self.tlv_detect_mode = self.params.get_int("TrafficLightDetectMode")
       except Exception:
-        self.tlv_mode = 0
-    if self.tlv_mode != 2:
+        self.tlv_detect_mode = 0
+    if self.tlv_detect_mode < 1:
       return
     if not (sm.seen['carrotTlv'] and sm.alive['carrotTlv'] and sm.valid['carrotTlv']):
       return

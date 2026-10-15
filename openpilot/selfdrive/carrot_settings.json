@@ -276,7 +276,6 @@
               "zh": "信号灯",
               "params": [
                 "TrafficLightDetectMode",
-                "CarrotTlvMode",
                 "TrafficStopDistanceAdjust"
               ]
             }
@@ -3411,32 +3410,16 @@
       "group": "감속제어",
       "name": "TrafficLightDetectMode",
       "title": "신호감지 기능",
-      "descr": "0:신호감지안함\n 1:신호정지만 감지\n 2:신호정지/출발 모두",
+      "descr": "0:신호감지안함\n 1:신호정지만 감지\n 2:신호정지/출발 모두\n (1 이상이면 카메라 신호등 비전 인식도 자동으로 함께 동작)",
       "egroup": "SPEED",
       "etitle": "TrafficLightDetectMode",
-      "edescr": "0:None,1:Stopping only, 2:Stop & Go",
+      "edescr": "0:None,1:Stopping only, 2:Stop & Go (1+ also runs camera traffic-light vision automatically)",
       "cgroup": "速度控制",
       "ctitle": "红绿灯检测模式",
-      "cdescr": "0: 无, 1: 仅停止, 2: 停止和起步",
+      "cdescr": "0: 无, 1: 仅停止, 2: 停止和起步 (1及以上同时自动启用摄像头红绿灯视觉识别)",
       "min": 0,
       "max": 2,
       "default": 2,
-      "unit": 1
-    },
-    {
-      "group": "감속제어",
-      "name": "CarrotTlvMode",
-      "title": "신호등 비전 인식(실험)",
-      "descr": "0:끔\n 1:기록·DSP시험 (주행에는 영향 없음, 신호감지 기능이 꺼져 있으면 동작 안 함)",
-      "egroup": "SPEED",
-      "etitle": "Vision traffic lights (experimental)",
-      "edescr": "0:Off, 1:Record & DSP test (no effect on driving; needs TrafficLightDetectMode)",
-      "cgroup": "速度控制",
-      "ctitle": "视觉红绿灯识别(实验)",
-      "cdescr": "0: 关闭, 1: 记录·DSP测试 (不影响驾驶)",
-      "min": 0,
-      "max": 1,
-      "default": 0,
       "unit": 1
     },
     {

@@ -124,25 +124,21 @@ def _signal_color_requested() -> bool:
     return False
 
 def enable_tlvd(started, params, CP: car.CarParams) -> bool:
-  # On-device traffic-light detector: onroad only and off by default. It also
-  # requires traffic-light detection (TrafficLightDetectMode) to be on, so
-  # turning that off in Carrot Web stops tlvd at the next manager pass.
+  # On-device traffic-light detector: onroad only, on whenever TrafficLightDetectMode
+  # is 1 or more (W129: vision follows TrafficLightDetectMode alone). The
+  # CarrotTlvDisabled latch (crash loop / rss_hard) suppresses restarts until the
+  # next manager start; turning TrafficLightDetectMode off stops tlvd at the next
+  # manager pass.
   try:
-    return (started and params.get_int("CarrotTlvMode") >= 1
-            and params.get_int("TrafficLightDetectMode") >= 1
+    return (started and params.get_int("TrafficLightDetectMode") >= 1
+            and not params.get_bool("CarrotTlvDisabled")
             and not _signal_color_requested())
   except Exception:
     return False
 
 def enable_tlv_dsp_probe(started, params, CP: car.CarParams) -> bool:
-  # Onroad one-time Hexagon DSP probe (W70 decision data): the process idles
-  # until the car is parked, then runs. The result file for the current commit
-  # latches it off; see .../tlv/dsp_probe.py should_run()/run_probe().
-  try:
-    from openpilot.selfdrive.carrot.tlv import dsp_probe
-    return dsp_probe.should_run(started, params)
-  except Exception:
-    return False
+  # DSP path parked 2026-10-14 (AGNOS has no lld; tinygrad DSPCompiler unusable): the probe never runs. Kept for a future DSP revisit.
+  return False
 
 procs = [
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
@@ -223,7 +219,7 @@ procs = [
   # Launch a fresh interpreter instead of forking that running manager state.
   PythonProcess("xiaoge_data", "openpilot.selfdrive.carrot.xiaoge_data", enable_xiaoge_data, spawn=True),
 
-  # On-device traffic light detector (CarrotTlvMode 1=shadow, 2=active). Cores 1-3, SCHED_IDLE.
+  # On-device traffic light detector (W129: on whenever TrafficLightDetectMode >= 1). Cores 1-3, SCHED_IDLE.
   # Spawn via the stdlib-only launcher: a mid-drive start must not fork the running manager
   # (field hang, route 0000043e), and tlvd_launch sets the env before tlvd imports numpy/tinygrad.
   PythonProcess("tlvd", "openpilot.selfdrive.carrot.tlv.tlvd_launch", enable_tlvd, restart_if_crash=True, spawn=True),

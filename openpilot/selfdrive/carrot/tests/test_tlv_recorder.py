@@ -202,12 +202,12 @@ def test_ring_full_drops_and_counts(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# mode gating (tlvd integration)
+# recorder readiness (tlvd integration; W129: no mode gate)
 # ---------------------------------------------------------------------------
 
 class FakeParams:
-  def __init__(self, values) -> None:
-    self._values = dict(values)
+  def __init__(self, values=None) -> None:
+    self._values = dict(values or {})
 
   def get_int(self, key):
     value = self._values.get(key)
@@ -223,100 +223,44 @@ class FakeParams:
     self._values[key] = value
 
 
-def test_mode2_never_constructs_recorder(tmp_path):
-  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 2, "CarrotTlvBackend": "null"}),
-                          recorder_root=str(tmp_path))
-  try:
-    assert runner.recorder is None
-  finally:
-    runner.close_recorder()
-
-
-def test_mode1_constructs_recorder_with_injected_root(tmp_path):
-  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1, "CarrotTlvBackend": "null"}),
+def test_recorder_constructs_with_injected_root(tmp_path):
+  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvBackend": "null"}),
                           recorder_root=str(tmp_path))
   try:
     assert runner.recorder is not None
+    assert runner.recorder.active is True
   finally:
     runner.close_recorder()
 
 
-def test_mode1_without_root_stays_off_on_pc():
-  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1, "CarrotTlvBackend": "null"}))
+def test_recorder_stays_off_on_pc_without_root():
+  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvBackend": "null"}))
   try:
     assert runner.recorder is None
   finally:
     runner.close_recorder()
 
 
-def test_mode_1_to_2_stops_recording(tmp_path):
-  """A live 1 -> 2 switch must stop recording at the next 1 s poll."""
-  params = FakeParams({"CarrotTlvMode": 1, "CarrotTlvBackend": "null"})
-  runner = tlvd.TlvRunner(params, recorder_root=str(tmp_path))
+def test_recorder_never_reads_carrot_tlv_mode(tmp_path):
+  """W129: the recorder is wanted whenever tlvd runs; a params object whose
+  CarrotTlvMode read raises must not affect recorder construction."""
+  class NoModeParams(FakeParams):
+    def get_int(self, key):
+      if key == "CarrotTlvMode":
+        raise RuntimeError("CarrotTlvMode must not be read")
+      return super().get_int(key)
+
+  runner = tlvd.TlvRunner(NoModeParams({"CarrotTlvBackend": "null"}),
+                          recorder_root=str(tmp_path))
   try:
-    rec = runner.recorder
-    assert rec is not None and rec.active is True
+    assert runner.recorder is not None
+    assert runner.recorder.active is True
     t = time.monotonic() + 60.0
     runner._poll_system(t)
-    assert offer(rec, 100.0, dets=[make_det()]) is True
-    assert rec.wait_idle()
-    assert rec.stats()["saved"] == 1
-
-    params._values["CarrotTlvMode"] = 2
-    runner._poll_system(t + 2.0)
-    assert rec.active is False
-    assert offer(rec, 101.0, dets=[make_det()]) is False
-    assert rec.wait_idle()
-    assert rec.stats()["saved"] == 1
-  finally:
-    runner.close_recorder()
-
-
-def test_mode_2_to_1_starts_recording(tmp_path):
-  """A tlvd started in mode 2 constructs the recorder lazily on a mode-1 poll."""
-  params = FakeParams({"CarrotTlvMode": 2, "CarrotTlvBackend": "null"})
-  runner = tlvd.TlvRunner(params, recorder_root=str(tmp_path))
-  try:
-    assert runner.recorder is None
-    t = time.monotonic() + 60.0
-    runner._poll_system(t)
-    assert runner.recorder is None
-
-    params._values["CarrotTlvMode"] = 1
-    runner._poll_system(t + 2.0)
-    rec = runner.recorder
-    assert rec is not None and rec.active is True
-    assert offer(rec, 100.0, dets=[make_det()]) is True
-    assert rec.wait_idle()
-    assert rec.stats()["saved"] == 1
-  finally:
-    runner.close_recorder()
-
-
-def test_mode_1_to_2_to_1_roundtrip(tmp_path):
-  """Reactivation records again without a spurious state-transition save."""
-  params = FakeParams({"CarrotTlvMode": 1, "CarrotTlvBackend": "null"})
-  runner = tlvd.TlvRunner(params, recorder_root=str(tmp_path))
-  try:
-    rec = runner.recorder
-    assert rec is not None
-    t = time.monotonic() + 60.0
-
-    assert offer(rec, 100.0, dets=[make_det()]) is True
-    assert rec.wait_idle()
-
-    params._values["CarrotTlvMode"] = 2
-    runner._poll_system(t)
-    assert rec.active is False
-    assert offer(rec, 101.0, dets=[make_det()]) is False
-
-    params._values["CarrotTlvMode"] = 1
-    runner._poll_system(t + 2.0)
-    assert rec.active is True
-    assert offer(rec, 102.0, dets=[make_det()]) is True
-    assert rec.wait_idle()
-    assert rec.stats()["saved"] == 2
-    assert [m["reason"] for m in read_index(str(tmp_path))] == ["light", "light"]
+    assert runner.recorder.active is True
+    assert offer(runner.recorder, 100.0, dets=[make_det()]) is True
+    assert runner.recorder.wait_idle()
+    assert runner.recorder.stats()["saved"] == 1
   finally:
     runner.close_recorder()
 

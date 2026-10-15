@@ -326,7 +326,7 @@ def _patch_bench_time(monkeypatch):
 
 
 def test_main_aborts_tlvd_phases_when_traffic_light_detect_off(monkeypatch, capsys):
-  params = _MainFakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 0, "CarrotTlvBackend": "null"})
+  params = _MainFakeParams({"CarrotTlvDisabled": True, "TrafficLightDetectMode": 0, "CarrotTlvBackend": "null"})
   _install_main_stubs(monkeypatch, params)
   _patch_bench_time(monkeypatch)
   calls = []
@@ -337,11 +337,12 @@ def test_main_aborts_tlvd_phases_when_traffic_light_detect_off(monkeypatch, caps
   err = capsys.readouterr().err
   assert "TrafficLightDetectMode=0" in err
   assert "tlvd will not start" in err
-  assert ("CarrotTlvMode", 1) not in params.writes
+  assert ("CarrotTlvDisabled", False) not in params.writes  # never unlatched past the abort
+  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
 
 
 def test_main_runs_phases_when_traffic_light_detect_enabled(monkeypatch, capsys):
-  params = _MainFakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 2, "CarrotTlvBackend": "null"})
+  params = _MainFakeParams({"CarrotTlvDisabled": True, "TrafficLightDetectMode": 2, "CarrotTlvBackend": "null"})
   sm = types.SimpleNamespace(seen={"carrotTlv": True}, update=lambda *a, **k: None)
   _install_main_stubs(monkeypatch, params, sm=sm)
   _patch_bench_time(monkeypatch)
@@ -354,6 +355,8 @@ def test_main_runs_phases_when_traffic_light_detect_enabled(monkeypatch, capsys)
   assert calls == [5.0, 6.0]
   payload = json.loads(capsys.readouterr().out)
   assert payload["verdict"] == "pass"
-  assert payload["parameters"]["original_mode"] == "2"
-  assert ("CarrotTlvMode", 1) in params.writes
-  assert params.values["CarrotTlvMode"] == 2  # restore wrote the original back
+  assert payload["parameters"]["original_disabled"] == "True"
+  assert ("CarrotTlvDisabled", True) in params.writes  # baseline latched tilvd off
+  assert ("CarrotTlvDisabled", False) in params.writes  # tlvd phase released it
+  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
+  assert params.values["CarrotTlvDisabled"] is True  # restore wrote the original back

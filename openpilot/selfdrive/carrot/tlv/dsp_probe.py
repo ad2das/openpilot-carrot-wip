@@ -1,8 +1,8 @@
 """Onroad-while-parked one-time Hexagon DSP probe for the carrot TLV detector.
 
 Runs as the manager process "tlv_dsp_probe" while the car is started
-(onroad). The manager starts it when started AND CarrotTlvMode >= 1 AND
-TrafficLightDetectMode >= 1 and the result file for the current git commit does
+(onroad). The manager starts it when started AND TrafficLightDetectMode >= 1
+(W129: no separate vision toggle) and the result file for the current git commit does
 not exist; after the result is written the process exits 0 and the manager does
 not restart it. There is no offroad window (the car cuts OBD power at ignition
 off), so the probe runs while PARKED during a normal drive.
@@ -228,7 +228,7 @@ def should_run(started: bool, params) -> bool:
   if not started or _probe_disabled_by_lost_attempts or _signal_color_requested():
     return False
   try:
-    if params.get_int("CarrotTlvMode") < 1 or params.get_int("TrafficLightDetectMode") < 1:
+    if params.get_int("TrafficLightDetectMode") < 1:
       return False
   except Exception:
     return False

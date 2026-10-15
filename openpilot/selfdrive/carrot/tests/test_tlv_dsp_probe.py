@@ -157,11 +157,10 @@ def _run_paths(tmp_path, name="abc1234"):
 # ---------------------------------------------------------------------------
 
 def test_should_run_truth_table(probe_root):
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  params = FakeParams({"TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is True  # onroad; PARKED is gated by run_probe
   assert dsp_probe.should_run(False, params) is False  # manager not started
-  assert dsp_probe.should_run(True, FakeParams({"CarrotTlvMode": 0, "TrafficLightDetectMode": 1})) is False
-  assert dsp_probe.should_run(True, FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 0})) is False
+  assert dsp_probe.should_run(True, FakeParams({"TrafficLightDetectMode": 0})) is False
   assert dsp_probe.should_run(True, FakeParams({})) is False  # missing -> off
 
   probe_root.mkdir(parents=True, exist_ok=True)
@@ -171,7 +170,7 @@ def test_should_run_truth_table(probe_root):
 
 def test_should_run_false_when_latched(probe_root, monkeypatch):
   monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", True)
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  params = FakeParams({"TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is False
 
 
@@ -183,13 +182,13 @@ def _install_fake_signal_color_module(monkeypatch, requested):
 
 def test_should_run_disabled_when_signal_color_requested(probe_root, monkeypatch):
   _install_fake_signal_color_module(monkeypatch, True)
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  params = FakeParams({"TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is False
 
 
 def test_should_run_unchanged_when_signal_color_not_requested(probe_root, monkeypatch):
   _install_fake_signal_color_module(monkeypatch, False)
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  params = FakeParams({"TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is True
 
 
@@ -924,7 +923,7 @@ def test_main_latches_after_three_same_step_losses(probe_root, monkeypatch):
   assert not os.path.exists(dsp_probe.attempt_path(result))
   assert not os.path.exists(dsp_probe.progress_path(result))
   os.unlink(result)
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 1})
+  params = FakeParams({"TrafficLightDetectMode": 1})
   assert dsp_probe.should_run(True, params) is False  # latched, not the result file
 
 

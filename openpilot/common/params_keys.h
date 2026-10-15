@@ -387,10 +387,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DriverMonitoringSessionDisabled", {CLEAR_ON_MANAGER_START | CLEAR_ON_IGNITION_ON, BOOL}},
     {"DriverMonitoringMode", {PERSISTENT, INT, "0"}},
     {"CarrotVisionEnabled", {PERSISTENT, BOOL, "0"}},
-    {"CarrotTlvMode", {PERSISTENT, INT, "0"}},  // 0=off, 1=shadow (detect+publish only), 2=active control fusion
+    {"CarrotTlvMode", {PERSISTENT, INT, "0"}},  // legacy, ignored since W129 (vision follows TrafficLightDetectMode)
     {"CarrotTlvBackend", {PERSISTENT, STRING, "onnx"}},
     {"CarrotTlvModelPath", {PERSISTENT, STRING}},
     {"CarrotTlvLampModelPath", {PERSISTENT, STRING}},  // lamp classifier (detect-then-track)
+    {"CarrotTlvDisabled", {CLEAR_ON_MANAGER_START, BOOL}},  // tlvd crash-loop / rss_hard latch; cleared every manager start
     {"CarrotTlvRecentStarts", {CLEAR_ON_MANAGER_START, STRING}},  // tlvd crash-loop guard (monotonic start times)
     {"CarrotTlvDspNotice", {CLEAR_ON_MANAGER_START, JSON}},  // parked DSP probe UI notice (ui/onroad/tlv_dsp_notice.py)
     {"MuteDoor", {PERSISTENT, INT, "0"}},

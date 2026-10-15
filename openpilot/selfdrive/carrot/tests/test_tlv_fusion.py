@@ -180,15 +180,15 @@ def tlv_message(state: str = "green", conf: float = 0.75, status: str = "running
   return t
 
 
-def make_serv(mode: int) -> CarrotServ:
+def make_serv(detect_mode: int) -> CarrotServ:
   serv = CarrotServ.__new__(CarrotServ)
   serv.traffic_light_q = collections.deque(maxlen=20)
   serv.traffic_light_count = -1
   serv.traffic_state = 0
   serv.traffic_state_src = 0
-  serv.tlv_mode = mode
-  serv.tlv_mode_poll = 0.0
-  serv.params = SimpleNamespace(get_int=lambda key, _mode=mode: _mode if key == "CarrotTlvMode" else 0)
+  serv.tlv_detect_mode = detect_mode
+  serv.tlv_detect_mode_poll = 0.0
+  serv.params = SimpleNamespace(get_int=lambda key, _mode=detect_mode: _mode if key == "TrafficLightDetectMode" else 0)
   return serv
 
 
@@ -201,7 +201,7 @@ def _replay_detect(serv: CarrotServ) -> None:
     serv.traffic_light(0.5, 0.5, color, cnf)
 
 
-def test_mode0_and_mode1_ignore_carrotTlv_and_match_no_tlv_outputs():
+def test_mode0_ignores_carrotTlv_and_mode1_feeds_like_mode2():
   def replay(mode, with_tlv):
     serv = make_serv(mode)
     if with_tlv:
@@ -213,7 +213,9 @@ def test_mode0_and_mode1_ignore_carrotTlv_and_match_no_tlv_outputs():
 
   baseline = replay(0, False)
   assert replay(0, True) == baseline
-  assert replay(1, True) == baseline
+  # W129: TrafficLightDetectMode 1 and 2 both run the vision feed; the
+  # stop-only vs stop-go distinction is enforced downstream (carrot_functions).
+  assert replay(1, True) == replay(2, True)
   assert baseline[0] == 2  # the DETECT green trigger still works
 
 
@@ -335,7 +337,7 @@ def test_mode2_left_phases_without_intent_are_straight_phases():
   assert serv3.traffic_state == 1
 
 
-def test_tlv_mode_is_cached_and_refreshed_at_most_once_per_second(monkeypatch):
+def test_tlv_detect_mode_is_cached_and_refreshed_at_most_once_per_second(monkeypatch):
   import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
   calls = []
 
@@ -348,18 +350,18 @@ def test_tlv_mode_is_cached_and_refreshed_at_most_once_per_second(monkeypatch):
   serv.traffic_light_count = -1
   serv.traffic_state = 0
   serv.traffic_state_src = 0
-  serv.tlv_mode = 2
-  serv.tlv_mode_poll = 0.0
+  serv.tlv_detect_mode = 2
+  serv.tlv_detect_mode_poll = 0.0
   serv.params = SimpleNamespace(get_int=fake_get_int)
   clock = [200.0]
   monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
   sm = FakeSM(carrotTlv=tlv_message("green"))
   serv._update_tlv_fusion(sm)
   serv._update_tlv_fusion(sm)
-  assert calls == ["CarrotTlvMode"]
+  assert calls == ["TrafficLightDetectMode"]
   clock[0] += 2.0
   serv._update_tlv_fusion(sm)
-  assert calls == ["CarrotTlvMode", "CarrotTlvMode"]
+  assert calls == ["TrafficLightDetectMode", "TrafficLightDetectMode"]
 
 
 def test_mode2_ignores_bad_or_inactive_tlv_messages():

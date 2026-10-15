@@ -1,4 +1,4 @@
-"""Shadow-mode C3X-native training-data recorder for tlvd (CarrotTlvMode == 1).
+"""C3X-native training-data recorder for tlvd (W129: active whenever tlvd runs).
 
 Records exactly the 640x320 RGB model input the detector just saw, one JPEG per
 saved unit plus one metadata line in <session>/index.jsonl. The hot path only
@@ -101,7 +101,7 @@ def _geom_dict(geom) -> dict:
 
 
 class TlvRecorder:
-  """One recorder instance per tlvd process; active only in CarrotTlvMode == 1."""
+  """One recorder instance per tlvd process; active whenever tlvd runs."""
 
   def __init__(self, root: str | None = None, *, active: bool = True, clock=time.monotonic,
                statvfs_fn=None, encode_fn=None,

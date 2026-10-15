@@ -66,7 +66,7 @@ def test_bundled_models_exist_and_match_hashes():
 
 def test_tlvd_empty_params_resolve_to_bundled_paths(monkeypatch):
   calls = _install_backend_capture(monkeypatch)
-  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1}))
+  runner = tlvd.TlvRunner(FakeParams({}))
   assert runner.backend is not None
   assert ("backend", "onnx", backends.BUNDLED_DETECTOR) in calls
   assert ("classifier", "onnx", backends.BUNDLED_LAMP) in calls
@@ -76,7 +76,6 @@ def test_tlvd_explicit_params_override_bundled_paths(monkeypatch):
   calls = _install_backend_capture(monkeypatch)
   params = FakeParams(
     {
-      "CarrotTlvMode": 1,
       "CarrotTlvModelPath": "D:/models/custom_detector.onnx",
       "CarrotTlvLampModelPath": "D:/models/custom_lamp.onnx",
     }
@@ -136,7 +135,7 @@ def test_detector_warmup_runs_before_budget_creation(monkeypatch):
       super().__init__(**kwargs)
 
   monkeypatch.setattr(resources, "CpuCreditBudget", RecordingBudget)
-  tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1}))
+  tlvd.TlvRunner(FakeParams({}))
 
   assert events.index("classifier_warmup") < events.index("budget")
   assert events.index("detector_warmup") < events.index("budget")
@@ -145,7 +144,7 @@ def test_detector_warmup_runs_before_budget_creation(monkeypatch):
 
 def test_detector_warmup_failure_sets_backend_error(monkeypatch):
   events, _detector = _install_warmup_capture(monkeypatch, detector_raises=RuntimeError("boom"))
-  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1}))
+  runner = tlvd.TlvRunner(FakeParams({}))
   assert "detector warmup failed" in runner.backend_error
   # A warm-up failure must block inference exactly like a backend error.
   assert runner._can_infer() is False

@@ -64,8 +64,8 @@ DETECT_MAX_GAP_S = 3.0
 # Flat-road tail-light gate needs a calibrated camera (crops.horizon_row uses
 # rpyCalib); str(calStatus) because pycapnp enums stringify as the enum name.
 GATE_CAL_STATUS = "calibrated"
-# Crash-loop guard: more than this many starts inside the window turns
-# CarrotTlvMode off so a struggling device cannot keep relaunching tlvd.
+# Crash-loop guard: more than this many starts inside the window sets the
+# CarrotTlvDisabled latch so a struggling device cannot keep relaunching tlvd.
 CRASH_LOOP_MAX_STARTS = 5
 CRASH_LOOP_WINDOW_S = 300.0
 
@@ -116,6 +116,14 @@ def _param_text(params, key: str, default: str = "") -> str:
     value = value.decode("utf-8", "replace")
   value = str(value).strip()
   return value if value else default
+
+
+def _param_bool(params, key: str, default: bool = False) -> bool:
+  try:
+    value = params.get_bool(key)
+    return default if value is None else bool(value)
+  except Exception:
+    return default
 
 def _host_is_tici() -> bool:
   try:
@@ -180,37 +188,38 @@ class TlvRunner:
     self.backend_error = ""
     self.classifier = backends.NullClassifier()
     self.classifier_error = ""
-    if _param_int(params, "CarrotTlvMode") >= 1:
-      name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
-      model_path = _param_text(params, "CarrotTlvModelPath", "") or backends.BUNDLED_DETECTOR
+    # W129: vision is always on while tlvd runs (gated by TrafficLightDetectMode
+    # in the manager); the mode toggle no longer exists.
+    name = resolve_backend_name(_param_text(params, "CarrotTlvBackend", ""), _host_is_tici())
+    model_path = _param_text(params, "CarrotTlvModelPath", "") or backends.BUNDLED_DETECTOR
+    try:
+      self.backend, self.decoder = backends.make_backend(name, model_path)
+    except NotImplementedError as exc:
+      self.backend_error = str(exc)
+    except backends.BackendError as exc:
+      self.backend_error = str(exc)
+    if self.backend is not None:
+      # Lamp classifier: a bad/missing lamp model must never kill tlvd; fall
+      # back to the detector-only behavior (CONTRACT.md detect-then-track).
+      lamp_path = _param_text(params, "CarrotTlvLampModelPath", "") or backends.BUNDLED_LAMP
       try:
-        self.backend, self.decoder = backends.make_backend(name, model_path)
-      except NotImplementedError as exc:
-        self.backend_error = str(exc)
-      except backends.BackendError as exc:
-        self.backend_error = str(exc)
-      if self.backend is not None:
-        # Lamp classifier: a bad/missing lamp model must never kill tlvd; fall
-        # back to the detector-only behavior (CONTRACT.md detect-then-track).
-        lamp_path = _param_text(params, "CarrotTlvLampModelPath", "") or backends.BUNDLED_LAMP
-        try:
-          self.classifier = backends.make_classifier(name, lamp_path)
-          self.classifier.warmup()
-        except Exception as exc:
-          self.classifier_error = str(exc)
-          self.classifier = backends.NullClassifier()
-        # Detector warm-up BEFORE the run loop and before the budget exists:
-        # the first real detect frame otherwise pays the one-time compile
-        # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
-        try:
-          self.backend.warmup()
-        except Exception as exc:
-          self.backend_error = f"detector warmup failed: {exc!r}"
+        self.classifier = backends.make_classifier(name, lamp_path)
+        self.classifier.warmup()
+      except Exception as exc:
+        self.classifier_error = str(exc)
+        self.classifier = backends.NullClassifier()
+      # Detector warm-up BEFORE the run loop and before the budget exists:
+      # the first real detect frame otherwise pays the one-time compile
+      # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
+      try:
+        self.backend.warmup()
+      except Exception as exc:
+        self.backend_error = f"detector warmup failed: {exc!r}"
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
-    # Shadow-mode training recorder: CarrotTlvMode == 1 only, never mode 2.
-    # _poll_system re-reads the mode every second, so a live 1 <-> 2 switch
-    # takes effect without a tlvd restart; the root is only injected by tests.
+    # Training recorder: wanted whenever tlvd runs (W129: no mode gate).
+    # The recorder is constructed lazily on the first poll (TICI or an injected
+    # test root); the root is only injected by tests.
     self._recorder_root = recorder_root
     self._recorder_last_try = -RECORDER_RETRY_S
     self._recorder_failures = 0
@@ -438,15 +447,16 @@ class TlvRunner:
       self._hard_exit_reason = self._mem.exit_reason
 
   def _handle_hard_exit(self) -> None:
-    """Hard RSS limit: publish status=error and clear CarrotTlvMode so the
-    manager's enable_tlvd() goes False and tlvd is not restarted (restart_if_crash
-    alone would start the process again regardless of exit code)."""
+    """Hard RSS limit: publish status=error and set the CarrotTlvDisabled latch
+    so the manager's enable_tlvd() goes False and tlvd is not restarted
+    (restart_if_crash alone would start the process again regardless of exit
+    code). The latch clears on the next manager start."""
     reason = self._hard_exit_reason or "rss_hard"
     self._publish("error", reason)
     try:
-      self.params.put_int("CarrotTlvMode", 0)
+      self.params.put_bool("CarrotTlvDisabled", True)
     except Exception as exc:
-      print(f"tlvd: failed to clear CarrotTlvMode on {reason}: {exc!r}", flush=True)
+      print(f"tlvd: failed to set CarrotTlvDisabled on {reason}: {exc!r}", flush=True)
     print(f"tlvd: hard memory limit ({reason}); exiting without restart", flush=True)
 
   def close_recorder(self) -> None:
@@ -459,17 +469,15 @@ class TlvRunner:
       pass
 
   def _sync_recorder_mode(self) -> None:
-    """1 Hz CarrotTlvMode check: only mode 1 records.
+    """Recorder is wanted whenever tlvd runs (W129: no mode gate).
 
-    The manager does not restart tlvd when the mode changes 1 <-> 2
-    (enable_tlvd is true for both), so the recorder is (de)activated here at
-    the existing poll. A tlvd that started in mode 2 constructs the recorder
-    lazily on the first mode-1 poll (TICI or an injected test root)."""
-    mode = _param_int(self.params, "CarrotTlvMode")
+    The manager does not restart tlvd on setting changes, so this stays on the
+    1 Hz poll; a tlvd with no recorder yet constructs it lazily (TICI or an
+    injected test root) with the RECORDER_RETRY_S backoff."""
     if self.recorder is not None:
-      self.recorder.active = mode == 1
+      self.recorder.active = True
       return
-    if mode != 1 or not (_host_is_tici() or self._recorder_root is not None):
+    if not (_host_is_tici() or self._recorder_root is not None):
       return
     now = time.monotonic()
     if now - self._recorder_last_try < RECORDER_RETRY_S:
@@ -664,7 +672,7 @@ class TlvRunner:
       self.budget.tick(now)
       if self._hard_exit_reason is not None:
         self._handle_hard_exit()
-        return  # exit code 0; CarrotTlvMode=0 keeps the manager from restarting tlvd
+        return  # exit code 0; the CarrotTlvDisabled latch keeps the manager from restarting tlvd
 
       if self.client is None or not self.client.is_connected():
         self._connect()
@@ -705,7 +713,7 @@ class TlvRunner:
 
 
 def crash_loop_guard(params, now: float) -> bool:
-  """Record this start; True (and CarrotTlvMode cleared) when tlvd has started
+  """Record this start; True (and CarrotTlvDisabled set) when tlvd has started
   more than CRASH_LOOP_MAX_STARTS times within CRASH_LOOP_WINDOW_S."""
   starts: list[float] = []
   for item in _param_text(params, "CarrotTlvRecentStarts", "").split(","):
@@ -723,9 +731,9 @@ def crash_loop_guard(params, now: float) -> bool:
   if len(starts) <= CRASH_LOOP_MAX_STARTS:
     return False
   try:
-    params.put_int("CarrotTlvMode", 0)
+    params.put_bool("CarrotTlvDisabled", True)
   except Exception as exc:
-    print(f"tlvd: failed to clear CarrotTlvMode on crash loop: {exc!r}", flush=True)
+    print(f"tlvd: failed to set CarrotTlvDisabled on crash loop: {exc!r}", flush=True)
   return True
 
 
@@ -738,14 +746,16 @@ def main() -> None:
   os.environ.setdefault("DEV", "CPU")
   from openpilot.common.params import Params
   params = Params()
-  if _param_int(params, "CarrotTlvMode") < 1:
-    print("tlvd: disabled (CarrotTlvMode off)", flush=True)
-    return
+  # W129: no CarrotTlvMode gate; the manager starts tlvd whenever
+  # TrafficLightDetectMode >= 1 and the CarrotTlvDisabled latch is clear.
   if _param_int(params, "TrafficLightDetectMode") < 1:
     print("tlvd: disabled (TrafficLightDetectMode off)", flush=True)
     return
+  if _param_bool(params, "CarrotTlvDisabled"):
+    print("tlvd: disabled (CarrotTlvDisabled latch)", flush=True)
+    return
   if crash_loop_guard(params, time.monotonic()):
-    print(f"tlvd: >{CRASH_LOOP_MAX_STARTS} starts in {CRASH_LOOP_WINDOW_S:.0f} s; CarrotTlvMode cleared", flush=True)
+    print(f"tlvd: >{CRASH_LOOP_MAX_STARTS} starts in {CRASH_LOOP_WINDOW_S:.0f} s; CarrotTlvDisabled set", flush=True)
     return
   print(f"tlvd: start cpu-policy={apply_cpu_policy()}", flush=True)
   if not resources.write_oom_score_adj(1000):

@@ -6,14 +6,14 @@ Runs on the C3X (Carrot web terminal):
   python3 openpilot/tools/carrot_tlv_bench.py --backend null
   python3 openpilot/tools/carrot_tlv_bench.py --backend tinygrad --model-path /data/models/tlv/model.onnx
 
-Phases: baseline (CarrotTlvMode=0), tlvd (mode 1), then a soak (default 20 min,
-`--soak-min`). Every phase samples modelV2 / controlsState / roadCameraState /
-uiDebug / deviceState messages plus, from /proc: per-process CPU and RSS for
-tlvd, modeld, controlsd, ui and camerad, MemAvailable, and the cores 1-3
+Phases: baseline (CarrotTlvDisabled=True, tlvd off), tlvd (CarrotTlvDisabled=False),
+then a soak (default 20 min, `--soak-min`). Every phase samples modelV2 / controlsState /
+roadCameraState / uiDebug / deviceState messages plus, from /proc: per-process CPU and
+RSS for tlvd, modeld, controlsd, ui and camerad, MemAvailable, and the cores 1-3
 /proc/stat totals.
 
 It prints ONE JSON document with pass/fail for each of the eight budget gates
-and the raw numbers, restores CarrotTlvMode (and backend/model path) on exit
+and the raw numbers, restores CarrotTlvDisabled (and backend/model path) on exit
 including Ctrl+C, and exits 0 only when every gate passes. A difference larger
 than the noise is a FAIL.
 
@@ -691,12 +691,12 @@ def main(argv=None) -> int:
   import openpilot.cereal.messaging as messaging
 
   params = Params()
-  original_mode = _param_bytes(params, "CarrotTlvMode")
+  original_disabled = _param_bytes(params, "CarrotTlvDisabled")
   original_backend = _param_bytes(params, "CarrotTlvBackend")
   original_model_path = _param_bytes(params, "CarrotTlvModelPath")
 
   def restore():
-    for key, value in (("CarrotTlvMode", original_mode), ("CarrotTlvBackend", original_backend),
+    for key, value in (("CarrotTlvDisabled", original_disabled), ("CarrotTlvBackend", original_backend),
                        ("CarrotTlvModelPath", original_model_path)):
       if value is not None:
         _put_raw(params, key, value)
@@ -714,7 +714,7 @@ def main(argv=None) -> int:
   baseline_report = tlv_report = soak_report = None
   try:
     print("carrot_tlv_bench: baseline phase (tlvd off) ...", file=sys.stderr)
-    _put_raw(params, "CarrotTlvMode", 0)
+    _put_raw(params, "CarrotTlvDisabled", True)
     time.sleep(3.0)
     baseline_report = _collect(sm, args.baseline_s)
 
@@ -723,11 +723,11 @@ def main(argv=None) -> int:
       print(f"carrot_tlv_bench: {block}; tlvd will not start, aborting tlvd/soak phases", file=sys.stderr)
       return 2
 
-    print("carrot_tlv_bench: tlvd phase (mode 1) ...", file=sys.stderr)
+    print("carrot_tlv_bench: tlvd phase (CarrotTlvDisabled=False) ...", file=sys.stderr)
     _put_raw(params, "CarrotTlvBackend", args.backend)
     if args.model_path is not None:
       _put_raw(params, "CarrotTlvModelPath", args.model_path)
-    _put_raw(params, "CarrotTlvMode", 1)
+    _put_raw(params, "CarrotTlvDisabled", False)
     deadline = time.monotonic() + args.startup_wait_s
     while time.monotonic() < deadline and not sm.seen.get("carrotTlv"):
       sm.update(100)
@@ -751,7 +751,7 @@ def main(argv=None) -> int:
   result["parameters"] = {
     "baseline_s": args.baseline_s, "tlv_s": args.tlv_s, "soak_min": args.soak_min,
     "backend": args.backend, "model_path": args.model_path,
-    "original_mode": _param_text(original_mode),
+    "original_disabled": _param_text(original_disabled),
   }
   last = (soak or tlv)
   telemetry = " ".join([

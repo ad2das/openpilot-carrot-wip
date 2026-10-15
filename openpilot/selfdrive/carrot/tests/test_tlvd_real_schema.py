@@ -53,7 +53,7 @@ class FakeSM:
 
 
 def build_runner():
-  return tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 2, "CarrotTlvBackend": "null"}))
+  return tlvd.TlvRunner(FakeParams({"CarrotTlvBackend": "null"}))
 
 
 def real_services(now: float):

@@ -451,7 +451,7 @@ class MemoryGuard:
   """RSS soft/hard caps and the MemAvailable floor, with hysteresis.
 
   soft -> suspend rss_soft:<rss_mb>MB, gc + cache drop once per crossing;
-  hard -> exit_reason rss_hard (caller publishes error, clears CarrotTlvMode,
+  hard -> exit_reason rss_hard (caller publishes error, sets CarrotTlvDisabled,
   exits 0 so the manager does not restart-loop);
   MemAvailable < floor -> suspend mem_low:<avail_mb>MB while it stays below.
   The MB values are in the reason so the field log shows the actual footprint

@@ -20,7 +20,7 @@ GPU_STRICT_KEY_TOKENS = ("QCOM", "CUDA", "OPENCL", "ROCM", "VULKAN")
 GPU_VALUE_TOKENS = ("QCOM", "CUDA", "OPENCL", "VULKAN", "ROCM")
 _FALSY = ("", "0", "false", "no", "off")
 
-# Bundled traffic-light models: shipped so CarrotTlvMode works with no model
+# Bundled traffic-light models: shipped so the TL vision works with no model
 # path params. The detector is r8s50a40 (single-class, 40-epoch r8s50a); the
 # lamp is the r9 device-crop retrain. Absolute paths resolved next to this
 # module; the SHA256 values are the verified artifacts, checked by the unit

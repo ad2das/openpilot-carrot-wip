@@ -363,7 +363,7 @@ def _page_html(sessions: list[dict], probe: dict | None = None) -> str:
     "<title>\uc2e0\ud638\ub4f1 \uc778\uc2dd \uae30\ub85d</title>"
     f"<style>{_PAGE_CSS}</style></head><body>"
     "<h1>\uc2e0\ud638\ub4f1 \uc778\uc2dd \uae30\ub85d</h1>"
-    '<p class="hint">CarrotTlvMode=1(\uad00\ucc30 \ubaa8\ub4dc) \uc2e4\ud589 \uc911\uc5d0 \uc800\uc7a5\ub41c \ub370\uc774\ud130\uc785\ub2c8\ub2e4. '
+    '<p class="hint">\uc2e0\ud638\uac10\uc9c0 \uae30\ub2a5\uc774 \ucf1c\uc838 \uc788\uc744 \ub54c \uc2e0\ud638\ub4f1 \ube44\uc804 \uc778\uc2dd\uc774 \uc800\uc7a5\ud55c \ub370\uc774\ud130\uc785\ub2c8\ub2e4. '
     "\uc138\uc158\uc744 \ub2e4\uc6b4\ub85c\ub4dc\ud574 PC\uc5d0\uc11c \ud559\uc2b5 \ub370\uc774\ud130\uc14b\uc73c\ub85c \ubcc0\ud658\ud558\uc138\uc694.</p>"
     "<table><thead><tr><th>\uc138\uc158</th><th>\ud06c\uae30</th><th>\ud30c\uc77c</th>"
     "<th>\ucc98\uc74c</th><th>\ub9c8\uc9c0\ub9c9</th><th></th></tr></thead><tbody>"

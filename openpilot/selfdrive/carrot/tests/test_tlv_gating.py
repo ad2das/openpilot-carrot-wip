@@ -1,8 +1,8 @@
 """Gating tests for tlvd.
 
-Covers process_config.enable_tlvd truth table (started x CarrotTlvMode x
-TrafficLightDetectMode), tlvd.main() early returns (CarrotTlvMode=0,
-TrafficLightDetectMode=0, crash loop) and crash_loop_guard start bookkeeping.
+Covers process_config.enable_tlvd truth table (started x TrafficLightDetectMode x
+CarrotTlvDisabled), tlvd.main() early returns (TrafficLightDetectMode=0 and the
+CarrotTlvDisabled latch, crash loop) and crash_loop_guard start bookkeeping.
 
 On a PC the fork's Cython modules (params_pyx, msgq) and Unix-only modules are
 not built, so this module installs minimal import shims when those imports are
@@ -144,8 +144,8 @@ from openpilot.system.manager import process_config
 
 
 _KEY_TYPES = {
-  "CarrotTlvMode": int,
   "TrafficLightDetectMode": int,
+  "CarrotTlvDisabled": bool,
   "CarrotTlvRecentStarts": str,
   "CarrotTlvBackend": str,
   "CarrotTlvModelPath": str,
@@ -166,6 +166,9 @@ class FakeParams:
     value = self.values.get(key, 0)
     return 0 if value is None else int(value)
 
+  def get_bool(self, key, block=False):
+    return bool(self.values.get(key, False))
+
   def put(self, key, value, block=True):
     expected = _KEY_TYPES.get(key)
     if expected is None:
@@ -178,6 +181,11 @@ class FakeParams:
   def put_int(self, key, value, block=True):
     if type(value) is not int:
       raise TypeError(f"put_int requires int for {key}: {type(value)!r}")
+    self.put(key, value, block)
+
+  def put_bool(self, key, value, block=True):
+    if type(value) is not bool:
+      raise TypeError(f"put_bool requires bool for {key}: {type(value)!r}")
     self.put(key, value, block)
 
 
@@ -202,11 +210,11 @@ def _install_recording_runner(monkeypatch):
 
 def test_enable_tlvd_truth_table():
   for started in (False, True):
-    for tlv in (0, 1, 2):
-      for tld in (0, 1, 2):
-        params = FakeParams({"CarrotTlvMode": tlv, "TrafficLightDetectMode": tld})
+    for tld in (0, 1, 2):
+      for disabled in (False, True):
+        params = FakeParams({"TrafficLightDetectMode": tld, "CarrotTlvDisabled": disabled})
         result = process_config.enable_tlvd(started, params, None)
-        assert result == (started and tlv >= 1 and tld >= 1), (started, tlv, tld)
+        assert result == (started and tld >= 1 and not disabled), (started, tld, disabled)
 
 
 def test_enable_tlvd_absent_params_is_off():
@@ -229,18 +237,18 @@ def _install_fake_signal_color_module(monkeypatch, requested):
 
 def test_enable_tlvd_disabled_when_signal_color_requested(monkeypatch):
   _install_fake_signal_color_module(monkeypatch, True)
-  params = FakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 2})
+  params = FakeParams({"TrafficLightDetectMode": 2})
   assert process_config.enable_tlvd(True, params, None) is False
 
 
 def test_enable_tlvd_unchanged_when_signal_color_not_requested(monkeypatch):
   _install_fake_signal_color_module(monkeypatch, False)
   for started in (False, True):
-    for tlv in (0, 1, 2):
-      for tld in (0, 1, 2):
-        params = FakeParams({"CarrotTlvMode": tlv, "TrafficLightDetectMode": tld})
+    for tld in (0, 1, 2):
+      for disabled in (False, True):
+        params = FakeParams({"TrafficLightDetectMode": tld, "CarrotTlvDisabled": disabled})
         result = process_config.enable_tlvd(started, params, None)
-        assert result == (started and tlv >= 1 and tld >= 1), (started, tlv, tld)
+        assert result == (started and tld >= 1 and not disabled), (started, tld, disabled)
 
 
 # -- tlv_dsp_probe process registration ---------------------------------------
@@ -251,16 +259,26 @@ def test_tlv_dsp_probe_process_registered():
   assert proc.should_run is process_config.enable_tlv_dsp_probe
 
 
+def test_tlv_dsp_probe_never_runs():
+  # DSP path parked 2026-10-14 (no lld on AGNOS); the probe gating is off for
+  # every started x TrafficLightDetectMode combination.
+  for started in (False, True):
+    for tld in (0, 1, 2):
+      params = FakeParams({"TrafficLightDetectMode": tld})
+      assert process_config.enable_tlv_dsp_probe(started, params, None) is False, (started, tld)
+  assert process_config.enable_tlv_dsp_probe(True, FakeParams(), None) is False
+
+
 # -- crash_loop_guard --------------------------------------------------------
 
-def test_crash_loop_guard_five_starts_ok_sixth_clears_mode():
-  params = FakeParams({"CarrotTlvMode": 2})
+def test_crash_loop_guard_five_starts_ok_sixth_sets_latch():
+  params = FakeParams({"CarrotTlvRecentStarts": ""})
   base = 1000.0
   for i in range(5):
     assert tlvd.crash_loop_guard(params, base + i) is False
-  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
+  assert all(key != "CarrotTlvDisabled" for key, _ in params.writes)
   assert tlvd.crash_loop_guard(params, base + 5) is True
-  assert params.values["CarrotTlvMode"] == 0
+  assert params.values["CarrotTlvDisabled"] is True
   assert "1005.0" in params.values["CarrotTlvRecentStarts"]
 
 
@@ -268,11 +286,11 @@ def test_crash_loop_guard_drops_entries_outside_window():
   params = FakeParams({"CarrotTlvRecentStarts": "10,20,30"})
   assert tlvd.crash_loop_guard(params, 1000.0) is False
   assert params.values["CarrotTlvRecentStarts"] == "1000.0"
-  assert "CarrotTlvMode" not in params.values
+  assert "CarrotTlvDisabled" not in params.values
 
 
 def test_crash_loop_guard_window_boundary_is_inclusive():
-  params = FakeParams({"CarrotTlvRecentStarts": "700.0,699.9", "CarrotTlvMode": 1})
+  params = FakeParams({"CarrotTlvRecentStarts": "700.0,699.9"})
   assert tlvd.crash_loop_guard(params, 1000.0) is False
   assert params.values["CarrotTlvRecentStarts"] == "700.0,1000.0"
 
@@ -297,23 +315,31 @@ def test_crash_loop_guard_survives_recent_starts_write_failure():
   assert tlvd.crash_loop_guard(NoPut(), 100.0) is False
 
 
+def test_crash_loop_guard_never_writes_carrot_tlv_mode():
+  params = FakeParams({"CarrotTlvRecentStarts": ""})
+  base = 1000.0
+  for i in range(6):
+    tlvd.crash_loop_guard(params, base + i)
+  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
+
+
 def test_strict_fake_rejects_the_old_bytes_idiom():
-  params = FakeParams({"CarrotTlvMode": 2, "CarrotTlvRecentStarts": ""})
+  params = FakeParams({"CarrotTlvDisabled": False, "CarrotTlvRecentStarts": ""})
   with pytest.raises(TypeError):
-    params.put("CarrotTlvMode", b"0")
+    params.put("CarrotTlvDisabled", b"1")
   with pytest.raises(TypeError):
-    params.put("CarrotTlvMode", "0")
+    params.put("CarrotTlvDisabled", "1")
   with pytest.raises(TypeError):
     params.put("CarrotTlvRecentStarts", b"1.0")
-  params.put("CarrotTlvMode", 0)
-  params.put_int("CarrotTlvMode", 0)
-  assert params.values["CarrotTlvMode"] == 0
+  params.put("CarrotTlvDisabled", True)
+  params.put_bool("CarrotTlvDisabled", True)
+  assert params.values["CarrotTlvDisabled"] is True
 
 
 # -- tlvd.main() -------------------------------------------------------------
 
 def test_main_returns_early_when_traffic_light_detect_off(monkeypatch):
-  params = FakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 0})
+  params = FakeParams({"TrafficLightDetectMode": 0})
   _install_fake_params_module(monkeypatch, params)
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
@@ -321,8 +347,8 @@ def test_main_returns_early_when_traffic_light_detect_off(monkeypatch):
   assert params.writes == []
 
 
-def test_main_returns_early_when_carrot_tlv_mode_off(monkeypatch):
-  params = FakeParams({"CarrotTlvMode": 0, "TrafficLightDetectMode": 2})
+def test_main_returns_early_when_disabled_latch_set(monkeypatch):
+  params = FakeParams({"TrafficLightDetectMode": 2, "CarrotTlvDisabled": True})
   _install_fake_params_module(monkeypatch, params)
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
@@ -331,7 +357,7 @@ def test_main_returns_early_when_carrot_tlv_mode_off(monkeypatch):
 
 
 def test_main_starts_runner_when_gates_on(monkeypatch):
-  params = FakeParams({"CarrotTlvMode": 1, "TrafficLightDetectMode": 2})
+  params = FakeParams({"TrafficLightDetectMode": 2})
   _install_fake_params_module(monkeypatch, params)
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
@@ -339,28 +365,28 @@ def test_main_starts_runner_when_gates_on(monkeypatch):
   assert "CarrotTlvRecentStarts" in params.values
 
 
-def test_main_crash_loop_clears_mode_and_skips_runner(monkeypatch):
+def test_main_crash_loop_sets_latch_and_skips_runner(monkeypatch):
   now = time.monotonic()
   seed = ",".join(f"{now - i:.1f}" for i in range(1, 6))
-  params = FakeParams({"CarrotTlvMode": 2, "TrafficLightDetectMode": 2,
-                       "CarrotTlvRecentStarts": seed})
+  params = FakeParams({"TrafficLightDetectMode": 2, "CarrotTlvRecentStarts": seed})
   _install_fake_params_module(monkeypatch, params)
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
   assert started == []
-  assert params.values["CarrotTlvMode"] == 0
+  assert params.values["CarrotTlvDisabled"] is True
 
 
-def test_handle_hard_exit_clears_mode_with_put_int(monkeypatch):
-  params = FakeParams({"CarrotTlvMode": 2})
+def test_handle_hard_exit_sets_latch(monkeypatch):
+  params = FakeParams({})
   runner = tlvd.TlvRunner.__new__(tlvd.TlvRunner)
   runner.params = params
   runner._hard_exit_reason = "rss_hard"
   published = []
   monkeypatch.setattr(runner, "_publish", lambda status, reason: published.append((status, reason)))
   runner._handle_hard_exit()
-  assert params.values["CarrotTlvMode"] == 0
+  assert params.values["CarrotTlvDisabled"] is True
   assert published == [("error", "rss_hard")]
+  assert all(key != "CarrotTlvMode" for key, _ in params.writes)
 
 
 def test_main_treats_raising_traffic_light_detect_read_as_off(monkeypatch):
@@ -370,7 +396,7 @@ def test_main_treats_raising_traffic_light_detect_read_as_off(monkeypatch):
         raise RuntimeError("param read failed")
       return super().get_int(key, block)
 
-  params = RaisingParams({"CarrotTlvMode": 2})
+  params = RaisingParams({})
   _install_fake_params_module(monkeypatch, params)
   started = _install_recording_runner(monkeypatch)
   tlvd.main()
