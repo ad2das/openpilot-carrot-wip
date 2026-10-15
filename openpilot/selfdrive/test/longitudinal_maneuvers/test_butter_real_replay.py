@@ -1134,12 +1134,17 @@ def test_butter_hyst_sweep():
       s = data["starts"][(m.title, "scc")]
       print(f"  scc {m.title:20s} start_delay={s.get('start_delay_s')}")
 
-  # f) default VEgoStopping=50 must be byte-identical to off (rule bypassed).
-  default50 = _run_default_vego50(0.30, "scc")
+  # f) With the default VEgoStopping (50 -> 0.5 m/s >= STOP_ENTER_V) the entry
+  #    rule is bypassed, so enabling it must be byte-identical to leaving it off.
   identity_fails = []
-  for key in ("final_gap_m", "end_net", "tail_s", "crawl_time_s", "min_gap_m"):
-    if default50.get(key) != off["b1"]["scc"].get(key):
-      identity_fails.append(f"f) VEgoStopping 50 {key} {default50.get(key)} != off {off['b1']['scc'].get(key)}")
+  identity_rows: dict = {}
+  for plant in _HYST_PLANTS:
+    ref = _run_default_vego50(0.0, plant)
+    on = _run_default_vego50(0.30, plant)
+    identity_rows[plant] = {"off": ref, "enter0.30": on}
+    for key in ("final_gap_m", "end_net", "tail_s", "crawl_time_s", "min_gap_m", "desired_distance_standstill_m"):
+      if on.get(key) != ref.get(key):
+        identity_fails.append(f"f) vego50 {plant} {key} {on.get(key)} != off {ref.get(key)}")
   print(f"HYST-IDENTITY-F vego50: pass={not identity_fails} fails={len(identity_fails)}")
 
   passing = [r for r in rows if r["label"] != "off" and r["all_pass"] and not identity_fails]
@@ -1155,7 +1160,7 @@ def test_butter_hyst_sweep():
     "criteria": list(_HYST_CRITERIA),
     "rows": rows,
     "chosen": chosen,
-    "identity_f": {"pass": not identity_fails, "failures": identity_fails, "vego50_b1_scc": default50},
+    "identity_f": {"pass": not identity_fails, "failures": identity_fails, "rows": identity_rows},
     "b2_proxy": _B2_PROXY.title,
     "note": "desktop closed-loop simulation only; end_net is the actual plant accel; no vehicle validation",
   }
@@ -1174,6 +1179,33 @@ def test_butter_hyst_sweep():
                  for r in rows for title, runs in r["starts"].items()
                  for plant, metrics in runs.items() if metrics.get("collision")]
   assert not collisions, "hysteresis sweep collision: " + "; ".join(collisions[:5])
+
+
+def test_butter_hyst_identity():
+  """Criterion f in isolation (cheap): with the default VEgoStopping=50 the entry
+  rule is bypassed, so enabling STOP_ENTER_V must not change any b1 metric."""
+  out_path = os.environ.get("BUTTER_HYST_IDENTITY_OUT")
+  if not out_path:
+    pytest.skip("hyst identity check runs only when BUTTER_HYST_IDENTITY_OUT is set")
+  rows = {}
+  fails = []
+  for plant in _HYST_PLANTS:
+    ref = _run_default_vego50(0.0, plant)
+    on = _run_default_vego50(0.30, plant)
+    rows[plant] = {"off": ref, "enter0.30": on}
+    for key in ("final_gap_m", "end_net", "tail_s", "crawl_time_s", "min_gap_m",
+                "desired_distance_standstill_m"):
+      if on.get(key) != ref.get(key):
+        fails.append(f"f) vego50 {plant} {key} {on.get(key)} != off {ref.get(key)}")
+  print(f"HYST-IDENTITY-F vego50: pass={not fails} fails={len(fails)}")
+  for fail in fails[:10]:
+    print(f"  {fail}")
+  table = {"vego_stopping": 50, "rows": rows, "pass": not fails, "failures": fails}
+  out_dir = os.path.dirname(out_path)
+  if out_dir:
+    os.makedirs(out_dir, exist_ok=True)
+  with open(out_path, "w", encoding="utf-8") as handle:
+    handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
 
 
 def test_write_butter_real_table():
