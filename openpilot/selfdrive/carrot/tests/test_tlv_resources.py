@@ -217,15 +217,24 @@ def test_parse_statm_and_meminfo():
 MB = 1024 * 1024
 
 
+def test_memory_guard_defaults_are_field_sized():
+  # W127 route 00000443: steady RSS 246 MB after both models compiled; the
+  # 220/300 MB caps suspended tlvd forever. 360/440 MB per the brief.
+  guard = resources.MemoryGuard()
+  assert guard.soft_bytes == 360 * MB
+  assert guard.hard_bytes == 440 * MB
+  assert guard.mem_available_min == 600 * MB
+
+
 def test_memory_guard_soft_limit_gc_once():
   guard = resources.MemoryGuard(soft_bytes=220 * MB, hard_bytes=300 * MB, mem_available_min=600 * MB)
   decision = guard.update(0.0, 100 * MB, 4000 * MB)
   assert decision == resources.MemoryDecision()
   decision = guard.update(1.0, 225 * MB, 4000 * MB)
-  assert decision.suspend_reason == "rss_soft"
+  assert decision.suspend_reason == "rss_soft:225MB"
   assert decision.run_gc and decision.drop_caches
   decision = guard.update(2.0, 228 * MB, 4000 * MB)
-  assert decision.suspend_reason == "rss_soft"
+  assert decision.suspend_reason == "rss_soft:228MB"
   assert not decision.run_gc  # gc once per crossing
   # must fall below the re-arm level before the next crossing counts
   assert guard.update(3.0, 205 * MB, 4000 * MB).suspend_reason is None
@@ -235,23 +244,23 @@ def test_memory_guard_soft_limit_gc_once():
 
 def test_memory_guard_hard_limit_exits():
   guard = resources.MemoryGuard()
-  decision = guard.update(0.0, 305 * MB, 4000 * MB)
+  decision = guard.update(0.0, 450 * MB, 4000 * MB)
   assert decision.exit_reason == "rss_hard"
   assert decision.suspend_reason is None
 
 
 def test_memory_guard_mem_low_hysteresis():
   guard = resources.MemoryGuard()
-  assert guard.update(0.0, 100 * MB, 550 * MB).suspend_reason == "mem_low"
-  assert guard.update(1.0, 100 * MB, 620 * MB).suspend_reason == "mem_low"  # below re-arm 650
+  assert guard.update(0.0, 100 * MB, 550 * MB).suspend_reason == "mem_low:550MB"
+  assert guard.update(1.0, 100 * MB, 620 * MB).suspend_reason == "mem_low:620MB"  # below re-arm 650
   assert guard.update(2.0, 100 * MB, 660 * MB).suspend_reason is None
-  assert guard.update(3.0, 100 * MB, 500 * MB).suspend_reason == "mem_low"
+  assert guard.update(3.0, 100 * MB, 500 * MB).suspend_reason == "mem_low:500MB"
 
 
 def test_memory_guard_soft_beats_mem_low():
   guard = resources.MemoryGuard()
-  decision = guard.update(0.0, 230 * MB, 500 * MB)
-  assert decision.suspend_reason == "rss_soft"
+  decision = guard.update(0.0, 370 * MB, 500 * MB)
+  assert decision.suspend_reason == "rss_soft:370MB"
 
 
 def test_write_oom_score_adj(tmp_path):

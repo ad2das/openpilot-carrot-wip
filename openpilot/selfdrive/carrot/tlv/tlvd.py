@@ -199,6 +199,13 @@ class TlvRunner:
         except Exception as exc:
           self.classifier_error = str(exc)
           self.classifier = backends.NullClassifier()
+        # Detector warm-up BEFORE the run loop and before the budget exists:
+        # the first real detect frame otherwise pays the one-time compile
+        # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
+        try:
+          self.backend.warmup()
+        except Exception as exc:
+          self.backend_error = f"detector warmup failed: {exc!r}"
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
     # Shadow-mode training recorder: CarrotTlvMode == 1 only, never mode 2.
@@ -212,6 +219,8 @@ class TlvRunner:
 
     # W99: strict CPU credit budget (replaces the pacing governor) and the
     # ego-motion odometry used for track-box prediction between detect frames.
+    # W127: built only AFTER both model warm-ups; the budget's accounting
+    # baseline is taken at creation, so warm-up CPU is never charged to frames.
     self.budget = resources.CpuCreditBudget()
     self.odo = tracker.EgoOdometry()
     self.last_detect = -float("inf")
@@ -301,6 +310,7 @@ class TlvRunner:
 
   def _can_infer(self) -> bool:
     return (self.backend is not None
+            and not self.backend_error
             and self.watchdog.inferring
             and self._cpu_reason is None
             and self._mem.suspend_reason is None)

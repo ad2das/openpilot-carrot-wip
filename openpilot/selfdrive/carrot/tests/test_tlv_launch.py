@@ -211,6 +211,78 @@ def test_launcher_import_is_stdlib_only_and_env_clean():
   assert payload["env_changed"] == [], f"import changed env vars: {payload['env_changed']}"
 
 
+def test_scrub_constants_cover_the_backend_guard():
+  from openpilot.selfdrive.carrot.tlv import backends
+  assert set(tlvd_launch.SCRUB_ENV_PREFIXES) == set(backends.GPU_ENV_PREFIXES)
+  for key in backends.GPU_ENV_KEYS:
+    if not any(key.startswith(p) for p in backends.GPU_ENV_PREFIXES):
+      assert key in tlvd_launch.SCRUB_ENV_KEYS
+
+
+# -- persistent tinygrad CACHEDB (W127) ---------------------------------------
+
+def test_set_process_env_leaves_cachedb_unset_on_pc(monkeypatch):
+  monkeypatch.delenv("CACHEDB", raising=False)
+  real_isdir = os.path.isdir
+  monkeypatch.setattr(tlvd_launch.os.path, "isdir",
+                      lambda p: False if p == "/data/media/0" else real_isdir(p))
+  saved = dict(os.environ)
+  try:
+    tlvd_launch.set_process_env()
+    assert "CACHEDB" not in os.environ
+  finally:
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_set_process_env_creates_cache_dir_and_sets_cachedb(monkeypatch, tmp_path):
+  monkeypatch.delenv("CACHEDB", raising=False)
+  cache_dir = tmp_path / "carrot_tlv_cache"
+  monkeypatch.setattr(tlvd_launch, "TLVD_CACHE_DIR", str(cache_dir))
+  monkeypatch.setattr(tlvd_launch, "TLVD_CACHE_DB", str(cache_dir / "tinygrad_cache.db"))
+  real_isdir = os.path.isdir
+  monkeypatch.setattr(tlvd_launch.os.path, "isdir",
+                      lambda p: True if p == "/data/media/0" else real_isdir(p))
+  saved = dict(os.environ)
+  try:
+    tlvd_launch.set_process_env()
+    assert os.environ["CACHEDB"] == str(cache_dir / "tinygrad_cache.db")
+  finally:
+    os.environ.clear()
+    os.environ.update(saved)
+  assert cache_dir.is_dir()
+
+
+def test_set_process_env_keeps_preset_cachedb(monkeypatch):
+  monkeypatch.setenv("CACHEDB", "/custom/tinygrad.db")
+  monkeypatch.setattr(tlvd_launch.os.path, "isdir", lambda p: True)
+  saved = dict(os.environ)
+  try:
+    tlvd_launch.set_process_env()
+    assert os.environ["CACHEDB"] == "/custom/tinygrad.db"
+  finally:
+    os.environ.clear()
+    os.environ.update(saved)
+
+
+def test_set_process_env_cachedb_makedirs_oserror_leaves_unset(monkeypatch):
+  monkeypatch.delenv("CACHEDB", raising=False)
+  monkeypatch.setattr(tlvd_launch.os.path, "isdir",
+                      lambda p: p == "/data/media/0")
+
+  def raise_oserror(*args, **kwargs):
+    raise OSError("read-only filesystem")
+
+  monkeypatch.setattr(tlvd_launch.os, "makedirs", raise_oserror)
+  saved = dict(os.environ)
+  try:
+    tlvd_launch.set_process_env()
+    assert "CACHEDB" not in os.environ
+  finally:
+    os.environ.clear()
+    os.environ.update(saved)
+
+
 # -- main() step order -------------------------------------------------------
 
 def test_main_sets_env_then_policy_then_oom_then_tlvd(monkeypatch):

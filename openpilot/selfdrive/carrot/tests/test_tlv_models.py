@@ -9,7 +9,7 @@ import types
 import numpy as np
 import pytest
 
-from openpilot.selfdrive.carrot.tlv import backends, dsp_probe, tlvd
+from openpilot.selfdrive.carrot.tlv import backends, dsp_probe, resources, tlvd
 
 DETECTOR_OUTPUT_SHAPES = ((1, 64, 40, 80), (1, 1, 40, 80), (1, 64, 20, 40), (1, 1, 20, 40), (1, 64, 10, 20), (1, 1, 10, 20))
 
@@ -85,6 +85,70 @@ def test_tlvd_explicit_params_override_bundled_paths(monkeypatch):
   assert runner.backend is not None
   assert ("backend", "onnx", "D:/models/custom_detector.onnx") in calls
   assert ("classifier", "onnx", "D:/models/custom_lamp.onnx") in calls
+
+
+def _install_warmup_capture(monkeypatch, *, detector_raises=None):
+  events: list = []
+
+  class FakeDetector:
+    def __init__(self):
+      self.warmups = 0
+
+    def warmup(self):
+      events.append("detector_warmup")
+      self.warmups += 1
+      if detector_raises is not None:
+        raise detector_raises
+
+    def close(self):
+      pass
+
+  class FakeClassifier:
+    def warmup(self):
+      events.append("classifier_warmup")
+
+    def close(self):
+      pass
+
+  detector = FakeDetector()
+
+  def make_backend(name, model_path="", decoder=None):
+    return detector, None
+
+  def make_classifier(name, model_path=""):
+    return FakeClassifier()
+
+  monkeypatch.setattr(backends, "make_backend", make_backend)
+  monkeypatch.setattr(backends, "make_classifier", make_classifier)
+  return events, detector
+
+
+def test_detector_warmup_runs_before_budget_creation(monkeypatch):
+  # W127: both warm-ups must complete BEFORE CpuCreditBudget() is constructed,
+  # so the one-time compile CPU (route 00000443) is not charged to the frames.
+  events, detector = _install_warmup_capture(monkeypatch)
+  real_budget_cls = resources.CpuCreditBudget
+
+  class RecordingBudget(real_budget_cls):
+    def __init__(self, **kwargs):
+      if kwargs == {}:
+        events.append("budget")
+      super().__init__(**kwargs)
+
+  monkeypatch.setattr(resources, "CpuCreditBudget", RecordingBudget)
+  tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1}))
+
+  assert events.index("classifier_warmup") < events.index("budget")
+  assert events.index("detector_warmup") < events.index("budget")
+  assert detector.warmups == 1
+
+
+def test_detector_warmup_failure_sets_backend_error(monkeypatch):
+  events, _detector = _install_warmup_capture(monkeypatch, detector_raises=RuntimeError("boom"))
+  runner = tlvd.TlvRunner(FakeParams({"CarrotTlvMode": 1}))
+  assert "detector warmup failed" in runner.backend_error
+  # A warm-up failure must block inference exactly like a backend error.
+  assert runner._can_infer() is False
 
 
 def _install_fake_params_module(monkeypatch, value) -> None:

@@ -65,6 +65,9 @@ class NullBackend:
   def infer(self, model_input):
     return []
 
+  def warmup(self) -> None:
+    pass
+
   def close(self) -> None:
     pass
 
@@ -101,6 +104,18 @@ class OnnxCpuBackend:
 
   def infer(self, model_input):
     return self._session.run(None, {self._input_name: model_input})
+
+  def warmup(self) -> None:
+    """One inference on a zero uint8 input of the model's input shape.
+
+    Mirrors the classifier warmup: runtimes may allocate lazy kernels/pools on
+    the first call (field route 00000443: the first detect frame took 12.2 s
+    and blew the CPU credit); doing it here keeps the run loop clean.
+    """
+    shape = self._session.get_inputs()[0].shape
+    if not all(isinstance(d, int) for d in shape):
+      return  # dynamic dims: the first real frame compiles once
+    self.infer(np.zeros(tuple(shape), dtype=np.uint8))
 
   def close(self) -> None:
     self._session = None
@@ -234,6 +249,7 @@ class TinygradCpuBackend:
     self.output_names = self._output_names
     self._jits: dict[tuple, object] = {}
     self.model_path = model_path
+    self._warmed = False
     self._warmup()
     _assert_only_cpu_devices_opened(Device)
 
@@ -296,6 +312,12 @@ class TinygradCpuBackend:
       raise
     except Exception as exc:
       raise BackendError(f"tinygrad CPU warmup failed: {exc}") from exc
+    self._warmed = True
+
+  def warmup(self) -> None:
+    """Public warm-up hook; the constructor already warmed fixed shapes."""
+    if not getattr(self, "_warmed", False):
+      self._warmup()
 
   def infer(self, model_input):
     return self._call(model_input)

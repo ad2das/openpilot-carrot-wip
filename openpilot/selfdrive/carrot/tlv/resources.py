@@ -189,8 +189,12 @@ class CpuCreditBudget:
     self._cpu_clock = cpu_clock
     self._clock = clock
     self._credit = float(self.CREDIT_START_S)
-    self._last_now: float | None = None
-    self._last_cpu: float | None = None
+    # Baseline at CREATION (W127): tlvd builds the budget only after both
+    # model warm-ups, so the one-time compile CPU (~160 s, route 00000443)
+    # can never be charged to the first frames; credit starts at the normal
+    # CREDIT_START_S with nothing used.
+    self._last_now: float | None = float(self._clock())
+    self._last_cpu: float | None = float(self._cpu_clock())
     self._samples: deque[tuple[float, float]] = deque()
     self._ema: dict[str, float] = dict(self.COST_INIT)
     self._costs: dict[str, deque[float]] = {kind: deque(maxlen=5) for kind in self.COST_INIT}
@@ -446,13 +450,18 @@ class MemoryDecision:
 class MemoryGuard:
   """RSS soft/hard caps and the MemAvailable floor, with hysteresis.
 
-  soft -> suspend rss_soft, gc + cache drop once per crossing;
+  soft -> suspend rss_soft:<rss_mb>MB, gc + cache drop once per crossing;
   hard -> exit_reason rss_hard (caller publishes error, clears CarrotTlvMode,
   exits 0 so the manager does not restart-loop);
-  MemAvailable < floor -> suspend mem_low for as long as it stays below.
+  MemAvailable < floor -> suspend mem_low:<avail_mb>MB while it stays below.
+  The MB values are in the reason so the field log shows the actual footprint
+  (W127: route 00000443 suspended at 246 MB with no size in the reason).
   """
 
-  def __init__(self, *, soft_bytes: int = 220 * MB, hard_bytes: int = 300 * MB, mem_available_min: int = 600 * MB,
+  # Field route 00000443 (C3X, tinygrad CPU, r8s50a40 + r9 lamp): steady RSS 246 MB
+  # after both models compiled; the old 220 MB soft cap suspended tlvd forever.
+  # MemAvailable >= 600 MB (mem_available_min) remains the system floor.
+  def __init__(self, *, soft_bytes: int = 360 * MB, hard_bytes: int = 440 * MB, mem_available_min: int = 600 * MB,
                soft_rearm_bytes: int | None = None, mem_rearm_bytes: int | None = None) -> None:
     self.soft_bytes = int(soft_bytes)
     self.hard_bytes = int(hard_bytes)
@@ -474,16 +483,16 @@ class MemoryGuard:
         self._soft_active = True
         run_gc = True
         drop = True
-      suspend = "rss_soft"
+      suspend = f"rss_soft:{rss_bytes / MB:.0f}MB"
     elif rss_bytes < self.soft_rearm_bytes:
       self._soft_active = False
     elif self._soft_active:
-      suspend = "rss_soft"
+      suspend = f"rss_soft:{rss_bytes / MB:.0f}MB"
     if mem_available_bytes is not None:
       if mem_available_bytes < self.mem_available_min:
         self._mem_active = True
       elif mem_available_bytes >= self.mem_rearm_bytes:
         self._mem_active = False
       if self._mem_active:
-        suspend = suspend or "mem_low"
+        suspend = suspend or f"mem_low:{mem_available_bytes / MB:.0f}MB"
     return MemoryDecision(suspend_reason=suspend, run_gc=run_gc, drop_caches=drop)

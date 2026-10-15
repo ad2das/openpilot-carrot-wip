@@ -86,6 +86,18 @@ def test_credit_starts_at_start_credit_and_caps():
   assert budget.credit == pytest.approx(resources.CpuCreditBudget.CREDIT_CAP_S)
 
 
+def test_budget_baseline_is_taken_at_creation_not_first_tick():
+  # W127: tlvd builds the budget only AFTER both model warm-ups; the baseline
+  # must be captured at construction so the one-time warm-up CPU (route
+  # 00000443: ~160 s) is invisible and the fill starts from normal credit.
+  clocks = SimClocks()
+  clocks.cpu = 160.0  # warm-up CPU already spent when the budget is built
+  budget = resources.CpuCreditBudget(clock=clocks.clock, cpu_clock=clocks.cpu_clock)
+  clocks.t = 1.0
+  budget.tick(1.0)  # only what ran after creation is charged (here: nothing)
+  assert budget.credit == pytest.approx(resources.CpuCreditBudget.CREDIT_START_S + 0.4)
+
+
 def test_credit_charges_all_process_cpu_not_only_frames():
   budget, clocks = make_budget()
   budget.tick(0.0)  # seed the baselines

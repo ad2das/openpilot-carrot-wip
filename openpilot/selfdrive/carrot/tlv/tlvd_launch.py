@@ -43,6 +43,14 @@ TLVD_ENV = {
 SCRUB_ENV_PREFIXES = ("QCOM", "CUDA", "OPENCL", "ROCM", "VULKAN", "GPU_", "TINYGPU")
 SCRUB_ENV_KEYS = ("GPU", "CL", "TINY_GPU")
 
+# Persistent tinygrad kernel cache (field route 00000443: the first start
+# compiled the detector for ~160 s of CPU; the cache under /data/media/0 lets
+# later starts reuse the compiled kernels). Set conditionally in
+# set_process_env: only on TICI, only when CACHEDB is not already set, only
+# when the directory can be created.
+TLVD_CACHE_DIR = "/data/media/0/carrot_tlv_cache"
+TLVD_CACHE_DB = TLVD_CACHE_DIR + "/tinygrad_cache.db"
+
 
 def scrub_gpu_env(environ=None) -> list[str]:
   """Delete inherited GPU-routing keys; returns the removed key names."""
@@ -63,6 +71,12 @@ def set_process_env() -> None:
     print(f"tlvd_launch: scrubbed env {scrubbed}", flush=True)
   for key, value in TLVD_ENV.items():
     os.environ[key] = value
+  if "CACHEDB" not in os.environ and os.path.isdir("/data/media/0"):
+    try:
+      os.makedirs(TLVD_CACHE_DIR, exist_ok=True)
+      os.environ["CACHEDB"] = TLVD_CACHE_DB
+    except OSError:
+      pass  # leave CACHEDB unset; tinygrad falls back to its default cache
 
 
 def apply_cpu_policy() -> list[str]:

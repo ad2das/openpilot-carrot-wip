@@ -113,6 +113,25 @@ def test_placeholder_decoder_contract():
   assert bad == []
 
 
+# -- detector warm-up hooks (W127) -------------------------------------------
+
+def test_null_backend_warmup_is_noop():
+  backends.NullBackend("").warmup()
+
+
+def test_onnx_backend_warmup_before_infer(tmp_path):
+  onnx = pytest.importorskip("onnx")
+  pytest.importorskip("onnxruntime")
+  path = _tiny_onnx_model(onnx, tmp_path)
+  backend, _decoder = backends.make_backend("onnx", str(path))
+  try:
+    backend.warmup()  # first-run allocations happen here, not on the road
+    raw = backend.infer(np.zeros((1, 3, 320, 640), dtype=np.uint8))
+    assert raw is not None
+  finally:
+    backend.close()
+
+
 def _tiny_conv_onnx_model(onnx, tmp_path):
   """A tiny Conv+ReLU ONNX (1,3,8,8) for CPU parity checks."""
   from onnx import TensorProto, helper
