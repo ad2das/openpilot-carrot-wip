@@ -384,6 +384,7 @@ class FarLeadLoop:
       jTargetNow=float(planner.output_j_target_now), shouldStop=bool(planner.output_should_stop),
       fcw=bool(planner.fcw), speeds=planner.v_desired_trajectory,
       longitudinalPlanSource=planner.mpc.source,
+      desiredDistance=float(planner.mpc.desired_distance),
       cruiseCoastingTarget=float(planner.coasting_target),
       cruiseCoastingPercent=int(planner.coasting_percent),
       cruiseTarget=float(planner.v_cruise_kph),
@@ -405,6 +406,7 @@ class FarLeadLoop:
     log_t, log_v, log_accel, log_x = [], [], [], []
     log_gap, log_active, log_vlead, log_atarget = [], [], [], []
     log_a_actual, log_should_stop, log_lc_state = [], [], []
+    log_desired_distance = []
     fcw_steps = 0
     msgs = None
     plan_view = None
@@ -468,6 +470,7 @@ class FarLeadLoop:
       log_a_actual.append(applied)
       log_should_stop.append(bool(plan_view.shouldStop))
       log_lc_state.append(int(self.long_control.long_control_state))
+      log_desired_distance.append(float(plan_view.desiredDistance))
 
       self.ego_v = max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
@@ -482,6 +485,7 @@ class FarLeadLoop:
       "t": log_t, "v": log_v, "accel": log_accel, "x": log_x,
       "gap": log_gap, "active": log_active, "v_lead": log_vlead, "a_target": log_atarget,
       "a_actual": log_a_actual, "should_stop": log_should_stop, "lc_state": log_lc_state,
+      "desired_distance": log_desired_distance,
       "fcw_steps": fcw_steps, "stopped": bool(stopped or self.ego_v < 0.05),
     }
 

@@ -6,6 +6,9 @@ import math
 import numpy as np
 
 
+STOPPED_LEAD_RELEASE_S = 1.0  # release tau for a stopped lead while the ego still rolls
+
+
 def comfort_path_has_reserve(ego_speeds, physical_gaps, danger_margins, times, stop_distance):
   near = times <= 3.0
   return bool(np.all(np.isfinite(danger_margins)) and np.all(np.isfinite(physical_gaps))
@@ -54,9 +57,16 @@ class BrakingGapState:
     # A stopped pair must not slowly creep forward just because its reference
     # expires. Departure evidence releases this episode's distance preference.
     stopped_pair = ego_speed < 0.3 and lead_speed < 0.3
+    lead_stopped = lead_speed < 0.3
     if not stopped_pair or releasing:
       target = min(self.floor, base_distance)
-      self.floor += (target - self.floor) * -math.expm1(-dt / (2.0 if releasing else 8.0))
+      # A stopped lead ends the following episode: approach the user's stop
+      # distance instead of carrying the braking-gap memory into the stop.
+      # This memory only ever ADDS comfort distance in the cost reference;
+      # releasing it returns to the base stop distance, and the physical
+      # constraints / danger margins are untouched.
+      tau = 2.0 if releasing else (STOPPED_LEAD_RELEASE_S if lead_stopped else 8.0)
+      self.floor += (target - self.floor) * -math.expm1(-dt / tau)
     requested = max(0.0, self.floor - desired_distance)
     self.margin = min(requested, self.margin + dt) if requested >= self.margin else max(requested, self.margin - dt)
     if releasing and self.margin < 0.01 and self.floor <= base_distance + 0.05:

@@ -1,6 +1,9 @@
+import math
+
 import numpy as np
 import pytest
 
+from openpilot.selfdrive.controls.lib import longitudinal_braking_gap
 from openpilot.selfdrive.controls.lib.longitudinal_braking_gap import BrakingGapState, braking_gap_reference
 
 
@@ -111,3 +114,66 @@ def test_nonfinite_prediction_withdraws_comfort_relief(field):
   relief(state)
   assert state.relief > 0.
   assert not relief(state, **{field: np.full(13, np.nan)}).any()
+
+
+def braking_pair(state, **kwargs):
+  args = {'enabled': True, 'track_id': 43, 'dt': .05, 'distance': 20., 'ego_speed': 5., 'ego_accel': -.5,
+              'lead_speed': 4.5, 'lead_accel': -.5, 'relative_speed': -.5, 'base_tf': 2.0,
+              'stop_distance': 5.5, 'desired_distance': 17.}
+  args.update(kwargs)
+  return state.update(**args)
+
+
+def capture(state):
+  for _ in range(10):
+    braking_pair(state)
+  assert state.floor is not None
+  return state.floor
+
+
+def test_stopped_lead_releases_the_braking_gap_memory_over_about_one_second():
+  state = BrakingGapState()
+  captured = capture(state)
+  assert 16.0 < captured <= 18.0  # bounded capture: min(20, base+10, sd+2.5*v) = 18
+  for _ in range(60):
+    braking_pair(state, ego_speed=1.5, ego_accel=-.5, lead_speed=0., lead_accel=0., relative_speed=-1.5)
+  base = 5.5 + 1.5 * 2.0
+  assert state.floor - base <= 0.5
+
+
+def test_old_eight_second_tau_would_not_release_within_three_seconds(monkeypatch):
+  monkeypatch.setattr(longitudinal_braking_gap, 'STOPPED_LEAD_RELEASE_S', 8.0)
+  state = BrakingGapState()
+  capture(state)
+  for _ in range(60):
+    braking_pair(state, ego_speed=1.5, ego_accel=-.5, lead_speed=0., lead_accel=0., relative_speed=-1.5)
+  base = 5.5 + 1.5 * 2.0
+  assert state.floor - base > 4.0
+
+
+def test_moving_lead_keeps_the_eight_second_tau():
+  state = BrakingGapState()
+  capture(state)
+  for _ in range(60):
+    braking_pair(state, ego_speed=1.5, ego_accel=-.5, lead_speed=2., lead_accel=0., relative_speed=-.5)
+  base = 5.5 + 1.5 * 2.0
+  assert state.floor - base > 4.0
+
+
+def test_stopped_pair_below_point_three_still_freezes():
+  state = BrakingGapState()
+  capture(state)
+  before = state.floor
+  for _ in range(600):
+    braking_pair(state, ego_speed=0.2, ego_accel=-.2, lead_speed=0.2, lead_accel=0., relative_speed=0.)
+  assert state.floor == before
+
+
+def test_releasing_path_still_uses_the_two_second_tau():
+  state = BrakingGapState()
+  before = capture(state)
+  base = 5.5 + 1.5 * 2.0
+  for _ in range(20):
+    braking_pair(state, ego_speed=1.5, ego_accel=.5, lead_speed=2.5, lead_accel=.5, relative_speed=-1.)
+  expected = base + (before - base) * math.exp(-1.0 / 2.0)
+  assert abs(state.floor - expected) < 0.05

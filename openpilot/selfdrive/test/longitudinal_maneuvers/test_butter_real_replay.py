@@ -29,7 +29,7 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.selfdrive.controls.radar_constants import LEAD_ACCEL_TAU
-from openpilot.selfdrive.controls.lib import butter_stop, longcontrol
+from openpilot.selfdrive.controls.lib import butter_stop, longcontrol, longitudinal_braking_gap
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPlanner
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
@@ -55,8 +55,8 @@ FIDELITY_BELOW7_S = 13.6
 FIDELITY_BELOW7_TOL_S = 4.0
 OPEN_LOOP_WINDOW_S = -10.0  # metric window; replay starts at fixture start (-20 s)
 
-RESULTS: dict = {"b1": {}, "open_loop": {}, "scenarios_plant_on": {}, "log_reference": {},
-                 "fidelity": {}, "report": {}}
+RESULTS: dict = {"b1": {}, "open_loop": {}, "stop_release": {}, "scenarios_plant_on": {},
+                 "log_reference": {}, "fidelity": {}, "report": {}}
 
 
 def _no_floor(*_args, **_kwargs):
@@ -111,6 +111,8 @@ def _log_reference(fixture):
   ref["should_stop_t_s"] = None if not ss_log.size else round(float(t[ss_log[0]]), 2)
   ref["should_stop_gap_m"] = None if not ss_log.size else round(float(gap[ss_log[0]]), 3)
   ref["should_stop_v_mps"] = None if not ss_log.size else round(float(v[ss_log[0]]), 3)
+  dd = _unscale(data["desiredDistanceLog"], scale["dist"])
+  ref["desired_distance_standstill_m"] = None if not stopped else round(float(dd[stand[0]]), 3)
   return ref
 
 
@@ -367,6 +369,7 @@ def _b1_metrics(run):
   v_lead = np.array(run["v_lead"], dtype=float)
   a_target = np.array(run["a_target"], dtype=float)
   should_stop = np.array(run["should_stop"], dtype=bool)
+  desired_distance = np.array(run["desired_distance"], dtype=float)
 
   stand = np.flatnonzero(v < 0.05)
   below7 = np.flatnonzero(v < 7.0 / 3.6)
@@ -375,6 +378,7 @@ def _b1_metrics(run):
     "stopped": stopped,
     "min_gap_m": None if not active.any() else round(float(np.min(gap[active])), 3),
     "collision": bool(np.any(gap[active] <= 0.0)),
+    "desired_distance_standstill_m": None if not stopped else round(float(desired_distance[stand[0]]), 3),
   }
   if stopped and below7.size and below7[0] < stand[0]:
     i_stop, i_b7 = int(stand[0]), int(below7[0])
@@ -423,6 +427,31 @@ def _run_b1(variant, mode):
     run = FarLeadLoop(header, FixtureProfile(fixture), plant=(mode != "ideal"),
                       scc_stop=(mode == "scc")).run()
   return _b1_metrics(run)
+
+
+def _run_stop_release(butter, release_tau, mode):
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  if butter == 0:
+    header["ButterStop"] = 0
+  saved = longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S
+  longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S = release_tau
+  try:
+    run = FarLeadLoop(header, FixtureProfile(fixture), plant=(mode != "ideal"),
+                      scc_stop=(mode == "scc")).run()
+  finally:
+    longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S = saved
+  return _b1_metrics(run)
+
+
+def test_butter_real_stop_release():
+  for butter in (0, 1):
+    for label, tau in (("M0", 8.0), ("M1", 1.0)):
+      for mode in ("ideal", "scc"):
+        key = f"{'B1' if butter else 'B0'}_{label}_plant_{mode}"
+        metrics = _run_stop_release(butter, tau, mode)
+        RESULTS["stop_release"][key] = metrics
+        assert not metrics["collision"], f"{key} collides (min gap {metrics['min_gap_m']})"
 
 
 def test_butter_real_b1():
@@ -494,16 +523,23 @@ def _scenario_metrics(logs, name):
 
 def test_butter_real_scenarios_plant_on():
   rows = []
-  for group, maneuver in _CASES:
-    if group not in ("a", "b", "c"):
-      continue
-    for butter in (0, 1):
-      logs = ButterStopLoop(maneuver, butter=butter, plant=True).run()
-      entry = _scenario_metrics(logs, maneuver.title)
-      entry["group"] = group
-      entry["butter"] = butter
-      rows.append(entry)
-      assert not entry["collision"], f"{maneuver.title} butter={butter} collides (min gap {entry['min_gap_m']})"
+  saved = longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S
+  try:
+    for group, maneuver in _CASES:
+      if group not in ("a", "b", "c"):
+        continue
+      for butter in (0, 1):
+        for label, tau in (("M0", 8.0), ("M1", 1.0)):
+          longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S = tau
+          logs = ButterStopLoop(maneuver, butter=butter, plant=True).run()
+          entry = _scenario_metrics(logs, maneuver.title)
+          entry["group"] = group
+          entry["butter"] = butter
+          entry["release"] = label
+          rows.append(entry)
+          assert not entry["collision"], f"{maneuver.title} butter={butter} {label} collides (min gap {entry['min_gap_m']})"
+  finally:
+    longitudinal_braking_gap.STOPPED_LEAD_RELEASE_S = saved
   RESULTS["scenarios_plant_on"] = rows
 
 
@@ -512,6 +548,7 @@ def test_write_butter_real_table():
   table = {
     "log_reference": RESULTS["log_reference"],
     "b1": RESULTS["b1"],
+    "stop_release": RESULTS["stop_release"],
     "open_loop": RESULTS["open_loop"],
     "fidelity": RESULTS["fidelity"],
     "scenarios_plant_on": RESULTS["scenarios_plant_on"],
