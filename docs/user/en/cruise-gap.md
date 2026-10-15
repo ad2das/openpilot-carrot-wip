@@ -155,11 +155,11 @@ This experimental sequence applies to Hyundai/Kia CANFD openpilot longitudinal c
 
 ### `VEgoStopping`
 
-Range 10–100, step 5, default 50. A value of 10 is 0.10 m/s; 50 is 0.50 m/s (about 1.8 km/h). `shouldStop` becomes true when both the planner's target speeds at the control-delay horizon and one second later are below this threshold.
+Range 10–100, step 5, default 50. A value of 10 is 0.10 m/s; 50 is 0.50 m/s (about 1.8 km/h). `shouldStop` becomes true when both the planner's target speeds at the control-delay horizon and one second later are below this threshold. If the value is below 0.30 m/s, the stop is entered at 0.30 m/s and only the departure (stop release) uses this value, so a low setting keeps starts quick without a slow crawl just before stopping.
 
 Previously stored values below 10 are automatically raised to 10 at startup. If a lower value is written during driving, control applies the minimum immediately and repairs the stored value. Existing values within the supported range are retained.
 
-Lowering it delays stop recognition and may release stop state sooner on departure. Raising it enters stop state earlier but can make departure feel sluggish.
+Lowering it delays stop recognition and may release stop state sooner on departure (below 0.30 m/s it only affects the departure). Raising it enters stop state earlier but can make departure feel sluggish.
 
 ### `AChangeCostStarting`
 
