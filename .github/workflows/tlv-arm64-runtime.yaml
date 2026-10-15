@@ -19,8 +19,6 @@ jobs:
     name: onnxruntime vs tinygrad on arm64
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 15
-    env:
-      PYTHONPATH: ${{ runner.temp }}/pydeps:${{ github.workspace }}
     steps:
       - name: Check out candidate code
         uses: actions/checkout@v6
@@ -41,13 +39,17 @@ jobs:
             --target "$RUNNER_TEMP/pydeps" \
             third_party/wheels/onnxruntime-1.31.0-cp312-cp312-manylinux_2_28_aarch64.whl
       - name: Confirm onnxruntime resolves from pydeps
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ runner.temp }}/pydeps
         run: |
           python - <<'PY'
-          import os, sys
+          import os
           import onnxruntime
           expected = os.path.join(os.environ["RUNNER_TEMP"], "pydeps")
           assert onnxruntime.__file__.startswith(expected), onnxruntime.__file__
           print("onnxruntime", onnxruntime.__version__, "from", onnxruntime.__file__)
           PY
       - name: Run the ARM64 runtime check
+        env:
+          PYTHONPATH: ${{ github.workspace }}:${{ runner.temp }}/pydeps
         run: python openpilot/selfdrive/carrot/tlv/tools/arm64_runtime_check.py
