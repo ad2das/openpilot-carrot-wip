@@ -16,13 +16,16 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from openpilot.selfdrive.carrot.tlv import crops, tracker
+from openpilot.selfdrive.carrot.tlv import crops, refine, tracker
 
 # CONTRACT.md "High-speed approach" view scheduling thresholds (km/h).
 FAR_RATE_V_KPH = 50.0
 NEAR_RATE_V_KPH = 20.0
 STANDSTILL_V_KPH = 5.0
 MAX_CLASSIFY_TRACKS = crops.MAX_LAMP_CROPS
+# W134 Addendum C: the real-frame device CPU estimate for 4 refines (~12.9 ms)
+# exceeds the 12 ms budget, so refine only the 2 relevance-first tracks.
+REFINE_TRACKS_2 = True
 
 # Flat-road tail-light gate (user decision: every road is assumed FLAT). On flat
 # ground anything whose whole box lies below the calibrated horizon is closer to
@@ -123,6 +126,70 @@ class FramePipeline:
     # legacy no-prediction behaviour (PC tools/tests).
     self.ego: tracker.EgoFrame | None = None
     self._classifier_probs = np.empty((MAX_CLASSIFY_TRACKS, 8), dtype=np.float32)
+    # W134 Addendum A: full-resolution luma copy + NCC template re-localisation.
+    # `luma` is a uint8[height, width] copy of the Y plane of the CURRENT frame,
+    # owned here and never published/recorded; reallocated only on size change.
+    self.luma: np.ndarray | None = None
+    self.relocalizer = refine.TemplateRelocalizer()
+    self.refine_ms = 0.0
+    self.refine_locks = 0
+    # Track IDs whose position on THIS frame is verified (detector match or
+    # accepted refine). Only these get a lamp crop and a vote (W134 Addendum C).
+    self._verified_ids: set[int] = set()
+
+  def capture_luma(self, y, width: int) -> None:
+    """Copy the full-resolution luma of this frame (y is [height, stride])."""
+    height = y.shape[0]
+    if self.luma is None or self.luma.shape != (height, width):
+      self.luma = np.empty((height, width), dtype=np.uint8)
+    np.copyto(self.luma, y[:, :width])
+
+  def _apply_refined(self, track, box, now: float) -> None:
+    """Adopt a refined box and re-anchor the odometry to this frame."""
+    track.box = box
+    if self.ego is not None:
+      track.anchor_box = box
+      track.anchor_s = self.ego.odo.s
+      track.anchor_psi = self.ego.odo.psi
+      track.anchor_t = float(now)
+
+  def _relocalize(self, now: float, detect: bool) -> None:
+    """NCC template re-localisation (W134 Addendum A 2A).
+
+    Detect frames: refresh the template of every matched/created track from its
+    detector box, then refine the tracks the detector did NOT match. Classify-only
+    frames: refine up to MAX_REFINE_TRACKS relevance-first tracks. Refinement
+    never refreshes a template and never resets the expiry counters, so a track
+    with no detector match for > 2.0 s still expires by the existing rules.
+    """
+    started = time.perf_counter()
+    rel = self.relocalizer
+    # W134 Addendum C: a detector-matched box IS verified on this frame, even
+    # without cv2/luma, so a cv2-less device still votes on detect frames. Only
+    # the classify-only frames depend on an accepted refine.
+    matched_ids = {tid for _det, tid in self.tracker.last_matches} if detect else set()
+    self._verified_ids = set(matched_ids)
+    self.refine_locks = 0
+    if rel.enabled and self.luma is not None and self.tracker.tracks:
+      rel.prune([t.track_id for t in self.tracker.tracks])
+      if detect:
+        for track in self.tracker.tracks:
+          if track.track_id in matched_ids:
+            rel.refresh(self.luma, track)
+      locks = 0
+      limit = rel.MAX_REFINE_TRACKS_2 if REFINE_TRACKS_2 else rel.MAX_REFINE_TRACKS
+      for track in self._classify_order():
+        if locks >= limit:
+          break
+        if track.track_id in matched_ids:
+          continue
+        new_box = rel.refine(self.luma, track, self._predicted_box(track))
+        if new_box is not None:
+          self._apply_refined(track, new_box, now)
+          self._verified_ids.add(track.track_id)
+          locks += 1
+      self.refine_locks = locks
+    self.refine_ms = (time.perf_counter() - started) * 1000.0
 
   @staticmethod
   def geometry(view: str, horizon_y: float, width: int, height: int, focal_px: float,
@@ -224,11 +291,19 @@ class FramePipeline:
     return "far" if inside else "near"
 
   def _classify_tracks(self, now: float, geom: crops.ViewGeometry) -> None:
-    """Re-classify up to 4 tracked lights from THIS frame, any view."""
+    """Re-classify up to 4 tracked lights from THIS frame, any view.
+
+    W134 Addendum C (safety): a track is classified ONLY if its box is verified
+    on this frame (detector match OR accepted refine). A rejected/skipped refine
+    gets no crop and no vote, so a lamp colour is never read from a box whose
+    position was not confirmed this frame.
+    """
     classifier = self.classifier
     if classifier is None or not self.tracker.tracks:
       return
-    ordered = self._classify_order()
+    ordered = [t for t in self._classify_order() if t.track_id in self._verified_ids]
+    if not ordered:
+      return
     boxes = [self._predicted_box(t) for t in ordered]
     batch, count = self.lamp_crops.build(self.preprocess.model_input, geom, boxes)
     if count == 0:
@@ -293,6 +368,9 @@ class FramePipeline:
       # crop's model-space focal (geom.focal_px = focal / geom.scale).
       self.tracker.update(self.frame_idx, dets, view, geom.focal_px * geom.scale, now=now, predict=predict,
                           anchor=anchor, crop_box=crop_box, frame_box=frame_box)
+    # W134 Addendum A: re-locate tracks between detects (and refine un-matched
+    # tracks on a detect) BEFORE the lamp crops so _classify_tracks uses them.
+    self._relocalize(now, detect)
     self._classify_tracks(now, geom)
 
     live = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks

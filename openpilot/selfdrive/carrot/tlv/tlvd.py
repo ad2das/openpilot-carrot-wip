@@ -45,6 +45,7 @@ CONNECT_RETRY_S = 0.5
 FRAME_STALE_S = 1.2
 PUBLISH_HZ = 10.0
 MODEL_FRESH_S = 0.5
+LIVEPOSE_MAX_AGE_S = 0.5
 LEFT_INTENT_ATCTYPES = ("turn left", "atc left")
 PROC_POLL_S = 1.0
 STATS_INTERVAL_S = 10.0
@@ -381,6 +382,13 @@ class TlvRunner:
     # we recv again (msgq/visionipc/visionipc_pyx.pyx:153), so it must never be
     # held across the model call.
     self.pipeline.prepare(data, width, height, frame.stride, frame.uv_offset, geom)
+    # W134 Addendum A: copy the full-resolution luma for NCC template
+    # re-localisation before the buffer is dropped (same lifetime rule).
+    try:
+      y_plane, _uv = crops.nv12_planes(data, width, height, frame.stride, frame.uv_offset)
+      self.pipeline.capture_luma(y_plane, width)
+    except Exception:
+      pass
     del frame, data
 
     out = self.pipeline.infer(
@@ -415,7 +423,9 @@ class TlvRunner:
       calib_rpy=self._calib_rpy,
       v_ego=_as_float(car.vEgo) if car is not None else None,
       a_ego=_as_float(car.aEgo) if car is not None else None,
-      yaw_rate=_as_float(getattr(car, "yawRate", None)),
+      # Same left-positive rad/s value odometry uses (W134): livePose -z, not
+      # carState.yawRate, so tlvrec analysis sees one consistent unit/sign.
+      yaw_rate=self._yaw_rate_left_rps(),
       steering_angle_deg=_as_float(getattr(car, "steeringAngleDeg", None)),
       left_blinker=bool(car.leftBlinker) if car is not None else None,
       right_blinker=bool(car.rightBlinker) if car is not None else None,
@@ -523,10 +533,45 @@ class TlvRunner:
         print(f"tlvd: recorder disabled: {exc!r}", flush=True)
 
   def _update_odometry(self, now: float) -> None:
-    """Integrate fresh carState vEgo/yawRate for ego-motion track prediction."""
-    if self.sm is not None and self.sm.updated["carState"]:
-      car = self.sm["carState"]
-      self.odo.update(now, _as_float(car.vEgo), _as_float(getattr(car, "yawRate", None)))
+    """Integrate fresh carState vEgo and livePose yaw for ego-motion prediction.
+
+    vEgo comes from carState; the yaw rate comes from livePose, NOT
+    carState.yawRate. The unit trap: on this Hyundai (opendbc
+    hyundai/carstate.py:520, ESP12.YAW_RATE) carState.yawRate is in deg/s with
+    the OPPOSITE sign to openpilot's rad/s-left-positive convention, so feeding
+    it to EgoOdometry made a 0.77 deg/s straight-road bias a -0.77 rad/s yaw and
+    the predicted boxes flew off-frame (field route 00000449). livePose is
+    rad/s; the camera/device z axis points DOWN, so a left turn is negative z and
+    yaw_left = -angularVelocityDevice.z. It is used only when livePose is seen,
+    valid, and younger than LIVEPOSE_MAX_AGE_S; otherwise yaw_rate_rps=None
+    (EgoOdometry keeps the previous yaw). If livePose was never seen the yaw
+    stays 0 (no psi integration); carState.yawRate is never used here.
+    """
+    if self.sm is None:
+      return
+    v_ego = None
+    if self.sm.updated["carState"]:
+      v_ego = _as_float(self.sm["carState"].vEgo)
+    if self.sm.seen.get("livePose") and self.sm.valid.get("livePose"):
+      av = self.sm["livePose"].angularVelocityDevice
+      age = time.monotonic() - self.sm.recv_time.get("livePose", 0.0)
+      if bool(av.valid) and age <= LIVEPOSE_MAX_AGE_S:
+        self.odo.update(now, v_ego, -_as_float(av.z))
+        return
+    # No fresh valid livePose: advance time/vEgo only (yaw unchanged).
+    if self.sm.updated["carState"]:
+      self.odo.update(now, v_ego, None)
+
+  def _yaw_rate_left_rps(self) -> float | None:
+    """Left-positive rad/s yaw from livePose (same value odometry integrates)."""
+    if self.sm is None or not (self.sm.seen.get("livePose") and self.sm.valid.get("livePose")):
+      return None
+    av = self.sm["livePose"].angularVelocityDevice
+    if not bool(av.valid):
+      return None
+    if time.monotonic() - self.sm.recv_time.get("livePose", 0.0) > LIVEPOSE_MAX_AGE_S:
+      return None
+    return -_as_float(av.z)
 
   # -- watchdog -------------------------------------------------------------
 
@@ -683,11 +728,16 @@ class TlvRunner:
   def run(self) -> None:
     from openpilot.cereal import messaging
 
-    self.sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "carState", "carrotMan", "liveCalibration"])
+    self.sm = messaging.SubMaster(["modelV2", "deviceState", "controlsState", "roadCameraState", "carState", "carrotMan", "liveCalibration", "livePose"])
     self.pub = messaging.PubMaster(["carrotTlv"])
     # carrotTlv has no free text/enum field for the runtime, so it is printed
     # once here and repeated in the periodic stats line.
     print(f"tlvd: runtime={self.runtime_name or 'none'}", flush=True)
+    if not self.pipeline.relocalizer.enabled:
+      # cv2 (opencv-python-headless) is an optional wheel; without it template
+      # re-localisation is disabled and behaviour is exactly the pre-W134 path
+      # plus the livePose yaw fix.
+      print("tlvd: refine disabled (cv2 unavailable); template re-localisation off", flush=True)
     if self.classifier_error:
       print(f"tlvd: lamp classifier disabled: {self.classifier_error}", flush=True)
     elif self.classifier.enabled:

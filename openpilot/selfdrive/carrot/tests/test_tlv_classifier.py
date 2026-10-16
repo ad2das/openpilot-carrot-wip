@@ -1,11 +1,26 @@
 """Speed-aware scheduler + detect-then-track classifier integration (PC)."""
 import numpy as np
 
-from openpilot.selfdrive.carrot.tlv import backends, decode, pipeline, tracker
+from openpilot.selfdrive.carrot.tlv import backends, crops, decode, pipeline, tracker
 
 W, H = 1928, 1208
 RED_CLASS = int(tracker.LampClass.RED)
 MODEL_BOX = (100.0, 50.0, 140.0, 90.0)
+
+
+def _luma_with_red_box():
+  """Full-res luma with a bright patch at the full-frame detector box.
+
+  W134 Addendum C: classify-only frames only vote for boxes verified on that
+  frame (a detector match or an accepted template refine), so these tests give
+  the pipeline a luma whose lamp patch the refine can lock onto. The detector
+  runs in the FAR view first, so the track's full-frame box is the FAR mapping
+  of MODEL_BOX; the patch sits there (full-frame coords are view-independent).
+  """
+  luma = np.full((H, W), 60, np.uint8)
+  x1, y1, x2, y2 = crops.map_model_box_to_full(MODEL_BOX, _far_geom())
+  luma[max(0, int(y1)):int(y2), max(0, int(x1)):int(x2)] = 210
+  return luma
 
 
 class ScriptedBackend:
@@ -81,16 +96,22 @@ def test_pipeline_classifier_confirms_and_grades():
   far = _far_geom()
   near = pipeline.FramePipeline.geometry("near", 600.0, W, H, 2648.0)
 
+  # W134 Addendum C: verify the box this frame. The detect frame verifies via the
+  # detector match; the classify-only frames verify via an accepted template
+  # refine, so luma must carry the lamp patch. Assertions are unchanged.
+  pipe.capture_luma(_luma_with_red_box(), W)
   out0 = pipe.infer("far", far, image_width=W, now=0.0, detect=True)
   assert out0.state == tracker.SignalState.none
   assert out0.red_likely is True  # one strong classifier vote, not confirmed
 
   # Detector skipped (throttled) on the other view; classification still runs.
+  pipe.capture_luma(_luma_with_red_box(), W)
   out1 = pipe.infer("near", near, image_width=W, now=0.2, detect=False)
   assert backend.calls == 1
   assert out1.state == tracker.SignalState.none
   assert out1.red_likely is True
 
+  pipe.capture_luma(_luma_with_red_box(), W)
   out2 = pipe.infer("near", near, image_width=W, now=0.4, detect=False)
   assert backend.calls == 1
   assert out2.state == tracker.SignalState.red  # 3 votes within 0.6 s
@@ -123,8 +144,12 @@ def test_pipeline_low_green_mass_votes_non_green():
   far = _far_geom()
   near = pipeline.FramePipeline.geometry("near", 600.0, W, H, 2648.0)
 
+  # W134 Addendum C: luma patches let the classify-only refines verify the box.
+  pipe.capture_luma(_luma_with_red_box(), W)
   pipe.infer("far", far, image_width=W, now=0.0, detect=True)
+  pipe.capture_luma(_luma_with_red_box(), W)
   pipe.infer("near", near, image_width=W, now=0.2, detect=False)
+  pipe.capture_luma(_luma_with_red_box(), W)
   out2 = pipe.infer("near", near, image_width=W, now=0.4, detect=False)
 
   votes = [vote for track in pipe.tracker.tracks for vote in track.votes]
@@ -151,6 +176,32 @@ def test_detect_false_keeps_last_published_dets():
   pipe.infer("far", far, image_width=W, now=0.2, detect=False)
   assert backend.calls == 1
   assert len(pipe.last_dets) == 1  # stale dets keep the fusion latch refreshed
+
+
+def test_cv2_missing_detect_frame_votes_but_classify_only_does_not(monkeypatch):
+  """W134 Addendum C (decision a): with cv2 missing, a detector-matched box is
+  still verified on a detect frame and votes; a classify-only frame verifies
+  nothing (no refine possible) so it records no votes."""
+  from openpilot.selfdrive.carrot.tlv import refine
+  monkeypatch.setattr(refine, "cv2", None)
+  monkeypatch.setattr(refine, "CV2_AVAILABLE", False)
+  stub = backends.StubClassifier(cls=RED_CLASS, prob=0.9)
+  pipe, backend = _make_pipe([_red_frame()], stub)
+  pipe.relocalizer = refine.TemplateRelocalizer()  # disabled (cv2 missing)
+  assert pipe.relocalizer.enabled is False
+  far = _far_geom()
+  near = pipeline.FramePipeline.geometry("near", 600.0, W, H, 2648.0)
+
+  # Detect frame: the matched box is verified by the detector -> votes.
+  out0 = pipe.infer("far", far, image_width=W, now=0.0, detect=True)
+  votes0 = [v for t in pipe.tracker.tracks for v in t.votes]
+  assert votes0 and out0.red_likely is True
+
+  # Classify-only frame: no cv2 refine, no detector match -> no new vote.
+  before = len(votes0)
+  pipe.infer("near", near, image_width=W, now=0.2, detect=False)
+  votes1 = [v for t in pipe.tracker.tracks for v in t.votes]
+  assert len(votes1) == before
 
 
 def test_classify_order_is_relevant_first_and_bounded():
