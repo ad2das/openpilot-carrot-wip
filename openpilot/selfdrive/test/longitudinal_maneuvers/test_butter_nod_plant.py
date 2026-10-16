@@ -66,6 +66,18 @@ LS_CMAX = [round(0.05 * i, 2) for i in range(11)]        # 0.0 .. 0.5
 LS_VHI = [round(0.2 * (i + 1), 1) for i in range(8)]     # 0.2 .. 1.6
 LS_CLOW = [round(-0.3 + 0.1 * i, 1) for i in range(10)]  # -0.3 .. 0.6
 
+# real_sr (regime-split + SCC stop) window and grid (brief step 1c.2).
+SR_WIN_END = 0.6   # window ends at t_rel +0.6
+SR_STOPPING = 2    # fixture long_state value for LongCtrlState.stopping
+# Reference set (vfit3.py); the implementation must reproduce it within tolerance.
+SR_REF = {"L": 0.6, "tau": 0.8, "SCC_A": -0.4, "C_MAX": 0.1, "V_HI": 1.0, "C_LOW": 0.3}
+SR_L = [round(0.2 + 0.1 * i, 1) for i in range(9)]          # 0.2 .. 1.0
+SR_TAU = [round(0.3 + 0.1 * i, 1) for i in range(10)]       # 0.3 .. 1.2
+SR_SCC = [round(-0.10 - 0.05 * i, 2) for i in range(15)]    # -0.10 .. -0.80
+SR_CMAX = [round(0.05 * i, 2) for i in range(7)]            # 0.0 .. 0.30
+SR_VHI = [0.25, 0.5, 1.0, 1.5, 2.0]
+SR_CLOW = [round(0.05 * i, 2) for i in range(13)]           # 0.0 .. 0.60
+
 # PASS targets (brief step 1.3).
 T_RMS = 0.12
 T_STOP_DECEL = 0.15   # decel error at t_rel = -0.3 s (replaces t = 0)
@@ -73,6 +85,14 @@ T_STOP_TIME = 0.4
 T_DIST = 0.25
 DECEL_AT_S = -0.3     # gated fidelity time point
 DECEL_INFO_S = (-1.0, -0.6, -0.3, 0.0)
+
+# real_sr fidelity targets (brief step 1c.4).
+SR_T_DIST = 0.25
+SR_T_STOP_TIME = 0.4
+SR_T_VRMS = 0.08
+SR_T_AWRMS = 0.12
+SR_CROSSCHECK_DIST = 0.02   # |ours - vfit3| distance match tolerance
+SR_CROSSCHECK_TIME = 0.05   # |ours - vfit3| stop-time match tolerance
 
 BASELINE_PARAMS = {"ButterStop": 1, "VEgoStopping": 10, "StoppingAccel": -50}
 
@@ -157,6 +177,53 @@ def real_ls_step(state, cmd, v, dt, p, scc_stop=False, lc_stopping=False):
   new_state = state.setdefault("new", {})
   a_old = old_plant_step(old_state, cmd, v, dt, scc_stop=scc_stop, lc_stopping=lc_stopping)
   a_new, _ = plant_real_step(new_state, cmd, v, dt, p)
+  w = min(1.0, max(0.0, (V_SW - v) / 1.0))
+  return w * a_new + (1.0 - w) * a_old
+
+
+def sr_new_step(state, cmd, v, dt, p, long_state):
+  """NEW low-speed plant with the SCC stop regime (brief 1c.1).
+
+  The command is delayed by L. While the (delayed) LongControl state is
+  `stopping`, the target is SCC_A (the SCC transmits its own StopReq decel, not
+  cmd); otherwise the target is the delayed cmd. The lag follows
+  a_lag += (target - a_lag) * min(1, dt / tau); creep c(v) = C_LOW + (C_MAX -
+  C_LOW) * min(1, v / V_HI) is added only while a_lag < 0.3 and v > 0.01; at
+  v <= 0 a negative accel is clamped to 0. Returns (a_act, v_next).
+  """
+  L = float(p["L"]); tau = float(p["tau"]); scc_a = float(p["SCC_A"])
+  C_MAX = float(p["C_MAX"]); V_HI = float(p["V_HI"]); C_LOW = float(p["C_LOW"])
+
+  hist = state.setdefault("hist", [])
+  hist.append((float(cmd), float(long_state)))
+  n = int(round(L / dt)) if dt > 0.0 else 0
+  idx = len(hist) - 1 - n
+  cmd_d, st_d = hist[idx] if idx >= 0 else hist[0]
+
+  target = scc_a if int(st_d) == SR_STOPPING else cmd_d
+  a_lag = float(state.get("a_lag", target))
+  a_lag += (target - a_lag) * min(1.0, dt / tau) if tau > 0.0 else (target - a_lag)
+  state["a_lag"] = a_lag
+
+  c = C_LOW + (C_MAX - C_LOW) * min(1.0, v / V_HI) if V_HI > 0.0 else C_MAX
+  a_act = a_lag + (c if (a_lag < 0.3 and v > 0.01) else 0.0)
+  if v <= 0.0:
+    a_act = 0.0 if a_act < 0.0 else a_act
+  v_next = max(0.0, v + a_act * dt)
+  return a_act, v_next
+
+
+def real_sr_step(state, cmd, v, dt, p, long_state):
+  """Regime-split plant: OLD above v >= 4 m/s, NEW (real_sr) below v <= 3 m/s.
+
+  Same speed blend as real_ls. `long_state` is the controller's own
+  longControlState at this step (feeds the delayed SCC stop regime).
+  """
+  old_state = state.setdefault("old", {})
+  new_state = state.setdefault("new", {})
+  lc_stopping = int(long_state) == SR_STOPPING
+  a_old = old_plant_step(old_state, cmd, v, dt, scc_stop=False, lc_stopping=lc_stopping)
+  a_new, _ = sr_new_step(new_state, cmd, v, dt, p, long_state)
   w = min(1.0, max(0.0, (V_SW - v) / 1.0))
   return w * a_new + (1.0 - w) * a_old
 
@@ -479,6 +546,139 @@ def fidelity_low_speed_all(stops, p):
           "all_pass": all(r["pass"] for r in rows)}
 
 
+# --- real_sr (SCC stop regime) fit to wheel speed / distance ---------------
+
+def _prepare_sr_stop(stop):
+  """real_sr window t0 = max(-4.0, last gas + 0.2) .. t_rel +0.6 (brief 1c.2)."""
+  rows = stop["rows"]
+  t = rows[:, 0]
+  t0 = -4.0
+  if stop["gas_cut_t"] is not None:
+    t0 = max(t0, stop["gas_cut_t"] + LS_GAS_PAD_S)
+  w = (t >= t0) & (t <= SR_WIN_END)
+  return {"t": t[w].copy(), "cmd": rows[w, 4].copy(), "st": rows[w, 5].copy(),
+          "v": rows[w, 1].copy(), "aw": rows[w, 2].copy(),
+          "v0": float(rows[w, 1][0]), "aw0": float(rows[w, 2][0])}
+
+
+def _sr_vec_metrics(prep, L, tau, scc_a, CM, VH, CL):
+  """Vectorized-over-creep metrics for the real_sr NEW plant.
+
+  Returns (vRMS, dist_err, stop_time_err, awRMS), each length K. The lag state
+  is scalar (independent of creep) so it is computed once.
+  """
+  t = prep["t"]; cmd = prep["cmd"]; st = prep["st"]; v_real = prep["v"]; aw = prep["aw"]
+  N = t.size; K = CM.size
+  cd = np.interp(t - L, t, cmd)
+  sd = np.interp(t - L, t, st)
+  a_lag = np.empty(N)
+  a_lag[0] = prep["aw0"]
+  for i in range(1, N):
+    dt = t[i] - t[i - 1]
+    target = scc_a if sd[i] > (SR_STOPPING - 0.5) else cd[i]
+    a_lag[i] = a_lag[i - 1] + (target - a_lag[i - 1]) * min(1.0, dt / tau) if tau > 0 else target
+  v = np.full(K, prep["v0"]); x = np.zeros(K)
+  vs = np.empty((N, K)); ys = np.empty((N, K))
+  for i in range(N):
+    dt = t[i] - t[i - 1] if i else 0.0
+    c = CL + (CM - CL) * np.minimum(1.0, v / VH)
+    a = a_lag[i] + np.where((a_lag[i] < 0.3) & (v > 0.01), c, 0.0)
+    a = np.where((v <= 0.0) & (a < 0.0), 0.0, a)
+    v = np.maximum(0.0, v + a * dt)
+    x = x + v * dt
+    vs[i] = v; ys[i] = a
+  xr = np.concatenate([[0], np.cumsum(v_real[1:] * np.diff(t))])
+  dist_err = x - xr[-1]
+  mask = vs < 0.05
+  any_stop = mask.any(axis=0)
+  ts = np.where(any_stop, t[np.argmax(mask, axis=0)], 9.0)
+  tr = t[np.argmax(v_real < 0.05)]
+  stopt_err = ts - tr
+  vRMS = np.sqrt(np.mean((vs - v_real[:, None]) ** 2, axis=0))
+  m = t < -0.2
+  awRMS = np.sqrt(np.mean((ys[m] - aw[m][:, None]) ** 2, axis=0))
+  return vRMS, dist_err, stopt_err, awRMS
+
+
+def _sr_scalar_metrics(prep, p):
+  """Scalar real_sr metrics for one stop (used for fidelity / traces / xcheck)."""
+  CM = np.array([p["C_MAX"]]); VH = np.array([p["V_HI"]]); CL = np.array([p["C_LOW"]])
+  vr, de, te, ar = _sr_vec_metrics(prep, p["L"], p["tau"], p["SCC_A"], CM, VH, CL)
+  return float(vr[0]), float(de[0]), float(te[0]), float(ar[0])
+
+
+def fit_sr_plant(stops, L_list, tau_list, scc_list, cmax_list, vhi_list, clow_list):
+  """Grid-search ONE real_sr set; loss = mean|dist_err| + mean vRMS. Sorted."""
+  preps = [_prepare_sr_stop(s) for s in stops]
+  CM, VH, CL = _mesh(cmax_list, vhi_list, clow_list)
+  K = CM.size
+  results = []
+  for L in L_list:
+    for tau in tau_list:
+      for scc_a in scc_list:
+        per_vr = np.empty((len(preps), K))
+        per_de = np.empty((len(preps), K))
+        for si, prep in enumerate(preps):
+          vr, de, _te, _ar = _sr_vec_metrics(prep, L, tau, scc_a, CM, VH, CL)
+          per_vr[si] = vr
+          per_de[si] = de
+        loss = np.mean(np.abs(per_de), axis=0) + np.mean(per_vr, axis=0)
+        for k in range(K):
+          results.append((float(loss[k]), {"L": L, "tau": tau, "SCC_A": scc_a,
+                                           "C_MAX": float(CM[k]), "V_HI": float(VH[k]),
+                                           "C_LOW": float(CL[k])}))
+  results.sort(key=lambda item: item[0])
+  return results
+
+
+def fidelity_sr_stop(stop, prep, p):
+  vr, de, te, ar = _sr_scalar_metrics(prep, p)
+  out = {"route": stop["route"], "minute": stop["minute"],
+         "window_s": [round(float(prep["t"][0]), 3), round(float(prep["t"][-1]), 3)],
+         "vRMS": round(vr, 4), "dist_err_m": round(de, 4), "dist_sign": "+" if de >= 0 else "-",
+         "stop_time_err_s": round(te, 4), "aWheel_rms": round(ar, 4)}
+  out["pass"] = bool(abs(de) <= SR_T_DIST and abs(te) <= SR_T_STOP_TIME
+                     and vr <= SR_T_VRMS and ar <= SR_T_AWRMS)
+  return out
+
+
+def fidelity_sr_all(stops, p):
+  preps = [_prepare_sr_stop(s) for s in stops]
+  rows = [fidelity_sr_stop(stop, prep, p) for stop, prep in zip(stops, preps, strict=True)]
+  return {"stops": rows,
+          "targets": {"dist_err_m": SR_T_DIST, "stop_time_err_s": SR_T_STOP_TIME,
+                      "vRMS": SR_T_VRMS, "aWheel_rms": SR_T_AWRMS},
+          "pass_count": sum(r["pass"] for r in rows),
+          "all_pass": all(r["pass"] for r in rows)}
+
+
+def sr_trace(stop, prep, p, t_lo=-3.0, t_hi=0.0, step=0.2):
+  """0.2 s trace over [t_lo, t_hi]: t, v_real, v_sim, cmd, long_state, aWheel, a_sim."""
+  L = p["L"]; tau = p["tau"]; scc_a = p["SCC_A"]
+  C_MAX = p["C_MAX"]; V_HI = p["V_HI"]; C_LOW = p["C_LOW"]
+  t = prep["t"]; cmd = prep["cmd"]; st = prep["st"]
+  cd = np.interp(t - L, t, cmd); sd = np.interp(t - L, t, st)
+  v = prep["v0"]; a_lag = prep["aw0"]; rows_out = []
+  sim_v = np.empty(t.size); sim_a = np.empty(t.size)
+  for i in range(t.size):
+    dt = t[i] - t[i - 1] if i else 0.0
+    target = scc_a if int(round(sd[i])) == SR_STOPPING else cd[i]
+    a_lag = a_lag + (target - a_lag) * min(1.0, dt / tau) if tau > 0 else target
+    c = C_LOW + (C_MAX - C_LOW) * min(1.0, v / V_HI)
+    a = a_lag + (c if (a_lag < 0.3 and v > 0.01) else 0.0)
+    if v <= 0.0 and a < 0:
+      a = 0.0
+    sim_v[i] = v; sim_a[i] = a
+    v = max(0.0, v + a * dt)
+  for tt in np.arange(t_lo, t_hi + 1e-9, step):
+    j = _closest_index(t, tt)
+    rows_out.append({"t": round(float(t[j]), 2), "v_real": round(float(prep["v"][j]), 3),
+                     "v_sim": round(float(sim_v[j]), 3), "cmd": round(float(cmd[j]), 3),
+                     "long_state": int(st[j]), "aWheel_real": round(float(prep["aw"][j]), 3),
+                     "a_sim": round(float(sim_a[j]), 3)})
+  return {"route": stop["route"], "minute": stop["minute"], "trace": rows_out}
+
+
 # --- closed-loop baseline with the real plant ------------------------------
 
 def _run_loop_real(loop):
@@ -568,10 +768,14 @@ def _run_loop_real(loop):
       maneuver_enabled, loop._cs_view(cs_cruise, standstill), plan_view,
       limits, t_since_plan, radar_view)
     accel = float(accel)
+    lc_state_now = loop.long_control.long_control_state
     if loop.plant_mode == "real_ls":
-      lc_stopping = loop.long_control.long_control_state == LongCtrlState.stopping
+      lc_stopping = lc_state_now == LongCtrlState.stopping
       applied = real_ls_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p,
                              scc_stop=False, lc_stopping=lc_stopping)
+    elif loop.plant_mode == "real_sr":
+      applied = real_sr_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p,
+                             int(lc_state_now))
     else:
       applied, _ = plant_real_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p)
 
@@ -744,45 +948,61 @@ def test_butter_nod_fixture_sha256():
 
 
 def test_butter_nod_smoke():
-  """LS mini-grid (brief 1b.5) on 2 stops + 2 closed-loop scenarios; fields checked."""
+  """real_sr smoke (brief 1c.7): reference set on 2 stops + 2 closed-loop scenarios."""
   _d, stops = load_stops()
   subset = [stops[0], stops[2]]
-  cmax = [0.15]
-  vhi = [0.6]
-  clow = [0.0, 0.3]
-  fits = fit_low_speed_plant(subset, [0.3, 0.8], [0.3, 1.0], cmax, vhi, clow)
-  assert fits, "mini-grid produced no finite fits"
-  losses = np.array([f[0] for f in fits], dtype=float)
-  assert np.all(np.isfinite(losses)), f"non-finite loss: {losses}"
-  assert losses.max() - losses.min() > 1e-6, f"loss is constant: {losses}"
-
-  best = fits[0][1]
-  prep = _prepare_ls_stop(subset[0])
-  CM, VH, CL = _mesh(cmax, vhi, clow)
-  vec = _ls_vec_rms(prep, best["L"], best["tau"], CM, VH, CL)
-  _vs, _aas, _k = _ls_simulate_scalar(prep, best)
-  scalar_rms = float(np.sqrt(np.mean((_aas - prep["imu"][:_aas.size]) ** 2)))
-  match = np.flatnonzero((np.abs(CM - best["C_MAX"]) < 1e-9)
-                         & (np.abs(VH - best["V_HI"]) < 1e-9)
-                         & (np.abs(CL - best["C_LOW"]) < 1e-9))
-  assert match.size, "best creep params not found in mesh"
-  assert abs(vec[match[0]] - scalar_rms) < 1e-6, f"vectorized {vec[match[0]]} != scalar {scalar_rms}"
-
-  fid = fidelity_low_speed_all(subset, best)
-  print(f"NOD-SMOKE loss min={losses.min():.5f} max={losses.max():.5f} n={losses.size}")
-  print(f"NOD-SMOKE best={best}")
+  p = dict(SR_REF)
+  fid = fidelity_sr_all(subset, p)
+  print(f"NOD-SMOKE ref={p}")
   print(f"NOD-SMOKE fidelity={json.dumps(fid['stops'], sort_keys=True)}")
+  metrics = []
   for row in fid["stops"]:
-    for key in ("accel_rms", "decel_err_at_minus0.3", "stop_time_sim_s",
-                "stop_time_err_s", "dist_sim_m", "dist_log_m", "dist_err_m"):
+    for key in ("vRMS", "dist_err_m", "stop_time_err_s", "aWheel_rms"):
       assert row[key] is not None and math.isfinite(row[key]), f"{key} not finite: {row[key]}"
+      metrics.append(row[key])
+  vec = _sr_scalar_metrics(_prepare_sr_stop(subset[0]), p)
+  assert all(math.isfinite(x) for x in vec), f"vec metrics not finite: {vec}"
+  print(f"NOD-SMOKE metrics min={min(metrics):.4f} max={max(metrics):.4f} n={len(metrics)}")
+  assert max(metrics) - min(metrics) > 1e-6, "metrics constant"
 
-  rows = run_baseline(best, plant_mode="real_ls")
+  rows = run_baseline(p, plant_mode="real_sr")
   base = [r for r in rows if r["name"] in ("b1", "stopped lead 20 km/h gap 30 m")]
   for r in base:
-    for key in ("stop_decel_at_stop", "nod_swing", "tail_s", "final_gap_m", "min_gap_m"):
+    for key in ("stop_decel_at_stop", "stop_decel_at_minus0.3", "nod_swing", "tail_s",
+                "final_gap_m", "min_gap_m"):
       assert r[key] is not None and math.isfinite(r[key]), f"{key} not finite: {r[key]}"
   print(f"NOD-SMOKE closed-loop rows={len(rows)} sample={base}")
+
+
+def test_butter_nod_sr_crosscheck():
+  """Our real_sr metrics at SR_REF must match vfit3.py within 0.02 m / 0.05 s (1c.3)."""
+  _d, stops = load_stops()
+  p = dict(SR_REF)
+  # vfit3.py reference output for set (L 0.6, tau 0.8, SCC_A -0.4, C_MAX 0.1, V_HI 1.0, C_LOW 0.3)
+  ref = {
+    "00000443--e1be7fac84": {"minute": 8.82, "dist": -0.117066, "stopt": 0.140400},
+    "00000445--7bd76114e3": [{"minute": 1.43, "dist": 0.056362, "stopt": 0.183000},
+                             {"minute": 7.27, "dist": 0.047173, "stopt": -0.179100},
+                             {"minute": 8.52, "dist": -0.584369, "stopt": -0.859800}],
+    "00000447--8ec1dcb6ff": {"minute": 7.07, "dist": -0.589841, "stopt": -1.080000},
+    "0000044c--4d25f7747b": {"minute": 6.21, "dist": -0.024030, "stopt": -0.181400},
+  }
+  used = {}
+  for stop in stops:
+    vr, de, te, ar = _sr_scalar_metrics(_prepare_sr_stop(stop), p)
+    entry = ref.get(stop["route"])
+    if entry is None:
+      continue
+    if isinstance(entry, list):
+      idx = used.get(stop["route"], 0)
+      entry = entry[idx]
+      used[stop["route"]] = idx + 1
+    assert entry["minute"] == stop["minute"], f"minute mismatch {entry} {stop['minute']}"
+    assert abs(de - entry["dist"]) <= SR_CROSSCHECK_DIST, \
+      f"{stop['route']}@{stop['minute']} dist {de:.4f} vs {entry['dist']:.4f}"
+    assert abs(te - entry["stopt"]) <= SR_CROSSCHECK_TIME, \
+      f"{stop['route']}@{stop['minute']} stopt {te:.4f} vs {entry['stopt']:.4f}"
+  print("NOD-XCHECK OK (real_sr matches vfit3 within 0.02 m / 0.05 s)")
 
 
 def test_butter_nod_fit_baseline():
@@ -791,41 +1011,54 @@ def test_butter_nod_fit_baseline():
   assert hashlib.sha256(raw).hexdigest() == NOD_SHA256
 
   _d, stops = load_stops()
-  fits = fit_low_speed_plant(stops, LS_L, LS_TAU, LS_CMAX, LS_VHI, LS_CLOW)
+  fits = fit_sr_plant(stops, SR_L, SR_TAU, SR_SCC, SR_CMAX, SR_VHI, SR_CLOW)
   assert fits, "fit produced no finite parameter sets"
   top5 = [{"loss": round(loss, 6), "params": params} for loss, params in fits[:5]]
   best_loss, best_p = fits[0]
   edge = {axis: best_p[axis] in (lo, hi) for axis, (lo, hi) in (
-    ("L", (LS_L[0], LS_L[-1])), ("tau", (LS_TAU[0], LS_TAU[-1])),
-    ("C_MAX", (LS_CMAX[0], LS_CMAX[-1])), ("V_HI", (LS_VHI[0], LS_VHI[-1])),
-    ("C_LOW", (LS_CLOW[0], LS_CLOW[-1])))}
+    ("L", (SR_L[0], SR_L[-1])), ("tau", (SR_TAU[0], SR_TAU[-1])),
+    ("SCC_A", (SR_SCC[0], SR_SCC[-1])), ("C_MAX", (SR_CMAX[0], SR_CMAX[-1])),
+    ("V_HI", (SR_VHI[0], SR_VHI[-1])), ("C_LOW", (SR_CLOW[0], SR_CLOW[-1])))}
 
-  fid = fidelity_low_speed_all(stops, best_p)
-  base = run_baseline(best_p, plant_mode="real_ls")
+  fid = fidelity_sr_all(stops, best_p)
+  fid_ref = fidelity_sr_all(stops, dict(SR_REF))
+  base = run_baseline(best_p, plant_mode="real_sr")
 
   def rows_by_butter(butter):
     return [r for r in base if r["butter"] == butter]
   collisions_b0 = [r for r in rows_by_butter(0) if r["collision"]]
-  fcw_b0 = [r for r in rows_by_butter(0) if r["fcw_steps"] > 0]
   collisions_b1 = [r for r in rows_by_butter(1) if r["collision"]]
+  # Only the known pre-existing s1 FCW at t < 0.1 s (OLD regime) is accepted.
+  accepted_fcw = "s1 short-gap stopped lead 15 km/h gap 9 m"
+  fcw_b0 = [r for r in rows_by_butter(0) if r["fcw_steps"] > 0]
+
+  # 1c.4 outliers: two worst stops by |distance error|.
+  worst = sorted(fid["stops"], key=lambda r: abs(r["dist_err_m"]), reverse=True)[:2]
+  traces = []
+  for row in worst:
+    stop = next(s for s in stops if s["route"] == row["route"] and s["minute"] == row["minute"])
+    traces.append(sr_trace(stop, _prepare_sr_stop(stop), best_p))
 
   table = {
     "fixture_sha256": NOD_SHA256,
     "fit": {
-      "mode": "real_ls",
-      "grid": {"L": LS_L, "tau": LS_TAU, "C_MAX": LS_CMAX, "V_HI": LS_VHI, "C_LOW": LS_CLOW,
-               "v_switch": V_SW, "window_v_max": LS_V_MAX, "gas_pad_s": LS_GAS_PAD_S,
-               "n_combo": len(fits)},
+      "mode": "real_sr",
+      "grid": {"L": SR_L, "tau": SR_TAU, "SCC_A": SR_SCC, "C_MAX": SR_CMAX,
+               "V_HI": SR_VHI, "C_LOW": SR_CLOW, "v_switch": V_SW, "stopping_state": SR_STOPPING,
+               "window_end": SR_WIN_END, "gas_pad_s": LS_GAS_PAD_S, "n_combo": len(fits)},
       "loss": round(best_loss, 6),
       "best": {"loss": round(best_loss, 6), "params": best_p},
       "edge": edge,
       "top5": top5,
     },
     "fidelity": fid,
-    "baseline": {"params": {"plant": "real_ls", **BASELINE_PARAMS}, "rows": base,
+    "fidelity_reference_set": fid_ref,
+    "outliers": traces,
+    "baseline": {"params": {"plant": "real_sr", **BASELINE_PARAMS}, "rows": base,
                  "collisions": [f"{r['name']} butter={r['butter']} min_gap={r['min_gap_m']}"
                                 for r in base if r["collision"]],
-                 "fcw_b0": [f"{r['name']} fcw={r['fcw_steps']}" for r in fcw_b0]},
+                 "fcw_b0": [f"{r['name']} fcw={r['fcw_steps']}" for r in fcw_b0],
+                 "accepted_fcw": accepted_fcw},
     "note": "desktop open-loop fit / closed-loop simulation only; no vehicle validation",
   }
   out_dir = os.path.dirname(out_path)
@@ -835,15 +1068,31 @@ def test_butter_nod_fit_baseline():
     handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
 
   print(f"NOD-FIT best loss={best_loss:.6f} params={best_p} n_combo={len(fits)} edge={edge}")
+  print(f"NOD-FIDELITY pass={fid['pass_count']}/{len(fid['stops'])}")
   for i, row in enumerate(fid["stops"]):
-    print(f"NOD-FIDELITY stop{i} {row['route'][-8:]}@{row['minute']} pass={row['pass']} {row}")
+    print(f"NOD-FIDELITY stop{i} {row['route'][-8:]}@{row['minute']} "
+          f"vRMS={row['vRMS']:.4f} dist={row['dist_sign']}{abs(row['dist_err_m']):.4f} "
+          f"stopt={row['stop_time_err_s']:+.4f} awRMS={row['aWheel_rms']:.4f} pass={row['pass']}")
+  print(f"NOD-FIDELITY-REF pass={fid_ref['pass_count']}/{len(fid_ref['stops'])}")
+  for i, row in enumerate(fid_ref["stops"]):
+    print(f"NOD-FIDELITY-REF stop{i} {row['route'][-8:]}@{row['minute']} "
+          f"vRMS={row['vRMS']:.4f} dist={row['dist_sign']}{abs(row['dist_err_m']):.4f} "
+          f"stopt={row['stop_time_err_s']:+.4f} awRMS={row['aWheel_rms']:.4f} pass={row['pass']}")
+  for tr in traces:
+    print(f"NOD-OUTLIER {tr['route'][-8:]}@{tr['minute']}")
+    for pt in tr["trace"]:
+      print(f"   t={pt['t']:+.2f} v_real={pt['v_real']:.3f} v_sim={pt['v_sim']:.3f} "
+            f"cmd={pt['cmd']:+.3f} st={pt['long_state']} aw_real={pt['aWheel_real']:+.3f} "
+            f"a_sim={pt['a_sim']:+.3f}")
   print(f"NOD-BASELINE rows={len(base)} collisions={len(collisions_b0) + len(collisions_b1)}")
   for r in collisions_b0 + collisions_b1:
     print(f"NOD-COLLISION {r['name']} butter={r['butter']} min_gap={r['min_gap_m']}")
-  # HARD GATE (process): 0 collisions and 0 FCW at ButterStop 0. FCW is reported,
-  # not asserted: the brief's test assertions are sha, fit ran, and no collision
-  # at ButterStop 0 and 1 (below). A B0 FCW must be surfaced to the parent.
+  # HARD GATE (process): 0 collisions at B0 and B1, and no B0 FCW other than the
+  # accepted pre-existing s1 one. FCW is reported; the brief's test assertions are
+  # sha, fit ran, and no collision at ButterStop 0 and 1 (below).
+  other_fcw = [r for r in fcw_b0 if r["name"] != accepted_fcw]
   print(f"NOD-GATE-B0 fcw_rows={[{'name': r['name'], 'fcw_steps': r['fcw_steps']} for r in fcw_b0]}")
+  print(f"NOD-GATE-B0 other_fcw={[r['name'] for r in other_fcw]}")
   assert not collisions_b0, "baseline collision at ButterStop 0: " + "; ".join(
     f"{r['name']} min_gap={r['min_gap_m']}" for r in collisions_b0)
   assert not collisions_b1, "baseline collision at ButterStop 1: " + "; ".join(
