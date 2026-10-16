@@ -307,7 +307,7 @@ def test_tlvrec_active_session_skips_fresh_and_uploads_stale(tmp_path, monkeypat
 def test_tlvrec_recent_file_blocks_upload(tmp_path, monkeypatch):
   tlv_root, uploads = tlv_prepare(monkeypatch, tmp_path)
   session_dir = write_tlv_session(tlv_root, mtime=old_timestamp())
-  recent = time.time() - 30.0  # noqa: TID251
+  recent = time.time() - (log_sync.TLVREC_QUIET_S / 2.0)  # noqa: TID251
   os.utime(os.path.join(session_dir, "0000002.jpg"), (recent, recent))
   sync = log_sync.LogSync()
   assert asyncio.run(sync.run_once()) == log_sync.POLL_S
@@ -453,3 +453,39 @@ def test_tlvrec_constants_match_recorder():
   assert log_sync.TLVREC_ROOT == recorder.DEFAULT_ROOT
   assert log_sync.TLVREC_SESSION_RE.pattern == recorder.SESSION_NAME_RE.pattern
   assert log_sync.TLVREC_ACTIVE_NAME == recorder.ACTIVE_NAME
+
+
+def test_tlvrec_during_drive_rotation_uploads_old_keeps_new(tmp_path, monkeypatch):
+  """60 s sessions: after the recorder rotates and the old session is quiet for
+  TLVREC_QUIET_S, it is uploaded and deleted while the new (active) one is left
+  alone; between drive segments next_segment is None so tlvrec gets a turn."""
+  assert log_sync.TLVREC_QUIET_S == 15.0
+  assert log_sync.TLVREC_ACTIVE_FRESH_S == 20.0
+  tlv_root, uploads = tlv_prepare(monkeypatch, tmp_path)
+  now = time.time()  # noqa: TID251
+  old_session = write_tlv_session(tlv_root, name="20260101-000000",
+                                  mtime=now - (log_sync.TLVREC_QUIET_S * 2))
+  new_session = write_tlv_session(tlv_root, name="20260101-000100", mtime=now)
+  # the recorder has rotated and its heartbeat names only the new session
+  active_path = os.path.join(str(tlv_root), log_sync.TLVREC_ACTIVE_NAME)
+  with open(active_path, "w", encoding="utf-8") as f:
+    f.write("20260101-000100")
+  os.utime(active_path, (now, now))
+
+  sync = log_sync.LogSync()
+  assert asyncio.run(sync.run_once()) == 0.5
+  assert [u["remote_path"] for u in uploads] == ["tlvrec--20260101-000000"]
+  assert not os.path.exists(old_session)
+  assert os.path.isdir(new_session)
+
+
+def test_tlvrec_rotated_session_when_drive_segments_absent(tmp_path, monkeypatch):
+  """While driving there is no complete drive segment, so next_segment returns
+  None between them and the tlv session is uploaded on that same pass."""
+  tlv_root, uploads = tlv_prepare(monkeypatch, tmp_path)
+  session_dir = write_tlv_session(tlv_root, mtime=old_timestamp())
+  assert log_sync.next_segment(BASE_URL, time.time()) is None  # noqa: TID251
+  sync = log_sync.LogSync()
+  assert asyncio.run(sync.run_once()) == 0.5
+  assert [u["remote_path"] for u in uploads] == [f"tlvrec--{TLV_SESSION}"]
+  assert not os.path.exists(session_dir)

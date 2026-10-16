@@ -475,7 +475,8 @@ def test_offer_no_allocation_growth(tmp_path):
 # session rotation and .active heartbeat
 # ---------------------------------------------------------------------------
 
-def test_session_rotates_after_ten_minutes(tmp_path):
+def test_session_rotates_after_rotate_interval(tmp_path):
+  assert recorder.SESSION_ROTATE_S == 60.0
   now = [1000.0]
   names = iter(["20260101-000000", "20260101-010000"])
   rec = make_recorder(tmp_path, clock=lambda: now[0], session_name_fn=lambda: next(names),
@@ -492,6 +493,10 @@ def test_session_rotates_after_ten_minutes(tmp_path):
   assert session_dirs(str(tmp_path)) == ["20260101-000000", "20260101-010000"]
   assert os.path.isfile(os.path.join(str(tmp_path), "20260101-000000", "0000000.jpg"))
   assert os.path.isfile(os.path.join(str(tmp_path), "20260101-010000", "0000001.jpg"))
+  # the heartbeat must stop naming the rotated session at once, so the old one
+  # becomes non-active (and thus upload-eligible) while the new one is .active.
+  with open(os.path.join(str(tmp_path), recorder.ACTIVE_NAME), encoding="utf-8") as f:
+    assert f.read() == "20260101-010000"
   rec.close()
 
 

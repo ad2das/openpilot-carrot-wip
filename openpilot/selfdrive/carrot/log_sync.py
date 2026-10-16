@@ -37,8 +37,8 @@ TLVREC_SEGMENT_PREFIX = "tlvrec--"
 TLVREC_SESSION_RE = re.compile(r"^\d{8}-\d{6}$")
 TLVREC_FILE_RE = re.compile(r"^(?:\d{7}\.jpg|index\.jsonl)$")
 TLVREC_ACTIVE_NAME = ".active"
-TLVREC_ACTIVE_FRESH_S = 60.0
-TLVREC_QUIET_S = 120.0
+TLVREC_ACTIVE_FRESH_S = 20.0
+TLVREC_QUIET_S = 15.0
 
 
 def target_url(settings: dict[str, Any]) -> str | None:

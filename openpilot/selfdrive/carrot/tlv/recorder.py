@@ -20,7 +20,9 @@ free on the filesystem that clears above 6 GB. Caps are enforced in the writer
 thread with a running byte counter and a full rescan at most once per 60 s.
 
 Sessions: the session being written is named in root/.active (heartbeat every
-5 s) and rotates every 10 minutes (or when its directory disappears). Finished
+5 s) and rotates every SESSION_ROTATE_S = 60 s (or when its directory
+disappears); rotation happens in _ensure_session on the next write, so a quiet
+period leaves the current session .active until the next frame. Finished
 sessions are uploaded by carrot_log_sync as folder tlvrec--<session> and are
 deleted from the device after a complete upload (see log_sync.py).
 
@@ -68,7 +70,7 @@ TRANSITION_MAX = 4
 RESCAN_INTERVAL_S = 60.0
 ERROR_LOG_INTERVAL_S = 60.0
 
-SESSION_ROTATE_S = 600.0
+SESSION_ROTATE_S = 60.0
 ACTIVE_NAME = ".active"
 ACTIVE_HEARTBEAT_S = 5.0
 SESSION_NAME_BUMP_MAX = 60
