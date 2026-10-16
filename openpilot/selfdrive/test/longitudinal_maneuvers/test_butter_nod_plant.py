@@ -56,7 +56,7 @@ BASELINE_PARAMS = {"ButterStop": 1, "VEgoStopping": 10, "StoppingAccel": -50}
 
 
 def _trapz(y, x):
-  return float(np.trapezoid(y, x) if hasattr(np, "trapezoid") else np.trapz(y, x))
+  return float(np.trapezoid(y, x))
 
 
 # --- candidate plant -------------------------------------------------------
@@ -73,8 +73,11 @@ def plant_real_step(state, cmd, v, dt, p):
   lagged command is < 0.3 and v > 0.01; at v == 0 the car holds (a_act = 0).
   Returns (a_act, v_next).
   """
-  L = float(p["L"]); tau = float(p["tau"])
-  C_MAX = float(p["C_MAX"]); V_HI = float(p["V_HI"]); C_LOW = float(p["C_LOW"])
+  L = float(p["L"])
+  tau = float(p["tau"])
+  C_MAX = float(p["C_MAX"])
+  V_HI = float(p["V_HI"])
+  C_LOW = float(p["C_LOW"])
 
   hist = state.setdefault("hist", [])
   hist.append(float(cmd))
@@ -261,7 +264,7 @@ def fidelity_stop(stop, prep, p):
 
 def fidelity_all(stops, p):
   preps = [_prepare_stop(s) for s in stops]
-  rows = [fidelity_stop(stop, prep, p) for stop, prep in zip(stops, preps)]
+  rows = [fidelity_stop(stop, prep, p) for stop, prep in zip(stops, preps, strict=True)]
   return {"stops": rows,
           "targets": {"accel_rms": T_RMS, "stop_decel_err": T_STOP_DECEL,
                       "stop_time_err_s": T_STOP_TIME, "dist_err_m": T_DIST},
@@ -526,7 +529,9 @@ def test_butter_nod_smoke():
   """2x2x2x2x2 mini-grid on 2 stops: every output finite, loss non-constant."""
   _d, stops = load_stops()
   subset = [stops[0], stops[2]]
-  cmax = [0.0, 0.25]; vhi = [0.4, 1.0]; clow = [-0.1, 0.2]
+  cmax = [0.0, 0.25]
+  vhi = [0.4, 1.0]
+  clow = [-0.1, 0.2]
   fits = fit_real_plant(subset, [0.0, 0.3], [0.1, 0.6], cmax, vhi, clow)
   assert fits, "mini-grid produced no finite fits"
   losses = np.array([f[0] for f in fits], dtype=float)
