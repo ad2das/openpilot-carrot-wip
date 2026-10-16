@@ -394,6 +394,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotTlvDisabled", {CLEAR_ON_MANAGER_START, BOOL}},  // tlvd crash-loop / rss_hard latch; cleared every manager start
     {"CarrotTlvRecentStarts", {CLEAR_ON_MANAGER_START, STRING}},  // tlvd crash-loop guard (monotonic start times)
     {"CarrotTlvDspNotice", {CLEAR_ON_MANAGER_START, JSON}},  // parked DSP probe UI notice (ui/onroad/tlv_dsp_notice.py)
+    {"CarrotTlvShowBox", {PERSISTENT, INT, "1"}},  // W136 onroad box on the light tlvd is following (UI only)
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 

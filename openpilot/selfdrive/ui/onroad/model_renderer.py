@@ -4,6 +4,7 @@ import time
 import numpy as np
 
 from openpilot.selfdrive.ui.onroad import hud_style as hs
+from openpilot.selfdrive.ui.onroad.tlv_overlay import TlvOverlay
 from openpilot.selfdrive.ui.onroad.path_geometry import project_path, sample_path
 from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
 import pyray as rl
@@ -152,11 +153,18 @@ class ModelRenderer(Widget):
       self._longitudinal_control = cp.openpilotLongitudinalControl
 
     self._font_display: rl.Font = gui_app.font(FontWeight.DISPLAY)
+    # W136: onroad box on the traffic light tlvd is following (Params CarrotTlvShowBox).
+    self._tlv_overlay = TlvOverlay()
+    self._carrot_tlv_show_box = 1
     self._init_carrot()
 
   def set_transform(self, transform: np.ndarray):
     self._car_space_transform = transform.astype(np.float32)
     self._transform_dirty = True
+
+  def set_tlv_pixel_transform(self, matrix: np.ndarray) -> None:
+    """W136: fcam full-frame pixel -> screen homography for the TLV overlay."""
+    self._tlv_overlay.set_pixel_transform(matrix)
 
   def _render(self, rect: rl.Rectangle):
     sm = ui_state.sm
@@ -215,6 +223,10 @@ class ModelRenderer(Widget):
     timing.call('radar', self._draw_radar_info_carrot, sm)
     if self._lead_capsule is not None:
       self._draw_lead_capsule_carrot(*self._lead_capsule)
+    # W136: the light tlvd is following. The lead capsule claims its box first;
+    # the TLV chip avoids it.
+    if self._carrot_tlv_show_box:
+      timing.call('tlv', self._tlv_overlay.render, sm, self._rect, self._float_boxes)
     timing.values['native_draw'] = float(native_draw.active())
     timing.values['native_geometry'] = float(native_geometry.active())
     timing.values['native_text'] = float(native_text.active())
@@ -539,6 +551,7 @@ class ModelRenderer(Widget):
     self._carrot_show_path_color_lane = ui_state.params.get_int("ShowPathColorLane")
     self._carrot_show_path_color_cruise_off = ui_state.params.get_int("ShowPathColorCruiseOff")
     self._carrot_tire_trajectory = ui_state.params.get_int("CarrotTireTrajectory")
+    self._carrot_tlv_show_box = ui_state.params.get_int("CarrotTlvShowBox")
     self._carrot_params_next_refresh_time = now + CARROT_PARAM_REFRESH_INTERVAL
 
 

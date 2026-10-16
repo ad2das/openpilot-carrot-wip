@@ -36,6 +36,14 @@ ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
 INF_POINT = np.array([1000.0, 0.0, 0.0])
 
 
+def tlv_pixel_transform(video_transform, fcam_intrinsics, ecam_intrinsics, view_from_calib, view_from_wide_calib, is_wide):
+  """Road-camera (fcam) full-frame pixels -> screen pixels of the stream on screen. Far lights: rotation-only
+  homography fcam -> ecam for the wide stream."""
+  if not is_wide:
+    return video_transform
+  return video_transform @ ecam_intrinsics @ view_from_wide_calib @ np.linalg.inv(view_from_calib) @ np.linalg.inv(fcam_intrinsics)
+
+
 class AugmentedRoadView(CameraView):
   def __init__(self, stream_type: VisionStreamType = VisionStreamType.VISION_STREAM_ROAD):
     super().__init__("camerad", stream_type)
@@ -272,6 +280,13 @@ class AugmentedRoadView(CameraView):
       [0.0, 0.0, 1.0]
     ])
     self.model_renderer.set_transform(video_transform @ calib_transform)
+    # W136: fcam full-frame pixel -> screen homography for the TLV overlay.
+    self.model_renderer.set_tlv_pixel_transform(
+      tlv_pixel_transform(
+        video_transform, device_camera.fcam.intrinsics, device_camera.ecam.intrinsics,
+        self.view_from_calib, self.view_from_wide_calib, is_wide_camera,
+      )
+    )
 
     return self._cached_matrix
 

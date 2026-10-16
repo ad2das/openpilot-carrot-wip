@@ -631,6 +631,17 @@ class TlvRunner:
     out.state = "redLikely" if self.pipeline.last_red_likely else self.pipeline.last_state.name
     out.stateConf = float(self.pipeline.last_conf)
     out.relevantTrackId = int(self.pipeline.last_track_id)
+    # W136: the relevant track's ego-predicted full-frame box for this frame.
+    # Zero box otherwise (relevantTrackId < 0 or no box). Unlike dets[0] this
+    # never falls back to an unrelated detection.
+    rel_box = self.pipeline.last_relevant_box
+    if self.pipeline.last_track_id >= 0 and rel_box is not None:
+      out.relevantBox.x1 = float(rel_box[0])
+      out.relevantBox.y1 = float(rel_box[1])
+      out.relevantBox.x2 = float(rel_box[2])
+      out.relevantBox.y2 = float(rel_box[3])
+      out.relevantBox.score = 1.0
+      out.relevantBox.cls = 0
     # Same-track green (W74D): only the light that was confirmed red/redLeft
     # within the last 120 s may release a TLV green/left start downstream.
     out.goAfterRed = bool(

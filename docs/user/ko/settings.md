@@ -39,7 +39,7 @@ carrotpilot의 세부 설정은 **Carrot Web에서 모두 확인하고 변경하
 
 `도구 > Web Settings > 업로드`의 자동 주행 로그 업로드는 기본 꺼짐이며, 켜면 주행 중에도 끝난 1분 구간마다 rlog와 qcamera를 자동 업로드 서버로 전송합니다. 자동 업로드 서버 주소는 소유자의 수신 서버가 기본값으로 들어 있고 직접 수정할 수 있습니다. 이 값을 기본 공용 업로드 서버로 바꾸면 자동 전송하지 않습니다. 수동 `로그 > 대시캠` 전송은 기존 업로드 서버 설정을 그대로 사용합니다.
 
-신호감지 기능(`TrafficLightDetectMode`)이 `1` 이상이면(C3X) 기록기의 신호등 사진(640x320 JPEG와 index.jsonl, 위치 정보 없음)도 같은 자동 업로드 서버로 `tlvrec--<세션>` 폴더로 전송됩니다. 세션은 10분마다 새로 시작되고 2분 동안 변화가 없으면 업로드되며, 업로드가 완전히 끝난 세션은 기기에서 삭제됩니다. 주행 로그 자체는 삭제되지 않습니다. 신호감지 기능이 꺼져 있거나 주소가 기본 공용 업로드 서버이면 아무것도 보내거나 지우지 않습니다.
+신호감지 기능(`TrafficLightDetectMode`)이 `1` 이상이면(C3X) 기록기의 신호등 사진(640x320 JPEG와 index.jsonl, 위치 정보 없음)도 같은 자동 업로드 서버로 `tlvrec--<세션>` 폴더로 전송됩니다. 세션은 1분마다 새로 시작되고 15초 동안 변화가 없으면 업로드되며, 업로드가 완전히 끝난 세션은 기기에서 삭제됩니다. 주행 로그 자체는 삭제되지 않습니다. 신호감지 기능이 꺼져 있거나 주소가 기본 공용 업로드 서버이면 아무것도 보내거나 지우지 않습니다.
 
 ## 설정 화면 사용법
 
@@ -202,7 +202,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 | [도로 제한속도](speed-deceleration.md#road-speed-limit) | `AutoRoadSpeedLimitOffset`, `AutoRoadSpeedAdjust`, `AutoSpeedUptoRoadSpeedLimit` | 도로 제한속도에 맞춘 목표 속도 조절 |
 | [과속방지턱](speed-deceleration.md#speed-bump) | `AutoNaviSpeedBumpTime`, `AutoNaviSpeedBumpSpeed`, `AutoNaviSpeedBumpEndDistance` | 방지턱 감속 완료 시점, 통과 속도와 조기 종료 거리 |
 | [커브·턴](speed-deceleration.md#curve-turn) | `AutoCurveSpeedFactor`, `AutoCurveSpeedLowerLimit`, `TurnSpeedControlMode`, `MapTurnSpeedFactor`, `ApplyModelSpeed` | 곡률·남은 거리 기반 감속, 회전 완화 확인 후 빠른 복구와 경로 턴 속도 |
-| [신호감지](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust` | 신호 정지·출발 감지, 정지 위치 및 정지차 기준 자동 보정 |
+| [신호감지](speed-deceleration.md#traffic-light) | `TrafficLightDetectMode`, `TrafficStopDistanceAdjust`, `CarrotTlvShowBox` | 신호 정지·출발 감지, 정지 위치 및 정지차 기준 자동 보정, 따라가는 신호등 화면 표시 |
 
 `AutoNaviSpeedCtrlMode`는 `0` 미사용, `1` 과속카메라, `2` 과속카메라+방지턱, `3` 과속카메라+방지턱+이동식카메라입니다.
 

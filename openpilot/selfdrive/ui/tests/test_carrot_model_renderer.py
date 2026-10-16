@@ -223,6 +223,7 @@ class FakeParams:
       "ShowPathColorLane": 20,
       "ShowPathColorCruiseOff": 19,
       "CarrotTireTrajectory": 1,
+      "CarrotTlvShowBox": 1,
     }
     self.calls = []
 
@@ -373,10 +374,37 @@ def test_model_overlay_draw_order():
   renderer._draw_ar_turn_carrot = lambda _: calls.append("arTurn")
   renderer._draw_blind_spot_carrot = lambda _: calls.append("blindSpot")
   renderer._draw_radar_info_carrot = lambda _: calls.append("radar")
+  renderer._carrot_tlv_show_box = 0
+  renderer._tlv_overlay = SimpleNamespace(render=lambda *_a, **_k: None)
 
   renderer._draw_carrot_overlays(object())
 
   assert calls == ["path", "laneLines", "arTurn", "blindSpot", "radar"]
+
+
+def test_tlv_overlay_called_only_when_show_box_truthy():
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  renderer._draw_path_carrot = lambda _: None
+  renderer._draw_lane_lines_carrot = lambda _: None
+  renderer._draw_ar_turn_carrot = lambda _: None
+  renderer._draw_blind_spot_carrot = lambda _: None
+  renderer._draw_radar_info_carrot = lambda _: None
+  calls = []
+  renderer._tlv_overlay = SimpleNamespace(render=lambda *a, **k: calls.append((a, k)))
+  sm = object()
+  renderer._rect = model_renderer.rl.Rectangle(0.0, 0.0, 2160.0, 1080.0)
+  renderer._float_boxes = []
+
+  renderer._carrot_tlv_show_box = 0
+  renderer._draw_carrot_overlays(sm)
+  assert calls == []
+
+  renderer._carrot_tlv_show_box = 1
+  renderer._draw_carrot_overlays(sm)
+  assert len(calls) == 1
+  assert calls[0][0][0] is sm
+  assert calls[0][0][1] is renderer._rect
+  assert calls[0][0][2] is renderer._float_boxes
 
 
 def test_render_stale_data_skips_overlays(monkeypatch):

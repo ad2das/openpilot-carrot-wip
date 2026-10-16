@@ -334,6 +334,10 @@ Adjust by 100 (1 m) at a time under comparable no-lead signal stops, because the
 
 When TrafficLightDetectMode is 1 or more, the C3X camera traffic-light vision runs automatically and feeds stops (1) or stops and starts (2). Set TrafficLightDetectMode to 0 to turn it off.
 
+### Box on the light the camera is following
+
+With `CarrotTlvShowBox` on, the driving screen draws a bracket and a state/distance chip on the traffic light the camera vision is currently following. Colours are red / amber / green; `빨간불?` marks a red not yet confirmed, and a white bracket means the light is being tracked before a colour is decided. The distance is an estimate from the box size. This is display only and does not affect control. Nothing is shown when TrafficLightDetectMode is 0.
+
 ## Quick troubleshooting
 
 | Symptom | Check first |

@@ -62,6 +62,7 @@ class UIState:
         "rawAudioData",
         "carrotMan",
         "carrotNavi",
+        "carrotTlv",
         "peripheralState",
         "liveDelay",
         "liveTorqueParameters",

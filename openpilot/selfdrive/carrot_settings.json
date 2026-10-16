@@ -276,7 +276,8 @@
               "zh": "信号灯",
               "params": [
                 "TrafficLightDetectMode",
-                "TrafficStopDistanceAdjust"
+                "TrafficStopDistanceAdjust",
+                "CarrotTlvShowBox"
               ]
             }
           ]
@@ -3420,6 +3421,22 @@
       "min": 0,
       "max": 2,
       "default": 2,
+      "unit": 1
+    },
+    {
+      "group": "감속제어",
+      "name": "CarrotTlvShowBox",
+      "title": "신호등 박스 표시",
+      "descr": "C3X 카메라 신호등 인식이 지금 따라가는 신호등에 테두리와 상태·거리 말풍선을 주행 화면에 표시합니다. 화면 표시만 하며 제어에는 영향이 없습니다. 신호감지 기능이 0이면 표시되지 않습니다.\n0:끄기, 1:켜기",
+      "egroup": "SPEED",
+      "etitle": "Traffic Light Box",
+      "edescr": "Draws a bracket and a state/distance chip on the traffic light the C3X camera vision is following. Display only; no effect on control. Nothing is shown when TrafficLightDetectMode is 0.\n0:Off, 1:On",
+      "cgroup": "速度控制",
+      "ctitle": "信号灯框显示",
+      "cdescr": "在C3X摄像头红绿灯识别正在跟踪的信号灯上显示边框及状态/距离标签。仅用于显示, 不影响控制。红绿灯检测模式为0时不显示。\n0:关, 1:开",
+      "min": 0,
+      "max": 1,
+      "default": 1,
       "unit": 1
     },
     {

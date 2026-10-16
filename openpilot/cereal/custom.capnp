@@ -297,6 +297,9 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	clsCostMs @16 :Float32;
 	skippedBudget @17 :UInt32;
 	tailGated @18 :UInt32;
+	# W136: the relevant track's ego-predicted full-frame box for this frame (valid when relevantTrackId >= 0;
+	# zero box otherwise). Unlike dets[0] it never falls back to an unrelated detection.
+	relevantBox @19 :Det;
 
 	enum Status {
 		off @0;

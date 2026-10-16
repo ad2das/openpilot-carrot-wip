@@ -121,6 +121,11 @@ class FramePipeline:
     self.last_state = tracker.SignalState.none
     self.last_conf = 0.0
     self.last_track_id = -1
+    # W136: the relevant track's ego-predicted full-frame box for THIS frame
+    # (None when there is no relevant track). Unlike dets[0] it never falls back
+    # to an unrelated detection. Ego is already updated for this frame before
+    # infer() runs (tlvd._update_odometry then FramePipeline.ego is set).
+    self.last_relevant_box: tuple[float, float, float, float] | None = None
     self.last_red_likely = False
     # Per-frame ego snapshot (tracker.EgoFrame) set by tlvd; None keeps the
     # legacy no-prediction behaviour (PC tools/tests).
@@ -407,6 +412,8 @@ class FramePipeline:
     else:
       self.last_gated = []
     self.last_track_id = relevant[0].track_id if relevant is not None else -1
+    # W136: the relevant track's ego-predicted full-frame box for this frame.
+    self.last_relevant_box = self._predicted_box(relevant[0]) if relevant is not None else None
     self.last_state, self.last_conf = state, conf
     self.last_red_likely = red_likely
     self.frame_idx += 1
