@@ -449,12 +449,13 @@ def frozen_clock(monkeypatch):
 
 
 def carrot_man_message(state: int = 2, src: int = 1, speed: int = 60,
-                       atc_type: str = "", x_dist: int = 0):
+                       atc_type: str = "", x_dist: int = 0, det_support: int = 0):
   msg = log.Event.new_message()
   msg.init("carrotMan")
   msg.carrotMan.desiredSpeed = speed
   msg.carrotMan.trafficState = state
   msg.carrotMan.trafficStateSrc = src
+  msg.carrotMan.tlvDetSupport = det_support
   msg.carrotMan.atcType = atc_type
   msg.carrotMan.activeCarrot = 0
   msg.carrotMan.xDistToTurn = x_dist
@@ -650,6 +651,14 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
   planner.tlv_log_veto_t = -1e9
   planner.tlv_log_clear_t = -1e9
   planner.tlv_log_coast_t = -1e9
+  planner.model_stop_sign_t = None
+  planner.tlv_fast_gate_open = False
+  planner._fast_gate_ep_start = 0.0
+  planner._fast_gate_started_slow = False
+  planner._fast_gate_applied = False
+  planner._fast_gate_opened_by = None
+  planner._raw_red_prev = False
+  planner._fast_gate_last_red_t = None
   return planner
 
 
@@ -1184,3 +1193,161 @@ def test_tlv_start_veto_rate_limited_within_2s(monkeypatch):
   planner._update_carrot_man(sm, 0.0, 60.0)
   assert planner.tlv_veto_active is True
   assert [e[0] for e in events] == ['tlv_start_veto']  # second event suppressed
+
+
+# ---------------------------------------------------------------------------
+# W139c: tlvDetSupport pass-through
+# ---------------------------------------------------------------------------
+
+def test_fusion_publishes_det_support_through():
+  serv = make_serv(2)
+  msg = tlv_message("red", rel_id=1)
+  msg.relevantDetSupport = 3
+  serv._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  assert serv.tlv_det_support == 3
+  # graded redLikely (state 7) also carries it
+  serv = make_serv(2)
+  graded = tlv_message("redLikely", conf=0.75, rel_id=1)
+  graded.relevantDetSupport = 2
+  serv._update_tlv_fusion(FakeSM(carrotTlv=graded))
+  assert serv.tlv_det_support == 2
+
+
+def test_det_support_is_zero_on_every_rejecting_path():
+  # no relevant track
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=-1)))
+  assert serv.tlv_det_support == 0
+  # degenerate relevant box
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_box=(0.0, 0.0, 0.0, 0.0))))
+  assert serv.tlv_det_support == 0
+  # low conf red
+  serv = make_serv(2)
+  msg = tlv_message("red", conf=0.1)
+  msg.relevantDetSupport = 5
+  serv._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  assert serv.tlv_det_support == 0
+  # not running
+  serv = make_serv(2)
+  msg = tlv_message("red", status="suspended")
+  msg.relevantDetSupport = 5
+  serv._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  assert serv.tlv_det_support == 0
+
+
+# ---------------------------------------------------------------------------
+# W139c: fast-road phantom gate (carrot_functions)
+# ---------------------------------------------------------------------------
+
+def _gate_planner(v_ego_mps, det_support, model_stop_age_s=None):
+  planner = accel_planner(2)
+  planner.model_stop_sign_t = (100.0 - model_stop_age_s) if model_stop_age_s is not None else None
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=det_support))
+  raw = planner._read_tlv_red_active(sm)
+  planner.tlv_red_active = raw and planner._apply_fast_gate(raw, sm, v_ego_mps) if raw else (
+    planner._apply_fast_gate(False, sm, v_ego_mps) and False)
+  planner._update_coast_cap(v_ego_mps)
+  return planner
+
+
+def test_fast_gate_below_threshold_is_ungated():
+  # 20 m/s < 22.2: byte-identical cap behaviour (cap on with raw red).
+  planner = _gate_planner(20.0, det_support=0)
+  assert planner.coast_cap_active is True
+
+
+def test_fast_gate_high_speed_needs_support_or_model():
+  # 25 m/s, support 1, no model stop -> no cap.
+  planner = _gate_planner(25.0, det_support=1)
+  assert planner.coast_cap_active is False
+  # support 2 -> cap.
+  planner = _gate_planner(25.0, det_support=2)
+  assert planner.coast_cap_active is True
+
+
+def test_fast_gate_model_stop_window():
+  # model stop 2.9 s ago -> cap; 3.1 s ago -> no cap (support 0).
+  planner = _gate_planner(25.0, det_support=0, model_stop_age_s=2.9)
+  assert planner.coast_cap_active is True
+  planner = _gate_planner(25.0, det_support=0, model_stop_age_s=3.1)
+  assert planner.coast_cap_active is False
+
+
+def test_fast_gate_latches_after_support_drops():
+  planner = accel_planner(2)
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=2))
+  planner.tlv_red_active = planner._read_tlv_red_active(sm)
+  planner.tlv_red_active = planner._apply_fast_gate(True, sm, 25.0)
+  assert planner.tlv_fast_gate_open is True
+  # support falls back to 0; the latch keeps the gate open.
+  sm2 = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
+  assert planner._apply_fast_gate(True, sm2, 25.0) is True
+
+
+def test_fast_gate_resets_when_red_ends(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_functions as cf
+  clock = [100.0]
+  monkeypatch.setattr(cf.time, "monotonic", lambda: clock[0])
+  planner = accel_planner(2)
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=2))
+  planner._apply_fast_gate(True, sm, 25.0)
+  assert planner.tlv_fast_gate_open is True
+  clock[0] += 0.6
+  planner._apply_fast_gate(False, sm, 25.0)   # red absent >= 0.5 s
+  assert planner.tlv_fast_gate_open is False
+  # A new red episode at high speed with no support is gated again.
+  sm0 = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
+  assert planner._apply_fast_gate(True, sm0, 25.0) is False
+
+
+def test_fast_gate_episode_started_slow_is_never_gated():
+  planner = accel_planner(2)
+  # Episode begins at 20 m/s (< 22.2): started_slow latches.
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
+  assert planner._apply_fast_gate(True, sm, 20.0) is True
+  # Speed rises to 25 m/s with no support: still ungated.
+  assert planner._apply_fast_gate(True, sm, 25.0) is True
+
+def test_fast_gate_survives_brief_red_flicker(monkeypatch):
+  # W139c review: a ~0.1-0.2 s raw-red flicker inside one real red must NOT drop
+  # the latched cap or re-arm the gate (CHECKPOINT 1b 18:47:59 / 19:13:13).
+  import openpilot.selfdrive.carrot.carrot_functions as cf
+  clock = [100.0]
+  monkeypatch.setattr(cf.time, "monotonic", lambda: clock[0])
+  planner = accel_planner(2)
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=2))
+
+  def run(raw, v=25.0):
+    # exact update() wiring
+    if raw:
+      return planner._apply_fast_gate(True, sm, v)
+    planner._apply_fast_gate(False, sm, v)
+    return False
+
+  assert run(True) is True            # gate opens (det support)
+  assert planner.tlv_fast_gate_open is True
+  clock[0] += 0.1
+  assert run(False) is False          # 0.1 s flicker: gate stays latched/open
+  assert planner.tlv_fast_gate_open is True
+  clock[0] += 0.1
+  assert run(True) is True            # red returns; same episode
+  assert planner.tlv_fast_gate_open is True
+  # A support-less new sample does not close the latch.
+  sm0 = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
+  assert planner._apply_fast_gate(True, sm0, 25.0) is True
+
+
+def test_fast_gate_resets_after_long_red_absence(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_functions as cf
+  clock = [100.0]
+  monkeypatch.setattr(cf.time, "monotonic", lambda: clock[0])
+  planner = accel_planner(2)
+  sm = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=2))
+  assert planner._apply_fast_gate(True, sm, 25.0) is True
+  clock[0] += 0.6
+  assert planner._apply_fast_gate(False, sm, 25.0) is False
+  assert planner.tlv_fast_gate_open is False   # reset after >= 0.5 s
+  # New episode with no support is gated again.
+  sm0 = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
+  assert planner._apply_fast_gate(True, sm0, 25.0) is False

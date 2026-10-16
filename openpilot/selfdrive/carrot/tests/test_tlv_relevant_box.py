@@ -22,6 +22,7 @@ def _make_publish_runner(last_track_id, last_relevant_box):
     infer_ms=0.0, proc_ms=0.0, last_dets=[], last_red_likely=False,
     last_state=tracker.SignalState.none, last_conf=0.0,
     last_track_id=last_track_id, last_relevant_box=last_relevant_box,
+    last_relevant_det_support=0, red_sustain_total=0,
     tail_gated_total=0, tracker=SimpleNamespace(last_matches=[], go_after_red=lambda *_: False),
   )
   sent = []

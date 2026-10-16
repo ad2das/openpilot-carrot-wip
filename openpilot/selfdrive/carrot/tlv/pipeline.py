@@ -27,6 +27,14 @@ MAX_CLASSIFY_TRACKS = crops.MAX_LAMP_CROPS
 # exceeds the 12 ms budget, so refine only the 2 relevance-first tracks.
 REFINE_TRACKS_2 = True
 
+# W139c red continuity: while the machine state stays red/redLeft, a strong red
+# vote on the current relevant track can keep the red alive for up to this long
+# after the last CONFIRMED red/published 1/5 (the fast classifier votes on the
+# new relevant track faster than the state machine re-confirms it, e.g. after a
+# relevance switch). It never creates red from none and never blocks a
+# green/yellow/left transition (the machine still receives those).
+RED_SUSTAIN_MAX_S = 10.0
+
 # Flat-road tail-light gate (user decision: every road is assumed FLAT). On flat
 # ground anything whose whole box lies below the calibrated horizon is closer to
 # the camera than the road plane at that image row, so it cannot be a traffic
@@ -127,6 +135,12 @@ class FramePipeline:
     # infer() runs (tlvd._update_odometry then FramePipeline.ego is set).
     self.last_relevant_box: tuple[float, float, float, float] | None = None
     self.last_red_likely = False
+    # W139c: monotonic time of the last confirmed red-family relevant track, and
+    # cumulative frames a confirmed red was sustained by a red vote on the new
+    # relevant track (telemetry), and the relevant track's detector support.
+    self._last_red_confirm_s: float | None = None
+    self.red_sustain_total = 0
+    self.last_relevant_det_support = 0
     # Per-frame ego snapshot (tracker.EgoFrame) set by tlvd; None keeps the
     # legacy no-prediction behaviour (PC tools/tests).
     self.ego: tracker.EgoFrame | None = None
@@ -405,6 +419,21 @@ class FramePipeline:
         if candidate is not None:
           relevant = candidate
           red_likely = candidate[0].classifier_red_likely(now)
+
+    # W139c red continuity: remember when the relevant track last confirmed red.
+    if confirmed_relevant is not None and int(confirmed_relevant[1]) in tracker.RED_FAMILY:
+      self._last_red_confirm_s = now
+    # While the machine is red and the red was confirmed recently, a strong red
+    # vote on the current relevant candidate refreshes the lamp so the 2 s off
+    # timer does not expire during a relevance switch. This only refreshes an
+    # already-red machine; it never creates red from none.
+    if (lamp_state is None and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
+        and self._last_red_confirm_s is not None and now - self._last_red_confirm_s <= RED_SUSTAIN_MAX_S
+        and relevant is not None and relevant[0].classifier_red_likely(now)):
+      lamp_state = self.machine.state
+      machine_conf = self.last_conf  # refresh only
+      self.red_sustain_total += 1
+    self.last_relevant_det_support = relevant[0].det_support(now) if relevant is not None else 0
     state, conf = self.machine.update(now, lamp_state, machine_conf)
 
     if detect:

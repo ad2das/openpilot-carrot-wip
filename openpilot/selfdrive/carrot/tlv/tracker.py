@@ -69,6 +69,11 @@ VOTE_TRACK_KEEP_S = 0.75
 # Same-track green (W74D): a TLV green/left start edge is only valid from the
 # tracked light that was confirmed red/redLeft within this window.
 GO_AFTER_RED_WINDOW_S = 120.0
+# W139c fast-road phantom gate support: count the detector matches (and creation)
+# of a track in this window. W139b showed >= 2 distinct detect cycles within
+# 2.5 s separates most high-speed phantom lamps (roof markers, LED boards,
+# isolated dots) from real lights, which keep the relevant track supported.
+DET_SUPPORT_WINDOW_S = 2.5
 # select_relevant default distance gate. W101 sweep (gates 120/160/200/240 m x
 # r3b/r8s50/r8t100s x 60/80/100 km/h, seeds 0..99, measured R8A curves, after
 # the full-frame-focal and odometry-decay fixes): 120 m is the smallest gate
@@ -213,6 +218,9 @@ class Track:
   # Detect frames where the predicted box centre was inside the crop but the
   # detector did not match; VIEW_MISS_LIMIT consecutive drops the track.
   view_misses: int = 0
+  # W139c: monotonic times of the detector matches (and creation) of this track,
+  # used by the fast-road phantom gate (det_support). Bounded deque.
+  det_times: deque[float] = field(default_factory=lambda: deque(maxlen=8))
 
   @property
   def cx(self) -> float:
@@ -269,6 +277,10 @@ class Track:
     if t <= now - CLASSIFIER_RED_WINDOW_S:
       return False
     return cls in RED_FAMILY and prob >= RED_LIKELY_MIN_PROB
+
+  def det_support(self, now: float, window_s: float = DET_SUPPORT_WINDOW_S) -> int:
+    """W139c: detector matches (and creation) within (now - window_s, now]."""
+    return sum(1 for t in self.det_times if now - window_s < t <= now)
 
 
 def _most_common(values: list[int]) -> int:
@@ -416,6 +428,8 @@ class TrafficLightTracker:
         track.misses = 0
         track.view_misses = 0
         track.history.append((frame_idx, int(det.cls)))
+        if now is not None:
+          track.det_times.append(float(now))
         matched_track_ids.add(track.track_id)
         self.last_matches.append((det, track.track_id))
       else:
@@ -426,6 +440,8 @@ class TrafficLightTracker:
         track.anchor_box = det.box
         apply_anchor(track)
         track.history.append((frame_idx, int(det.cls)))
+        if now is not None:
+          track.det_times.append(float(now))
         self._next_id += 1
         self.tracks.append(track)
         matched_track_ids.add(track.track_id)

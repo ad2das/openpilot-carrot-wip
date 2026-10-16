@@ -429,3 +429,31 @@ def test_select_relevant_default_gate_is_the_module_constant():
   odo = EgoOdometry()
   odo.s = 30.0
   assert select_relevant(entry, 0, **kwargs, odo=odo) is not None
+
+
+# --- W139c: detector support for the fast-road phantom gate -------------------
+
+def test_det_support_counts_matches_and_creation():
+  t = TrafficLightTracker()
+  t.update(0, [det()], "far", 2648.0, now=100.0)   # creation counts
+  t.update(1, [det(box=BOX_SHIFTED)], "far", 2648.0, now=101.0)
+  track = t.tracks[0]
+  assert track.det_support(101.0) == 2
+  assert track.det_support(100.5) == 1             # creation only
+
+
+def test_det_support_excludes_older_than_window():
+  from openpilot.selfdrive.carrot.tlv.tracker import DET_SUPPORT_WINDOW_S
+  t = TrafficLightTracker()
+  t.update(0, [det()], "far", 2648.0, now=100.0)
+  t.update(10, [det(box=BOX_SHIFTED)], "far", 2648.0, now=100.0 + DET_SUPPORT_WINDOW_S + 0.1)
+  track = t.tracks[0]
+  assert track.det_support(100.0 + DET_SUPPORT_WINDOW_S + 0.1) == 1
+
+
+def test_det_support_appends_nothing_when_now_is_none():
+  t = TrafficLightTracker()
+  t.update(0, [det()], "far", 2648.0)              # now=None
+  t.update(1, [det(box=BOX_SHIFTED)], "far", 2648.0)
+  assert list(t.tracks[0].det_times) == []
+  assert t.tracks[0].det_support(0.0) == 0

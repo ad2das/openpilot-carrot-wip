@@ -87,6 +87,18 @@ TLV_BLINKER_STOP_GAP_S = 0.5
 TLV_A4_LEFT_EDGE_MAX_M = 5.6
 TLV_A4_EDGE_STD_MAX_M = 0.6
 TLV_A4_APPROACH_WINDOW_FRAMES = int(3.0 / DT_MDL)
+# W139c fast-road phantom gate: only at >= 80 km/h (W139b: every phantom was
+# >= 87 km/h; real high-speed reds at >= 80 km/h were suppressed 0-0.4 s at
+# most), open the TLV red coast cap only when the relevant track has detector
+# support OR the model is signalling a stop. G-det|G-model, latched per episode.
+TLV_FAST_GATE_MPS = 22.2
+TLV_FAST_GATE_MIN_DET = 2
+TLV_FAST_GATE_MODEL_S = 3.0
+# W139c: the TLV red stream can flicker off for ~0.1-0.2 s (fusion latch decay)
+# inside one real red. The gate must not treat that as an episode end: it resets
+# the latched episode only after raw red has been inactive this long, so a
+# mid-approach flicker never drops the coast cap or re-arms the gate.
+TLV_FAST_GATE_RESET_S = 0.5
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
 
@@ -243,6 +255,15 @@ class CarrotPlanner:
     self.tlv_log_veto_t = -1e9
     self.tlv_log_clear_t = -1e9
     self.tlv_log_coast_t = -1e9
+    # W139c fast-road phantom gate state.
+    self.model_stop_sign_t = None
+    self.tlv_fast_gate_open = False
+    self._fast_gate_ep_start = 0.0
+    self._fast_gate_started_slow = False
+    self._fast_gate_applied = False
+    self._fast_gate_opened_by = None
+    self._raw_red_prev = False
+    self._fast_gate_last_red_t = None
 
   def _params_update(self):
     self.frame += 1
@@ -431,6 +452,9 @@ class CarrotPlanner:
 
     self.last_model_stop_sign = bool(stopSign)
     self.last_model_start_sign = bool(startSign)
+    # W139c: remember when the model last signalled a stop (fast-road gate).
+    if stopSign:
+      self.model_stop_sign_t = time.monotonic()
 
     # self.stopSignCount = (
     #   self.stopSignCount + 1
@@ -729,6 +753,73 @@ class CarrotPlanner:
     except Exception:
       return False
 
+  def _apply_fast_gate(self, raw_red: bool, sm, v_ego: float) -> bool:
+    """W139c fast-road phantom gate: G-det OR G-model, only at >= 22.2 m/s.
+
+    At high speed the TLV red coast cap is suppressed until the relevant track
+    has >= 2 detector matches in the last 2.5 s (carrotMan.tlvDetSupport) OR the
+    model signalled a stop within 3.0 s. The gate LATCHES open for the episode
+    (until the raw TLV red goes inactive), so a support gap does not flicker it.
+    An episode that starts below 22.2 m/s is never gated, even if speed rises.
+    Below the threshold the cap is byte-identical to the ungated behaviour.
+    """
+    now = time.monotonic()
+    if not raw_red:
+      # Raw red inactive: hold the latched episode until red has been absent
+      # TLV_FAST_GATE_RESET_S (measured from the last red frame), so a brief
+      # stream flicker does not drop the cap or re-arm the gate (W139c).
+      elapsed = None if self._fast_gate_last_red_t is None else now - self._fast_gate_last_red_t
+      if elapsed is not None and elapsed >= TLV_FAST_GATE_RESET_S:
+        self._log_fast_gate_episode_end()
+        self.tlv_fast_gate_open = False
+        self._fast_gate_applied = False
+        self._fast_gate_ep_start = 0.0
+        self._fast_gate_started_slow = False
+        self._fast_gate_opened_by = None
+        self._fast_gate_last_red_t = None
+      self._raw_red_prev = False
+      return False
+    cont = (self._fast_gate_last_red_t is not None
+            and (now - self._fast_gate_last_red_t) <= TLV_FAST_GATE_RESET_S)
+    if not cont:
+      # New red episode.
+      self._fast_gate_ep_start = now
+      self._fast_gate_started_slow = v_ego < TLV_FAST_GATE_MPS
+      self._fast_gate_applied = False
+      self._fast_gate_opened_by = None
+      self.tlv_fast_gate_open = False
+    # Continuation across a flicker keeps the latched state (started_slow, open,
+    # opened_by) unchanged.
+    self._raw_red_prev = True
+    self._fast_gate_last_red_t = now
+    if self._fast_gate_started_slow:
+      # Episode began below the threshold: never gated.
+      return True
+    if self.tlv_fast_gate_open:
+      return True
+    det_ok = False
+    try:
+      det_ok = int(getattr(sm['carrotMan'], 'tlvDetSupport', 0)) >= TLV_FAST_GATE_MIN_DET
+    except Exception:
+      det_ok = False
+    model_ok = self.model_stop_sign_t is not None and (now - self.model_stop_sign_t) <= TLV_FAST_GATE_MODEL_S
+    if det_ok or model_ok:
+      self.tlv_fast_gate_open = True
+      self._fast_gate_opened_by = "det" if det_ok else "model"
+    return self.tlv_fast_gate_open
+
+  def _log_fast_gate_episode_end(self) -> None:
+    """One cloudlog event per TLV red episode that the fast gate touched."""
+    if self._fast_gate_applied and self.tlv_fast_gate_open:
+      return
+    duration = max(0.0, time.monotonic() - self._fast_gate_ep_start) if self._fast_gate_ep_start else 0.0
+    opened = bool(self.tlv_fast_gate_open)
+    cloudlog.event("tlv_fast_gate", opened=opened, opened_by=self._fast_gate_opened_by,
+                   suppressed=not opened, duration_s=round(duration, 2),
+                   started_slow=bool(self._fast_gate_started_slow))
+    if opened:
+      self._fast_gate_applied = True
+
   def _update_coast_cap(self, v_ego: float) -> None:
     """TLV red active (confirmed 1 or graded 4) -> coast (accel cap 0): mode 2
     only, gas cooldown respected. Never adds braking; mode 0/1 keep the pre-W74C
@@ -922,6 +1013,12 @@ class CarrotPlanner:
     # sign does not release the cap; a stuck false red is bounded by the moving
     # time limit inside _update_coast_cap.
     self.tlv_red_active = self._read_tlv_red_active(sm)
+    # W139c fast-road phantom gate: only the TLV red cap is gated (>= 22.2 m/s
+    # needs detector support or a recent model stop); everything else unchanged.
+    if self.tlv_red_active:
+      self.tlv_red_active = self._apply_fast_gate(True, sm, v_ego)
+    else:
+      self._apply_fast_gate(False, sm, v_ego)
     self._update_coast_cap(v_ego)
 
     start_hold = False

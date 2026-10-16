@@ -325,7 +325,7 @@ def test_publish_fills_credit_telemetry(monkeypatch):
   runner.pipeline = types.SimpleNamespace(
     infer_ms=1.5, proc_ms=2.5, last_dets=[], last_red_likely=False,
     last_state=tracker.SignalState.none, last_conf=0.0, last_track_id=-1,
-    last_relevant_box=None,
+    last_relevant_box=None, last_relevant_det_support=0, red_sustain_total=0,
     tail_gated_total=4, tracker=types.SimpleNamespace(last_matches=[]),
   )
   sent = []

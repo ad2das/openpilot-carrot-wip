@@ -218,6 +218,7 @@ class CarrotServ:
     self.traffic_light_count = -1
     self.traffic_state = 0
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
+    self.tlv_det_support = 0    # W139c: carrotTlv.relevantDetSupport passed through
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
 
@@ -321,6 +322,7 @@ class CarrotServ:
       self.traffic_light_count = -1
       self.traffic_state = 0
       self.traffic_state_src = 0
+      self.tlv_det_support = 0
 
   def _handle_detect_command(self, xArg):
     elements = [e.strip() for e in xArg.split(',')]
@@ -398,6 +400,10 @@ class CarrotServ:
     `dets[0]`, which can be an unrelated light on frames where the relevant track
     has no detector match. Coordinates are full-frame pixels."""
     now = time.monotonic()
+    # W139c: default to no detector support; set below only when a TLV state is
+    # accepted. Every early-return path (mode off, not valid/updated, not
+    # running, no relevant track, no confirmed color) leaves 0.
+    self.tlv_det_support = 0
     if now - self.tlv_detect_mode_poll >= 1.0:
       self.tlv_detect_mode_poll = now
       try:
@@ -426,6 +432,7 @@ class CarrotServ:
         return
       self.traffic_state = TLV_GRADED_TRAFFIC_STATE
       self.traffic_state_src = 1
+      self.tlv_det_support = int(msg.relevantDetSupport)
       self.traffic_light_count = int(0.5 / 0.1)
       return
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
@@ -441,6 +448,7 @@ class CarrotServ:
     x = 0.5 * (float(rb.x1) + float(rb.x2)) / TLV_FRAME_W
     y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
+    self.tlv_det_support = int(msg.relevantDetSupport)
     self.traffic_light_count = int(0.5 / 0.1)
 
   def _tlv_left_intent(self, sm) -> bool:
@@ -1659,6 +1667,7 @@ class CarrotServ:
     msg.carrotMan.carrotArg = self.carrotArg
     msg.carrotMan.trafficState = self.traffic_state
     msg.carrotMan.trafficStateSrc = int(self.traffic_state_src)
+    msg.carrotMan.tlvDetSupport = int(self.tlv_det_support)
 
     msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)

@@ -49,6 +49,8 @@ struct CarrotMan @0x81c2f05a394cf4af {
 	xDistToTurnNext @34 : Int32;
 	# 0 = external navi DETECT, 1 = carrotTlv device detector.
 	trafficStateSrc @35 : Int32;
+	# W139c carrotTlv.relevantDetSupport passed through by the fusion (0 when not TLV).
+	tlvDetSupport @36 :UInt8;
 }
 
 struct CarrotNaviState @0xaedffd8f31e7b55d {
@@ -300,6 +302,10 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	# W136: the relevant track's ego-predicted full-frame box for this frame (valid when relevantTrackId >= 0;
 	# zero box otherwise). Unlike dets[0] it never falls back to an unrelated detection.
 	relevantBox @19 :Det;
+	# W139c detector matches (and creation) of the relevant track in the last 2.5 s.
+	relevantDetSupport @20 :UInt8;
+	# W139c cumulative frames an already-confirmed red was sustained by a red vote on the relevant track.
+	redSustain @21 :UInt32;
 
 	enum Status {
 		off @0;

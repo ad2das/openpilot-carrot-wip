@@ -652,6 +652,10 @@ class TlvRunner:
       self.pipeline.last_state in (tracker.SignalState.green, tracker.SignalState.greenLeft, tracker.SignalState.left)
       and self.pipeline.tracker.go_after_red(self.pipeline.last_track_id, time.monotonic())
     )
+    # W139c: relevant track detector support (last 2.5 s) and cumulative red
+    # sustain frames, for the fast-road phantom gate downstream.
+    out.relevantDetSupport = int(min(255, max(0, self.pipeline.last_relevant_det_support)))
+    out.redSustain = int(self.pipeline.red_sustain_total)
     self.pub.send("carrotTlv", msg)
 
   def _ordered_dets(self) -> list[tracker.Detection]:
