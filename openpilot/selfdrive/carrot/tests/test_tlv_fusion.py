@@ -163,15 +163,18 @@ class FakeSM(dict):
 
 
 def tlv_message(state: str = "green", conf: float = 0.75, status: str = "running", box=BOX,
-                go_after_red: bool = False):
+                go_after_red: bool = False, rel_id: int = 1, rel_box=BOX):
   msg = log.Event.new_message()
   msg.init("carrotTlv")
   t = msg.carrotTlv
   t.status = status
   t.state = state
   t.stateConf = conf
-  t.relevantTrackId = 1
+  t.relevantTrackId = rel_id
   t.goAfterRed = go_after_red
+  # W138: the fusion follows relevantBox, not dets[0]; dets is kept so tests can
+  # prove the two are independent.
+  t.relevantBox.x1, t.relevantBox.y1, t.relevantBox.x2, t.relevantBox.y2 = rel_box
   t.init("dets", 1)
   d = t.dets[0]
   d.cls = 2
@@ -374,9 +377,69 @@ def test_mode2_ignores_bad_or_inactive_tlv_messages():
   empty.carrotTlv.status = "running"
   empty.carrotTlv.state = "green"
   empty.carrotTlv.stateConf = 0.75
+  empty.carrotTlv.relevantTrackId = -1
   empty.carrotTlv.init("dets", 0)
   serv._update_tlv_fusion(FakeSM(carrotTlv=empty.carrotTlv))
   assert snapshot(serv) == (0, 0, -1, [])
+
+
+# ---------------------------------------------------------------------------
+# W138: fusion follows relevantBox, not dets[0]; the message must be valid.
+# ---------------------------------------------------------------------------
+
+def test_fusion_uses_relevant_box_not_dets0():
+  serv = make_serv(2)
+  # red confirmed with the relevant box far from dets[0]; the recorded position
+  # must be the relevantBox centre, not the unrelated detection.
+  rel = (900.0, 400.0, 940.0, 440.0)      # centre (920, 420)
+  det0 = (100.0, 600.0, 140.0, 640.0)     # centre (120, 640)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", box=det0, rel_box=rel)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", box=det0, rel_box=rel)))
+  assert serv.traffic_state == 1
+  assert (serv.traffic_light_q[-1][0], serv.traffic_light_q[-1][1]) == (920.0 / 1928.0, 420.0 / 1208.0)
+
+
+def test_fusion_returns_when_relevant_track_missing():
+  serv = make_serv(2)
+  base = snapshot(serv)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=-1)))
+  assert snapshot(serv) == base
+
+
+def test_fusion_returns_when_relevant_box_degenerate():
+  serv = make_serv(2)
+  base = snapshot(serv)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_box=(0.0, 0.0, 0.0, 0.0))))
+  assert snapshot(serv) == base
+
+
+def test_fusion_requires_valid_message():
+  serv = make_serv(2)
+  base = snapshot(serv)
+  msg = tlv_message("red")
+  sm = FakeSM(carrotTlv=msg)
+  sm.valid["carrotTlv"] = False
+  serv._update_tlv_fusion(sm)
+  assert snapshot(serv) == base
+
+
+def test_fusion_accepts_running_message_without_dets():
+  # W138: the len(dets) == 0 gate is dropped; a running message with a valid
+  # relevantBox feeds the fusion even when dets is empty (relevant track had no
+  # detector match this frame).
+  serv = make_serv(2)
+  msg = log.Event.new_message()
+  msg.init("carrotTlv")
+  t = msg.carrotTlv
+  t.status = "running"
+  t.state = "red"
+  t.stateConf = 0.75
+  t.relevantTrackId = 1
+  t.relevantBox.x1, t.relevantBox.y1, t.relevantBox.x2, t.relevantBox.y2 = BOX
+  t.init("dets", 0)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=t))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=t))
+  assert serv.traffic_state == 1
 
 
 @pytest.fixture(autouse=True)

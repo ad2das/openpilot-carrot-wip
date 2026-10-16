@@ -67,6 +67,15 @@ def test_publish_zero_relevant_box_when_box_none(monkeypatch):
   assert (out.relevantBox.x1, out.relevantBox.y1, out.relevantBox.x2, out.relevantBox.y2) == (0.0, 0.0, 0.0, 0.0)
 
 
+def test_publish_marks_message_valid(monkeypatch):
+  # W138: the carrotTlv default valid bit is False; the missing bit kept every
+  # message out of carrot_serv's fusion path, so _publish must set it True.
+  runner, sent = _make_publish_runner(7, (10.0, 20.0, 30.0, 40.0))
+  _publish_captured(monkeypatch, runner)
+  assert sent and sent[0][0] == "carrotTlv"
+  assert bool(sent[0][1].valid) is True
+
+
 # ---------------------------------------------------------------------------
 # FramePipeline.last_relevant_box
 # ---------------------------------------------------------------------------

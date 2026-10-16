@@ -393,9 +393,10 @@ class CarrotServ:
     """Feed the confirmed carrotTlv relevant track into the existing traffic_light()
     path (only when TrafficLightDetectMode >= 1; W129: vision is automatic while
     tlvd runs). Downstream, carrot_functions enforces mode 1 = stop only
-    (trafficLightDetectMode != 1 gate there). The tlvd process publishes the
-    relevant track's current detection as dets[0]; coordinates are full-frame
-    pixels."""
+    (trafficLightDetectMode != 1 gate there). W138: the light position comes from
+    `relevantBox` (the relevant track's ego-predicted full-frame box), not
+    `dets[0]`, which can be an unrelated light on frames where the relevant track
+    has no detector match. Coordinates are full-frame pixels."""
     now = time.monotonic()
     if now - self.tlv_detect_mode_poll >= 1.0:
       self.tlv_detect_mode_poll = now
@@ -410,7 +411,14 @@ class CarrotServ:
     if not sm.updated['carrotTlv']:
       return
     msg = sm['carrotTlv']
-    if int(msg.status.raw) != 1 or len(msg.dets) == 0:  # Status.running only
+    if int(msg.status.raw) != 1:  # Status.running only
+      return
+    # W138: require the relevant track and a non-degenerate relevantBox; dets[0]
+    # is no longer a fallback (it may be an unrelated light).
+    if int(msg.relevantTrackId) < 0:
+      return
+    rb = msg.relevantBox
+    if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
       return
     state_raw = int(msg.state.raw)
     if state_raw == TLV_RED_LIKELY_STATE:  # graded redLikely: no confirmed color
@@ -430,9 +438,8 @@ class CarrotServ:
     # while holding the previous value can never create a start edge.
     if color in (TLV_COLOR_GREEN, TLV_COLOR_LEFT) and not bool(msg.goAfterRed):
       return
-    det = msg.dets[0]
-    x = 0.5 * (float(det.x1) + float(det.x2)) / TLV_FRAME_W
-    y = 0.5 * (float(det.y1) + float(det.y2)) / TLV_FRAME_H
+    x = 0.5 * (float(rb.x1) + float(rb.x2)) / TLV_FRAME_W
+    y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.traffic_light_count = int(0.5 / 0.1)
 

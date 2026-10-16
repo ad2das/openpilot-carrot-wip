@@ -603,6 +603,10 @@ class TlvRunner:
     from openpilot.cereal import messaging
     msg = messaging.new_message("carrotTlv")
     out = msg.carrotTlv
+    # W138: the message carries a real payload and its consumer checks status
+    # itself, so mark it valid (the capnp default is False; the missing valid
+    # bit kept every carrotTlv message out of carrot_serv's fusion path).
+    msg.valid = True
     out.status = status
     out.suspendReason = reason
     out.view = CAPNP_VIEW[self.last_view]
