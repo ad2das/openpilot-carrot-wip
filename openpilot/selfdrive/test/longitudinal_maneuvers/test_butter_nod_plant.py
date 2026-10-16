@@ -573,7 +573,8 @@ def test_butter_nod_fit_baseline():
 
   fid = fidelity_all(stops, best_p)
   base = run_baseline(best_p)
-  assert not any(r["collision"] for r in base), "baseline collision"
+  collisions = [f"{r['name']} butter={r['butter']} min_gap={r['min_gap_m']}"
+                for r in base if r["collision"]]
 
   table = {
     "fixture_sha256": NOD_SHA256,
@@ -585,7 +586,8 @@ def test_butter_nod_fit_baseline():
       "top5": top5,
     },
     "fidelity": fid,
-    "baseline": {"params": {"plant": "real", **BASELINE_PARAMS}, "rows": base},
+    "baseline": {"params": {"plant": "real", **BASELINE_PARAMS}, "rows": base,
+                 "collisions": collisions},
     "note": "desktop open-loop fit / closed-loop simulation only; no vehicle validation",
   }
   out_dir = os.path.dirname(out_path)
@@ -597,4 +599,7 @@ def test_butter_nod_fit_baseline():
   print(f"NOD-FIT best loss={best_loss:.6f} params={best_p} n_combo={len(fits)}")
   for i, row in enumerate(fid["stops"]):
     print(f"NOD-FIDELITY stop{i} {row['route'][-8:]}@{row['minute']} pass={row['pass']} {row}")
-  print(f"NOD-BASELINE rows={len(base)} collisions={sum(r['collision'] for r in base)}")
+  print(f"NOD-BASELINE rows={len(base)} collisions={len(collisions)}")
+  for line in collisions:
+    print(f"NOD-COLLISION {line}")
+  assert not collisions, "baseline collision: " + "; ".join(collisions)
