@@ -80,13 +80,33 @@ def dump_table(table: np.ndarray) -> str:
   return json.dumps([round(float(v), 4) for v in table])
 
 
+BASE_MAX = AVOID_R_MAX + AVOID_DEV_MAX  # baseline persistence clip, m
+
+
+def load_base(text) -> np.ndarray:
+  try:
+    if isinstance(text, bytes):
+      text = text.decode("utf-8")
+    values = json.loads(text)
+    base = np.array([float(v) for v in values], dtype=float)
+    if base.shape != KNOTS.shape or not np.all(np.isfinite(base)):
+      return np.zeros_like(KNOTS)
+    return np.clip(base, -BASE_MAX, BASE_MAX)
+  except Exception:
+    return np.zeros_like(KNOTS)
+
+
+def dump_base(base: np.ndarray) -> str:
+  return json.dumps([round(float(v), 4) for v in base])
+
+
 def knot_weights(kappa: float) -> np.ndarray:
   k = float(np.clip(kappa, KNOTS[0], KNOTS[-1]))
   return np.array([np.interp(k, KNOTS, np.eye(len(KNOTS))[i]) for i in range(len(KNOTS))])
 
 
 class LaneCenterBlend:
-  def __init__(self, table=None):
+  def __init__(self, table=None, base=None):
     self.table = np.zeros_like(KNOTS) if table is None else np.clip(np.array(table, dtype=float), -OFFSET_MAX, OFFSET_MAX)
     self.w = 0.0
     self.offset = 0.0
@@ -97,7 +117,7 @@ class LaneCenterBlend:
     self.e_prev = None
     self.r_prev = None
     self.r_rate = 0.0
-    self.r_base = np.zeros_like(KNOTS)
+    self.r_base = np.zeros_like(KNOTS) if base is None else np.clip(np.array(base, dtype=float), -BASE_MAX, BASE_MAX)
     self.r_far = 0.0
     self.r_dev = 0.0
     self.lane_change_t = 0.0
@@ -221,7 +241,8 @@ class LaneCenterBlend:
 
     if (gates & ~GATE_AVOID) == 0 and not steering_pressed:
       t_base = T_BASE_HOLD if avoid_now else T_BASE
-      self.r_base = self.r_base + h * (self.r_far - float(h @ self.r_base)) * DT_MDL / t_base
+      self.r_base = np.clip(self.r_base + h * (self.r_far - float(h @ self.r_base)) * DT_MDL / t_base,
+                            -BASE_MAX, BASE_MAX)
 
     self.offset = float(h @ self.table)
     lookahead = float(np.clip(LOOKAHEAD_S * v_ego, LOOKAHEAD_MIN, LOOKAHEAD_MAX))

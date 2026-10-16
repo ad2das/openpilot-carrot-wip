@@ -25,8 +25,9 @@ class StubMpc:
 
 class StubLaneCenterBlend:
   # The slim CI job has no openpilot runtime deps; routing does not depend on the blend.
-  def __init__(self, table=None):
+  def __init__(self, table=None, base=None):
     self.table = np.zeros(7)
+    self.r_base = np.zeros(7)
     self.curvature = self.offset = self.w = self.r_dev = 0.0
     self.gates = 0
 
@@ -72,6 +73,8 @@ def make_planner():
     'LaneCenterBlend': StubLaneCenterBlend,
     'dump_table': lambda table: '[]',
     'load_table': lambda text: None,
+    'dump_base': lambda base: '[]',
+    'load_base': lambda text: None,
     'time': SimpleNamespace(monotonic=lambda: 0),
     'log': SimpleNamespace(Desire=SimpleNamespace(none=0), LaneChangeState=SimpleNamespace(off=0)),
     'yaw_from_path_no_scipy': lambda *a, **k: (np.zeros(33), np.zeros(33)),

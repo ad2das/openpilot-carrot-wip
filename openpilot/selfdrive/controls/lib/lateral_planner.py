@@ -13,7 +13,7 @@ from openpilot.common.params import Params
 #from openpilot.selfdrive.controls.lib.lane_planner import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
 from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
-from openpilot.selfdrive.controls.lib.lane_center_blend import LaneCenterBlend, dump_table, load_table
+from openpilot.selfdrive.controls.lib.lane_center_blend import LaneCenterBlend, dump_base, dump_table, load_base, load_table
 from collections import deque
 
 TRAJECTORY_SIZE = 33
@@ -77,8 +77,10 @@ class LateralPlanner:
     self.laneless_only = True
 
     self.lane_center_blend_enabled = self.params.get_int("LaneCenterBlend") > 0
-    self.lane_center_blend = LaneCenterBlend(load_table(self.params.get("LaneCenterBlendMap")))
+    self.lane_center_blend = LaneCenterBlend(load_table(self.params.get("LaneCenterBlendMap")),
+                                             load_base(self.params.get("LaneCenterBlendBase")))
     self.lane_center_blend_saved = dump_table(self.lane_center_blend.table)
+    self.lane_center_blend_base_saved = dump_base(self.lane_center_blend.r_base)
     self.lane_center_blend_save_frame = 0
 
   def reset_mpc(self, x0=None):
@@ -181,6 +183,10 @@ class LateralPlanner:
       if self.lane_center_blend_enabled and table_text != self.lane_center_blend_saved:
         self.params.put_nonblocking("LaneCenterBlendMap", table_text)
         self.lane_center_blend_saved = table_text
+      base_text = dump_base(self.lane_center_blend.r_base)
+      if self.lane_center_blend_enabled and base_text != self.lane_center_blend_base_saved:
+        self.params.put_nonblocking("LaneCenterBlendBase", base_text)
+        self.lane_center_blend_base_saved = base_text
 
     self.latDebugText = self.LP.debugText
     #self.lanelines_active = True if self.LP.d_prob > 0.3 and self.LP.lanefull_mode else False

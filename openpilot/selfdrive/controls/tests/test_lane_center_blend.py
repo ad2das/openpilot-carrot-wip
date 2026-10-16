@@ -11,9 +11,9 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
-  GATE_AVOID, GATE_CURVE, GATE_E_LARGE, GATE_INVALID, GATE_JUMP, GATE_LANE_CHANGE,
+  BASE_MAX, GATE_AVOID, GATE_CURVE, GATE_E_LARGE, GATE_INVALID, GATE_JUMP, GATE_LANE_CHANGE,
   GATE_LANE_MODE, GATE_OFF, GATE_PROB, GATE_SPEED, GATE_STEER, GATE_WIDTH,
-  LaneCenterBlend, OFFSET_MAX, dump_table, load_table,
+  LaneCenterBlend, OFFSET_MAX, dump_base, dump_table, load_base, load_table, knot_weights,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -332,6 +332,43 @@ def test_load_table_validation():
   assert np.array_equal(load_table(json.dumps([0.0] * 6 + [float("nan")])), zeros)
 
   assert np.allclose(load_table(json.dumps([0.9] * 7)), np.full(7, OFFSET_MAX))
+
+
+def test_load_base_round_trip_and_validation():
+  base = np.array([0.1, -0.2, 0.3, 0.0, -0.1, 0.25, -0.05])
+  assert np.allclose(load_base(dump_base(base)), base)
+
+  zeros = np.zeros(7)
+  assert np.array_equal(load_base(""), zeros)
+  assert np.array_equal(load_base("x"), zeros)
+  assert np.array_equal(load_base(json.dumps([0.0] * 6)), zeros)
+  assert np.array_equal(load_base(json.dumps([0.0] * 6 + [float("nan")])), zeros)
+
+  assert np.allclose(load_base(json.dumps([9.9] * 7)), np.full(7, BASE_MAX))
+  assert np.allclose(load_base(json.dumps([-9.9] * 7)), np.full(7, -BASE_MAX))
+
+
+def test_base_clips_on_construction():
+  blend = LaneCenterBlend(base=np.full(7, 9.9))
+  assert np.allclose(blend.r_base, BASE_MAX)
+  blend = LaneCenterBlend(base=np.full(7, -9.9))
+  assert np.allclose(blend.r_base, -BASE_MAX)
+  assert np.array_equal(LaneCenterBlend().r_base, np.zeros(7))
+
+
+def test_base_used_for_r_dev_and_fed_by_persistence():
+  """A persisted baseline is subtracted from r_far in r_dev, and reset clears it."""
+  base = np.full(7, 0.2)
+  blend = LaneCenterBlend(base=base.copy())
+  assert np.allclose(blend.r_base, base)
+  x, lll, rll, centre = _synth(centre0=0.0)
+  blend.update(True, False, V, 0.9, 0.9, x, lll, rll, T, x, centre, False, False)
+  # r_far is 0 on a straight centre; r_dev must equal -baseline along the current knot
+  h = knot_weights(blend.kappa_road)
+  assert blend.r_dev == pytest.approx(blend.r_far - float(h @ base), abs=1e-9)
+
+  blend.reset()
+  assert np.array_equal(blend.r_base, np.zeros(7))
 
 
 def test_lateral_acceleration_cap():

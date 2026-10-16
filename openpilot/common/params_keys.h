@@ -347,6 +347,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AdjustLaneOffset", {PERSISTENT, INT, "0"}},
     {"LaneCenterBlend", {PERSISTENT, INT, "0"}},
     {"LaneCenterBlendMap", {PERSISTENT, STRING, ""}},
+    {"LaneCenterBlendBase", {PERSISTENT, STRING, ""}},
     {"LaneChangeNeedTorque", {PERSISTENT, INT, "0"}},
     {"LaneChangeDelay", {PERSISTENT, INT, "0"}},
     {"LaneChangeBsd", {PERSISTENT, INT, "0"}},
