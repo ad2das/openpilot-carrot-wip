@@ -54,6 +54,7 @@ def hud_module(monkeypatch):
     "draw_rectangle_rounded_lines_ex",
     "draw_text_ex",
     "draw_texture_pro",
+    "draw_triangle",
   ):
     setattr(raylib, name, lambda *args, **kwargs: None)
 
@@ -376,6 +377,7 @@ def test_drive_card_uses_one_limit_snapshot_and_keeps_draw_order(hud_module, mon
   renderer.speed = 40.0
   renderer.is_cruise_set = False
   renderer._engaged = False
+  renderer._cruise_gap_levels = module.GAP_LEVELS_MAX
   calls = []
   labels = []
 
