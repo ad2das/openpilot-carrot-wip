@@ -34,7 +34,8 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
-  ButterStopLoop, _CASES, _START_SCENARIOS, _FakeSM, PLANNER_PERIOD,
+  ButterStopLoop, _A_SCENARIOS, _B2_PROXY, _CASES, _S1, _S3, _S3B, _S3C,
+  _START_SCENARIOS, _FakeSM, PLANNER_PERIOD,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
   FarLeadLoop, FixtureProfile, PLANT_A_GATE, PLANT_SCC_BRAKE, PLANT_TAU,
@@ -93,6 +94,26 @@ SR_T_VRMS = 0.08
 SR_T_AWRMS = 0.12
 SR_CROSSCHECK_DIST = 0.02   # |ours - vfit3| distance match tolerance
 SR_CROSSCHECK_TIME = 0.05   # |ours - vfit3| stop-time match tolerance
+
+# real_sg (real_sr + road-grade term) window/grid and reference (brief 1d).
+G_ACCEL = 9.81
+# Per-stop raw standstill grade signal: -accelerometer.z median over t_rel
+# 1.5-3.0 s, BEFORE the fixture's offset removal (parent CP-D review). More
+# negative = more downhill. Keyed "NNN@MM" from route[5:8] + "@" + minute.
+SR_HOLD = {"443@8.82": -0.895, "445@1.43": -0.455, "445@7.27": -0.548,
+           "445@8.52": -0.848, "447@7.07": -0.922, "44c@6.21": -0.810}
+SRG_REF = {"M0": -0.8, "K": 0.25, "L": 0.6, "tau": 0.5, "SCC_A": -0.5,
+           "C_MAX": 0.2, "V_HI": 0.5, "C_LOW": 0.2}
+SRG_M0 = [round(-1.0 + 0.1 * i, 1) for i in range(6)]     # -1.0 .. -0.5
+SRG_K = [round(0.125 * i, 3) for i in range(9)]           # 0.0 .. 1.0
+SRG_L = [0.5, 0.6, 0.7]
+SRG_TAU = [0.4, 0.5, 0.6, 0.8]
+SRG_SCC = [round(-0.30 - 0.05 * i, 2) for i in range(7)]  # -0.30 .. -0.60
+SRG_CMAX = [round(0.05 * i, 2) for i in range(7)]         # 0.0 .. 0.30
+SRG_VHI = [0.5, 1.0, 1.5]
+SRG_CLOW = [round(0.05 * i, 2) for i in range(11)]        # 0.0 .. 0.50
+SRG_GRADES = (-0.03, 0.03)  # closed-loop scenario grades (downhill, uphill)
+SRG_GAP_ORDER_M = 0.05      # flag if B1 stops closer than B0 by more than this
 
 BASELINE_PARAMS = {"ButterStop": 1, "VEgoStopping": 10, "StoppingAccel": -50}
 
@@ -224,6 +245,35 @@ def real_sr_step(state, cmd, v, dt, p, long_state):
   lc_stopping = int(long_state) == SR_STOPPING
   a_old = old_plant_step(old_state, cmd, v, dt, scc_stop=False, lc_stopping=lc_stopping)
   a_new, _ = sr_new_step(new_state, cmd, v, dt, p, long_state)
+  w = min(1.0, max(0.0, (V_SW - v) / 1.0))
+  return w * a_new + (1.0 - w) * a_old
+
+
+def sg_new_step(state, cmd, v, dt, p, long_state, a_grade):
+  """real_sr NEW plant plus a road-grade acceleration term (brief 1d.1).
+
+  Identical to sr_new_step except `a_grade` (m/s^2) is added to the applied
+  accel. The grade term is applied in the NEW (low-speed) plant only.
+  """
+  a_act, v_next = sr_new_step(state, cmd, v, dt, p, long_state)
+  if v > 0.0 or a_act + a_grade > 0.0:
+    a_act = a_act + a_grade
+    if v <= 0.0 and a_act < 0.0:
+      a_act = 0.0
+    v_next = max(0.0, v + a_act * dt)
+  return a_act, v_next
+
+
+def real_sg_step(state, cmd, v, dt, p, long_state, a_grade):
+  """Regime-split plant: OLD above v >= 4 m/s, NEW (real_sg) below v <= 3 m/s.
+
+  `a_grade` is added inside the NEW plant only; the OLD plant is unchanged.
+  """
+  old_state = state.setdefault("old", {})
+  new_state = state.setdefault("new", {})
+  lc_stopping = int(long_state) == SR_STOPPING
+  a_old = old_plant_step(old_state, cmd, v, dt, scc_stop=False, lc_stopping=lc_stopping)
+  a_new, _ = sg_new_step(new_state, cmd, v, dt, p, long_state, a_grade)
   w = min(1.0, max(0.0, (V_SW - v) / 1.0))
   return w * a_new + (1.0 - w) * a_old
 
@@ -652,6 +702,133 @@ def fidelity_sr_all(stops, p):
           "all_pass": all(r["pass"] for r in rows)}
 
 
+# --- real_sg (real_sr + road-grade term) fit to wheel speed / distance ------
+
+def _stop_key(stop):
+  """Fixture key for the HOLD table: route[5:8] + '@' + minute."""
+  return f"{stop['route'][5:8]}@{stop['minute']:g}"
+
+
+def _sr_grade(stop, M0, K):
+  """Fit-time grade accel a_grade = -K*(HOLD[stop] - M0) (brief 1d.1)."""
+  return -K * (SR_HOLD[_stop_key(stop)] - M0)
+
+
+def _sg_scalar_metrics(prep, p, a_grade):
+  """real_sg scalar metrics: real_sr metrics with a_grade added to sim accel."""
+  L = p["L"]; tau = p["tau"]; scc_a = p["SCC_A"]
+  C_MAX = p["C_MAX"]; V_HI = p["V_HI"]; C_LOW = p["C_LOW"]
+  t = prep["t"]; cmd = prep["cmd"]; st = prep["st"]; v_real = prep["v"]
+  cd = np.interp(t - L, t, cmd); sd = np.interp(t - L, t, st)
+  v = prep["v0"]; a_lag = prep["aw0"]; x = 0.0
+  vs = np.empty(t.size); ys = np.empty(t.size); stop_i = t.size - 1; seen = False
+  for i in range(t.size):
+    dt = t[i] - t[i - 1] if i else 0.0
+    target = scc_a if int(round(sd[i])) == SR_STOPPING else cd[i]
+    a_lag = a_lag + (target - a_lag) * min(1.0, dt / tau) if tau > 0 else target
+    c = C_LOW + (C_MAX - C_LOW) * min(1.0, v / V_HI)
+    a = a_lag + (c if (a_lag < 0.3 and v > 0.01) else 0.0) + a_grade
+    if v <= 0.0 and a < 0:
+      a = 0.0
+    vs[i] = v; ys[i] = a
+    v = max(0.0, v + a * dt); x += v * dt
+    if not seen and v < 0.05:
+      stop_i = i; seen = True
+  xr = np.concatenate([[0], np.cumsum(v_real[1:] * np.diff(t))])
+  dist_err = x - xr[-1]
+  ts = t[stop_i] if seen else 9.0
+  tr = t[np.argmax(v_real < 0.05)]
+  stopt_err = ts - tr
+  vRMS = float(np.sqrt(np.mean((vs - v_real) ** 2)))
+  m = t < -0.2
+  awRMS = float(np.sqrt(np.mean((ys[m] - prep["aw"][m]) ** 2)))
+  return vRMS, float(dist_err), float(stopt_err), awRMS
+
+
+def _sg_vec_metrics(prep, L, tau, scc_a, a_grade, CM, VH, CL):
+  """Vectorized-over-creep real_sg metrics (grade is a per-stop scalar)."""
+  t = prep["t"]; cmd = prep["cmd"]; st = prep["st"]; v_real = prep["v"]; aw = prep["aw"]
+  N = t.size; K = CM.size
+  cd = np.interp(t - L, t, cmd); sd = np.interp(t - L, t, st)
+  a_lag = np.empty(N); a_lag[0] = prep["aw0"]
+  for i in range(1, N):
+    dt = t[i] - t[i - 1]
+    target = scc_a if sd[i] > (SR_STOPPING - 0.5) else cd[i]
+    a_lag[i] = a_lag[i - 1] + (target - a_lag[i - 1]) * min(1.0, dt / tau) if tau > 0 else target
+  v = np.full(K, prep["v0"]); x = np.zeros(K)
+  vs = np.empty((N, K)); ys = np.empty((N, K))
+  for i in range(N):
+    dt = t[i] - t[i - 1] if i else 0.0
+    c = CL + (CM - CL) * np.minimum(1.0, v / VH)
+    a = a_lag[i] + np.where((a_lag[i] < 0.3) & (v > 0.01), c, 0.0) + a_grade
+    a = np.where((v <= 0.0) & (a < 0.0), 0.0, a)
+    v = np.maximum(0.0, v + a * dt)
+    x = x + v * dt
+    vs[i] = v; ys[i] = a
+  xr = np.concatenate([[0], np.cumsum(v_real[1:] * np.diff(t))])
+  dist_err = x - xr[-1]
+  mask = vs < 0.05
+  any_stop = mask.any(axis=0)
+  ts = np.where(any_stop, t[np.argmax(mask, axis=0)], 9.0)
+  tr = t[np.argmax(v_real < 0.05)]
+  stopt_err = ts - tr
+  vRMS = np.sqrt(np.mean((vs - v_real[:, None]) ** 2, axis=0))
+  m = t < -0.2
+  awRMS = np.sqrt(np.mean((ys[m] - aw[m][:, None]) ** 2, axis=0))
+  return vRMS, dist_err, stopt_err, awRMS
+
+
+def fit_sg_plant(stops, M0_list, K_list, L_list, tau_list, scc_list,
+                 cmax_list, vhi_list, clow_list):
+  """Grid-search ONE real_sg set; loss = mean|dist_err| + mean vRMS. Sorted."""
+  preps = [_prepare_sr_stop(s) for s in stops]
+  CM, VH, CL = _mesh(cmax_list, vhi_list, clow_list)
+  K = CM.size
+  results = []
+  for M0 in M0_list:
+    for Kg in K_list:
+      grades = [_sr_grade(s, M0, Kg) for s in stops]
+      for L in L_list:
+        for tau in tau_list:
+          for scc_a in scc_list:
+            per_vr = np.empty((len(preps), K))
+            per_de = np.empty((len(preps), K))
+            for si, prep in enumerate(preps):
+              vr, de, _te, _ar = _sg_vec_metrics(prep, L, tau, scc_a, grades[si], CM, VH, CL)
+              per_vr[si] = vr
+              per_de[si] = de
+            loss = np.mean(np.abs(per_de), axis=0) + np.mean(per_vr, axis=0)
+            for k in range(K):
+              results.append((float(loss[k]), {"M0": M0, "K": Kg, "L": L, "tau": tau,
+                                               "SCC_A": scc_a, "C_MAX": float(CM[k]),
+                                               "V_HI": float(VH[k]), "C_LOW": float(CL[k])}))
+  results.sort(key=lambda item: item[0])
+  return results
+
+
+def fidelity_sg_stop(stop, prep, p):
+  a_grade = _sr_grade(stop, p["M0"], p["K"])
+  vr, de, te, ar = _sg_scalar_metrics(prep, p, a_grade)
+  out = {"route": stop["route"], "minute": stop["minute"],
+         "window_s": [round(float(prep["t"][0]), 3), round(float(prep["t"][-1]), 3)],
+         "a_grade": round(a_grade, 4),
+         "vRMS": round(vr, 4), "dist_err_m": round(de, 4), "dist_sign": "+" if de >= 0 else "-",
+         "stop_time_err_s": round(te, 4), "aWheel_rms": round(ar, 4)}
+  out["pass"] = bool(abs(de) <= SR_T_DIST and abs(te) <= SR_T_STOP_TIME
+                     and vr <= SR_T_VRMS and ar <= SR_T_AWRMS)
+  return out
+
+
+def fidelity_sg_all(stops, p):
+  preps = [_prepare_sr_stop(s) for s in stops]
+  rows = [fidelity_sg_stop(stop, prep, p) for stop, prep in zip(stops, preps, strict=True)]
+  return {"stops": rows,
+          "targets": {"dist_err_m": SR_T_DIST, "stop_time_err_s": SR_T_STOP_TIME,
+                      "vRMS": SR_T_VRMS, "aWheel_rms": SR_T_AWRMS},
+          "pass_count": sum(r["pass"] for r in rows),
+          "all_pass": all(r["pass"] for r in rows)}
+
+
 def sr_trace(stop, prep, p, t_lo=-3.0, t_hi=0.0, step=0.2):
   """0.2 s trace over [t_lo, t_hi]: t, v_real, v_sim, cmd, long_state, aWheel, a_sim."""
   L = p["L"]; tau = p["tau"]; scc_a = p["SCC_A"]
@@ -776,6 +953,10 @@ def _run_loop_real(loop):
     elif loop.plant_mode == "real_sr":
       applied = real_sr_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p,
                              int(lc_state_now))
+    elif loop.plant_mode == "real_sg":
+      a_grade = -loop.real_p["K"] * G_ACCEL * math.sin(loop.grade_rad)
+      applied = real_sg_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p,
+                             int(lc_state_now), a_grade)
     else:
       applied, _ = plant_real_step(loop._real_state, accel, loop.ego_v, dt, loop.real_p)
 
@@ -838,10 +1019,11 @@ def _run_loop_real(loop):
 
 
 class _RealScenarioLoop(ButterStopLoop):
-  def __init__(self, maneuver, butter, p, plant_mode="real"):
+  def __init__(self, maneuver, butter, p, plant_mode="real", grade_rad=0.0):
     super().__init__(maneuver, butter=butter, plant=False)
     self.real_p = dict(p)
     self.plant_mode = plant_mode
+    self.grade_rad = float(grade_rad)
     self._real_state = None
 
   def run(self):
@@ -850,10 +1032,11 @@ class _RealScenarioLoop(ButterStopLoop):
 
 
 class _RealFixtureLoop(FarLeadLoop):
-  def __init__(self, header, profile, p, plant_mode="real"):
+  def __init__(self, header, profile, p, plant_mode="real", grade_rad=0.0):
     super().__init__(header, profile, plant=False)
     self.real_p = dict(p)
     self.plant_mode = plant_mode
+    self.grade_rad = float(grade_rad)
     self._real_state = None
 
   def run(self):
@@ -861,7 +1044,8 @@ class _RealFixtureLoop(FarLeadLoop):
     return _run_loop_real(self)
 
 
-def _stop_row(name, group, butter, t, v, applied, gap, fcw_steps, start_delay):
+def _stop_row(name, group, butter, t, v, applied, gap, fcw_steps, start_delay, grade=0.0,
+              fcw_times=None):
   t = np.asarray(t, dtype=float)
   v = np.asarray(v, dtype=float)
   applied = np.asarray(applied, dtype=float)
@@ -869,12 +1053,17 @@ def _stop_row(name, group, butter, t, v, applied, gap, fcw_steps, start_delay):
   finite = np.isfinite(gap)
   stand = np.flatnonzero(v < 0.01)
   stopped = bool(stand.size)
-  row = {"name": name, "group": group, "butter": int(butter), "stopped": stopped,
+  fcw_first_t = fcw_last_t = None
+  if fcw_times is not None and len(fcw_times):
+    fcw_first_t = round(float(np.min(fcw_times)), 3)
+    fcw_last_t = round(float(np.max(fcw_times)), 3)
+  row = {"name": name, "group": group, "butter": int(butter), "grade": grade, "stopped": stopped,
          "stop_decel_at_stop": None, "stop_decel_at_minus0.3": None, "nod_swing": None,
          "tail_s": None, "final_gap_m": None,
          "min_gap_m": None if not finite.any() else round(float(np.nanmin(gap)), 3),
          "collision": bool(finite.any() and np.nanmin(gap) < COLLISION_GAP_M),
-         "fcw_steps": int(fcw_steps), "start_delay_s": start_delay}
+         "fcw_steps": int(fcw_steps), "fcw_first_t": fcw_first_t, "fcw_last_t": fcw_last_t,
+         "start_delay_s": start_delay}
   if stopped:
     i = int(stand[0])
     step = float(t[1] - t[0]) if t.size > 1 else DT_CTRL
@@ -908,37 +1097,92 @@ def _apply_baseline_params(params, loop):
   loop.long_control._refresh_butter_stop()
 
 
-def run_baseline(p, plant_mode="real"):
-  rows = []
+# Every "stopped lead" scenario (brief 1d.5): the a-group, the short-gap and
+# noisy-radar s-cases, and the no-lead b2 proxy. Grade variants use these + b1.
+_STOPPED_LEAD = ([("a", m) for m in _A_SCENARIOS]
+                 + [("s1", _S1), ("s3", _S3), ("s3b", _S3B), ("s3c", _S3C),
+                    ("b2", _B2_PROXY)])
+
+
+def _run_one(loop, params):
+  _apply_baseline_params(params, loop)
+  return loop.run()
+
+
+def _iter_rows(p, plant_mode="real", with_grade=False):
+  """Yield baseline rows (one per scenario x butter); flat first, then grades."""
   params = Params()
-  fixture = load_fixture("b1")
-  for butter in (1, 0):
-    header = dict(fixture["params"])
-    if butter == 0:
-      header["ButterStop"] = 0
-    loop = _RealFixtureLoop(header, FixtureProfile(fixture), p, plant_mode=plant_mode)
-    _apply_baseline_params(params, loop)
-    run = loop.run()
-    rows.append(_stop_row("b1", "b1", butter, run["t"], run["v"], run["a_actual"],
-                          run["gap"], run["fcw_steps"], None))
+
+  def scenario_rows(maneuver, group, grade, gtag, startdelay=False):
+    grade_rad = math.asin(grade)
+    suffix = f" [{gtag}]" if gtag else ""
+    for butter in (1, 0):
+      loop = _RealScenarioLoop(maneuver, butter, p, plant_mode=plant_mode,
+                               grade_rad=grade_rad)
+      logs = _run_one(loop, params)
+      gap = logs[:, 4] - logs[:, 3]
+      fcw_mask = logs[:, 12] > 0.5
+      yield _stop_row(maneuver.title + suffix, group, butter, logs[:, 0], logs[:, 1],
+                      logs[:, 10], gap, int(np.sum(fcw_mask)),
+                      _start_delay(logs[:, 0], logs[:, 1]) if startdelay else None,
+                      grade, logs[fcw_mask, 0])
+
+  def b1_rows(grade, gtag):
+    grade_rad = math.asin(grade)
+    suffix = f" [{gtag}]" if gtag else ""
+    fixture = load_fixture("b1")
+    for butter in (1, 0):
+      header = dict(fixture["params"])
+      if butter == 0:
+        header["ButterStop"] = 0
+      loop = _RealFixtureLoop(header, FixtureProfile(fixture), p, plant_mode=plant_mode,
+                              grade_rad=grade_rad)
+      run = _run_one(loop, params)
+      yield _stop_row("b1" + suffix, "b1", butter, run["t"], run["v"], run["a_actual"],
+                      run["gap"], run["fcw_steps"], None, grade)
+
+  yield from b1_rows(0.0, "")
   for group, maneuver in _CASES:
-    for butter in (1, 0):
-      loop = _RealScenarioLoop(maneuver, butter, p, plant_mode=plant_mode)
-      _apply_baseline_params(params, loop)
-      logs = loop.run()
-      gap = logs[:, 4] - logs[:, 3]
-      rows.append(_stop_row(maneuver.title, group, butter, logs[:, 0], logs[:, 1],
-                            logs[:, 10], gap, int(np.sum(logs[:, 12] > 0.5)), None))
+    yield from scenario_rows(maneuver, group, 0.0, "")
   for maneuver in _START_SCENARIOS:
-    for butter in (1, 0):
-      loop = _RealScenarioLoop(maneuver, butter, p, plant_mode=plant_mode)
-      _apply_baseline_params(params, loop)
-      logs = loop.run()
-      gap = logs[:, 4] - logs[:, 3]
-      rows.append(_stop_row(maneuver.title, "start", butter, logs[:, 0], logs[:, 1],
-                            logs[:, 10], gap, int(np.sum(logs[:, 12] > 0.5)),
-                            _start_delay(logs[:, 0], logs[:, 1])))
-  return rows
+    yield from scenario_rows(maneuver, "start", 0.0, "", startdelay=True)
+  if with_grade:
+    for grade, gtag in ((-0.03, "dn3"), (0.03, "up3")):
+      yield from b1_rows(grade, gtag)
+      for group, maneuver in _STOPPED_LEAD:
+        yield from scenario_rows(maneuver, group, grade, gtag)
+
+
+def run_baseline(p, plant_mode="real", with_grade=False):
+  return list(_iter_rows(p, plant_mode=plant_mode, with_grade=with_grade))
+
+
+# Only this FCW is accepted: s1's pre-existing one at t < 0.1 s (OLD regime).
+_ACCEPTED_FCW_PREFIX = "s1 short-gap stopped lead 15 km/h gap 9 m"
+
+
+def _gate_failure(row):
+  """Return a reason string if `row` violates the 1d.4/1d.6 gate, else None."""
+  if row["collision"]:
+    return f"collision {row['name']} b{row['butter']} min_gap={row['min_gap_m']}"
+  if row["fcw_steps"] > 0:
+    accepted = (row["name"].startswith(_ACCEPTED_FCW_PREFIX)
+                and row["fcw_last_t"] is not None and row["fcw_last_t"] < 0.1)
+    if not accepted:
+      return (f"fcw {row['name']} b{row['butter']} steps={row['fcw_steps']} "
+              f"t=[{row['fcw_first_t']},{row['fcw_last_t']}]")
+  return None
+
+
+def gate_check(p, plant_mode="real", with_grade=True):
+  """Evaluate all scenarios; return (failed, reason, failed_at, rows_until_stop)."""
+  partial = []
+  for row in _iter_rows(p, plant_mode=plant_mode, with_grade=with_grade):
+    partial.append(row)
+    reason = _gate_failure(row)
+    if reason is not None:
+      return True, reason, row["name"] + (f" [b{row['butter']}]"), partial
+  return False, None, None, partial
 
 
 # --- tests -----------------------------------------------------------------
@@ -948,30 +1192,34 @@ def test_butter_nod_fixture_sha256():
 
 
 def test_butter_nod_smoke():
-  """real_sr smoke (brief 1c.7): reference set on 2 stops + 2 closed-loop scenarios."""
+  """real_sg smoke (brief 1d.7): reference set on 2 stops + 2 closed-loop scenarios
+  including one -3% grade. Every field finite; min/max printed."""
   _d, stops = load_stops()
-  subset = [stops[0], stops[2]]
-  p = dict(SR_REF)
-  fid = fidelity_sr_all(subset, p)
+  subset = [stops[0], stops[4]]
+  p = dict(SRG_REF)
+  fid = fidelity_sg_all(subset, p)
   print(f"NOD-SMOKE ref={p}")
   print(f"NOD-SMOKE fidelity={json.dumps(fid['stops'], sort_keys=True)}")
   metrics = []
   for row in fid["stops"]:
-    for key in ("vRMS", "dist_err_m", "stop_time_err_s", "aWheel_rms"):
+    for key in ("vRMS", "dist_err_m", "stop_time_err_s", "aWheel_rms", "a_grade"):
       assert row[key] is not None and math.isfinite(row[key]), f"{key} not finite: {row[key]}"
       metrics.append(row[key])
-  vec = _sr_scalar_metrics(_prepare_sr_stop(subset[0]), p)
+  vec = _sg_scalar_metrics(_prepare_sr_stop(subset[0]), p, _sr_grade(subset[0], p["M0"], p["K"]))
   assert all(math.isfinite(x) for x in vec), f"vec metrics not finite: {vec}"
   print(f"NOD-SMOKE metrics min={min(metrics):.4f} max={max(metrics):.4f} n={len(metrics)}")
   assert max(metrics) - min(metrics) > 1e-6, "metrics constant"
 
-  rows = run_baseline(p, plant_mode="real_sr")
-  base = [r for r in rows if r["name"] in ("b1", "stopped lead 20 km/h gap 30 m")]
-  for r in base:
+  # 2 closed-loop scenarios: b1 flat and the a-group 20 km/h stopped lead at -3%.
+  b1_rows = run_baseline(p, plant_mode="real_sg")
+  grade_rows = [r for r in _iter_rows(p, plant_mode="real_sg", with_grade=True)
+                if r["grade"] == -0.03 and r["name"].startswith("stopped lead 20 km/h gap 30 m")]
+  sample = [r for r in b1_rows if r["name"] == "b1" and r["butter"] == 1] + grade_rows
+  for r in sample:
     for key in ("stop_decel_at_stop", "stop_decel_at_minus0.3", "nod_swing", "tail_s",
                 "final_gap_m", "min_gap_m"):
       assert r[key] is not None and math.isfinite(r[key]), f"{key} not finite: {r[key]}"
-  print(f"NOD-SMOKE closed-loop rows={len(rows)} sample={base}")
+  print(f"NOD-SMOKE closed-loop rows={len(b1_rows)} sample={sample}")
 
 
 def test_butter_nod_sr_crosscheck():
@@ -1005,60 +1253,101 @@ def test_butter_nod_sr_crosscheck():
   print("NOD-XCHECK OK (real_sr matches vfit3 within 0.02 m / 0.05 s)")
 
 
+def test_butter_nod_sg_crosscheck():
+  """Our real_sg metrics at SRG_REF must match vfit6.py within 0.02 m / 0.05 s (1d.3)."""
+  _d, stops = load_stops()
+  p = dict(SRG_REF)
+  # vfit6.py output for (M0 -0.8, K 0.25, L 0.6, tau 0.5, SCC_A -0.5, C_MAX 0.2, V_HI 0.5, C_LOW 0.2)
+  ref = [
+    (8.82, -0.04, -0.42), (1.43, +0.08, -0.40), (7.27, +0.22, +0.08),
+    (8.52, -0.09, -0.44), (7.07, -0.05, -0.34), (6.21, +0.08, -0.56),
+  ]
+  by_minute = {}
+  for stop in stops:
+    vr, de, te, ar = _sg_scalar_metrics(_prepare_sr_stop(stop), p,
+                                        _sr_grade(stop, p["M0"], p["K"]))
+    by_minute[stop["minute"]] = (de, te)
+  for minute, dist, stopt in ref:
+    de, te = by_minute[minute]
+    assert abs(de - dist) <= SR_CROSSCHECK_DIST, \
+      f"@{minute} dist {de:.4f} vs {dist:.4f}"
+    assert abs(te - stopt) <= SR_CROSSCHECK_TIME, \
+      f"@{minute} stopt {te:.4f} vs {stopt:.4f}"
+  print("NOD-XCHECK-SG OK (real_sg matches vfit6 within 0.02 m / 0.05 s)")
+
+
 def test_butter_nod_fit_baseline():
   out_path = os.environ.get("BUTTER_NOD_OUT", "/tmp/butter_nod.json")
   raw = _read_nod_raw()
   assert hashlib.sha256(raw).hexdigest() == NOD_SHA256
 
   _d, stops = load_stops()
-  fits = fit_sr_plant(stops, SR_L, SR_TAU, SR_SCC, SR_CMAX, SR_VHI, SR_CLOW)
+  fits = fit_sg_plant(stops, SRG_M0, SRG_K, SRG_L, SRG_TAU, SRG_SCC, SRG_CMAX, SRG_VHI, SRG_CLOW)
   assert fits, "fit produced no finite parameter sets"
   top5 = [{"loss": round(loss, 6), "params": params} for loss, params in fits[:5]]
   best_loss, best_p = fits[0]
   edge = {axis: best_p[axis] in (lo, hi) for axis, (lo, hi) in (
-    ("L", (SR_L[0], SR_L[-1])), ("tau", (SR_TAU[0], SR_TAU[-1])),
-    ("SCC_A", (SR_SCC[0], SR_SCC[-1])), ("C_MAX", (SR_CMAX[0], SR_CMAX[-1])),
-    ("V_HI", (SR_VHI[0], SR_VHI[-1])), ("C_LOW", (SR_CLOW[0], SR_CLOW[-1])))}
+    ("M0", (SRG_M0[0], SRG_M0[-1])), ("K", (SRG_K[0], SRG_K[-1])),
+    ("L", (SRG_L[0], SRG_L[-1])), ("tau", (SRG_TAU[0], SRG_TAU[-1])),
+    ("SCC_A", (SRG_SCC[0], SRG_SCC[-1])), ("C_MAX", (SRG_CMAX[0], SRG_CMAX[-1])),
+    ("V_HI", (SRG_VHI[0], SRG_VHI[-1])), ("C_LOW", (SRG_CLOW[0], SRG_CLOW[-1])))}
 
-  fid = fidelity_sr_all(stops, best_p)
-  fid_ref = fidelity_sr_all(stops, dict(SR_REF))
-  base = run_baseline(best_p, plant_mode="real_sr")
+  # 1d.4 selection: closed-loop gate the top-20 sets in loss order.
+  chosen = None
+  chosen_rank = None
+  rejections = []
+  gate_rows = None
+  for rank, (loss, params) in enumerate(fits[:20], start=1):
+    failed, reason, where, partial = gate_check(params, plant_mode="real_sg", with_grade=True)
+    if not failed:
+      chosen, chosen_rank = params, rank
+      gate_rows = partial
+      break
+    rejections.append({"rank": rank, "loss": round(loss, 6), "params": params,
+                       "reason": reason, "failed_at": where})
+  assert chosen is not None, "no set in the top-20 passed the closed-loop gate"
 
-  def rows_by_butter(butter):
-    return [r for r in base if r["butter"] == butter]
-  collisions_b0 = [r for r in rows_by_butter(0) if r["collision"]]
-  collisions_b1 = [r for r in rows_by_butter(1) if r["collision"]]
-  # Only the known pre-existing s1 FCW at t < 0.1 s (OLD regime) is accepted.
-  accepted_fcw = "s1 short-gap stopped lead 15 km/h gap 9 m"
-  fcw_b0 = [r for r in rows_by_butter(0) if r["fcw_steps"] > 0]
+  fid = fidelity_sg_all(stops, chosen)
+  fid_ref = fidelity_sg_all(stops, dict(SRG_REF))
+  base = list(gate_rows)
 
-  # 1c.4 outliers: two worst stops by |distance error|.
-  worst = sorted(fid["stops"], key=lambda r: abs(r["dist_err_m"]), reverse=True)[:2]
-  traces = []
-  for row in worst:
-    stop = next(s for s in stops if s["route"] == row["route"] and s["minute"] == row["minute"])
-    traces.append(sr_trace(stop, _prepare_sr_stop(stop), best_p))
+  collisions = [r for r in base if r["collision"]]
+  # ButterStop-order safety check (1d.5): B1 stopping closer than B0 by > 0.05 m.
+  by_key = {}
+  for r in base:
+    by_key.setdefault((r["name"], r["grade"]), {})[r["butter"]] = r
+  gap_order_flags = []
+  for (name, grade), pair in by_key.items():
+    if 0 in pair and 1 in pair:
+      f0, f1 = pair[0]["final_gap_m"], pair[1]["final_gap_m"]
+      if f0 is not None and f1 is not None:
+        delta = f1 - f0
+        if delta < -SRG_GAP_ORDER_M:
+          gap_order_flags.append({"name": name, "grade": grade, "final_gap_b0": f0,
+                                  "final_gap_b1": f1, "delta_m": round(delta, 3)})
 
   table = {
     "fixture_sha256": NOD_SHA256,
+    "hold_table": SR_HOLD,
     "fit": {
-      "mode": "real_sr",
-      "grid": {"L": SR_L, "tau": SR_TAU, "SCC_A": SR_SCC, "C_MAX": SR_CMAX,
-               "V_HI": SR_VHI, "C_LOW": SR_CLOW, "v_switch": V_SW, "stopping_state": SR_STOPPING,
-               "window_end": SR_WIN_END, "gas_pad_s": LS_GAS_PAD_S, "n_combo": len(fits)},
+      "mode": "real_sg",
+      "grid": {"M0": SRG_M0, "K": SRG_K, "L": SRG_L, "tau": SRG_TAU, "SCC_A": SRG_SCC,
+               "C_MAX": SRG_CMAX, "V_HI": SRG_VHI, "C_LOW": SRG_CLOW,
+               "v_switch": V_SW, "stopping_state": SR_STOPPING, "window_end": SR_WIN_END,
+               "grades": list(SRG_GRADES), "n_combo": len(fits)},
       "loss": round(best_loss, 6),
       "best": {"loss": round(best_loss, 6), "params": best_p},
       "edge": edge,
       "top5": top5,
+      "selection": {"chosen_rank": chosen_rank, "chosen": chosen,
+                    "rejections": rejections},
     },
     "fidelity": fid,
     "fidelity_reference_set": fid_ref,
-    "outliers": traces,
-    "baseline": {"params": {"plant": "real_sr", **BASELINE_PARAMS}, "rows": base,
-                 "collisions": [f"{r['name']} butter={r['butter']} min_gap={r['min_gap_m']}"
-                                for r in base if r["collision"]],
-                 "fcw_b0": [f"{r['name']} fcw={r['fcw_steps']}" for r in fcw_b0],
-                 "accepted_fcw": accepted_fcw},
+    "baseline": {"params": {"plant": "real_sg", **BASELINE_PARAMS}, "rows": base,
+                 "collisions": [f"{r['name']} b{r['butter']} min_gap={r['min_gap_m']}"
+                                for r in collisions],
+                 "gap_order_flags": gap_order_flags},
     "note": "desktop open-loop fit / closed-loop simulation only; no vehicle validation",
   }
   out_dir = os.path.dirname(out_path)
@@ -1068,9 +1357,12 @@ def test_butter_nod_fit_baseline():
     handle.write(json.dumps(table, ensure_ascii=False, indent=2, sort_keys=False) + "\n")
 
   print(f"NOD-FIT best loss={best_loss:.6f} params={best_p} n_combo={len(fits)} edge={edge}")
+  print(f"NOD-CHOSEN rank={chosen_rank} loss={round(fits[chosen_rank - 1][0], 6)} params={chosen}")
+  for rj in rejections:
+    print(f"NOD-REJECT rank={rj['rank']} loss={rj['loss']} at={rj['failed_at']} {rj['reason']}")
   print(f"NOD-FIDELITY pass={fid['pass_count']}/{len(fid['stops'])}")
   for i, row in enumerate(fid["stops"]):
-    print(f"NOD-FIDELITY stop{i} {row['route'][-8:]}@{row['minute']} "
+    print(f"NOD-FIDELITY stop{i} {row['route'][-8:]}@{row['minute']} a_g={row['a_grade']:+.3f} "
           f"vRMS={row['vRMS']:.4f} dist={row['dist_sign']}{abs(row['dist_err_m']):.4f} "
           f"stopt={row['stop_time_err_s']:+.4f} awRMS={row['aWheel_rms']:.4f} pass={row['pass']}")
   print(f"NOD-FIDELITY-REF pass={fid_ref['pass_count']}/{len(fid_ref['stops'])}")
@@ -1078,22 +1370,11 @@ def test_butter_nod_fit_baseline():
     print(f"NOD-FIDELITY-REF stop{i} {row['route'][-8:]}@{row['minute']} "
           f"vRMS={row['vRMS']:.4f} dist={row['dist_sign']}{abs(row['dist_err_m']):.4f} "
           f"stopt={row['stop_time_err_s']:+.4f} awRMS={row['aWheel_rms']:.4f} pass={row['pass']}")
-  for tr in traces:
-    print(f"NOD-OUTLIER {tr['route'][-8:]}@{tr['minute']}")
-    for pt in tr["trace"]:
-      print(f"   t={pt['t']:+.2f} v_real={pt['v_real']:.3f} v_sim={pt['v_sim']:.3f} "
-            f"cmd={pt['cmd']:+.3f} st={pt['long_state']} aw_real={pt['aWheel_real']:+.3f} "
-            f"a_sim={pt['a_sim']:+.3f}")
-  print(f"NOD-BASELINE rows={len(base)} collisions={len(collisions_b0) + len(collisions_b1)}")
-  for r in collisions_b0 + collisions_b1:
-    print(f"NOD-COLLISION {r['name']} butter={r['butter']} min_gap={r['min_gap_m']}")
-  # HARD GATE (process): 0 collisions at B0 and B1, and no B0 FCW other than the
-  # accepted pre-existing s1 one. FCW is reported; the brief's test assertions are
-  # sha, fit ran, and no collision at ButterStop 0 and 1 (below).
-  other_fcw = [r for r in fcw_b0 if r["name"] != accepted_fcw]
-  print(f"NOD-GATE-B0 fcw_rows={[{'name': r['name'], 'fcw_steps': r['fcw_steps']} for r in fcw_b0]}")
-  print(f"NOD-GATE-B0 other_fcw={[r['name'] for r in other_fcw]}")
-  assert not collisions_b0, "baseline collision at ButterStop 0: " + "; ".join(
-    f"{r['name']} min_gap={r['min_gap_m']}" for r in collisions_b0)
-  assert not collisions_b1, "baseline collision at ButterStop 1: " + "; ".join(
-    f"{r['name']} min_gap={r['min_gap_m']}" for r in collisions_b1)
+  print(f"NOD-BASELINE rows={len(base)} collisions={len(collisions)}")
+  for r in collisions:
+    print(f"NOD-COLLISION {r['name']} b{r['butter']} min_gap={r['min_gap_m']}")
+  for fl in gap_order_flags:
+    print(f"NOD-GAPORDER {fl['name']} grade={fl['grade']} b0={fl['final_gap_b0']} "
+          f"b1={fl['final_gap_b1']} delta={fl['delta_m']}")
+  assert not collisions, "closed-loop collision in CHOSEN set"
+  assert not gap_order_flags, "ButterStop 1 stops closer than ButterStop 0 by > 0.05 m"
