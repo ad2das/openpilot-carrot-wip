@@ -75,9 +75,9 @@ NEXT_H = 104
 NEXT_ARROW = 84
 NEXT_DISTANCE_SIZE = 66
 NEXT_UNIT_SIZE = 34
-CLOCK_SIZE = 86
-DATE_SIZE = 54
-CLOCK_H = 116
+CLOCK_SIZE = 132
+DATE_SIZE = 56
+CLOCK_H = 160
 BADGE_SIZE = 44
 BADGE_H = 80
 TPMS_W = 340
@@ -936,8 +936,8 @@ class HudRenderer(Widget):
     guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
     lo = guide[0] + guide[2] + 24 if guide is not None else rect.x
     hi = tpms[0] - 24 if tpms is not None else rect.x + rect.width
-    pad, sep = 44.0, 30.0
-    clock_w = t.width(clock, CLOCK_SIZE, hs.SEMI) if clock else 0.0
+    pad, sep = 48.0, 32.0
+    clock_w = t.width(clock, CLOCK_SIZE, hs.BOLD) if clock else 0.0
     date_w = t.width(date, DATE_SIZE, hs.SEMI) if date else 0.0
     w = pad * 2 + clock_w + date_w + (2 * sep + 2 if clock and date else 0.0)
     if clock and date and w > hi - lo:
@@ -950,9 +950,9 @@ class HudRenderer(Widget):
     hs.chip(x, top, w, CLOCK_H)
     x += pad
     if clock:
-      x += t.draw(clock, x, mid + CLOCK_SIZE * hs.INTER_CAP / 2, CLOCK_SIZE, hs.TEXT, hs.SEMI)
+      x += t.draw(clock, x, mid + CLOCK_SIZE * hs.INTER_CAP / 2, CLOCK_SIZE, hs.TEXT, hs.BOLD)
       if date:
-        hs.card(x + sep, mid - 28, 2, 56, hs.rgba(255, 255, 255, 56), 1, None)
+        hs.card(x + sep, mid - 36, 2, 72, hs.rgba(255, 255, 255, 56), 1, None)
         x += 2 * sep + 2
     if date:
       t.draw(date, x, mid + DATE_SIZE * 0.39, DATE_SIZE, hs.TEXT_2, hs.SEMI)
@@ -1003,7 +1003,7 @@ class HudRenderer(Widget):
 
     weekday = WEEKDAYS_KO[(now.tm_wday + 1) % 7]
     self._date_time_text = time.strftime("%H:%M", now)
-    self._date_text = f"{now.tm_mon}월 {now.tm_mday}일 {weekday}요일"
+    self._date_text = f"{now.tm_mon}월 {now.tm_mday}일 ({weekday})"
     self._date_time_minute_key = minute_key
 
   # ---- tyre pressure ------------------------------------------------------------------------

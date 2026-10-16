@@ -661,10 +661,10 @@ def test_clock_reformats_only_when_minute_key_changes(hud_module, monkeypatch):
   assert len(localtime_calls) == 4
   # The wall-clock string is rebuilt only when the minute key changes.
   assert strftime_calls == [("%H:%M", 12, 1), ("%H:%M", 12, 2), ("%H:%M", 13, 2)]
-  assert draws == ["12:01", "7월 16일 목요일", "12:01", "7월 16일 목요일",
-                   "12:02", "7월 16일 목요일", "13:02", "7월 16일 목요일"]
+  assert draws == ["12:01", "7월 16일 (목)", "12:01", "7월 16일 (목)",
+                   "12:02", "7월 16일 (목)", "13:02", "7월 16일 (목)"]
   assert renderer._date_time_minute_key == (2026, 197, 13, 2, 0)
-  assert renderer._date_text == "7월 16일 목요일"
+  assert renderer._date_text == "7월 16일 (목)"
 
   renderer._show_date_time = 0
   monkeypatch.setattr(module.time, "localtime", lambda: pytest.fail("hidden clock read the clock"))
