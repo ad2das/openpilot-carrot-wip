@@ -43,6 +43,20 @@ LEAD_ACCEL_MIN = -1.5
 LEAD_CLOSING_TIME_MIN = 2.5
 STOP_DISTANCE_DEFAULT = 5.5
 
+# ButterStop early-ease (BSE): adds braking EARLIER (0.3..V_E m/s) so the car
+# arrives slow with distance left and the lagging actuator decays before the
+# stop, removing the end-of-stop nod. These are the sweepable defaults; the
+# tuning sweep overrides the module attributes (read at call time).
+K_E = 0.8            # BSE taper slope: ceiling(v) = -(a_end + K_E * v)
+L_E = 0.3            # dead-time budget (s): v_ego * L_E metres reserved
+MARGIN_E = 0.0       # extra distance kept unused before the ease (m)
+EXTRA_MAX = 0.6      # most BSE may brake harder than stock (m/s^2)
+V_E = 4.0            # BSE upper speed bound (m/s)
+BSE_V_MIN = 0.3      # BSE lower speed bound (m/s)
+BSE_LEAD_V = 0.3     # lead counts as stationary below this (m/s)
+BSE_LEAD_A_MIN = -0.5  # lead accel floor for "stationary" (m/s^2)
+BSE_INELIG_END_S = 0.5  # ineligible this long ends the episode
+
 
 def plan_stop_distance(plan_t, plan_speeds):
   """Trapezoid distance along the plan until it first drops below standstill."""
@@ -145,6 +159,28 @@ def solve_taper_a_end(v, avail, k):
   return hi
 
 
+def solve_taper_a_end_range(v, avail, k, a_min=None, a_max=None):
+  """Parameterised solve_taper_a_end; does not read/mutate the module constants.
+
+  Same monotonic bisection as solve_taper_a_end but with caller-provided bounds
+  so BSE can use its own K_E without changing the existing taper behaviour.
+  """
+  a_min = A_MIN if a_min is None else a_min
+  a_max = A_MAX if a_max is None else a_max
+  if taper_stop_distance(v, a_min, k) <= avail:
+    return a_min
+  if taper_stop_distance(v, a_max, k) > avail:
+    return None
+  lo, hi = a_min, a_max
+  for _ in range(SOLVE_ITERS):
+    mid = 0.5 * (lo + hi)
+    if taper_stop_distance(v, mid, k) <= avail:
+      hi = mid
+    else:
+      lo = mid
+  return hi
+
+
 def slew_floor(prev, floor_raw, dt=DT_CTRL):
   """One-way floor slew: tightening is instant, relaxing is rate-limited.
 
@@ -237,3 +273,173 @@ def butter_eligible(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan
     if v_lead < v_ego and d_rel / (v_ego - v_lead) < LEAD_CLOSING_TIME_MIN:
       return False
   return True
+
+
+def bse_eligible(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan,
+                 long_state_pid, lead):
+  """BSE eligibility (brief 2.1).
+
+  Same gates as butter_eligible except the speed window uses BSE's own
+  0.3 < v_ego <= V_E bound (V_E may exceed V_TAPER), and the long state must be
+  pid. The lead must be valid and stationary: vLead < BSE_LEAD_V and
+  aLeadK > BSE_LEAD_A_MIN. K_E/L_E/... are read at call time so the sweep can
+  patch them.
+  """
+  if not active or not long_state_pid:
+    return False
+  if not (math.isfinite(v_ego) and math.isfinite(t_since_plan)):
+    return False
+  if not (BSE_V_MIN < v_ego <= V_E):
+    return False
+  if brake_pressed or gas_pressed or fcw:
+    return False
+  if not 0.0 <= t_since_plan <= MAX_PLAN_AGE:
+    return False
+  if lead is None or not getattr(lead, "status", False):
+    return False
+  try:
+    d_rel = float(lead.dRel)
+    a_lead = float(lead.aLeadK)
+    v_lead = float(lead.vLead)
+  except (TypeError, ValueError, AttributeError):
+    return False
+  if not all(map(math.isfinite, (d_rel, a_lead, v_lead))):
+    return False
+  if v_lead >= BSE_LEAD_V or a_lead <= BSE_LEAD_A_MIN:
+    return False
+  return True
+
+
+def butter_ceiling(v_ego, lead, stop_distance_orig, d_rel_eff=None, diag=None):
+  """Most-negative allowed acceleration BSE may add, or None.
+
+  Room: avail_e = d_rel_eff - max(MIN_FINAL_GAP_ABS, stop_distance_orig -
+  LEAD_SLACK) - MARGIN_E - v_ego*L_E. The v_ego*L_E term budgets the actuator
+  dead time so the ease completes before the stop. Taper:
+  a_end = solve_taper_a_end_range(v_ego, avail_e, K_E); when avail_e <= AVAIL_MIN
+  or a_end is None, returns None (stock wins). Otherwise
+  ceiling = -(a_end + K_E*v_ego). diag records avail_e/a_end for telemetry.
+  """
+  if diag is not None:
+    diag["ceiling"] = None
+    diag["avail_e"] = None
+    diag["a_end"] = None
+  if not (math.isfinite(v_ego) and BSE_V_MIN < v_ego <= V_E):
+    return None
+  if lead is None or not getattr(lead, "status", False):
+    return None
+  if d_rel_eff is not None:
+    try:
+      d_rel = float(d_rel_eff)
+    except (TypeError, ValueError):
+      return None
+  else:
+    try:
+      d_rel = float(lead.dRel)
+    except (TypeError, ValueError, AttributeError):
+      return None
+  if not math.isfinite(d_rel):
+    return None
+  if stop_distance_orig is None or not math.isfinite(stop_distance_orig) or stop_distance_orig < 0.0:
+    return None
+  room = d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK) - MARGIN_E - v_ego * L_E
+  if diag is not None:
+    diag["avail_e"] = room
+  if room <= AVAIL_MIN:
+    return None
+  a_end = solve_taper_a_end_range(v_ego, room, K_E)
+  if a_end is None:
+    return None
+  if diag is not None:
+    diag["a_end"] = a_end
+  ceiling = -(a_end + K_E * v_ego)
+  if diag is not None:
+    diag["ceiling"] = ceiling
+  return ceiling
+
+
+def ceiling_extra(stock_out, ceiling):
+  """Target extra braking (stock - out) the ceiling clamp asks for (brief 2.4).
+
+  out_target = max(min(stock, ceiling), stock - EXTRA_MAX); returns
+  stock - out_target >= 0. 0 when the ceiling does not bind. The caller slews
+  this value with slew_extra so leaving BSE never steps the braking down.
+  """
+  if ceiling is None:
+    return 0.0
+  clamped = max(min(stock_out, ceiling), stock_out - EXTRA_MAX)
+  return max(0.0, stock_out - clamped)
+
+
+def slew_extra(prev, target, dt=DT_CTRL):
+  """Symmetric jerk-limited slew for the BSE extra braking (invariant I4 + G6).
+
+  The extra is rate-limited in BOTH directions at FLOOR_RELAX_JERK so that
+  neither entering nor leaving BSE steps the braking (G6 caps cmd |jerk| at
+  2.5 m/s^3). Growing toward more braking and decaying toward 0 both obey the
+  same limit; I4 ("leaving never steps down") is the decaying half. Returns the
+  applied extra. FLOOR_RELAX_JERK is read at call time so the sweep can patch it.
+  """
+  if prev is None:
+    return target
+  lo = prev - FLOOR_RELAX_JERK * dt
+  hi = prev + FLOOR_RELAX_JERK * dt
+  return min(max(target, lo), hi)
+
+
+class BseState:
+  """BSE episode latch (brief 2.5).
+
+  Starts when the ceiling first binds (eligible and a ceiling exists). Ends on a
+  hard reason (lead not stationary, gas/brake/FCW, v_ego > V_E + 0.5, or the
+  stopping state is entered) immediately, or after BSE_INELIG_END_S of any other
+  ineligibility. On end the extra decays to 0 at FLOOR_RELAX_JERK (never steps).
+  Pure state + arithmetic; the caller supplies stock_out, status and timing.
+  """
+
+  def __init__(self):
+    self.active = False
+    self.inelig_time = 0.0
+    self.extra_prev = None
+    self.ceiling_last = None
+    self.avail_e_last = None
+    self.a_end_last = None
+
+  def reset(self):
+    self.active = False
+    self.inelig_time = 0.0
+    self.extra_prev = None
+    self.ceiling_last = None
+    self.avail_e_last = None
+    self.a_end_last = None
+
+  def update(self, stock_out, eligible, hard_end, ceiling, dt=DT_CTRL):
+    """Advance one step; returns the BSE output (<= stock_out).
+
+    `extra_prev` is a float for the whole BSE episode lifetime (seeded at 0 on
+    first activation) so the jerk limit applies to entering, changing and leaving
+    equally; it is only cleared by reset().
+    """
+    if not self.active:
+      if eligible and ceiling is not None:
+        self.active = True
+        self.inelig_time = 0.0
+        if self.extra_prev is None:
+          self.extra_prev = 0.0
+    else:
+      if hard_end:
+        self.active = False
+      elif not eligible:
+        self.inelig_time += dt
+        if self.inelig_time >= BSE_INELIG_END_S:
+          self.active = False
+      else:
+        self.inelig_time = 0.0
+
+    target = ceiling_extra(stock_out, ceiling) if self.active else 0.0
+    applied = slew_extra(self.extra_prev, target, dt)
+    self.extra_prev = applied
+    out = min(stock_out, stock_out - applied)
+    self.ceiling_last = ceiling if self.active else None
+    return out
+

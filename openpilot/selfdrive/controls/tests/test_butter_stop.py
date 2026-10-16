@@ -81,20 +81,33 @@ if "acados" not in sys.modules:
   sys.modules.setdefault("acados", acados_module)
   sys.modules.setdefault("acados.acados_template", acados_template_module)
 
-_generated_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code")
-_generated_module.__path__ = []
-_solver_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx")
-_solver_module.AcadosOcpSolverCython = None
-sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code", _generated_module)
-sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
+# Register the solver stub only when the real compiled solver is unavailable
+# (Windows unit-test hosts). On Linux/WSL the real module must win: this file's
+# module-level stub is process-global, and unconditionally poisoning the solver
+# would break other test modules (e.g. the maneuver closed-loop sims) that run
+# later in the same session.
+try:
+  import openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx as _real_solver  # noqa: F401
+  _HAVE_REAL_SOLVER = getattr(_real_solver, "AcadosOcpSolverCython", None) is not None
+except Exception:
+  _HAVE_REAL_SOLVER = False
+
+if not _HAVE_REAL_SOLVER:
+  _generated_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code")
+  _generated_module.__path__ = []
+  _solver_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx")
+  _solver_module.AcadosOcpSolverCython = None
+  sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code", _generated_module)
+  sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
 
 import openpilot.selfdrive.controls.lib.longcontrol as lc
 from openpilot.selfdrive.controls.lib import butter_stop
 from openpilot.selfdrive.controls.lib.butter_stop import (
   A_MAX, A_MIN, CREEP_ACCEL, D_EXTRA, FLOOR_RELAX_JERK, HOLD_RAMP, K_TAPER,
   LEAD_JUMP_M, LEAD_RAW_ALLOW, LEAD_SLACK, MARGIN, MIN_FINAL_GAP_ABS, STANDSTILL_T,
-  STANDSTILL_V, V_TAPER, LeadPosFilter, butter_eligible, butter_floor,
-  plan_stop_distance, slew_floor, solve_taper_a_end, taper_stop_distance,
+  STANDSTILL_V, V_TAPER, BseState, LeadPosFilter, butter_ceiling, butter_eligible,
+  butter_floor, bse_eligible, ceiling_extra, plan_stop_distance, slew_extra,
+  slew_floor, solve_taper_a_end, solve_taper_a_end_range, taper_stop_distance,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongControl, LongCtrlState,
@@ -918,3 +931,169 @@ def test_state_sequence_identical_on_vs_off_but_output_differs(monkeypatch):
     if on_out != off_out:
       outputs_differ = True
   assert outputs_differ, "ButterStop=1 must change the stopping output somewhere"
+
+
+# ---------------------------------------------------------------------------
+# ButterStop early-ease (BSE)
+# ---------------------------------------------------------------------------
+
+def _stationary_lead(d_rel, v_lead=0.0, a_lead=0.0, status=True):
+  return SimpleNamespace(status=status, dRel=d_rel, aLeadK=a_lead, vLead=v_lead)
+
+
+def bse_kwargs(**overrides):
+  kwargs = {"active": True, "v_ego": 1.0, "brake_pressed": False, "gas_pressed": False,
+            "fcw": False, "t_since_plan": 0.05, "long_state_pid": True,
+            "lead": _stationary_lead(20.0)}
+  kwargs.update(overrides)
+  return kwargs
+
+
+def test_solve_taper_a_end_range_matches_parameterised_unbounded():
+  for v in (0.3, 1.0, 2.5, 4.0):
+    for avail in (0.1, 0.5, 2.0, 6.0):
+      for k in (0.0, 0.5, 1.2):
+        a = solve_taper_a_end(v, avail, k)
+        b = solve_taper_a_end_range(v, avail, k)
+        assert (a is None and b is None) or (a is not None and b is not None and a == pytest.approx(b))
+
+
+def test_bse_eligibility_requires_stationary_lead_and_pid():
+  assert bse_eligible(**bse_kwargs())
+  assert not bse_eligible(**bse_kwargs(long_state_pid=False))
+  assert not bse_eligible(**bse_kwargs(lead=_stationary_lead(20.0, status=False)))
+  assert not bse_eligible(**bse_kwargs(lead=_stationary_lead(20.0, v_lead=0.5)))
+  assert not bse_eligible(**bse_kwargs(lead=_stationary_lead(20.0, a_lead=-0.6)))
+  assert not bse_eligible(**bse_kwargs(v_ego=0.25))
+  assert not bse_eligible(**bse_kwargs(v_ego=5.5))
+  assert not bse_eligible(**bse_kwargs(active=False))
+  assert not bse_eligible(**bse_kwargs(gas_pressed=True))
+  assert not bse_eligible(**bse_kwargs(brake_pressed=True))
+  assert not bse_eligible(**bse_kwargs(fcw=True))
+
+
+def test_butter_ceiling_none_when_no_room():
+  # Far lead with plenty of room -> a real ceiling.
+  assert butter_ceiling(2.0, _stationary_lead(60.0), 5.5) is not None
+  # At the minimum gap (lead bound) there is no room.
+  assert butter_ceiling(2.0, _stationary_lead(MIN_FINAL_GAP_ABS), 5.5) is None
+  # Non-finite stop distance and bad speed.
+  assert butter_ceiling(2.0, _stationary_lead(60.0), float("nan")) is None
+  assert butter_ceiling(float("nan"), _stationary_lead(60.0), 5.5) is None
+  assert butter_ceiling(0.0, _stationary_lead(60.0), 5.5) is None
+  assert butter_ceiling(9.0, _stationary_lead(60.0), 5.5) is None
+
+
+def test_butter_ceiling_uses_dead_time_budget():
+  lead = _stationary_lead(60.0)
+  c0 = butter_ceiling(2.0, lead, 5.5, d_rel_eff=60.0)
+  d0 = {}
+  butter_ceiling(2.0, lead, 5.5, d_rel_eff=60.0, diag=d0)
+  # A larger dead-time budget must leave less room -> a stronger (more negative)
+  # or equal ceiling.
+  monkey = butter_stop
+  saved = monkey.L_E
+  try:
+    monkey.L_E = 1.5
+    d1 = {}
+    c1 = butter_ceiling(2.0, lead, 5.5, d_rel_eff=60.0, diag=d1)
+  finally:
+    monkey.L_E = saved
+  assert d1["avail_e"] < d0["avail_e"]
+  assert c1 <= c0 + 1e-9
+
+
+def test_ceiling_extra_never_positive_and_limits_extra():
+  # Ceiling below stock: extra = min(EXTRA_MAX, stock - ceiling).
+  monkey = butter_stop
+  saved = monkey.EXTRA_MAX
+  try:
+    monkey.EXTRA_MAX = 2.0
+    assert ceiling_extra(-1.0, -2.0) == pytest.approx(1.0)
+    assert ceiling_extra(-1.0, -0.5) == pytest.approx(0.0)
+    assert ceiling_extra(-1.0, None) == pytest.approx(0.0)
+    # EXTRA_MAX caps how much harder than stock.
+    monkey.EXTRA_MAX = 0.3
+    assert ceiling_extra(-1.0, -3.0) == pytest.approx(0.3)
+  finally:
+    monkey.EXTRA_MAX = saved
+
+
+def test_slew_extra_is_jerk_limited_both_ways():
+  dt = lc.DT_CTRL
+  assert slew_extra(None, 0.5) == pytest.approx(0.5)
+  # Growing is rate-limited too (G6: cmd |jerk| bounded on entry).
+  assert slew_extra(0.0, 1.0) == pytest.approx(FLOOR_RELAX_JERK * dt)
+  assert slew_extra(0.2, 1.0) == pytest.approx(0.2 + FLOOR_RELAX_JERK * dt)
+  # Decaying is rate-limited (I4: leaving never steps down).
+  assert slew_extra(1.0, 0.0) == pytest.approx(1.0 - FLOOR_RELAX_JERK * dt)
+  # Unchanged value stays.
+  assert slew_extra(0.3, 0.3) == pytest.approx(0.3)
+
+
+# I1: out <= stock_out for random states and any ceiling.
+def test_bse_state_output_never_exceeds_stock():
+  rng = np.random.default_rng(1234)
+  state = BseState()
+  for _ in range(20000):
+    stock = float(rng.uniform(-3.5, 2.0))
+    eligible = bool(rng.integers(0, 2))
+    hard_end = bool(rng.integers(0, 2))
+    ceiling = None if rng.random() < 0.5 else float(rng.uniform(-6.0, 1.0))
+    out = state.update(stock, eligible=eligible, hard_end=hard_end, ceiling=ceiling)
+    assert out <= stock + 1e-9
+    assert out >= stock - EXTRA_MAX_CLAMP - 1e-9
+
+
+EXTRA_MAX_CLAMP = 1.0  # loose upper bound for the property check
+
+
+# I4: leaving BSE (ceiling disappears / ineligible) never steps down faster than
+# FLOOR_RELAX_JERK.
+def test_bse_state_relaxes_at_jerk_limit_on_ceiling_loss():
+  controls = [1.0, 0.8, 1.2]
+  margins = [0.0, 0.2]
+  saved = (butter_stop.K_E, butter_stop.L_E, butter_stop.MARGIN_E, butter_stop.EXTRA_MAX)
+  try:
+    for ke in controls:
+      for me in margins:
+        butter_stop.K_E = ke
+        butter_stop.MARGIN_E = me
+        state = BseState()
+        stock = -1.0
+        # Bind the ceiling for a while (stationary lead well inside room).
+        for _ in range(50):
+          state.update(stock, eligible=True, hard_end=False,
+                       ceiling=butter_ceiling(2.0, _stationary_lead(60.0), 5.5, d_rel_eff=60.0))
+        assert state.active
+        prev_out = stock - (state.extra_prev or 0.0)
+        # Ceiling vanishes; the extra may only decay at the jerk limit.
+        for _ in range(200):
+          out = state.update(stock, eligible=True, hard_end=False, ceiling=None)
+          assert out >= prev_out - 1e-9
+          assert out <= prev_out + FLOOR_RELAX_JERK * lc.DT_CTRL + 1e-9
+          prev_out = out
+        # Eventually fully relaxed to stock.
+        assert state.extra_prev == pytest.approx(0.0)
+        assert out == pytest.approx(stock)
+  finally:
+    butter_stop.K_E, butter_stop.L_E, butter_stop.MARGIN_E, butter_stop.EXTRA_MAX = saved
+
+
+def test_bse_state_hard_end_stops_immediately_but_relaxes():
+  state = BseState()
+  stock = -1.0
+  for _ in range(50):
+    state.update(stock, eligible=True, hard_end=False,
+                 ceiling=butter_ceiling(2.0, _stationary_lead(60.0), 5.5, d_rel_eff=60.0))
+  assert state.active
+  prev_out = stock - (state.extra_prev or 0.0)
+  out = state.update(stock, eligible=True, hard_end=True, ceiling=None)
+  assert not state.active
+  # I1 still holds (never above stock), the extra stays bounded by EXTRA_MAX, and
+  # the hard end only relaxes the extra at the jerk limit (no snap-back).
+  assert out <= stock + 1e-9
+  assert out >= stock - EXTRA_MAX_CLAMP - 1e-9
+  assert out >= prev_out - 1e-9
+  assert out <= prev_out + FLOOR_RELAX_JERK * lc.DT_CTRL + 1e-9
+

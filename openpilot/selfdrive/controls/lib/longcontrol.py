@@ -12,8 +12,8 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 )
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, HOLD_RAMP, LeadPosFilter, STANDSTILL_T, STANDSTILL_V,
-  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor,
+  BseState, CREEP_ACCEL, CREEP_V, HOLD_RAMP, LeadPosFilter, STANDSTILL_T, STANDSTILL_V,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_ceiling, butter_floor, bse_eligible,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -100,6 +100,17 @@ class LongControl:
     self._butter_lead_filter = LeadPosFilter()
     self._butter_diag = {}
 
+    # ButterStop early-ease (BSE) episode state and telemetry. BSE keeps its own
+    # lead-position filter and odometry accumulator so the floor's is untouched.
+    self._bse = BseState()
+    self._bse_s_ego = 0.0
+    self._bse_lead_filter = LeadPosFilter()
+    self._bse_diag = {}
+    self.bse_ceiling_last = None
+    self.bse_avail_last = None
+    self.bse_a_end_last = None
+    self.bse_active_last = False
+
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
       self._apply_hyundai_longitudinal_tuning()
@@ -173,6 +184,39 @@ class LongControl:
       self._butter_lead_filter.reset()
     return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig,
                         d_rel_eff=d_eff, diag=self._butter_diag)
+
+  def _bse_ceiling(self, active, CS, long_plan, t_since_plan, radarState, v_ego):
+    """Compute the BSE ceiling for this step, or None (brief 2.1-2.3)."""
+    self._bse_diag["ceiling"] = None
+    self._bse_diag["avail_e"] = None
+    self._bse_diag["a_end"] = None
+    lead = getattr(radarState, "leadOne", None) if radarState is not None else None
+    try:
+      t_age = float(t_since_plan)
+    except (TypeError, ValueError):
+      return None
+    pid_state = self.long_control_state == LongCtrlState.pid
+    if not bse_eligible(
+        active=bool(active), v_ego=v_ego,
+        brake_pressed=bool(getattr(CS, "brakePressed", False)),
+        gas_pressed=bool(getattr(CS, "gasPressed", False)),
+        fcw=bool(getattr(long_plan, "fcw", False)),
+        t_since_plan=t_age, long_state_pid=pid_state, lead=lead):
+      self._bse_lead_filter.reset()
+      self._bse_s_ego = 0.0
+      return None
+    d_eff = None
+    if lead is not None and bool(getattr(lead, "status", False)):
+      try:
+        d_rel_raw = float(lead.dRel)
+      except (TypeError, ValueError, AttributeError):
+        return None
+      self._bse_s_ego += v_ego * DT_CTRL
+      d_eff = self._bse_lead_filter.update(True, d_rel_raw, self._bse_s_ego)
+      if d_eff is None:
+        return None
+    return butter_ceiling(v_ego, lead, self.stop_distance_orig, d_rel_eff=d_eff,
+                          diag=self._bse_diag)
 
   def _apply_hyundai_longitudinal_tuning(self):
     # Hyundai, Kia, and Genesis all use the opendbc "hyundai" brand. Keep the
@@ -370,6 +414,62 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
         output_accel = min(0.0, max(output_accel, butter_floor_value))
+
+    stock_final = np.clip(output_accel, accel_limits[0], accel_limits[1])
+    self._bse_stock_last = float(stock_final)
+
+    # ButterStop early-ease (BSE). Applied after the floor/coasting/state logic;
+    # it only ever adds braking (I1). Episode ends on hard reasons immediately or
+    # after BSE_INELIG_END_S of ordinary ineligibility; leaving decays at
+    # FLOOR_RELAX_JERK (I4). Nothing here touches hold, creep guard or the state
+    # machine.
+    if self.butter_stop:
+      self._bse_diag = {"ceiling": None, "avail_e": None, "a_end": None}
+      try:
+        v_now = float(CS.vEgo)
+      except (TypeError, ValueError):
+        v_now = float("nan")
+      try:
+        t_age_now = float(t_since_plan)
+      except (TypeError, ValueError):
+        t_age_now = float("inf")
+      lead = getattr(radarState, "leadOne", None) if radarState is not None else None
+      gas = bool(getattr(CS, "gasPressed", False))
+      brake = bool(getattr(CS, "brakePressed", False))
+      fcw = bool(getattr(long_plan, "fcw", False))
+      pid_state = self.long_control_state == LongCtrlState.pid
+      lead_stat = bool(getattr(lead, "status", False)) if lead is not None else False
+      lead_stationary = False
+      if lead_stat:
+        try:
+          lead_stationary = (float(lead.vLead) < butter_stop_module.BSE_LEAD_V
+                             and float(lead.aLeadK) > butter_stop_module.BSE_LEAD_A_MIN)
+        except (TypeError, ValueError):
+          lead_stationary = False
+      eligible = bse_eligible(
+        active=bool(active), v_ego=v_now, brake_pressed=brake, gas_pressed=gas, fcw=fcw,
+        t_since_plan=t_age_now, long_state_pid=pid_state, lead=lead)
+      hard_end = ((not pid_state) or gas or brake or fcw
+                  or (not lead_stationary)
+                  or (math.isfinite(v_now) and v_now > butter_stop_module.V_E + 0.5))
+      ceiling = None
+      if eligible and not hard_end:
+        ceiling = self._bse_ceiling(active, CS, long_plan, t_since_plan, radarState, v_now)
+      bse_out = self._bse.update(float(stock_final), eligible=eligible, hard_end=hard_end,
+                                 ceiling=ceiling, dt=DT_CTRL)
+      output_accel = np.clip(bse_out, accel_limits[0], accel_limits[1])
+      self.bse_ceiling_last = self._bse_diag.get("ceiling")
+      self.bse_avail_last = self._bse_diag.get("avail_e")
+      self.bse_a_end_last = self._bse_diag.get("a_end")
+      self.bse_active_last = bool(self._bse.active)
+    else:
+      self._bse.reset()
+      self._bse_lead_filter.reset()
+      self._bse_s_ego = 0.0
+      self.bse_ceiling_last = None
+      self.bse_avail_last = None
+      self.bse_a_end_last = None
+      self.bse_active_last = False
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel, a_target_ff, j_target_now
