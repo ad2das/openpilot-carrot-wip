@@ -780,3 +780,86 @@ def test_a_short_feed_dropout_keeps_the_last_turn(hud_module):
   assert renderer._held_turn(turn_info(), False, 11.9) == (2, 350, 1, 180)
   assert renderer._held_turn(turn_info(), True, 12.0) == (0, 0, 0, 0)
   assert renderer._guide_turn is None
+
+
+@pytest.mark.parametrize("metric, dist, text", [
+  (True, 0, ""), (True, 237, "237 m"), (True, 999, "999 m"), (True, 1000, "1.0 km"), (True, 1234, "1.2 km"),
+  (False, 100, "328 ft"), (False, 2000, "1.2 mi"),
+])
+def test_camera_distance_text_shows_the_exact_metres(hud_module, metric, dist, text):
+  module, fake_ui_state = hud_module
+  fake_ui_state.is_metric = metric
+  renderer = object.__new__(module.HudRenderer)
+
+  assert renderer._format_camera_distance_text(dist) == text
+
+
+def test_camera_distance_is_latched_for_a_second_and_refreshes_at_once_for_a_new_camera(hud_module):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._camera_dist_held = None
+  key = ("camera", 2)
+
+  assert renderer._camera_display_dist(key, 300, 0.0) == 300
+  assert renderer._camera_display_dist(key, 292, 0.5) == 300  # held: within the refresh second
+  assert renderer._camera_display_dist(key, 285, 1.0) == 285  # one second has passed
+  assert renderer._camera_display_dist(("camera", 3), 240, 1.2) == 240  # a new camera shows its value at once
+  assert renderer._camera_display_dist(("camera", 3), 260, 1.3) == 260  # rising distance (new camera) at once
+
+
+def held_camera_renderer(module, fake_ui_state):
+  renderer = object.__new__(module.HudRenderer)
+  renderer._camera_dist_held = None
+  renderer._progress_key = None
+  renderer._progress_start = module.NAV_PROGRESS_SPAN
+  renderer._progress_last = 0
+  renderer._guide_turn = None
+  fake_ui_state.sm = {"carrotMan": SimpleNamespace(xSpdLimit=80, xSignType=2, nRoadLimitSpeed=90)}
+  return renderer
+
+
+def camera_card_draws(renderer, module, monkeypatch, dist, now):
+  numbers = []
+  renderer._type = SimpleNamespace(
+    draw=lambda text, *args, **kwargs: (numbers.append(text), 20.0)[1],
+    width=lambda *args, **kwargs: 20.0,
+    draw_mid=lambda *args, **kwargs: None,
+    ellipsize=lambda text, *args, **kwargs: text,
+  )
+  monkeypatch.setattr(module.hs, "glass_card", lambda *args, **kwargs: None)
+  monkeypatch.setattr(module.hs, "regulatory_sign", lambda *args, **kwargs: None)
+  monkeypatch.setattr(module.time, "monotonic", lambda: now)
+  module.hs.zones.clear()
+  module.hs.top_boxes.clear()
+  info = {
+    "x_spd_dist": dist,
+    "n_go_pos_dist": 0,
+    "n_go_pos_time": 0,
+    "x_turn_info": 0,
+    "x_dist_to_turn": 0,
+    "x_turn_info_next": 0,
+    "x_dist_to_turn_next": 0,
+    "atc_type": "",
+    "sdi_descr": "과속 단속",
+  }
+  renderer._draw_guidance_card(module.rl.Rectangle(10, 20, 1000, 600), info)
+  return numbers[0] if numbers else None
+
+
+def test_camera_card_holds_the_number_within_a_second_and_changes_after(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
+  renderer = held_camera_renderer(module, fake_ui_state)
+
+  assert camera_card_draws(renderer, module, monkeypatch, 300, 0.0) == "300"
+  assert camera_card_draws(renderer, module, monkeypatch, 292, 0.5) == "300"
+  assert camera_card_draws(renderer, module, monkeypatch, 285, 1.0) == "285"
+
+
+def test_camera_card_resets_the_latch_when_the_camera_comes_back(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
+  renderer = held_camera_renderer(module, fake_ui_state)
+
+  assert camera_card_draws(renderer, module, monkeypatch, 300, 0.0) == "300"
+  assert camera_card_draws(renderer, module, monkeypatch, 0, 0.4) is None  # camera gone: nothing drawn
+  assert renderer._camera_dist_held is None
+  assert camera_card_draws(renderer, module, monkeypatch, 250, 0.6) == "250"  # new camera shows at once

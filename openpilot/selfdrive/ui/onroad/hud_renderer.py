@@ -69,6 +69,7 @@ NAV_UNIT_SIZE = 60
 NAV_TEXT_SIZE = 56
 NAV_PROGRESS_SPAN = 2000.0
 GUIDE_HOLD_S = 2.0      # a turn card outlives a dropout in the navigator's feed by this long instead of blinking
+CAMERA_DIST_REFRESH_S = 1.0  # the speed-camera countdown shows the exact metres, refreshed once a second
 NEXT_GAP = 12           # turn-after-next card: under the turn card, a step smaller
 NEXT_H = 104
 NEXT_ARROW = 84
@@ -245,6 +246,7 @@ class HudRenderer(Widget):
     self._overspeed = False
     self._progress_key: tuple | None = None
     self._guide_turn: tuple[int, int, int, int, float] | None = None
+    self._camera_dist_held: tuple[tuple, int, float] | None = None  # (camera key, shown metres, when)
     self._progress_start = NAV_PROGRESS_SPAN
     self._progress_last = 0
     self._set_anchor = (0.0, 0.0)
@@ -1115,6 +1117,25 @@ class HudRenderer(Widget):
         return f"{math.ceil(feet / step) * step} ft"
       return f"{dist_m / 1609.344:.1f} mi"
 
+  @staticmethod
+  def _format_camera_distance_text(dist_m: int) -> str:
+    """Speed-camera countdown: the exact remaining distance (it is refreshed by time, not by distance steps)."""
+    if dist_m <= 0:
+      return ""
+    if ui_state.is_metric:
+      return f"{dist_m} m" if dist_m < 1000 else f"{dist_m / 1000.0:.1f} km"
+    if dist_m < 1609:
+      return f"{int(round(dist_m * 3.28084))} ft"
+    return f"{dist_m / 1609.344:.1f} mi"
+
+  def _camera_display_dist(self, key: tuple, dist: int, now: float) -> int:
+    """The camera distance to print: latched for CAMERA_DIST_REFRESH_S, refreshed at once for a new camera."""
+    held = self._camera_dist_held
+    if held is None or held[0] != key or dist > held[1] or now - held[2] >= CAMERA_DIST_REFRESH_S:
+      self._camera_dist_held = (key, dist, now)
+      return dist
+    return held[1]
+
   def _progress(self, key: tuple, dist: int) -> float:
     """Approach progress: fills over the last two kilometres, or from where a longer approach began."""
     if key != self._progress_key or dist > self._progress_last + 50:
@@ -1153,12 +1174,15 @@ class HudRenderer(Widget):
     t = self._type
     x_spd_limit, x_sign_type, _ = self._get_speed_limit_info()
     route = info["n_go_pos_dist"] > 0 and info["n_go_pos_time"] > 0
-    turn_info, turn_dist, next_info, next_gap = self._held_turn(info, route, time.monotonic())
+    now = time.monotonic()
+    turn_info, turn_dist, next_info, next_gap = self._held_turn(info, route, now)
     turn = turn_info > 0
     cam_dist = info["x_spd_dist"]
     camera = x_spd_limit > 0 and x_sign_type != 22 and cam_dist > 0
     if camera and turn and turn_dist < cam_dist:
       camera = False
+    if not camera:
+      self._camera_dist_held = None
     if not (camera or turn):
       self._progress_key = None
       return
@@ -1171,15 +1195,17 @@ class HudRenderer(Widget):
       extra = str(limit)
       body, bar = hs.CARD_WARN, hs.WARN_RED
       key: tuple = ("camera", x_sign_type)
+      dist_text = self._format_camera_distance_text(self._camera_display_dist(key, dist, now))
     else:
       # Turn guidance is the arrow and the distance alone; the road name only cost a glance.
       dist = turn_dist
       text, extra = "", ""
       body, bar = hs.CARD_BODY, hs.LIVE_GREEN if info["atc_type"] else NAV_BLUE
       key = ("turn", turn_info)
+      dist_text = self._format_turn_distance_text(dist)
 
     # The card hugs its content: no blank tail after the distance or the instruction line.
-    number, _, unit = self._format_turn_distance_text(dist).partition(" ")
+    number, _, unit = dist_text.partition(" ")
     content = 0.0
     if number:
       content = t.width(number, NAV_DISTANCE_SIZE, hs.SEMI, -3) + 14 + t.width(unit, NAV_UNIT_SIZE, hs.MEDIUM)
