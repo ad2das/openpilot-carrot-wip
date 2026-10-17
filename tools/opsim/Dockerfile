@@ -50,7 +50,7 @@ WORKDIR ${OPENPILOT}
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python && \
     uv sync --frozen --all-extras && \
     .venv/bin/python -c "import numpy, capnp; print('venv ok')" && \
-    scons -j"$(nproc)"
+    PATH="${OPENPILOT}/.venv/bin:${PATH}" scons -j"$(nproc)"
 
 # SSH for the pod; root login with injected keys (RunPod supplies PUBLIC_KEY).
 RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh && \
