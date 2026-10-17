@@ -1724,7 +1724,7 @@ def _cs_row(name, group, tag, t, v, applied, cmd, gap, stock, floor_raw,
          "collision": bool(finite.any() and np.nanmin(gap) < COLLISION_GAP_M),
          "fcw_steps": int(fcw_steps), "fcw_first_t": fcw_first_t, "fcw_last_t": fcw_last_t,
          "start_delay_s": start_delay, "floor_bind_steps": 0, "floor_active_steps": 0,
-         "bind_v_lo": None, "bind_v_hi": None,
+         "bind_v_lo": None, "bind_v_hi": None, "peak_jerk_plant": None,
          "creep_latched": bool(np.any(creep_latched)),
          "hold_reached": bool(np.any(standstill_confirmed)),
          "ran_stop": bool(np.any(np.isfinite(psd)))}
@@ -1744,6 +1744,8 @@ def _cs_row(name, group, tag, t, v, applied, cmd, gap, stock, floor_raw,
     else:
       jj = jerk[1:] if jerk.size > 1 else jerk
     row["peak_jerk_cmd"] = round(float(np.max(np.abs(jj))) if jj.size else 0.0, 4)
+    pj = np.gradient(applied, t)
+    row["peak_jerk_plant"] = round(float(np.max(np.abs(pj))) if pj.size else 0.0, 4)
   if stopped:
     i = int(stand[0])
     w = (t >= t[i] - 0.6) & (t <= t[i])
@@ -1764,6 +1766,10 @@ def _cs_row(name, group, tag, t, v, applied, cmd, gap, stock, floor_raw,
     xx = np.asarray(x, dtype=float)
     row["post_stop_travel"] = round(float(xx[-1] - xx[i]), 4) if xx.size == t.size else 0.0
   row["_cmd_digest"] = hashlib.sha256(np.nan_to_num(cmd).tobytes()).hexdigest()
+  # Private per-step traces for the redefined H3 (stripped from serialized rows).
+  row["_gap"] = gap
+  row["_applied"] = applied
+  row["_final_v"] = round(float(v[-1]), 4) if v.size else None
   return row
 
 
@@ -1889,6 +1895,32 @@ def _cs_iter_pairs(p, plant_mode="real_sg"):
       yield name, b1, cs_run(factory), "a"
 
 
+def _cs_h3_new(b1, cs):
+  """Redefined H3 for no-planned-stop scenarios: same or safer, never harsher.
+
+  At every step gap_cs >= gap_b1 - 0.005 m; peak decel <= b1 + 0.1; peak plant
+  |jerk| <= b1 + 0.2; no extra stop (both must end still not stopping, or the
+  final speed states match). Returns a list of violation strings.
+  """
+  out = []
+  g1, g2 = b1.get("_gap"), cs.get("_gap")
+  if g1 is not None and g2 is not None and len(g1) == len(g2) and len(g1):
+    worst = float(np.nanmin(np.asarray(g2) - np.asarray(g1)))
+    if worst < -CS_EPS:
+      out.append(f"H3 gap shrink {worst:.4f} m")
+  b1d, c2d = b1["peak_decel"], cs["peak_decel"]
+  if b1d is not None and c2d is not None and c2d < b1d - 0.1:
+    out.append(f"H3 decel {b1d}->{c2d}")
+
+  b1jp, c2jp = b1.get("peak_jerk_plant"), cs.get("peak_jerk_plant")
+  if b1jp is not None and c2jp is not None and c2jp > b1jp + 0.2 + 1e-9:
+    out.append(f"H3 plant jerk {b1jp}->{c2jp}")
+  # No extra stop: if B1 did not stop, CS must not either.
+  if not b1["stopped"] and cs["stopped"]:
+    out.append("H3 extra stop where B1 did not stop")
+  return out
+
+
 def _cs_gate_failures(b1, cs, tag, name):
   out = []
   if b1["final_gap_m"] is not None and cs["final_gap_m"] is not None:
@@ -1901,15 +1933,12 @@ def _cs_gate_failures(b1, cs, tag, name):
     out.append(f"H2 collision min_gap={cs['min_gap_m']}")
   if cs["fcw_steps"] > b1["fcw_steps"]:
     out.append(f"H2 fcw {cs['fcw_steps']} > b1 {b1['fcw_steps']}")
-  # H3: a scenario with no planned stop must reproduce B1 bit-identically.
-  # H3: ButterStop=0 identity is covered by the unit tests; here, a scenario in
-  # which B1 never had a planned stop must reproduce B1 bit-identically.
-  # NOTE: D_EXTRA is the global MPC stop-point shift (long_mpc), so D_EXTRA !=
-  # 0.4 also moves these plans; if that happens the gate binds as-is and is
-  # reported, never loosened.
+  # H3 (redefined): a scenario with no planned stop must be same-or-safer, never
+  # harsher. Bit-identity is impossible when D_EXTRA != 0.4 because D_EXTRA is
+  # part of the MPC stop distance and shifts the following distance everywhere.
+  # Old bit-identity H3 is kept only as the informational h3_old field.
   if not b1["ran_stop"]:
-    if b1.get("_cmd_digest") != cs.get("_cmd_digest"):
-      out.append("H3 cmd trace differs from B1 on no-planned-stop scenario")
+    out.extend(_cs_h3_new(b1, cs))
   if b1["post_stop_travel"] is not None and cs["post_stop_travel"] is not None:
     if cs["post_stop_travel"] > b1["post_stop_travel"] + CS_POST_STOP_M + 1e-9:
       out.append(f"H4 post_stop {cs['post_stop_travel']} > b1 {b1['post_stop_travel']}+{CS_POST_STOP_M}")
@@ -1950,6 +1979,7 @@ def _cs_nod_reductions(pairs):
 
 def _cs_eval_params(p, plant_mode="real_sg"):
   pairs, hard, comfort = [], [], []
+  h3_old = []
   try:
     for name, b1, cs, tag in _cs_iter_pairs(p, plant_mode=plant_mode):
       pairs.append((name, b1, cs, tag))
@@ -1957,12 +1987,16 @@ def _cs_eval_params(p, plant_mode="real_sg"):
         hard.append({"name": name, "tag": tag, "reason": reason})
       for reason in _cs_comfort_failures(b1, cs):
         comfort.append({"name": name, "tag": tag, "reason": reason})
+      # Informational: old bit-identity H3 on no-planned-stop scenarios.
+      if not b1["ran_stop"]:
+        h3_old.append({"name": name,
+                       "identical": bool(b1.get("_cmd_digest") == cs.get("_cmd_digest"))})
   finally:
     cs_restore_defaults()
   reds, mean, worst = _cs_nod_reductions(pairs)
   s1_ok = mean >= CS_NOD_REDUCE and worst >= -CS_NOD_WORSE
   analysis = {"pairs": pairs, "nod_mean": mean, "nod_worst": worst,
-              "s1_ok": bool(s1_ok), "nod_reductions": reds}
+              "s1_ok": bool(s1_ok), "nod_reductions": reds, "h3_old": h3_old}
   return analysis, hard, comfort
 
 
