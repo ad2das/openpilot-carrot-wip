@@ -7,7 +7,7 @@ Sets are sharded across the nproc pool; each worker prints NOD-SD-PROGRESS per
 finished set. Stage 0 runs the H0 identity check over every scenario+variant and
 aborts on any mismatch.
 
-Usage: SD_OUT=./stop_delay.json python sd_sweep_driver.py [nproc]
+Usage: SD_OUT=./stop_delay.json [SD_SKIP_H0=1] python sd_sweep_driver.py [nproc]
 """
 import json
 import os
@@ -91,14 +91,22 @@ def main():
 
   # Stage 0: H0 identity over EVERY scenario+variant; abort the whole job on any
   # mismatch (the sweep would be meaningless on top of a broken off path).
-  h0 = H.sd_h0_check(plant_mode=plant_mode)
-  h0_bad = [r for r in h0 if not r.get("identical")]
-  h0_ok = not h0_bad
-  print(f"NOD-SD-H0 ok={h0_ok} n={len(h0)} bad={len(h0_bad)} "
-        f"{h0_bad[:5]}", flush=True)
-  if not h0_ok:
-    print("NOD-SD-ABORT H0 identity failed", flush=True)
-    sys.exit(2)
+  # SD_SKIP_H0=1 skips the serial stage when identity was already proven by the
+  # same-commit smoke run; h0_ok is then not re-derived here.
+  h0_ok = True
+  h0_bad = []
+  skip_h0 = os.environ.get("SD_SKIP_H0", "0") == "1"
+  if skip_h0:
+    print("NOD-SD-H0 skipped=1 (SD_SKIP_H0=1; identity verified separately)", flush=True)
+  else:
+    h0 = H.sd_h0_check(plant_mode=plant_mode)
+    h0_bad = [r for r in h0 if not r.get("identical")]
+    h0_ok = not h0_bad
+    print(f"NOD-SD-H0 ok={h0_ok} n={len(h0)} bad={len(h0_bad)} "
+          f"{h0_bad[:5]}", flush=True)
+    if not h0_ok:
+      print("NOD-SD-ABORT H0 identity failed", flush=True)
+      sys.exit(2)
 
   grid = H.sd_grid()
   with mp.Pool(nproc) as pool:
@@ -139,7 +147,7 @@ def main():
     "b1_delay": H.SD_B1_DELAY,
     "grid": {**H.SD_GRID, "n_combo": len(results), "V_FADE": H.SD_V_FADE,
              "SLEW_UP": H.SD_SLEW_UP},
-    "h0_ok": h0_ok, "h0_bad": h0_bad,
+    "h0_ok": h0_ok, "h0_bad": h0_bad, "h0_skipped": skip_h0,
     "determinism_ok": det_ok,
     "npassing": len(passing),
     "chosen": None if chosen is None else {"params": chosen["params"],
