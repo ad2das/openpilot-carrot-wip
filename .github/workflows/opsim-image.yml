@@ -80,16 +80,6 @@ jobs:
             ${{ env.IMAGE }}:${{ steps.commit.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Mirror to public ttl.sh (24h)
-        continue-on-error: true
-        run: |
-          # GHCR user packages default to private and GITHUB_TOKEN cannot change
-          # visibility, so also publish an anonymous, pullable copy for RunPod.
-          # ttl.sh images are public and expire after the tag's TTL (24h max).
-          docker pull "${{ env.IMAGE }}:latest"
-          docker tag "${{ env.IMAGE }}:latest" "ttl.sh/ad2das-opsim:24h"
-          docker push "ttl.sh/ad2das-opsim:24h"
-          docker buildx imagetools inspect "ttl.sh/ad2das-opsim:24h" || true
       - name: Try to make the package public
         continue-on-error: true
         run: |
@@ -108,5 +98,4 @@ jobs:
             echo "- ref: \`${{ steps.ref.outputs.ref }}\`"
             echo "- commit: \`${{ steps.commit.outputs.sha }}\`"
             echo "- image: \`${{ env.IMAGE }}:latest\`, \`${{ env.IMAGE }}:${{ steps.commit.outputs.sha }}\`"
-            echo "- public mirror: \`ttl.sh/ad2das-opsim:24h\` (private GHCR fallback)"
           } >> "$GITHUB_STEP_SUMMARY"
