@@ -1010,6 +1010,29 @@ def test_cs_parity_with_b1_at_default_params(monkeypatch):
       assert cs == pytest.approx(b1, abs=1e-12), (v, a, stop_d, b1, cs)
 
 
+def test_cs_larger_margin_never_less_negative(monkeypatch):
+  """A larger MARGIN_CS can only tighten (more negative) or keep the CS floor."""
+  monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
+  monkeypatch.setattr(_bs, "K_CS", 0.4)
+  monkeypatch.setattr(_bs, "T_LAG", 0.9)
+  rng = np.random.default_rng(11)
+  for _ in range(300):
+    v = float(rng.uniform(0.1, 4.9))
+    a = float(rng.uniform(-3.0, 0.5))
+    speeds = np.maximum(0.0, v * (1.0 - PLAN_T / float(rng.uniform(1.5, 6.0))))
+    stop_d = float(rng.uniform(3.0, 10.0))
+    floors = []
+    for margin in (0.0, 0.1, 0.2, 0.3, 0.5):
+      monkeypatch.setattr(_bs, "MARGIN_CS", margin)
+      floors.append(butter_floor_cs(v, a, PLAN_T, speeds, SimpleNamespace(status=False), stop_d))
+    for earlier, later in zip(floors, floors[1:], strict=False):
+      if earlier is None:
+        continue  # a larger margin can only turn a floor into None, never the reverse
+      if later is None:
+        continue
+      assert later <= earlier + 1e-12, (v, a, floors)
+
+
 def test_cs_eligibility_uses_v_taper_cs(monkeypatch):
   monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
   monkeypatch.setattr(_bs, "V_TAPER", 3.0)

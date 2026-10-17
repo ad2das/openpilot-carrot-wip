@@ -37,6 +37,7 @@ V_TAPER_CS = 3.0     # eligibility/floor taper ceiling (replaces V_TAPER for CS)
 T_LAG = 0.0          # plant lag predicted ahead (s); 0 == B1 (no prediction)
 K_CS = 0.5           # CS taper slope (== K_TAPER at parity)
 LEAD_SLACK_CS = 1.2  # CS lead-bound slack (replaces LEAD_SLACK in the CS floor)
+MARGIN_CS = 0.0      # extra distance (m) held back from avail_cs (safety margin)
 BUTTER_CS = False    # when True, LongControl uses butter_floor_cs; else butter_floor
 SOLVE_ITERS = 30
 LEAD_JUMP_M = 1.5      # raw-lead jump that forces a filter reset (m)
@@ -295,7 +296,7 @@ def butter_floor_cs(v_ego, a_ego, plan_t, plan_speeds, lead, stop_distance_orig,
     # The car reaches standstill inside the lag; spend v^2/(2|a|) then hold.
     d_lag = v_ego * tau if a == 0.0 else v_ego * v_ego / (2.0 * abs(a))
     v_p = 0.0
-  avail_cs = avail - d_lag
+  avail_cs = avail - d_lag - MARGIN_CS
   if diag is not None:
     diag["v_p"] = v_p
     diag["d_lag"] = d_lag
