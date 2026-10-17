@@ -899,6 +899,7 @@ def _run_loop_real(loop):
   log_a_actual, log_should_stop, log_lc_state = [], [], []
   log_desired_distance = []
   log_stock, log_fcw_t = [], []
+  log_floor_raw, log_floor_applied, log_bound = [], [], []
   fcw_steps = 0
   fcw = 0.0
   msgs = None
@@ -1014,6 +1015,10 @@ def _run_loop_real(loop):
         "a_end": lc.butter_a_end_last,
         "a_ego": float(getattr(loop.long_control, "last_output_accel", float("nan"))),
         "plan_stop_d": plan_stop_d, "lead_avail": lead_avail,
+        "x": float(loop.ego_x),
+        "creep_latched": bool(getattr(lc, "_butter_creep_latched", False)),
+        "standstill_confirmed": bool(getattr(lc, "_butter_standstill_confirmed", False)),
+        "should_stop": bool(getattr(plan_view, "shouldStop", False)),
         "plant_target": plant_diag.get("target"), "plant_a": float(applied),
         "plant_grade": plant_diag.get("grade"), "plant_w_new": plant_diag.get("w_new"),
         "gap": gap_now,
@@ -1041,6 +1046,10 @@ def _run_loop_real(loop):
       log_lc_state.append(int(loop.long_control.long_control_state))
       log_desired_distance.append(float(plan_view.desiredDistance))
       log_stock.append(float(stock_now) if stock_now is not None else float("nan"))
+      lc_f = loop.long_control
+      log_floor_raw.append(float(lc_f.butter_floor_raw_last) if lc_f.butter_floor_raw_last is not None else float("nan"))
+      log_floor_applied.append(float(lc_f.butter_floor_last) if lc_f.butter_floor_last is not None else float("nan"))
+      log_bound.append(lc_f.butter_bound_last if lc_f.butter_bound_last is not None else "")
       if loop.planner.mpc.crash_cnt > 0:
         log_fcw_t.append(t)
     else:
@@ -1077,6 +1086,7 @@ def _run_loop_real(loop):
       "gap": log_gap, "active": log_active, "v_lead": log_vlead, "a_target": log_atarget,
       "a_actual": log_a_actual, "should_stop": log_should_stop, "lc_state": log_lc_state,
       "desired_distance": log_desired_distance, "stock": log_stock,
+      "floor_raw": log_floor_raw, "floor_applied": log_floor_applied, "bound": log_bound,
       "fcw_times": log_fcw_t,
       "fcw_steps": fcw_steps, "stopped": bool(stopped or loop.ego_v < 0.05),
     }
@@ -1622,3 +1632,417 @@ def cs_trace_metrics(trace):
     if np.isfinite(x).any() and np.isfinite(g).any():
       m["post_stop_travel"] = None
   return m
+# ===========================================================================
+# STOP-NOD chauffeur-stop (CS): CP-H2 sweep, gates H1-H5 / S1-S4, selection
+# ===========================================================================
+# CS patches butter_stop.V_TAPER_CS/T_LAG/K_CS/D_EXTRA/LEAD_SLACK_CS/
+# FLOOR_RELAX_JERK AND butter_stop.BUTTER_CS at run time; nothing here changes
+# production code. B1 = the landed ButterStop with BUTTER_CS False.
+
+import copy as _copy  # noqa: E402
+import openpilot.selfdrive.controls.lib.butter_stop as _bs  # noqa: E402
+
+_CS_GRID = {
+  "V_TAPER_CS": [3.0, 4.0, 5.0],
+  "T_LAG": [0.6, 0.9, 1.2],
+  "K_CS": [0.3, 0.5],
+  "D_EXTRA": [0.4, 0.8, 1.2],
+  "LEAD_SLACK_CS": [1.2, 0.6],
+  "FLOOR_RELAX_JERK": [0.8, 1.5],
+}
+
+_CS_DEFAULTS = {"V_TAPER_CS": 3.0, "T_LAG": 0.0, "K_CS": 0.5, "D_EXTRA": 0.4,
+                "LEAD_SLACK_CS": 1.2, "FLOOR_RELAX_JERK": 0.8}
+_CS_ATTRS = ("V_TAPER_CS", "T_LAG", "K_CS", "D_EXTRA", "LEAD_SLACK_CS", "FLOOR_RELAX_JERK")
+
+CS_EPS = 0.005
+CS_POST_STOP_M = 0.02
+CS_DELAY_M = 0.05
+CS_DECEL_ADD = 0.4
+CS_JERK_ADD = 0.5
+CS_GAP_ADD = 1.0
+CS_NOD_REDUCE = 0.30
+CS_NOD_WORSE = 0.05
+
+CS_ROBUST_VARIANTS = {"L": [0.5, 0.9], "tau": [0.2, 0.6], "SCC_A": [-0.4, -0.8]}
+
+
+def cs_apply_params(p):
+  if p is None:
+    cs_restore_defaults()
+    return
+  _bs.BUTTER_CS = True
+  for k in _CS_ATTRS:
+    if k in p:
+      setattr(_bs, k, p[k])
+
+
+def cs_restore_defaults():
+  _bs.BUTTER_CS = False
+  for k, v in _CS_DEFAULTS.items():
+    setattr(_bs, k, v)
+
+
+def cs_grid():
+  return [{"V_TAPER_CS": vt, "T_LAG": tl, "K_CS": kc, "D_EXTRA": de,
+           "LEAD_SLACK_CS": ls, "FLOOR_RELAX_JERK": fr}
+          for vt in _CS_GRID["V_TAPER_CS"] for tl in _CS_GRID["T_LAG"]
+          for kc in _CS_GRID["K_CS"] for de in _CS_GRID["D_EXTRA"]
+          for ls in _CS_GRID["LEAD_SLACK_CS"] for fr in _CS_GRID["FLOOR_RELAX_JERK"]]
+
+
+def _cs_plant(plant_p=None, **over):
+  base = dict(PLANT_REAL) if plant_p is None else dict(plant_p)
+  base.update(over)
+  return base
+
+
+def _cs_row(name, group, tag, t, v, applied, cmd, gap, stock, floor_raw,
+            floor_applied, bound, fcw_steps, fcw_times, start_delay, x,
+            creep_latched, standstill_confirmed, plan_stop_d, grade=0.0):
+  t = np.asarray(t, dtype=float)
+  v = np.asarray(v, dtype=float)
+  applied = np.asarray(applied, dtype=float)
+  cmd = np.asarray(cmd, dtype=float)
+  gap = np.asarray(gap, dtype=float)
+  stock = np.asarray(stock, dtype=float)
+  fraw = np.asarray(floor_raw, dtype=float)
+  psd = np.array([np.nan if d is None else float(d) for d in plan_stop_d], dtype=float)
+  finite = np.isfinite(gap)
+  stand = np.flatnonzero(v < 0.05)
+  stopped = bool(stand.size)
+  fcw_first_t = fcw_last_t = None
+  if fcw_times is not None and len(fcw_times):
+    fcw_first_t = round(float(np.min(fcw_times)), 3)
+    fcw_last_t = round(float(np.max(fcw_times)), 3)
+  step = float(t[1] - t[0]) if t.size > 1 else DT_CTRL
+  row = {"name": name, "group": group, "tag": tag, "grade": grade, "stopped": stopped,
+         "a_stop": None, "a_at_m03": None, "peak_decel": None, "nod_swing": None,
+         "tail_s": None, "final_gap_m": None, "min_gap_after_stop": None,
+         "peak_jerk_cmd": None, "post_stop_travel": None,
+         "min_gap_m": None if not finite.any() else round(float(np.nanmin(gap)), 3),
+         "collision": bool(finite.any() and np.nanmin(gap) < COLLISION_GAP_M),
+         "fcw_steps": int(fcw_steps), "fcw_first_t": fcw_first_t, "fcw_last_t": fcw_last_t,
+         "start_delay_s": start_delay, "floor_bind_steps": 0, "floor_active_steps": 0,
+         "bind_v_lo": None, "bind_v_hi": None,
+         "creep_latched": bool(np.any(creep_latched)),
+         "hold_reached": bool(np.any(standstill_confirmed)),
+         "ran_stop": bool(np.any(np.isfinite(psd)))}
+  active = np.isfinite(fraw)
+  binding = active & np.isfinite(stock) & np.isfinite(cmd) & (cmd > stock + 1e-4)
+  row["floor_active_steps"] = int(np.sum(active))
+  row["floor_bind_steps"] = int(np.sum(binding))
+  if binding.any():
+    vb = v[binding]
+    row["bind_v_lo"] = round(float(np.min(vb)), 3)
+    row["bind_v_hi"] = round(float(np.max(vb)), 3)
+  if t.size > 1:
+    jerk = np.gradient(cmd, t)
+    if stand.size:
+      aw = (t >= max(0.0, t[stand[0]] - 6.0)) & (t <= t[stand[0]])
+      jj = jerk[aw] if aw.any() else jerk
+    else:
+      jj = jerk[1:] if jerk.size > 1 else jerk
+    row["peak_jerk_cmd"] = round(float(np.max(np.abs(jj))) if jj.size else 0.0, 4)
+  if stopped:
+    i = int(stand[0])
+    w = (t >= t[i] - 0.6) & (t <= t[i])
+    if w.any():
+      row["peak_decel"] = round(float(np.min(applied[w])), 4)
+    row["a_stop"] = round(float(applied[i]), 4)
+    j = _closest_index(t, t[i] - 0.3)
+    row["a_at_m03"] = round(float(applied[j]), 4) if j < applied.size else None
+    w2 = (t > t[i]) & (t <= t[i] + 1.0)
+    if w2.any():
+      row["nod_swing"] = round(float(np.max(applied[w2]) - row["a_stop"]), 4)
+    tail_w = (t >= max(0.0, t[i] - 6.0)) & (t <= t[i])
+    row["tail_s"] = round(float(np.sum((v > 0.05) & (v < 0.5) & tail_w)) * step, 3)
+    if finite.any():
+      row["final_gap_m"] = round(float(gap[i]), 3)
+      after = (t >= t[i]) & finite
+      row["min_gap_after_stop"] = round(float(np.nanmin(gap[after])), 3) if after.any() else None
+    xx = np.asarray(x, dtype=float)
+    row["post_stop_travel"] = round(float(xx[-1] - xx[i]), 4) if xx.size == t.size else 0.0
+  row["_cmd_digest"] = hashlib.sha256(np.nan_to_num(cmd).tobytes()).hexdigest()
+  return row
+
+
+def _cs_scenario_row(maneuver, group, butter, p, plant_mode, grade, gtag,
+                     plant_p=None, with_startdelay=False):
+  grade_rad = math.asin(grade)
+  suffix = f" [{gtag}]" if gtag else ""
+  loop = _RealScenarioLoop(maneuver, butter, _cs_plant(plant_p), plant_mode=plant_mode,
+                           grade_rad=grade_rad)
+  loop._trace = []
+  logs = _run_one(loop, Params())
+  tr = loop._trace
+  gap = logs[:, 4] - logs[:, 3]
+  fcw_mask = logs[:, 12] > 0.5
+  sd = _start_delay(logs[:, 0], logs[:, 1]) if with_startdelay else None
+  return _cs_row(maneuver.title + suffix, group, group, logs[:, 0], logs[:, 1], logs[:, 10],
+                 logs[:, 2], gap, logs[:, 13], [r["floor_raw"] for r in tr],
+                 [r["floor_applied"] for r in tr], [r["bound"] for r in tr],
+                 int(np.sum(fcw_mask)), logs[fcw_mask, 0], sd, [r["x"] for r in tr],
+                 np.array([r["creep_latched"] for r in tr]),
+                 np.array([r["standstill_confirmed"] for r in tr]),
+                 [r["plan_stop_d"] for r in tr], grade)
+
+
+def _cs_fixture_row(profile, group, butter, p, plant_mode, grade, gtag, name, tag,
+                    grade_rad=0.0, fixed_grade=None, header=None, plant_p=None):
+  suffix = f" [{gtag}]" if gtag else ""
+  loop = _RealFixtureLoop(dict(header or {}), profile, _cs_plant(plant_p),
+                          plant_mode=plant_mode, grade_rad=grade_rad)
+  loop.fixed_a_grade = fixed_grade
+  loop._trace = []
+  run = _run_one(loop, Params())
+  tr = loop._trace
+  return _cs_row(name + suffix, group, tag, run["t"], run["v"], run["a_actual"], run["accel"],
+                 run["gap"], run["stock"], run["floor_raw"], run["floor_applied"],
+                 run["bound"], run["fcw_steps"], run.get("fcw_times"), None,
+                 [r["x"] for r in tr], np.array([r["creep_latched"] for r in tr]),
+                 np.array([r["standstill_confirmed"] for r in tr]),
+                 [r["plan_stop_d"] for r in tr], grade)
+
+
+_CS_B1_CACHE = {}
+
+
+def _cs_b1(key, plant_mode, factory):
+  ck = (key, plant_mode)
+  if ck not in _CS_B1_CACHE:
+    cs_apply_params(None)
+    _CS_B1_CACHE[ck] = factory()
+  return _CS_B1_CACHE[ck]
+
+
+def _cs_iter_pairs(p, plant_mode="real_sg"):
+  fixture = load_fixture("b1")
+
+  def cs_run(factory):
+    cs_apply_params(p)
+    return factory()
+
+  for group, maneuver in _CASES:
+    name = maneuver.title
+    factory = (lambda m=maneuver, g=group: _cs_scenario_row(m, g, 1, p, plant_mode, 0.0, ""))
+    b1 = _cs_b1(f"man:{name}", plant_mode, factory)
+    yield name, b1, cs_run(factory), group
+
+  b1_factory = (lambda: _cs_fixture_row(FixtureProfile(fixture), "b1", 1, p, plant_mode, 0.0, "",
+                                        "b1", "b1", header=fixture.get("params")))
+  b1 = _cs_b1("b1", plant_mode, b1_factory)
+  yield "b1", b1, cs_run(b1_factory), "b1"
+
+  for maneuver in _START_SCENARIOS:
+    factory = (lambda m=maneuver: _cs_scenario_row(m, "start", 1, p, plant_mode, 0.0, "",
+                                                   with_startdelay=True))
+    b1 = _cs_b1(f"start:{maneuver.title}", plant_mode, factory)
+    yield maneuver.title, b1, cs_run(factory), "start"
+
+  for grade, gtag in ((SRG_GRADES[0], "dn3"), (SRG_GRADES[1], "up3")):
+    gb1_factory = (lambda gr=grade, gr2=grade, t=gtag: _cs_fixture_row(
+      FixtureProfile(fixture), "b1", 1, p, plant_mode, gr, t, "b1", "b1",
+      grade_rad=math.asin(gr2), header=fixture.get("params")))
+    b1 = _cs_b1(f"b1:{gtag}", plant_mode, gb1_factory)
+    yield f"b1 [{gtag}]", b1, cs_run(gb1_factory), "b1"
+    for group, maneuver in _STOPPED_LEAD:
+      factory = (lambda m=maneuver, g=group, gr=grade, t=gtag: _cs_scenario_row(
+        m, g, 1, p, plant_mode, gr, t))
+      b1 = _cs_b1(f"man:{maneuver.title}:{gtag}", plant_mode, factory)
+      yield maneuver.title + f" [{gtag}]", b1, cs_run(factory), group
+
+  _d, stops = load_stops()
+  for key in CS_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    name = f"replica {key}"
+    factory = (lambda pr=profile, n=name: _cs_fixture_row(
+      pr, "replica", 1, p, plant_mode, 0.0, "", n, "replica", fixed_grade=pr.grade))
+    b1 = _cs_b1(f"rep:{key}", plant_mode, factory)
+    yield name, b1, cs_run(factory), "replica"
+
+  for key in CS_NOLEAD_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    name = f"replica {key}"
+    factory = (lambda pr=profile, n=name: _cs_fixture_row(
+      pr, "replica_nolead", 1, p, plant_mode, 0.0, "", n, "replica_nolead",
+      fixed_grade=pr.grade))
+    b1 = _cs_b1(f"repnl:{key}", plant_mode, factory)
+    yield name, b1, cs_run(factory), "replica_nolead"
+
+  for axis, vals in CS_ROBUST_VARIANTS.items():
+    for val in vals:
+      vtag = f"{axis}={val}"
+      pv = _cs_plant(**{axis: val})
+      for key in CS_REPLICA_KEYS:
+        profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+        name = f"replica {key} [{vtag}]"
+        factory = (lambda pr=profile, n=name, nv=pv: _cs_fixture_row(
+          pr, "replica", 1, p, plant_mode, 0.0, "", n, "replica",
+          fixed_grade=pr.grade, plant_p=nv))
+        b1 = _cs_b1(f"rep:{key}:{vtag}", plant_mode, factory)
+        yield name, b1, cs_run(factory), "replica"
+      man40 = next(m for g, m in _CASES if m.title == "stopped lead 40 km/h gap 60 m")
+      name = f"stopped lead 40 km/h gap 60 m [{vtag}]"
+      factory = (lambda m=man40, nv=pv: _cs_scenario_row(m, "a", 1, p, plant_mode, 0.0, "", plant_p=nv))
+      b1 = _cs_b1(f"man40:{vtag}", plant_mode, factory)
+      yield name, b1, cs_run(factory), "a"
+
+
+def _cs_gate_failures(b1, cs, tag, name):
+  out = []
+  if b1["final_gap_m"] is not None and cs["final_gap_m"] is not None:
+    if cs["final_gap_m"] < b1["final_gap_m"] - CS_EPS:
+      out.append(f"H1 gap {cs['final_gap_m']} < b1 {b1['final_gap_m']}")
+  if b1["min_gap_m"] is not None and cs["min_gap_m"] is not None:
+    if cs["min_gap_m"] < b1["min_gap_m"] - CS_EPS:
+      out.append(f"H1 min_gap {cs['min_gap_m']} < b1 {b1['min_gap_m']}")
+  if cs["collision"]:
+    out.append(f"H2 collision min_gap={cs['min_gap_m']}")
+  if cs["fcw_steps"] > b1["fcw_steps"]:
+    out.append(f"H2 fcw {cs['fcw_steps']} > b1 {b1['fcw_steps']}")
+  # H3: a scenario with no planned stop must reproduce B1 bit-identically.
+  # H3: ButterStop=0 identity is covered by the unit tests; here, a scenario in
+  # which B1 never had a planned stop must reproduce B1 bit-identically.
+  # NOTE: D_EXTRA is the global MPC stop-point shift (long_mpc), so D_EXTRA !=
+  # 0.4 also moves these plans; if that happens the gate binds as-is and is
+  # reported, never loosened.
+  if not b1["ran_stop"]:
+    if b1.get("_cmd_digest") != cs.get("_cmd_digest"):
+      out.append("H3 cmd trace differs from B1 on no-planned-stop scenario")
+  if b1["post_stop_travel"] is not None and cs["post_stop_travel"] is not None:
+    if cs["post_stop_travel"] > b1["post_stop_travel"] + CS_POST_STOP_M + 1e-9:
+      out.append(f"H4 post_stop {cs['post_stop_travel']} > b1 {b1['post_stop_travel']}+{CS_POST_STOP_M}")
+  if cs["creep_latched"] and not b1["creep_latched"]:
+    out.append("H4 creep latched where B1 did not")
+  if b1["start_delay_s"] is not None and cs["start_delay_s"] is not None:
+    if abs(cs["start_delay_s"] - b1["start_delay_s"]) > CS_DELAY_M:
+      out.append(f"H5 start_delay {cs['start_delay_s']} vs {b1['start_delay_s']}")
+  return out
+
+
+def _cs_comfort_failures(b1, cs):
+  out = []
+  if b1["peak_decel"] is not None and cs["peak_decel"] is not None:
+    if cs["peak_decel"] < b1["peak_decel"] - CS_DECEL_ADD:
+      out.append(f"S2 decel {b1['peak_decel']}->{cs['peak_decel']}")
+  if cs["peak_jerk_cmd"] is not None:
+    b1j = b1["peak_jerk_cmd"] if b1["peak_jerk_cmd"] is not None else 0.0
+    if cs["peak_jerk_cmd"] > b1j + CS_JERK_ADD + 1e-9:
+      out.append(f"S3 jerk {b1j}->{cs['peak_jerk_cmd']}")
+  if b1["final_gap_m"] is not None and cs["final_gap_m"] is not None:
+    if cs["final_gap_m"] - b1["final_gap_m"] > CS_GAP_ADD:
+      out.append(f"S4 gap +{cs['final_gap_m'] - b1['final_gap_m']:.3f}")
+  return out
+
+
+def _cs_nod_reductions(pairs):
+  """(reductions list, worst) over the 3 replicas + a-group."""
+  reds = []
+  for name, b1, cs, tag in pairs:
+    if tag in ("replica", "a") and b1["nod_swing"] is not None and cs["nod_swing"] is not None:
+      denom = b1["nod_swing"] if abs(b1["nod_swing"]) > 1e-6 else 1e-6
+      reds.append((name, (b1["nod_swing"] - cs["nod_swing"]) / denom))
+  worst = min((r for _n, r in reds), default=float("-inf"))
+  mean = float(np.mean([r for _n, r in reds])) if reds else float("-inf")
+  return reds, mean, worst
+
+
+def _cs_eval_params(p, plant_mode="real_sg"):
+  pairs, hard, comfort = [], [], []
+  try:
+    for name, b1, cs, tag in _cs_iter_pairs(p, plant_mode=plant_mode):
+      pairs.append((name, b1, cs, tag))
+      for reason in _cs_gate_failures(b1, cs, tag, name):
+        hard.append({"name": name, "tag": tag, "reason": reason})
+      for reason in _cs_comfort_failures(b1, cs):
+        comfort.append({"name": name, "tag": tag, "reason": reason})
+  finally:
+    cs_restore_defaults()
+  reds, mean, worst = _cs_nod_reductions(pairs)
+  s1_ok = mean >= CS_NOD_REDUCE and worst >= -CS_NOD_WORSE
+  analysis = {"pairs": pairs, "nod_mean": mean, "nod_worst": worst,
+              "s1_ok": bool(s1_ok), "nod_reductions": reds}
+  return analysis, hard, comfort
+
+
+def cs_sweep(plant_mode="real_sg", only=None, shard=None, nshards=None):
+  grid = only if only is not None else cs_grid()
+  if shard is not None and nshards is not None:
+    grid = [g for i, g in enumerate(grid) if i % nshards == shard]
+  results = []
+  for p in grid:
+    analysis, hard, comfort = _cs_eval_params(p, plant_mode=plant_mode)
+    passes = not hard and not comfort and analysis["s1_ok"]
+    results.append({"params": dict(p), "hard": hard, "comfort": comfort,
+                    "nod_mean": analysis["nod_mean"], "nod_worst": analysis["nod_worst"],
+                    "s1_ok": analysis["s1_ok"], "passes": passes, "analysis": analysis})
+  results.sort(key=lambda r: (not r["passes"], -r["nod_mean"]))
+  return results
+
+
+def _cs_replica_sanity(plant_mode="real_sg"):
+  _d, stops = load_stops()
+  out = []
+  for key in CS_REPLICA_KEYS:
+    stop = _cs_find_stop(stops, key)
+    profile = RealStopReplicaProfile(stop)
+    cs_apply_params(None)
+    try:
+      row = _cs_fixture_row(profile, "replica", 1, _CS_DEFAULTS, plant_mode, 0.0, "",
+                            f"replica {key}", "replica", fixed_grade=profile.grade)
+    finally:
+      cs_restore_defaults()
+    out.append({"key": key, "has_lead": bool(profile.has_lead),
+                "log_final_gap_m": None if profile.log_final_gap is None else round(profile.log_final_gap, 3),
+                "sim_final_gap_m": row["final_gap_m"], "sim_stopped": row["stopped"],
+                "sim_a_stop": row["a_stop"]})
+  return out
+
+
+def test_cs_fixture_uses_real_harness_defaults():
+  """CS defaults must equal the landed B1 constants (no accidental drift)."""
+  assert _CS_DEFAULTS["V_TAPER_CS"] == _bs.V_TAPER
+  assert _CS_DEFAULTS["K_CS"] == _bs.K_TAPER
+  assert _CS_DEFAULTS["D_EXTRA"] == 0.4
+  assert _CS_DEFAULTS["LEAD_SLACK_CS"] == _bs.LEAD_SLACK
+  assert _CS_DEFAULTS["T_LAG"] == 0.0
+  assert not getattr(_bs, "BUTTER_CS")
+
+
+def test_cs_replica_sanity_and_smoke():
+  if os.environ.get("BUTTER_NOD_FULL") != "1":
+    pytest.skip("heavy closed-loop CS smoke; set BUTTER_NOD_FULL=1 to run")
+  rows = _cs_replica_sanity()
+  print(f"NOD-CS-SANITY {json.dumps(rows, sort_keys=True)}")
+  for r in rows:
+    if r["has_lead"]:
+      assert r["sim_stopped"] and r["sim_final_gap_m"] is not None
+  # Smoke: one param set x {1 replica, 1 a-scenario, 1 grade} - every metric finite.
+  p = {"V_TAPER_CS": 4.0, "T_LAG": 0.9, "K_CS": 0.5, "D_EXTRA": 0.8,
+       "LEAD_SLACK_CS": 0.6, "FLOOR_RELAX_JERK": 1.5}
+  pairs = list(_cs_iter_pairs(p, plant_mode="real_sg"))
+  sample = [pr for pr in pairs if pr[3] in ("replica", "a")][:6]
+  metrics = []
+  for name, b1, cs, tag in sample:
+    for row in (b1, cs):
+      for key in ("a_stop", "peak_decel", "peak_jerk_cmd", "final_gap_m", "min_gap_m", "tail_s"):
+        v = row[key]
+        assert v is None or math.isfinite(v), f"{name}:{key}={v}"
+        if v is not None:
+          metrics.append(v)
+  print(f"NOD-CS-SMOKE n={len(sample)} metrics_min={min(metrics):.4f} max={max(metrics):.4f}")
+  assert max(metrics) - min(metrics) > 1e-6
+
+
+def test_cs_sweep():
+  if os.environ.get("BUTTER_NOD_FULL") != "1":
+    pytest.skip("heavy CS grid sweep; set BUTTER_NOD_FULL=1 to run")
+  out_path = os.environ.get("BUTTER_CS_OUT", "/tmp/butter_cs.json")
+  results = cs_sweep()
+  passing = [r for r in results if r["passes"]]
+  print(f"NOD-CS-SWEEP n_combo={len(results)} n_passing={len(passing)}")
+  for i, r in enumerate(results[:5], start=1):
+    print(f"NOD-CS-TOP{i} nod_mean={r['nod_mean']:.4f} params={r['params']} "
+          f"hard={len(r['hard'])} comfort={len(r['comfort'])} s1={r['s1_ok']}")
+  assert results
