@@ -28,6 +28,7 @@ from openpilot.common.params import Params
 from openpilot.common.stopping_params import get_stopping_speed
 from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
 from openpilot.selfdrive.controls.lib.cruise_coasting import CruiseCoastingPlan, coasting_percent, no_coasting_lead
+import openpilot.selfdrive.controls.lib.stop_delay as stop_delay
 
 
 LON_MPC_STEP = 0.2  # first step is 0.2s
@@ -71,6 +72,12 @@ class LongitudinalPlanner:
     self.lead_preview_accel = 0.0
     self.lead_track_ids = [-1, -1]
     self.lead_track_frames = [0, 0]
+    # CP-SD stop-phase delay state (starts at the base delay; only used when
+    # stop_delay.STOP_DELAY_ENABLED is True).
+    self._delay_eff = 0.0
+    self._delay_eff_init = False
+    self.stop_delay_last = 0.0
+    self.stop_delay_weight_last = 0.0
 
     self.v_desired_trajectory = np.zeros(CONTROL_N)
     self.a_desired_trajectory = np.zeros(CONTROL_N)
@@ -290,24 +297,52 @@ class LongitudinalPlanner:
     self.action_t_last = float(action_t)
     self.long_actuator_delay_last = float(longitudinalActuatorDelay)
 
+    lead_index = 1 if self.mpc.source == 'lead1' else 0
+    leads = (sm['radarState'].leadOne, sm['radarState'].leadTwo)
+    lead = leads[lead_index]
+
+    # CP-SD: in the last low-speed phase of a stop behind a stationary lead, use a
+    # longer sampling delay for the acceleration target only. The schedule rises
+    # at most SLEW_UP*DT_MDL per frame and drops instantly (dropping = stronger
+    # braking, the safe direction). STOP_DELAY_ENABLED False keeps action_t_a ==
+    # action_t (bit-identical).
+    sd_w = 0.0
+    if stop_delay.STOP_DELAY_ENABLED:
+      sd_w = stop_delay.stop_phase_weight(
+        float(v_ego), bool(lead.status), float(lead.dRel), float(lead.vLeadK),
+        float(lead.aLeadK), bool(self.fcw), bool(sm['carState'].gasPressed),
+        bool(sm['carState'].brakePressed))
+      base_delay = longitudinalActuatorDelay
+      target = base_delay + sd_w * max(0.0, stop_delay.DELAY_LO - base_delay)
+      if not self._delay_eff_init:
+        self._delay_eff = base_delay
+        self._delay_eff_init = True
+      if target < self._delay_eff:
+        self._delay_eff = target
+      else:
+        self._delay_eff = min(target, self._delay_eff + stop_delay.SLEW_UP * DT_MDL)
+    else:
+      self._delay_eff = longitudinalActuatorDelay
+    action_t_a = self._delay_eff + DT_MDL
+    self.stop_delay_last = float(self._delay_eff)
+    self.stop_delay_weight_last = float(sd_w)
+
     output_a_target_base, output_should_stop_mpc, output_v_target_mpc, _ = get_accel_from_plan(
       self.v_desired_trajectory,
       self.a_desired_trajectory,
       CONTROL_N_T_IDX,
-      action_t=action_t,
+      action_t=action_t_a,
       vEgoStopping=vEgoStopping,
     )
 
     # Separate stop entry/release speeds: enter at STOP_ENTER_V so the car does not crawl on idle creep
     # while the plan lingers just above VEgoStopping; release only when the plan rises past VEgoStopping
     # (unchanged departure). VEgoStopping >= STOP_ENTER_V keeps the original single-threshold rule.
-    v_t, v_t1 = plan_stop_speeds(self.v_desired_trajectory, CONTROL_N_T_IDX, action_t)
+    latch_action_t = action_t_a if stop_delay.APPLY_TO_LATCH else action_t
+    v_t, v_t1 = plan_stop_speeds(self.v_desired_trajectory, CONTROL_N_T_IDX, latch_action_t)
     self._stop_latched = stop_latch(self._stop_latched, v_t, v_t1, float(sm['carState'].vEgo), vEgoStopping)
     output_should_stop_mpc = self._stop_latched
 
-    lead_index = 1 if self.mpc.source == 'lead1' else 0
-    leads = (sm['radarState'].leadOne, sm['radarState'].leadTwo)
-    lead = leads[lead_index]
     preview_enabled = (
       self.mpc.mode == 'acc'
       and not reset_state

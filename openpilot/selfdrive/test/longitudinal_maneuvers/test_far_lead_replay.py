@@ -415,6 +415,8 @@ class FarLeadLoop:
       cruiseCoastingPercent=int(planner.coasting_percent),
       cruiseTarget=float(planner.v_cruise_kph),
       actionTime=float(getattr(planner, "action_t_last", float("nan"))),
+      stopDelay=float(getattr(planner, "stop_delay_last", float("nan"))),
+      stopDelayW=float(getattr(planner, "stop_delay_weight_last", 0.0)),
     )
 
   def _cs_view(self, v_cruise_kph, standstill):

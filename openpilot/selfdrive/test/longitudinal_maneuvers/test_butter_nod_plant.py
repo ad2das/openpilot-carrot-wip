@@ -1025,6 +1025,9 @@ def _run_loop_real(loop):
         "v_lead": v_lead_now,
         "v_cruise_ms": (float(v_cruise_ms) if not fixture_mode else float(v_cruise_kph) / 3.6),
         "action_t": float(getattr(plan_view, "actionTime", float("nan"))),
+        "stop_delay": float(getattr(plan_view, "stopDelay", float("nan"))),
+        "stop_delay_w": float(getattr(plan_view, "stopDelayW", 0.0)),
+        "d_rel": float(getattr(radar_view.leadOne, "dRel", float("nan"))),
         "fcw": bool(getattr(plan_view, "fcw", False)) or loop.planner.mpc.crash_cnt > 0,
         "plant_target": plant_diag.get("target"), "plant_a": float(applied),
         "plant_grade": plant_diag.get("grade"), "plant_w_new": plant_diag.get("w_new"),
@@ -2426,3 +2429,413 @@ def ad_b1_cache(specs):
     except Exception:  # noqa: BLE001
       pass
   return cache
+
+
+# ===========================================================================
+# Stop-phase actuator delay sweep (SD): analysis/sim only, no product change
+# ===========================================================================
+# CP-SD: stop-phase-only longer sampling delay. B1 = STOP_DELAY_ENABLED False
+# (the landed ButterStop, LongActuatorDelay 0.25). Each set patches the
+# stop_delay module constants and re-runs the whole AD scenario set (97 specs).
+
+import openpilot.selfdrive.controls.lib.stop_delay as _sd  # noqa: E402
+
+SD_GRID = {
+  "DELAY_LO": [0.4, 0.5, 0.65, 0.8],
+  "V_LO": [1.0, 2.0, 3.0],
+  "A_REQ_MAX": [0.6, 0.8, 1.0],
+  "MARGIN_SD": [0.3, 0.6],
+  "APPLY_TO_LATCH": [False, True],
+}
+SD_DEFAULTS = {"DELAY_LO": 0.5, "V_LO": 2.0, "A_REQ_MAX": 0.8, "MARGIN_SD": 0.3,
+               "APPLY_TO_LATCH": False}
+SD_V_FADE = 1.0
+SD_SLEW_UP = 0.5
+SD_B1_DELAY = AD_B1_DELAY
+
+SD_EPS = 0.005
+SD_POST_STOP_M = 0.02
+SD_DELAY_M = 0.05
+SD_DECEL_ADD = 0.4
+SD_JERK_ADD = 0.5
+SD_GAP_ABS = 3.0              # absolute final/min gap floor (m)
+SD_GAP_CLOSER = 0.5          # reject if closer than B1 by more than this (m)
+SD_NOD_REDUCE = 0.15         # S1a big-nod mean reduction floor
+SD_NOD_WORSE = 0.02          # S1b max absolute nod-swing increase (m/s^2)
+SD_BIG_NOD = 0.7             # a stop scenario enters the big-nod group at/above this
+SD_BIG_NOD_REPLICAS = ("445@7.27", "445@8.52")
+
+
+def sd_grid():
+  return [{"DELAY_LO": dl, "V_LO": vl, "A_REQ_MAX": ar, "MARGIN_SD": mg,
+           "APPLY_TO_LATCH": bool(at)}
+          for dl in SD_GRID["DELAY_LO"] for vl in SD_GRID["V_LO"]
+          for ar in SD_GRID["A_REQ_MAX"] for mg in SD_GRID["MARGIN_SD"]
+          for at in SD_GRID["APPLY_TO_LATCH"]]
+
+
+def sd_apply_params(p):
+  """Enable stop delay and patch the module constants for one candidate set."""
+  _sd.STOP_DELAY_ENABLED = True
+  for k, v in SD_DEFAULTS.items():
+    setattr(_sd, k, p.get(k, v))
+  _sd.V_FADE = SD_V_FADE
+  _sd.SLEW_UP = SD_SLEW_UP
+
+
+def sd_restore_defaults():
+  _sd.STOP_DELAY_ENABLED = False
+  for k, v in SD_DEFAULTS.items():
+    setattr(_sd, k, v)
+  _sd.V_FADE = SD_V_FADE
+  _sd.SLEW_UP = SD_SLEW_UP
+
+
+def _sd_run(loop):
+  """Run a loop at the base LongActuatorDelay 0.25 with the current stop_delay patch."""
+  loop._trace = []
+  params = Params()
+  _ad_apply(loop, params, SD_B1_DELAY)
+  loop.run()
+  return loop._trace
+
+
+def _sd_metrics(trace, tag):
+  m = _ad_metrics(trace, tag)
+  t = np.array([r["t"] for r in trace], dtype=float)
+  w = np.array([r.get("stop_delay_w", 0.0) for r in trace], dtype=float)
+  sdly = np.array([r.get("stop_delay", np.nan) for r in trace], dtype=float)
+  m["_t"] = t
+  m["_v"] = np.array([r["v"] for r in trace], dtype=float)
+  m["_out"] = np.array([r["out"] if r["out"] is not None else np.nan for r in trace], dtype=float)
+  m["_plant"] = np.array([r["plant_a"] if r["plant_a"] is not None else np.nan for r in trace], dtype=float)
+  m["_w"] = w
+  m["_d_rel"] = np.array([r.get("d_rel", np.nan) for r in trace], dtype=float)
+  m["delay_eff_max"] = round(float(np.nanmax(sdly)), 4) if np.isfinite(sdly).any() else None
+  m["w_max"] = round(float(np.nanmax(w)), 4)
+  onset = np.flatnonzero(w > 0.0)
+  if onset.size:
+    i = int(onset[0])
+    m["w_onset_idx"] = i
+    m["w_onset_t"] = round(float(t[i]), 3)
+    m["w_onset_v"] = round(float(m["_v"][i]), 3)
+  else:
+    m["w_onset_idx"] = None
+    m["w_onset_t"] = None
+    m["w_onset_v"] = None
+  return m
+
+
+def _sd_scenario_row(maneuver, group, tag, plant_p=None, plant_mode="real_sg",
+                     grade=0.0, gtag=""):
+  suffix = f" [{gtag}]" if gtag else ""
+  loop = _RealScenarioLoop(maneuver, 1, _cs_plant(plant_p), plant_mode=plant_mode,
+                           grade_rad=math.asin(grade))
+  trace = _sd_run(loop)
+  m = _sd_metrics(trace, tag)
+  m.update({"name": maneuver.title + suffix, "group": group, "tag": tag, "grade": grade,
+            "fcw_steps": int(loop.planner.mpc.crash_cnt > 0)})
+  return m
+
+
+def _sd_fixture_row(profile, group, tag, name, plant_p=None, plant_mode="real_sg",
+                    fixed_grade=None, header=None, grade=0.0):
+  loop = _RealFixtureLoop(dict(header or {}), profile, _cs_plant(plant_p),
+                          plant_mode=plant_mode, grade_rad=math.asin(grade))
+  loop.fixed_a_grade = fixed_grade
+  trace = _sd_run(loop)
+  m = _sd_metrics(trace, tag)
+  m.update({"name": name, "group": group, "tag": tag, "grade": grade,
+            "fcw_steps": int(loop.planner.mpc.crash_cnt > 0)})
+  return m
+
+
+def _sd_build_specs(plant_mode="real_sg"):
+  """Same 97-spec scenario set as AD, built with the SD row builders."""
+  specs = []
+  fixture = load_fixture("b1")
+
+  for group, maneuver in _CASES:
+    specs.append((maneuver.title, group, "stop",
+                  lambda m=maneuver, g=group: _sd_scenario_row(m, g, g, plant_mode=plant_mode)))
+  specs.append(("b1", "b1", "stop",
+                lambda: _sd_fixture_row(FixtureProfile(fixture), "b1", "b1", "b1",
+                                        header=fixture.get("params"), plant_mode=plant_mode)))
+  for grade, gtag in ((SRG_GRADES[0], "dn3"), (SRG_GRADES[1], "up3")):
+    specs.append((f"b1 [{gtag}]", "b1", "stop",
+                  lambda gr=grade, t=gtag: _sd_fixture_row(
+                    FixtureProfile(fixture), "b1", "b1", "b1", header=fixture.get("params"),
+                    grade=gr, plant_mode=plant_mode)))
+    for group, maneuver in _STOPPED_LEAD:
+      specs.append((maneuver.title + f" [{gtag}]", group, "stop",
+                    lambda m=maneuver, g=group, gr=grade, t=gtag: _sd_scenario_row(
+                      m, g, g, grade=gr, gtag=t, plant_mode=plant_mode)))
+  for maneuver in _START_SCENARIOS:
+    specs.append((maneuver.title, "start", "start",
+                  lambda m=maneuver: _sd_scenario_row(m, "start", "start",
+                                                      plant_mode=plant_mode)))
+  _d, stops = load_stops()
+  for key in CS_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    specs.append((f"replica {key}", "replica", "stop",
+                  lambda pr=profile, n=f"replica {key}": _sd_fixture_row(
+                    pr, "replica", "stop", n, fixed_grade=pr.grade, plant_mode=plant_mode)))
+  for key in CS_NOLEAD_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    specs.append((f"replica {key}", "replica_nolead", "stop",
+                  lambda pr=profile, n=f"replica {key}": _sd_fixture_row(
+                    pr, "replica_nolead", "stop", n, fixed_grade=pr.grade, plant_mode=plant_mode)))
+  for m in create_maneuvers({"e2e": False, "force_decel": False}):
+    cls = _ad_class_for(m.title, None)
+    specs.append((m.title, "std", cls,
+                  lambda m=m, c=cls: _sd_scenario_row(m, "std", c, plant_mode=plant_mode)))
+
+  man40 = next(m for g, m in _CASES if m.title == "stopped lead 40 km/h gap 60 m")
+  man_lead_brake = _B_SCENARIO
+  man_follow = next(m for m in create_maneuvers({"e2e": False, "force_decel": False})
+                    if m.title.startswith("steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2"))
+  man_cutin = next(m for m in create_maneuvers({"e2e": False, "force_decel": False})
+                   if m.title.startswith("approach slower cut-in"))
+  for axis, vals in CS_ROBUST_VARIANTS.items():
+    for val in vals:
+      vtag = f"{axis}={val}"
+      pv = _cs_plant(**{axis: val})
+      for key in CS_REPLICA_KEYS:
+        profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+        specs.append((f"replica {key} [{vtag}]", "replica", "stop",
+                      lambda pr=profile, n=f"replica {key} [{vtag}]", nv=pv: _sd_fixture_row(
+                        pr, "replica", "stop", n, fixed_grade=pr.grade, plant_p=nv,
+                        plant_mode=plant_mode)))
+      specs.append((man40.title + f" [{vtag}]", "a", "stop",
+                    lambda m=man40, t=vtag, nv=pv: _sd_scenario_row(
+                      m, "a", "stop", plant_p=nv, gtag=t, plant_mode=plant_mode)))
+      specs.append((man_lead_brake.title + f" [{vtag}]", "b", "stop",
+                    lambda m=man_lead_brake, t=vtag, nv=pv: _sd_scenario_row(
+                      m, "b", "stop", plant_p=nv, gtag=t, plant_mode=plant_mode)))
+      specs.append((man_follow.title + f" [{vtag}]", "std", "follow",
+                    lambda m=man_follow, t=vtag, nv=pv: _sd_scenario_row(
+                      m, "std", "follow", plant_p=nv, gtag=t, plant_mode=plant_mode)))
+      specs.append((man_cutin.title + f" [{vtag}]", "std", "follow",
+                    lambda m=man_cutin, t=vtag, nv=pv: _sd_scenario_row(
+                      m, "std", "follow", plant_p=nv, gtag=t, plant_mode=plant_mode)))
+  return specs
+
+
+def _sd_speed_phase_identity(b1, sd):
+  """H3 speed-phase identity: steps before the first w>0 must equal B1 exactly.
+
+  Returns a list of violation strings; also None-safe on short traces.
+  """
+  out = []
+  onset = sd.get("w_onset_idx")
+  b1_out, sd_out = b1.get("_out"), sd.get("_out")
+  b1_plant, sd_plant = b1.get("_plant"), sd.get("_plant")
+  if b1_out is None or sd_out is None or b1_plant is None or sd_plant is None:
+    return out
+  n = len(sd_out) if onset is None else int(onset)
+  if n <= 0:
+    return out
+  if not np.array_equal(b1_out[:n], sd_out[:n]):
+    out.append("H3 pre-onset command not identical to B1")
+  if not np.array_equal(b1_plant[:n], sd_plant[:n]):
+    out.append("H3 pre-onset plant not identical to B1")
+  return out
+
+
+def _sd_pair_failures(b1, sd, cls):
+  out = []
+  if cls == "stop":
+    if sd["final_gap_m"] is not None:
+      if sd["final_gap_m"] < SD_GAP_ABS - 1e-9:
+        out.append(f"H1 abs final gap {sd['final_gap_m']} < {SD_GAP_ABS}")
+    if sd["min_gap_m"] is not None:
+      if sd["min_gap_m"] < SD_GAP_ABS - 1e-9:
+        out.append(f"H1 abs min gap {sd['min_gap_m']} < {SD_GAP_ABS}")
+    if b1["final_gap_m"] is not None and sd["final_gap_m"] is not None:
+      if sd["final_gap_m"] < b1["final_gap_m"] - SD_GAP_CLOSER:
+        out.append(f"H1 closer {sd['final_gap_m']} < b1 {b1['final_gap_m']}-{SD_GAP_CLOSER}")
+    if b1["post_stop_travel"] is not None and sd["post_stop_travel"] is not None:
+      if sd["post_stop_travel"] > b1["post_stop_travel"] + SD_POST_STOP_M + 1e-9:
+        out.append(f"H4 post_stop {sd['post_stop_travel']} > b1 {b1['post_stop_travel']}+{SD_POST_STOP_M}")
+    if sd["creep_latched"] and not b1["creep_latched"]:
+      out.append("H4 creep latched where B1 did not")
+    if not sd["hold_reached"] and b1["hold_reached"]:
+      out.append("H4 hold not reached where B1 reached it")
+  if cls == "start":
+    if b1["start_delay_s"] is not None and sd["start_delay_s"] is not None:
+      if sd["start_delay_s"] > b1["start_delay_s"] + SD_DELAY_M:
+        out.append(f"H5 start_delay {sd['start_delay_s']} > b1 {b1['start_delay_s']}+{SD_DELAY_M}")
+  # H3 speed-phase identity + the w-onset must be in the low-speed band.
+  out.extend(_sd_speed_phase_identity(b1, sd))
+  if sd.get("w_onset_v") is not None and sd["w_onset_v"] > _sd.V_LO + _sd.V_FADE + 1e-6:
+    out.append(f"H3 w-onset v {sd['w_onset_v']} > V_LO+V_FADE {_sd.V_LO + _sd.V_FADE}")
+  # H2 all classes.
+  if sd["collision"]:
+    out.append(f"H2 collision min_gap={sd['min_gap_m']}")
+  if sd["fcw_steps"] > b1["fcw_steps"]:
+    out.append(f"H2 fcw {sd['fcw_steps']} > b1 {b1['fcw_steps']}")
+  # H3 for follow scenarios.
+  if cls == "follow":
+    if b1["min_gap_m"] is not None and sd["min_gap_m"] is not None:
+      if sd["min_gap_m"] < b1["min_gap_m"] - SD_EPS:
+        out.append(f"H3 follow min_gap {sd['min_gap_m']} < b1 {b1['min_gap_m']}")
+    if b1["min_ttc"] is not None and sd["min_ttc"] is not None:
+      if sd["min_ttc"] < b1["min_ttc"] - SD_EPS:
+        out.append(f"H3 follow min_ttc {sd['min_ttc']} < b1 {b1['min_ttc']}")
+  return out
+
+
+def _sd_comfort_failures(b1, sd, cls):
+  out = []
+  if b1["peak_decel"] is not None and sd["peak_decel"] is not None:
+    if sd["peak_decel"] < b1["peak_decel"] - SD_DECEL_ADD:
+      out.append(f"S2 decel {b1['peak_decel']}->{sd['peak_decel']}")
+  if sd["peak_jerk_plant"] is not None:
+    bj = b1["peak_jerk_plant"] if b1["peak_jerk_plant"] is not None else 0.0
+    if sd["peak_jerk_plant"] > bj + SD_JERK_ADD + 1e-9:
+      out.append(f"S3 jerk {bj}->{sd['peak_jerk_plant']}")
+  return out
+
+
+def _sd_nod_groups(pairs):
+  """S1a big-nod mean reduction and S1b worst absolute nod increase."""
+  big = []
+  stop_worse = float("-inf")
+  for name, b1, sd, cls in pairs:
+    if cls != "stop":
+      continue
+    b1n, sdn = b1["nod_swing"], sd["nod_swing"]
+    if b1n is not None and sdn is not None:
+      stop_worse = max(stop_worse, sdn - b1n)
+    if b1n is None or sdn is None:
+      continue
+    in_big = (b1["group"] == "replica"
+              and any(f"replica {k}" == name for k in SD_BIG_NOD_REPLICAS))
+    if in_big or b1n >= SD_BIG_NOD:
+      denom = b1n if abs(b1n) > 1e-6 else 1e-6
+      big.append((name, (b1n - sdn) / denom))
+  mean = float(np.mean([r for _n, r in big])) if big else float("-inf")
+  return big, mean, stop_worse
+
+
+def _sd_eval_params(p, plant_mode="real_sg", b1_cache=None, specs=None):
+  if specs is None:
+    specs = _sd_build_specs(plant_mode)
+  if b1_cache is None:
+    b1_cache = _sd_b1_cache(specs)
+  pairs, hard, comfort = [], [], []
+  sd_apply_params(p)
+  try:
+    for name, group, cls, factory in specs:
+      try:
+        b1 = b1_cache[name]
+        sd = factory()
+      except Exception as exc:  # noqa: BLE001
+        hard.append({"name": name, "class": cls, "reason": f"HERR {type(exc).__name__}: {exc}"})
+        continue
+      pairs.append((name, b1, sd, cls))
+      for reason in _sd_pair_failures(b1, sd, cls):
+        hard.append({"name": name, "class": cls, "reason": reason})
+      for reason in _sd_comfort_failures(b1, sd, cls):
+        comfort.append({"name": name, "class": cls, "reason": reason})
+  finally:
+    sd_restore_defaults()
+  big, mean, stop_worse = _sd_nod_groups(pairs)
+  s1a_ok = mean >= SD_NOD_REDUCE
+  s1b_ok = stop_worse <= SD_NOD_WORSE + 1e-9
+  min_final = float("inf")
+  for _n, _b1, sd, cls in pairs:
+    if cls == "stop" and sd["final_gap_m"] is not None:
+      min_final = min(min_final, sd["final_gap_m"])
+  if not np.isfinite(min_final):
+    min_final = None
+  analysis = {"pairs": pairs, "big_nod": big, "s1a_mean": mean, "stop_worse": stop_worse,
+              "s1a_ok": bool(s1a_ok), "s1b_ok": bool(s1b_ok), "min_final_gap": min_final}
+  passes = (not hard) and (not comfort) and s1a_ok and s1b_ok
+  return analysis, hard, comfort, passes
+
+
+def _sd_b1_cache(specs):
+  """B1 = stop_delay disabled; cache the reference rows keyed by scenario name."""
+  cache = {}
+  sd_restore_defaults()
+  for name, group, cls, factory in specs:
+    try:
+      cache[name] = factory()
+    except Exception:  # noqa: BLE001
+      pass
+  return cache
+
+
+def sd_sweep(plant_mode="real_sg", only=None, shard=None, nshards=None):
+  grid = only if only is not None else sd_grid()
+  if shard is not None and nshards is not None:
+    grid = [g for i, g in enumerate(grid) if i % nshards == shard]
+  specs = _sd_build_specs(plant_mode)
+  b1_cache = _sd_b1_cache(specs)
+  results = []
+  for p in grid:
+    analysis, hard, comfort, passes = _sd_eval_params(
+      p, plant_mode=plant_mode, b1_cache=b1_cache, specs=specs)
+    results.append({"params": dict(p), "hard": hard, "comfort": comfort,
+                    "s1a_mean": analysis["s1a_mean"], "s1b_ok": analysis["s1b_ok"],
+                    "min_final_gap": analysis["min_final_gap"],
+                    "passes": passes, "analysis": analysis})
+  results.sort(key=lambda r: (not r["passes"], -r["s1a_mean"]))
+  return results
+
+
+def sd_h0_check(plant_mode="real_sg"):
+  """H0: STOP_DELAY_ENABLED False is bit-identical to the landed (AD) path.
+
+  Runs a few representative scenarios through the SD builder with the module
+  disabled and through the AD builder at the same base delay, and compares the
+  per-step command/plant/vehicle traces exactly.
+  """
+  fixture = load_fixture("b1")
+  _d, stops = load_stops()
+  man40 = next(m for g, m in _CASES if m.title == "stopped lead 40 km/h gap 60 m")
+
+  def _rep_factory():
+    pr = RealStopReplicaProfile(_cs_find_stop(stops, "445@7.27"))
+    loop = _RealFixtureLoop({}, pr, _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)
+    loop.fixed_a_grade = pr.grade
+    return loop
+
+  checks = [
+    ("a:stopped lead 40 km/h gap 60 m",
+     lambda: _RealScenarioLoop(man40, 1, _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)),
+    ("b1",
+     lambda: _RealFixtureLoop(dict(fixture.get("params")), FixtureProfile(fixture),
+                              _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)),
+    ("replica 445@7.27", _rep_factory),
+  ]
+  out = []
+  for name, loop_factory in checks:
+    identical = _sd_trace_identical_to_ad(loop_factory, plant_mode)
+    out.append({"name": name, "identical": identical})
+  return out
+
+
+def _sd_trace_identical_to_ad(loop_factory, plant_mode="real_sg"):
+  """Run the same loop through SD (disabled) and AD builders; compare traces."""
+  sd_restore_defaults()
+  loop = loop_factory()
+  sd_trace = _sd_run(loop)
+  loop2 = loop_factory()
+  loop2._trace = []
+  params = Params()
+  _ad_apply(loop2, params, SD_B1_DELAY)
+  loop2.run()
+  ad_trace = loop2._trace
+  if len(sd_trace) != len(ad_trace):
+    return False
+  for rs, ra in zip(sd_trace, ad_trace):
+    for k in ("out", "plant_a", "v", "action_t"):
+      a, b = rs.get(k), ra.get(k)
+      if a == b:
+        continue
+      if isinstance(a, float) and isinstance(b, float) and np.isnan(a) and np.isnan(b):
+        continue
+      return False
+  return True
