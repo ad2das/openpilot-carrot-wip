@@ -6,6 +6,11 @@ name: opsim-image
 # Public repo code + public packages only: no datasets, keys, logs or private paths.
 
 on:
+  # workflow_dispatch only registers once this file is on the default branch
+  # (carrot-wip). Until then, pushing to the opsim-image branch triggers a build.
+  push:
+    branches:
+      - opsim-image
   workflow_dispatch:
     inputs:
       ref:
@@ -37,16 +42,19 @@ jobs:
       - name: Resolve ref
         id: ref
         run: |
-          echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
+          REF="${{ inputs.ref }}"
+          echo "ref=${REF:-carrot-wip}" >> "$GITHUB_OUTPUT"
       - name: Checkout requested ref into build context
         uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.ref }}
+          ref: ${{ steps.ref.outputs.ref }}
           submodules: recursive
           fetch-depth: 0
       - name: Record resolved commit
         id: commit
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Log in to GHCR
@@ -68,7 +76,6 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:latest
             ${{ env.IMAGE }}:${{ steps.commit.outputs.sha }}
-            ${{ inputs.tag != '' && format('{0}:{1}', env.IMAGE, inputs.tag) || format('{0}:{1}', env.IMAGE, steps.commit.outputs.sha) }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Make package public
