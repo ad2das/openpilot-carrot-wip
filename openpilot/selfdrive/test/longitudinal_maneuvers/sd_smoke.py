@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""CP-SD smoke: 2 candidate sets x 6 scenarios, printing every output column.
+"""CP-SD smoke: 1 candidate set x 6 scenarios, printing every output column.
 
-Prints nod/gap/w-onset for each set and the H0 identity check; asserts finite
-metrics and that the stop-phase weight actually activates somewhere.
+Runs the H0 identity check and the briefed set (V_LO 8.0 / DELAY_LO 0.65 /
+A_REQ_MAX 1.0 / MARGIN_SD 0.3; override with SD_SMOKE_* env vars). Prints
+nod/gap/w-onset per scenario, asserts finite metrics, that the stop-phase weight
+activates, and that follow scenarios keep w = 0.
 """
 import os
 import sys

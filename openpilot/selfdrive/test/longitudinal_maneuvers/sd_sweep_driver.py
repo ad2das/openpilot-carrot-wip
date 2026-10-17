@@ -1,11 +1,13 @@
-"""CP-SD stop-phase delay sweep driver (16 workers, WSL openpilot venv).
+"""CP-SD stop-phase delay sweep driver (parallel workers).
 
-144 sets = DELAY_LO {0.4,0.5,0.65,0.8} x V_LO {1,2,3} x A_REQ_MAX {0.6,0.8,1.0}
-x MARGIN_SD {0.3,0.6} x APPLY_TO_LATCH {False,True}. Each set re-runs the whole
-97-spec AD scenario set behind a shared B1 cache. Sets are sharded across the
-16-process pool; each worker prints NOD-SD-PROGRESS per finished set.
+240 sets = DELAY_LO {0.4,0.5,0.65,0.8} x V_LO {1,2,3,5,8} x A_REQ_MAX
+{0.6,0.8,1.0} x MARGIN_SD {0.3,0.6} x APPLY_TO_LATCH {False,True}. Each set
+re-runs the whole ~92-spec scenario set behind a shared per-worker B1 cache.
+Sets are sharded across the nproc pool; each worker prints NOD-SD-PROGRESS per
+finished set. Stage 0 runs the H0 identity check over every scenario+variant and
+aborts on any mismatch.
 
-Usage: BUTTER_SD_OUT=... python sd_sweep_driver.py [nproc]
+Usage: SD_OUT=./stop_delay.json python sd_sweep_driver.py [nproc]
 """
 import json
 import os
@@ -83,7 +85,7 @@ def _histogram(results):
 
 def main():
   nproc = int(sys.argv[1]) if len(sys.argv) > 1 else 8
-  out_path = os.environ.get("BUTTER_SD_OUT", "/tmp/stop_delay.json")
+  out_path = os.environ.get("SD_OUT", os.environ.get("BUTTER_SD_OUT", "stop_delay.json"))
   plant_mode = os.environ.get("BUTTER_SD_PLANT", "real_sg")
   t0 = time.monotonic()
 
