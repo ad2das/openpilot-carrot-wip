@@ -1,0 +1,90 @@
+name: opsim-image
+
+# Builds a public CPU-only openpilot test image for the RunPod "opsim-pod" driver.
+# The image is self-contained (system deps + uv venv + a built carrot-wip checkout)
+# so a fresh pod can `git fetch <ref> && scons` incrementally instead of a cold build.
+# Public repo code + public packages only: no datasets, keys, logs or private paths.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref of ad2das/openpilot-carrot-wip to bake into the image
+        required: false
+        default: carrot-wip
+        type: string
+      tag:
+        description: Extra image tag (in addition to latest and the commit sha)
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/opsim
+  UV_VERSION: '0.13.1'
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: build ${{ inputs.ref }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          echo "ref=${{ inputs.ref }}" >> "$GITHUB_OUTPUT"
+      - name: Checkout requested ref into build context
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 0
+      - name: Record resolved commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost || true
+          df -h /
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: tools/opsim/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ steps.commit.outputs.sha }}
+            ${{ inputs.tag != '' && format('{0}:{1}', env.IMAGE, inputs.tag) || format('{0}:{1}', env.IMAGE, steps.commit.outputs.sha) }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Make package public
+        continue-on-error: true
+        run: |
+          # Best-effort: flip the GHCR package visibility to public so pods can pull anonymously.
+          # Needs a token with admin:packages; GITHUB_TOKEN usually cannot change visibility,
+          # so this may fail and require a one-time manual console click.
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/user/packages/container/opsim" \
+            -d '{"visibility":"public"}' || true
+      - name: Summary
+        run: |
+          echo "### opsim image" >> "$GITHUB_STEP_SUMMARY"
+          echo "- ref: \`${{ inputs.ref }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- commit: \`${{ steps.commit.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- image: \`${{ env.IMAGE }}:latest\`, \`${{ env.IMAGE }}:${{ steps.commit.outputs.sha }}\`" >> "$GITHUB_STEP_SUMMARY"

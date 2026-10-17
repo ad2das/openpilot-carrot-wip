@@ -1,0 +1,9 @@
+# Keep the build context small; .git MUST stay (the pod fetches refs from it).
+.git/blob
+.git/lfs
+.analysis
+**/.venv
+**/node_modules
+**/__pycache__
+**/*.pyc
+tools/opsim/.dockerignore
