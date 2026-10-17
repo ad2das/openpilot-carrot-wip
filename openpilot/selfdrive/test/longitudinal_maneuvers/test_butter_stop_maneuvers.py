@@ -153,38 +153,48 @@ class ButterStopLoop:
     carrot = CarrotPlanner()
     self.carrot = _NeutralCarrot(carrot) if neutralize else carrot
 
-  def _radar_message(self, lead):
+  def _radar_message(self, lead, lead_two=False):
     radar = messaging.new_message('radarState')
     l1 = log.RadarState.LeadData.new_message()
-    if lead is None:
-      l1.status = False
-      l1.dRel = 200.0
-      l1.vRel = 0.0
-      l1.vLead = float(self.ego_v)
-      l1.vLeadK = float(self.ego_v)
-      l1.aLeadK = 0.0
-      l1.aRel = 0.0
-      l1.modelProb = 0.0
-      l1.radar = True
-      l1.radarTrackId = -1
-    else:
-      l1.status = True
-      l1.dRel = float(max(0.0, lead["d_rel"]))
-      l1.vRel = float(lead["v_rel"])
-      l1.vLead = float(lead["v_lead"])
-      l1.vLeadK = float(lead["v_lead"])
-      l1.aLeadK = float(lead["a_lead"])
-      l1.aRel = float(lead["a_lead"] - self.long_control.last_output_accel)
-      l1.modelProb = float(lead["prob"])
-      l1.radar = True
-      l1.radarTrackId = 7
-    l1.aLeadTau = float(LEAD_ACCEL_TAU)
-    radar.radarState.leadOne = l1
     l2 = log.RadarState.LeadData.new_message()
-    l2.status = False
-    l2.dRel = 200.0
-    l2.vLead = float(self.ego_v)
-    l2.vLeadK = float(self.ego_v)
+    if lead is None:
+      for l in (l1, l2):
+        l.status = False
+        l.dRel = 200.0
+        l.vRel = 0.0
+        l.vLead = float(self.ego_v)
+        l.vLeadK = float(self.ego_v)
+        l.aLeadK = 0.0
+        l.aRel = 0.0
+        l.modelProb = 0.0
+        l.radar = True
+        l.radarTrackId = -1
+      l1.aLeadTau = float(LEAD_ACCEL_TAU)
+    else:
+      tgt = l2 if lead_two else l1
+      tgt.status = True
+      tgt.dRel = float(max(0.0, lead["d_rel"]))
+      tgt.vRel = float(lead["v_rel"])
+      tgt.vLead = float(lead["v_lead"])
+      tgt.vLeadK = float(lead["v_lead"])
+      tgt.aLeadK = float(lead["a_lead"])
+      tgt.aRel = float(lead["a_lead"] - self.long_control.last_output_accel)
+      tgt.modelProb = float(lead["prob"])
+      tgt.radar = True
+      tgt.radarTrackId = 7
+      tgt.aLeadTau = float(LEAD_ACCEL_TAU)
+      other = l1 if lead_two else l2
+      other.status = False
+      other.dRel = 200.0
+      other.vRel = 0.0
+      other.vLead = float(self.ego_v)
+      other.vLeadK = float(self.ego_v)
+      other.aLeadK = 0.0
+      other.aRel = 0.0
+      other.modelProb = 0.0
+      other.radar = True
+      other.radarTrackId = -1
+    radar.radarState.leadOne = l1
     radar.radarState.leadTwo = l2
     return radar.radarState
 
@@ -245,6 +255,7 @@ class ButterStopLoop:
       cruiseCoastingTarget=float(planner.coasting_target),
       cruiseCoastingPercent=int(planner.coasting_percent),
       cruiseTarget=float(planner.v_cruise_kph),
+      actionTime=float(getattr(planner, "action_t_last", float("nan"))),
     )
 
   def _cs_view(self, v_cruise_ms, standstill):

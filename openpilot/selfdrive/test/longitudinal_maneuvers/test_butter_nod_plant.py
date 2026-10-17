@@ -35,9 +35,10 @@ from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState, CONTROL_N_T_IDX
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
-  ButterStopLoop, _A_SCENARIOS, _B2_PROXY, _CASES, _S1, _S3, _S3B, _S3C,
+  ButterStopLoop, _A_SCENARIOS, _B2_PROXY, _B_SCENARIO, _CASES, _S1, _S3, _S3B, _S3C,
   _START_SCENARIOS, _FakeSM, PLANNER_PERIOD,
 )
+from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
   FarLeadLoop, FixtureProfile, PLANT_A_GATE, PLANT_SCC_BRAKE, PLANT_TAU,
   load_fixture, plant_creep,
@@ -948,7 +949,7 @@ def _run_loop_real(loop):
                   "prob": prob_lead if status else 0.0}
         else:
           lead = None
-        radar_state = loop._radar_message(lead)
+        radar_state = loop._radar_message(lead, lead_two=bool(getattr(maneuver, "only_lead2", False)))
         msgs = {"radarState": radar_state}
         msgs.update(loop._sm_messages(v_cruise_ms, pitch, prob_throttle, standstill))
         loop.planner.update(_FakeSM(msgs, frame), loop.carrot)
@@ -985,15 +986,17 @@ def _run_loop_real(loop):
     if getattr(loop, "_trace", None) is not None:
       # Gap to the lead where the profile exposes one (replica/a/b2); else NaN.
       gap_now = float("nan")
+      v_lead_now = float("nan")
       try:
         if fixture_mode:
           for spec in profile.sample(t, loop.ego_x):
             if spec is not None and spec[3]:
               g = spec[0] - loop.ego_x
               if not np.isfinite(gap_now) or g < gap_now:
-                gap_now = g
+                gap_now, v_lead_now = g, spec[1]
         elif getattr(loop, "maneuver", None) is not None and maneuver.lead_relevancy:
           gap_now = max(0.0, loop.lead_x - loop.ego_x)
+          v_lead_now = float(v_lead) if v_lead is not None else float("nan")
       except (NameError, TypeError):
         gap_now = float("nan")
       lc = loop.long_control
@@ -1019,6 +1022,10 @@ def _run_loop_real(loop):
         "creep_latched": bool(getattr(lc, "_butter_creep_latched", False)),
         "standstill_confirmed": bool(getattr(lc, "_butter_standstill_confirmed", False)),
         "should_stop": bool(getattr(plan_view, "shouldStop", False)),
+        "v_lead": v_lead_now,
+        "v_cruise_ms": (float(v_cruise_ms) if not fixture_mode else float(v_cruise_kph) / 3.6),
+        "action_t": float(getattr(plan_view, "actionTime", float("nan"))),
+        "fcw": bool(getattr(plan_view, "fcw", False)) or loop.planner.mpc.crash_cnt > 0,
         "plant_target": plant_diag.get("target"), "plant_a": float(applied),
         "plant_grade": plant_diag.get("grade"), "plant_w_new": plant_diag.get("w_new"),
         "gap": gap_now,
@@ -2080,3 +2087,342 @@ def test_cs_sweep():
     print(f"NOD-CS-TOP{i} nod_mean={r['nod_mean']:.4f} params={r['params']} "
           f"hard={len(r['hard'])} comfort={len(r['comfort'])} s1={r['s1_ok']}")
   assert results
+
+# ===========================================================================
+# LongActuatorDelay sweep (AD): analysis/sim only, no product change
+# ===========================================================================
+# B1 = the user's real config at LongActuatorDelay 0.25 (Params INT x0.01) with
+# landed ButterStop (BUTTER_CS off). The sweep varies LongActuatorDelay and
+# checks, per value, H1-H5 hard gates and S1-S6 comfort, all vs B1.
+
+AD_DELAYS = [0.25, 0.4, 0.5, 0.65, 0.8, 1.0]
+AD_B1_DELAY = 0.25
+# The user's full parameter set (the defaults already match except the delay).
+AD_USER_PARAMS = {"ButterStop": 1, "VEgoStopping": 10, "StoppingAccel": -50,
+                  "StopDistanceCarrot": 550, "LongTuningKpV": 100,
+                  "LongTuningKiV": 0, "LongTuningKf": 100}
+
+AD_EPS = 0.005
+AD_POST_STOP_M = 0.02
+AD_DELAY_M = 0.05
+AD_DECEL_ADD = 0.4
+AD_JERK_ADD = 0.5
+AD_GAP_ADD = 1.5
+AD_FOLLOW_STD_ADD = 0.05
+AD_CRUISE_OVER_ADD = 0.3   # km/h
+AD_CREEP_V = _bs.CREEP_V
+
+
+def ad_set_params(params, delay):
+  """Seed the user's params + LongActuatorDelay (Params INT = seconds x100)."""
+  params.put_int("ButterStop", AD_USER_PARAMS["ButterStop"])
+  params.put_int("VEgoStopping", AD_USER_PARAMS["VEgoStopping"])
+  params.put_int("StoppingAccel", AD_USER_PARAMS["StoppingAccel"])
+  params.put_int("StopDistanceCarrot", AD_USER_PARAMS["StopDistanceCarrot"])
+  params.put_int("LongTuningKpV", AD_USER_PARAMS["LongTuningKpV"])
+  params.put_int("LongTuningKiV", AD_USER_PARAMS["LongTuningKiV"])
+  params.put_int("LongTuningKf", AD_USER_PARAMS["LongTuningKf"])
+  params.put_int("LongActuatorDelay", int(round(delay * 100)))
+
+
+def _ad_apply(loop, params, delay):
+  ad_set_params(params, delay)
+  loop.long_control._refresh_stopping_accel()
+  loop.long_control._refresh_butter_stop()
+  loop.long_control._refresh_longitudinal_tuning()
+
+
+def ad_action_t_of(loop):
+  return float(getattr(loop.planner, "action_t_last", float("nan")))
+
+
+def _ad_metrics(trace, tag):
+  """Metric dict from an AD trace. `tag` selects scenario-class extra metrics."""
+  t = np.array([r["t"] for r in trace], dtype=float)
+  v = np.array([r["v"] for r in trace], dtype=float)
+  a = np.array([r["plant_a"] if r["plant_a"] is not None else np.nan for r in trace], dtype=float)
+  cmd = np.array([r["out"] if r["out"] is not None else np.nan for r in trace], dtype=float)
+  gap = np.array([r.get("gap", np.nan) for r in trace], dtype=float)
+  vlead = np.array([r.get("v_lead", np.nan) for r in trace], dtype=float)
+  vcru = np.array([r.get("v_cruise_ms", np.nan) for r in trace], dtype=float)
+  x = np.array([r.get("x", np.nan) for r in trace], dtype=float)
+  finite = np.isfinite(gap)
+  stand = np.flatnonzero(v < 0.05)
+  stopped = bool(stand.size)
+  step = float(t[1] - t[0]) if t.size > 1 else DT_CTRL
+  m = {"stopped": stopped, "a_stop": None, "nod_swing": None, "peak_decel": None,
+       "peak_jerk_plant": None, "p95_jerk_plant": None, "final_gap_m": None,
+       "min_gap_m": None, "min_ttc": None, "post_stop_travel": None,
+       "creep_latched": bool(np.any([r.get("creep_latched", False) for r in trace])),
+       "hold_reached": bool(np.any([r.get("standstill_confirmed", False) for r in trace])),
+       "start_delay_s": None, "follow_std": None, "cruise_over_kph": None,
+       "collision": bool(finite.any() and np.nanmin(gap) < COLLISION_GAP_M),
+       "fcw_steps": int(sum(1 for r in trace if r.get("fcw", False))),
+       "action_t": float(np.nanmax([r.get("action_t", np.nan) for r in trace])) if trace else None}
+  if finite.any():
+    m["min_gap_m"] = round(float(np.nanmin(gap)), 3)
+  if t.size > 1:
+    jp = np.abs(np.gradient(a, t))
+    m["peak_jerk_plant"] = round(float(np.nanmax(jp)) if np.isfinite(jp).any() else 0.0, 4)
+    m["p95_jerk_plant"] = round(float(np.nanpercentile(jp, 95)) if np.isfinite(jp).any() else 0.0, 4)
+  if finite.any() and np.isfinite(vlead).any():
+    closing = v - vlead
+    approach = finite & (closing > 0.1) & (gap > 0.1)
+    if approach.any():
+      ttc = gap[approach] / closing[approach]
+      m["min_ttc"] = round(float(np.min(ttc)), 3)
+  # start delay: first moving sample relative to t=0 (maneuvers start at 0, but
+  # the CS harness uses a 5 s offset; use the same convention as _start_delay).
+  moving = np.flatnonzero(v > 0.3)
+  if moving.size:
+    m["start_delay_s"] = round(float(t[moving[0]] - 5.0), 3)
+  if t.size > 1 and np.isfinite(a).any():
+    # steady-following accel std over the pre-decel window (t in [5, 14]).
+    w = (t >= 5.0) & (t <= 14.0) & np.isfinite(a)
+    if w.sum() > 20:
+      m["follow_std"] = round(float(np.nanstd(a[w])), 4)
+  if np.isfinite(vcru).any() and np.isfinite(v).any():
+    # cruise speed overshoot above the commanded cruise target (km/h).
+    over = (v - vcru) * 3.6
+    over = over[np.isfinite(over)]
+    if over.size:
+      m["cruise_over_kph"] = round(float(np.max(over)), 3)
+  if stopped:
+    i = int(stand[0])
+    m["a_stop"] = round(float(a[i]), 4)
+    m["peak_decel"] = round(float(np.nanmin(a[max(0, i - 30):i + 1])), 4)
+    w2 = (t > t[i]) & (t <= t[i] + 1.0)
+    if w2.any():
+      m["nod_swing"] = round(float(np.nanmax(a[w2]) - m["a_stop"]), 4)
+    if finite.any():
+      m["final_gap_m"] = round(float(gap[i]), 3)
+    if np.isfinite(x).any():
+      m["post_stop_travel"] = round(float(x[-1] - x[i]), 4)
+  return m
+
+
+def _ad_scenario_row(maneuver, group, tag, delay, plant_p=None, plant_mode="real_sg",
+                     grade=0.0, gtag="", with_startdelay=False):
+  suffix = f" [{gtag}]" if gtag else ""
+  loop = _RealScenarioLoop(maneuver, 1, _cs_plant(plant_p), plant_mode=plant_mode,
+                           grade_rad=math.asin(grade))
+  loop._trace = []
+  params = Params()
+  _ad_apply(loop, params, delay)
+  loop.run()
+  m = _ad_metrics(loop._trace, tag)
+  m.update({"name": maneuver.title + suffix, "group": group, "tag": tag, "grade": grade,
+            "fcw_steps": int(loop.planner.mpc.crash_cnt > 0)})
+  return m
+
+
+def _ad_fixture_row(profile, group, tag, delay, name, plant_p=None, plant_mode="real_sg",
+                    fixed_grade=None, header=None, grade=0.0):
+  loop = _RealFixtureLoop(dict(header or {}), profile, _cs_plant(plant_p),
+                          plant_mode=plant_mode, grade_rad=math.asin(grade))
+  loop.fixed_a_grade = fixed_grade
+  loop._trace = []
+  params = Params()
+  _ad_apply(loop, params, delay)
+  loop.run()
+  m = _ad_metrics(loop._trace, tag)
+  m.update({"name": name, "group": group, "tag": tag, "grade": grade,
+            "fcw_steps": int(loop.planner.mpc.crash_cnt > 0)})
+  return m
+
+# --- AD scenario registry ---------------------------------------------------
+
+def _ad_class_for(name, tag):
+  """Gate class: 'stop' (H1/H4), 'start' (H5), else non-stop (H3)."""
+  if tag in ("start",):
+    return "start"
+  if "following" in name or "cruise" in name.lower() or "disabled" in name or "cut-in" in name:
+    return "follow"
+  return "stop"
+
+
+def _ad_build_specs():
+  """Deterministic list of AD scenario specs.
+
+  Every spec is a callable(delay) -> metrics row. B1 is the same factory run with
+  AD_B1_DELAY, so each pair shares the scenario definition.
+  """
+  specs = []
+  fixture = load_fixture("b1")
+
+  # CS scenario set (a/b/c groups, s1/s2/s3*), flat + grades.
+  for group, maneuver in _CASES:
+    specs.append((maneuver.title, group, "stop",
+                  lambda d, m=maneuver, g=group: _ad_scenario_row(m, g, g, d)))
+  # b1 fixture (flat + grades).
+  specs.append(("b1", "b1", "stop",
+                lambda d: _ad_fixture_row(FixtureProfile(fixture), "b1", "b1", d, "b1",
+                                          header=fixture.get("params"))))
+  for grade, gtag in ((SRG_GRADES[0], "dn3"), (SRG_GRADES[1], "up3")):
+    specs.append((f"b1 [{gtag}]", "b1", "stop",
+                  lambda d, gr=grade, t=gtag: _ad_fixture_row(
+                    FixtureProfile(fixture), "b1", "b1", d, "b1", header=fixture.get("params"),
+                    grade=gr)))
+    for group, maneuver in _STOPPED_LEAD:
+      specs.append((maneuver.title + f" [{gtag}]", group, "stop",
+                    lambda d, m=maneuver, g=group, gr=grade, t=gtag: _ad_scenario_row(
+                      m, g, g, d, grade=gr, gtag=t)))
+  # Starts.
+  for maneuver in _START_SCENARIOS:
+    specs.append((maneuver.title, "start", "start",
+                  lambda d, m=maneuver: _ad_scenario_row(m, "start", "start", d,
+                                                         with_startdelay=True)))
+  # Replicas (lead) + no-lead.
+  _d, stops = load_stops()
+  for key in CS_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    specs.append((f"replica {key}", "replica", "stop",
+                  lambda d, pr=profile, n=f"replica {key}": _ad_fixture_row(
+                    pr, "replica", "stop", d, n, fixed_grade=pr.grade)))
+  for key in CS_NOLEAD_REPLICA_KEYS:
+    profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+    specs.append((f"replica {key}", "replica_nolead", "stop",
+                  lambda d, pr=profile, n=f"replica {key}": _ad_fixture_row(
+                    pr, "replica_nolead", "stop", d, n, fixed_grade=pr.grade)))
+  # Whole standard longitudinal maneuver list.
+  for m in create_maneuvers({"e2e": False, "force_decel": False}):
+    cls = _ad_class_for(m.title, None)
+    specs.append((m.title, "std", cls,
+                  lambda d, m=m, c=cls: _ad_scenario_row(m, "std", c, d)))
+
+  # Plant-robustness variants for 3 replicas + 2 named maneuvers + 1 following
+  # + 1 cut-in.
+  man40 = next(m for g, m in _CASES if m.title == "stopped lead 40 km/h gap 60 m")
+  man_lead_brake = _B_SCENARIO
+  man_follow = next(m for m in create_maneuvers({"e2e": False, "force_decel": False})
+                    if m.title.startswith("steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2"))
+  man_cutin = next(m for m in create_maneuvers({"e2e": False, "force_decel": False})
+                   if m.title.startswith("approach slower cut-in"))
+  for axis, vals in CS_ROBUST_VARIANTS.items():
+    for val in vals:
+      vtag = f"{axis}={val}"
+      pv = _cs_plant(**{axis: val})
+      for key in CS_REPLICA_KEYS:
+        profile = RealStopReplicaProfile(_cs_find_stop(stops, key))
+        specs.append((f"replica {key} [{vtag}]", "replica", "stop",
+                      lambda d, pr=profile, n=f"replica {key} [{vtag}]", nv=pv: _ad_fixture_row(
+                        pr, "replica", "stop", d, n, fixed_grade=pr.grade, plant_p=nv)))
+      specs.append((man40.title + f" [{vtag}]", "a", "stop",
+                    lambda d, m=man40, t=vtag, nv=pv: _ad_scenario_row(
+                      m, "a", "stop", d, plant_p=nv, gtag=t)))
+      specs.append((man_lead_brake.title + f" [{vtag}]", "b", "stop",
+                    lambda d, m=man_lead_brake, t=vtag, nv=pv: _ad_scenario_row(
+                      m, "b", "stop", d, plant_p=nv, gtag=t)))
+      specs.append((man_follow.title + f" [{vtag}]", "std", "follow",
+                    lambda d, m=man_follow, t=vtag, nv=pv: _ad_scenario_row(
+                      m, "std", "follow", d, plant_p=nv, gtag=t)))
+      specs.append((man_cutin.title + f" [{vtag}]", "std", "follow",
+                    lambda d, m=man_cutin, t=vtag, nv=pv: _ad_scenario_row(
+                      m, "std", "follow", d, plant_p=nv, gtag=t)))
+  return specs
+
+# --- AD gates --------------------------------------------------------------
+
+def _ad_pair_failures(b1, ad, cls):
+  """Hard gate violations for one (B1, delay) pair; list of reason strings."""
+  out = []
+  if cls == "stop":
+    if b1["final_gap_m"] is not None and ad["final_gap_m"] is not None:
+      if ad["final_gap_m"] < b1["final_gap_m"] - AD_EPS:
+        out.append(f"H1 gap {ad['final_gap_m']} < b1 {b1['final_gap_m']}")
+    if b1["min_gap_m"] is not None and ad["min_gap_m"] is not None:
+      if ad["min_gap_m"] < b1["min_gap_m"] - AD_EPS:
+        out.append(f"H1 min_gap {ad['min_gap_m']} < b1 {b1['min_gap_m']}")
+    if b1["post_stop_travel"] is not None and ad["post_stop_travel"] is not None:
+      if ad["post_stop_travel"] > b1["post_stop_travel"] + AD_POST_STOP_M + 1e-9:
+        out.append(f"H4 post_stop {ad['post_stop_travel']} > b1 {b1['post_stop_travel']}+{AD_POST_STOP_M}")
+    if ad["creep_latched"] and not b1["creep_latched"]:
+      out.append("H4 creep latched where B1 did not")
+    if not ad["hold_reached"] and b1["hold_reached"]:
+      out.append("H4 hold not reached where B1 reached it")
+  if cls == "start":
+    if b1["start_delay_s"] is not None and ad["start_delay_s"] is not None:
+      if ad["start_delay_s"] > b1["start_delay_s"] + AD_DELAY_M:
+        out.append(f"H5 start_delay {ad['start_delay_s']} > b1 {b1['start_delay_s']}+{AD_DELAY_M}")
+  # H2 + H3 apply to all classes.
+  if ad["collision"]:
+    out.append(f"H2 collision min_gap={ad['min_gap_m']}")
+  if ad["fcw_steps"] > b1["fcw_steps"]:
+    out.append(f"H2 fcw {ad['fcw_steps']} > b1 {b1['fcw_steps']}")
+  if cls != "stop":
+    if b1["min_gap_m"] is not None and ad["min_gap_m"] is not None:
+      if ad["min_gap_m"] < b1["min_gap_m"] - AD_EPS:
+        out.append(f"H3 min_gap {ad['min_gap_m']} < b1 {b1['min_gap_m']}")
+    if b1["min_ttc"] is not None and ad["min_ttc"] is not None:
+      if ad["min_ttc"] < b1["min_ttc"] - 1e-9:
+        out.append(f"H3 min_ttc {ad['min_ttc']} < b1 {b1['min_ttc']}")
+  return out
+
+
+def _ad_comfort_failures(b1, ad, cls):
+  """Comfort gate violations (S2-S6); S1 reported separately."""
+  out = []
+  if b1["peak_decel"] is not None and ad["peak_decel"] is not None:
+    if ad["peak_decel"] < b1["peak_decel"] - AD_DECEL_ADD:
+      out.append(f"S2 decel {b1['peak_decel']}->{ad['peak_decel']}")
+  if ad["peak_jerk_plant"] is not None:
+    bj = b1["peak_jerk_plant"] if b1["peak_jerk_plant"] is not None else 0.0
+    if ad["peak_jerk_plant"] > bj + AD_JERK_ADD + 1e-9:
+      out.append(f"S3 jerk {bj}->{ad['peak_jerk_plant']}")
+  if b1["final_gap_m"] is not None and ad["final_gap_m"] is not None:
+    if ad["final_gap_m"] - b1["final_gap_m"] > AD_GAP_ADD:
+      out.append(f"S4 gap +{ad['final_gap_m'] - b1['final_gap_m']:.3f}")
+  if cls == "follow":
+    if b1["follow_std"] is not None and ad["follow_std"] is not None:
+      if ad["follow_std"] > b1["follow_std"] + AD_FOLLOW_STD_ADD:
+        out.append(f"S5 follow_std {b1['follow_std']}->{ad['follow_std']}")
+    if b1["cruise_over_kph"] is not None and ad["cruise_over_kph"] is not None:
+      if ad["cruise_over_kph"] > b1["cruise_over_kph"] + AD_CRUISE_OVER_ADD:
+        out.append(f"S6 cruise_over {b1['cruise_over_kph']}->{ad['cruise_over_kph']}")
+  return out
+
+
+def _ad_nod_reductions(pairs):
+  """S1: per-stop-scenario nod reduction over replicas + a-group."""
+  reds = []
+  for name, b1, ad, cls in pairs:
+    if cls == "stop" and b1["nod_swing"] is not None and ad["nod_swing"] is not None:
+      if b1["group"] in ("replica", "a"):
+        denom = b1["nod_swing"] if abs(b1["nod_swing"]) > 1e-6 else 1e-6
+        reds.append((name, (b1["nod_swing"] - ad["nod_swing"]) / denom))
+  mean = float(np.mean([r for _n, r in reds])) if reds else float("inf")
+  return reds, mean
+
+
+def _ad_eval_delay(specs, b1_cache, delay):
+  """Run all specs for `delay`; return (pairs, hard, comfort). Pair = tuple.
+
+  A scenario that raises is recorded as an H-error and skipped, so one bad spec
+  cannot abort the whole delay.
+  """
+  pairs, hard, comfort = [], [], []
+  for name, group, cls, factory in specs:
+    try:
+      if name not in b1_cache:
+        b1_cache[name] = factory(AD_B1_DELAY)
+      b1 = b1_cache[name]
+      ad = factory(delay)
+    except Exception as exc:  # noqa: BLE001
+      hard.append({"name": name, "class": cls, "reason": f"HERR {type(exc).__name__}: {exc}"})
+      continue
+    pairs.append((name, b1, ad, cls))
+    for reason in _ad_pair_failures(b1, ad, cls):
+      hard.append({"name": name, "class": cls, "reason": reason})
+    for reason in _ad_comfort_failures(b1, ad, cls):
+      comfort.append({"name": name, "class": cls, "reason": reason})
+  return pairs, hard, comfort
+
+
+def ad_b1_cache(specs):
+  cache = {}
+  for name, group, cls, factory in specs:
+    try:
+      cache[name] = factory(AD_B1_DELAY)
+    except Exception:  # noqa: BLE001
+      pass
+  return cache

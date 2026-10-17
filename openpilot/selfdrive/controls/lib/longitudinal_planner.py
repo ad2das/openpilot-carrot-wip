@@ -286,6 +286,9 @@ class LongitudinalPlanner:
     longitudinalActuatorDelay = self.params.get_float("LongActuatorDelay")*0.01
     vEgoStopping = get_stopping_speed(self.params)
     action_t =  longitudinalActuatorDelay + DT_MDL
+    # Read-only telemetry for the actuator-delay experiment (harness reads it).
+    self.action_t_last = float(action_t)
+    self.long_actuator_delay_last = float(longitudinalActuatorDelay)
 
     output_a_target_base, output_should_stop_mpc, output_v_target_mpc, _ = get_accel_from_plan(
       self.v_desired_trajectory,
