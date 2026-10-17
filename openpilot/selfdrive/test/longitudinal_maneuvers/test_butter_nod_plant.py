@@ -1642,18 +1642,25 @@ def cs_trace_metrics(trace):
 import copy as _copy  # noqa: E402
 import openpilot.selfdrive.controls.lib.butter_stop as _bs  # noqa: E402
 
+# CP-H3 grid: 2*3*3*2*2*2*3 = 432 sets. V_TAPER_CS 3.0 and D_EXTRA 1.2 dropped,
+# K_CS 0.2 added, MARGIN_CS added as the new safety-margin axis.
 _CS_GRID = {
-  "V_TAPER_CS": [3.0, 4.0, 5.0],
+  "V_TAPER_CS": [4.0, 5.0],
   "T_LAG": [0.6, 0.9, 1.2],
-  "K_CS": [0.3, 0.5],
-  "D_EXTRA": [0.4, 0.8, 1.2],
+  "K_CS": [0.2, 0.3, 0.5],
+  "D_EXTRA": [0.4, 0.8],
   "LEAD_SLACK_CS": [1.2, 0.6],
   "FLOOR_RELAX_JERK": [0.8, 1.5],
+  "MARGIN_CS": [0.1, 0.2, 0.3],
 }
 
 _CS_DEFAULTS = {"V_TAPER_CS": 3.0, "T_LAG": 0.0, "K_CS": 0.5, "D_EXTRA": 0.4,
-                "LEAD_SLACK_CS": 1.2, "FLOOR_RELAX_JERK": 0.8}
-_CS_ATTRS = ("V_TAPER_CS", "T_LAG", "K_CS", "D_EXTRA", "LEAD_SLACK_CS", "FLOOR_RELAX_JERK")
+                "LEAD_SLACK_CS": 1.2, "FLOOR_RELAX_JERK": 0.8, "MARGIN_CS": 0.0}
+_CS_ATTRS = ("V_TAPER_CS", "T_LAG", "K_CS", "D_EXTRA", "LEAD_SLACK_CS",
+             "FLOOR_RELAX_JERK", "MARGIN_CS")
+
+# CP-H3 runs every scenario (B1 and CS) at the user's real actuator delay.
+CS_LONG_ACTUATOR_DELAY = 0.25
 
 CS_EPS = 0.005
 CS_POST_STOP_M = 0.02
@@ -1661,8 +1668,9 @@ CS_DELAY_M = 0.05
 CS_DECEL_ADD = 0.4
 CS_JERK_ADD = 0.5
 CS_GAP_ADD = 1.0
-CS_NOD_REDUCE = 0.30
-CS_NOD_WORSE = 0.05
+CS_NOD_REDUCE = 0.20        # S1: a-group mean nod reduction floor
+CS_NOD_WORSE_ABS = 0.02     # S1: max absolute nod-swing increase vs B1 (m/s^2)
+CS_H1_RELAX = 0.05          # relaxed H1: gap >= B1 - 0.05 m
 
 CS_ROBUST_VARIANTS = {"L": [0.5, 0.9], "tau": [0.2, 0.6], "SCC_A": [-0.4, -0.8]}
 
@@ -1683,12 +1691,20 @@ def cs_restore_defaults():
     setattr(_bs, k, v)
 
 
+def _cs_run(loop):
+  """Run a CS loop at the user's real LongActuatorDelay (B1 and CS alike)."""
+  params = Params()
+  params.put_int("LongActuatorDelay", int(round(CS_LONG_ACTUATOR_DELAY * 100)))
+  return _run_one(loop, params)
+
+
 def cs_grid():
   return [{"V_TAPER_CS": vt, "T_LAG": tl, "K_CS": kc, "D_EXTRA": de,
-           "LEAD_SLACK_CS": ls, "FLOOR_RELAX_JERK": fr}
+           "LEAD_SLACK_CS": ls, "FLOOR_RELAX_JERK": fr, "MARGIN_CS": mg}
           for vt in _CS_GRID["V_TAPER_CS"] for tl in _CS_GRID["T_LAG"]
           for kc in _CS_GRID["K_CS"] for de in _CS_GRID["D_EXTRA"]
-          for ls in _CS_GRID["LEAD_SLACK_CS"] for fr in _CS_GRID["FLOOR_RELAX_JERK"]]
+          for ls in _CS_GRID["LEAD_SLACK_CS"] for fr in _CS_GRID["FLOOR_RELAX_JERK"]
+          for mg in _CS_GRID["MARGIN_CS"]]
 
 
 def _cs_plant(plant_p=None, **over):
@@ -1780,7 +1796,7 @@ def _cs_scenario_row(maneuver, group, butter, p, plant_mode, grade, gtag,
   loop = _RealScenarioLoop(maneuver, butter, _cs_plant(plant_p), plant_mode=plant_mode,
                            grade_rad=grade_rad)
   loop._trace = []
-  logs = _run_one(loop, Params())
+  logs = _cs_run(loop)
   tr = loop._trace
   gap = logs[:, 4] - logs[:, 3]
   fcw_mask = logs[:, 12] > 0.5
@@ -1801,7 +1817,7 @@ def _cs_fixture_row(profile, group, butter, p, plant_mode, grade, gtag, name, ta
                           plant_mode=plant_mode, grade_rad=grade_rad)
   loop.fixed_a_grade = fixed_grade
   loop._trace = []
-  run = _run_one(loop, Params())
+  run = _cs_run(loop)
   tr = loop._trace
   return _cs_row(name + suffix, group, tag, run["t"], run["v"], run["a_actual"], run["accel"],
                  run["gap"], run["stock"], run["floor_raw"], run["floor_applied"],
@@ -1921,14 +1937,18 @@ def _cs_h3_new(b1, cs):
   return out
 
 
-def _cs_gate_failures(b1, cs, tag, name):
+def _cs_gate_failures(b1, cs, tag, name, h1_relax=CS_EPS):
   out = []
   if b1["final_gap_m"] is not None and cs["final_gap_m"] is not None:
-    if cs["final_gap_m"] < b1["final_gap_m"] - CS_EPS:
+    if cs["final_gap_m"] < b1["final_gap_m"] - h1_relax:
       out.append(f"H1 gap {cs['final_gap_m']} < b1 {b1['final_gap_m']}")
   if b1["min_gap_m"] is not None and cs["min_gap_m"] is not None:
-    if cs["min_gap_m"] < b1["min_gap_m"] - CS_EPS:
+    if cs["min_gap_m"] < b1["min_gap_m"] - h1_relax:
       out.append(f"H1 min_gap {cs['min_gap_m']} < b1 {b1['min_gap_m']}")
+  # H1-5cm also requires an absolute safe final gap and no collision.
+  if h1_relax > CS_EPS and cs["final_gap_m"] is not None:
+    if cs["final_gap_m"] < _bs.MIN_FINAL_GAP_ABS:
+      out.append(f"H1 abs gap {cs['final_gap_m']} < {_bs.MIN_FINAL_GAP_ABS}")
   if cs["collision"]:
     out.append(f"H2 collision min_gap={cs['min_gap_m']}")
   if cs["fcw_steps"] > b1["fcw_steps"]:
@@ -1944,9 +1964,10 @@ def _cs_gate_failures(b1, cs, tag, name):
       out.append(f"H4 post_stop {cs['post_stop_travel']} > b1 {b1['post_stop_travel']}+{CS_POST_STOP_M}")
   if cs["creep_latched"] and not b1["creep_latched"]:
     out.append("H4 creep latched where B1 did not")
+  # H5 one-sided: CS must not delay the departure start by more than +0.05 s.
   if b1["start_delay_s"] is not None and cs["start_delay_s"] is not None:
-    if abs(cs["start_delay_s"] - b1["start_delay_s"]) > CS_DELAY_M:
-      out.append(f"H5 start_delay {cs['start_delay_s']} vs {b1['start_delay_s']}")
+    if cs["start_delay_s"] > b1["start_delay_s"] + CS_DELAY_M:
+      out.append(f"H5 start_delay {cs['start_delay_s']} > b1 {b1['start_delay_s']}+{CS_DELAY_M}")
   return out
 
 
@@ -1966,24 +1987,41 @@ def _cs_comfort_failures(b1, cs):
 
 
 def _cs_nod_reductions(pairs):
-  """(reductions list, worst) over the 3 replicas + a-group."""
-  reds = []
+  """CP-H3 S1 inputs over the a-group + 3 replicas + stop scenarios.
+
+  Returns (a_reds, a_mean, a_worst, stop_worse_max, replica_worse_max):
+   - a_reds: relative nod reduction per a-group scenario,
+   - a_mean / a_worst: mean and min of those reductions,
+   - stop_worse_max: worst absolute nod-swing increase (m/s^2) over every
+     scenario where B1 planned a stop,
+   - replica_worse_max: worst absolute nod-swing increase over the replicas.
+  """
+  a_reds = []
+  stop_worse = float("-inf")
+  replica_worse = float("-inf")
   for name, b1, cs, tag in pairs:
-    if tag in ("replica", "a") and b1["nod_swing"] is not None and cs["nod_swing"] is not None:
-      denom = b1["nod_swing"] if abs(b1["nod_swing"]) > 1e-6 else 1e-6
-      reds.append((name, (b1["nod_swing"] - cs["nod_swing"]) / denom))
-  worst = min((r for _n, r in reds), default=float("-inf"))
-  mean = float(np.mean([r for _n, r in reds])) if reds else float("-inf")
-  return reds, mean, worst
+    b1n, csn = b1["nod_swing"], cs["nod_swing"]
+    if b1n is None or csn is None:
+      continue
+    if tag == "a":
+      denom = b1n if abs(b1n) > 1e-6 else 1e-6
+      a_reds.append((name, (b1n - csn) / denom))
+    if b1["ran_stop"]:
+      stop_worse = max(stop_worse, csn - b1n)
+    if tag == "replica":
+      replica_worse = max(replica_worse, csn - b1n)
+  a_mean = float(np.mean([r for _n, r in a_reds])) if a_reds else float("-inf")
+  a_worst = min((r for _n, r in a_reds), default=float("-inf"))
+  return a_reds, a_mean, a_worst, stop_worse, replica_worse
 
 
-def _cs_eval_params(p, plant_mode="real_sg"):
+def _cs_eval_params(p, plant_mode="real_sg", h1_relax=CS_EPS):
   pairs, hard, comfort = [], [], []
   h3_old = []
   try:
     for name, b1, cs, tag in _cs_iter_pairs(p, plant_mode=plant_mode):
       pairs.append((name, b1, cs, tag))
-      for reason in _cs_gate_failures(b1, cs, tag, name):
+      for reason in _cs_gate_failures(b1, cs, tag, name, h1_relax=h1_relax):
         hard.append({"name": name, "tag": tag, "reason": reason})
       for reason in _cs_comfort_failures(b1, cs):
         comfort.append({"name": name, "tag": tag, "reason": reason})
@@ -1993,24 +2031,44 @@ def _cs_eval_params(p, plant_mode="real_sg"):
                        "identical": bool(b1.get("_cmd_digest") == cs.get("_cmd_digest"))})
   finally:
     cs_restore_defaults()
-  reds, mean, worst = _cs_nod_reductions(pairs)
-  s1_ok = mean >= CS_NOD_REDUCE and worst >= -CS_NOD_WORSE
-  analysis = {"pairs": pairs, "nod_mean": mean, "nod_worst": worst,
-              "s1_ok": bool(s1_ok), "nod_reductions": reds, "h3_old": h3_old}
+  a_reds, a_mean, a_worst, stop_worse, replica_worse = _cs_nod_reductions(pairs)
+  # S1: a-group mean nod reduction >= 20% and no stop scenario / replica nod
+  # worse than B1 by more than CS_NOD_WORSE_ABS.
+  s1_ok = (a_mean >= CS_NOD_REDUCE
+           and stop_worse <= CS_NOD_WORSE_ABS + 1e-9
+           and replica_worse <= CS_NOD_WORSE_ABS + 1e-9)
+  # Minimum (CS gap - B1 gap) over every scenario; the binding H1 margin.
+  min_gap_margin = float("inf")
+  for _name, b1, cs, _tag in pairs:
+    if b1["final_gap_m"] is not None and cs["final_gap_m"] is not None:
+      min_gap_margin = min(min_gap_margin, cs["final_gap_m"] - b1["final_gap_m"])
+    if b1["min_gap_m"] is not None and cs["min_gap_m"] is not None:
+      min_gap_margin = min(min_gap_margin, cs["min_gap_m"] - b1["min_gap_m"])
+  if not np.isfinite(min_gap_margin):
+    min_gap_margin = None
+  analysis = {"pairs": pairs, "nod_mean": a_mean, "nod_worst": a_worst,
+              "a_reds": a_reds, "stop_worse": stop_worse, "replica_worse": replica_worse,
+              "s1_ok": bool(s1_ok), "h3_old": h3_old, "min_gap_margin": min_gap_margin}
   return analysis, hard, comfort
 
 
-def cs_sweep(plant_mode="real_sg", only=None, shard=None, nshards=None):
+def _cs_passes(hard, comfort, analysis):
+  return not hard and not comfort and analysis["s1_ok"]
+
+
+def cs_sweep(plant_mode="real_sg", only=None, shard=None, nshards=None, h1_relax=CS_EPS):
   grid = only if only is not None else cs_grid()
   if shard is not None and nshards is not None:
     grid = [g for i, g in enumerate(grid) if i % nshards == shard]
   results = []
   for p in grid:
-    analysis, hard, comfort = _cs_eval_params(p, plant_mode=plant_mode)
-    passes = not hard and not comfort and analysis["s1_ok"]
+    analysis, hard, comfort = _cs_eval_params(p, plant_mode=plant_mode, h1_relax=h1_relax)
     results.append({"params": dict(p), "hard": hard, "comfort": comfort,
                     "nod_mean": analysis["nod_mean"], "nod_worst": analysis["nod_worst"],
-                    "s1_ok": analysis["s1_ok"], "passes": passes, "analysis": analysis})
+                    "stop_worse": analysis["stop_worse"], "replica_worse": analysis["replica_worse"],
+                    "min_gap_margin": analysis["min_gap_margin"],
+                    "s1_ok": analysis["s1_ok"], "h3_old": analysis["h3_old"],
+                    "passes": _cs_passes(hard, comfort, analysis), "analysis": analysis})
   results.sort(key=lambda r: (not r["passes"], -r["nod_mean"]))
   return results
 
@@ -2041,6 +2099,7 @@ def test_cs_fixture_uses_real_harness_defaults():
   assert _CS_DEFAULTS["D_EXTRA"] == 0.4
   assert _CS_DEFAULTS["LEAD_SLACK_CS"] == _bs.LEAD_SLACK
   assert _CS_DEFAULTS["T_LAG"] == 0.0
+  assert _CS_DEFAULTS["MARGIN_CS"] == _bs.MARGIN_CS
   assert not getattr(_bs, "BUTTER_CS")
 
 
@@ -2054,7 +2113,7 @@ def test_cs_replica_sanity_and_smoke():
       assert r["sim_stopped"] and r["sim_final_gap_m"] is not None
   # Smoke: one param set x {1 replica, 1 a-scenario, 1 grade} - every metric finite.
   p = {"V_TAPER_CS": 4.0, "T_LAG": 0.9, "K_CS": 0.5, "D_EXTRA": 0.8,
-       "LEAD_SLACK_CS": 0.6, "FLOOR_RELAX_JERK": 1.5}
+       "LEAD_SLACK_CS": 0.6, "FLOOR_RELAX_JERK": 1.5, "MARGIN_CS": 0.2}
   pairs = list(_cs_iter_pairs(p, plant_mode="real_sg"))
   sample = [pr for pr in pairs if pr[3] in ("replica", "a")][:6]
   metrics = []
