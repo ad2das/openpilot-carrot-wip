@@ -5,9 +5,13 @@
 # Contains public repo code and public packages only: no datasets, keys, logs or
 # private paths. The pod is the only thing that talks to the pr-fork remote.
 #
-# Build context is the checked-out ad2das/openpilot-carrot-wip tree (see
-# .github/workflows/opsim-image.yml), including .git so the pod can fetch.
+# Build context is the opsim-image branch (this Dockerfile). The carrot-wip
+# checkout is cloned at build time into ${OPENPILOT}, with .git kept so the pod
+# can `git fetch pr-fork <ref>` incrementally.
 FROM ubuntu:24.04
+
+ARG OPENPILOT_REF=carrot-wip
+ARG OPENPILOT_REPO=https://github.com/ad2das/openpilot-carrot-wip.git
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_VERSION=0.13.1 \
@@ -36,22 +40,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN curl -LsSf https://astral.sh/uv/install.sh | UV_INSTALL_DIR=/usr/local/bin sh \
     && uv --version
 
-# Copy the built-context checkout (includes .git for later incremental fetch).
-COPY . ${OPENPILOT}
+# Clone the requested carrot-wip ref (keep .git for incremental fetch on the pod).
+RUN git clone --branch "${OPENPILOT_REF}" "${OPENPILOT_REPO}" "${OPENPILOT}" \
+    && cd "${OPENPILOT}" && git log -1 --oneline
+
 WORKDIR ${OPENPILOT}
 
 # System + python deps, then a full scons build so the checkout ships prebuilt.
 RUN ln -sf /usr/bin/python3 /usr/local/bin/python && \
     uv sync --frozen --all-extras && \
     .venv/bin/python -c "import numpy, capnp; print('venv ok')" && \
-    scons -j"$(nproc)" || scons
+    scons -j"$(nproc)"
 
 # SSH for the pod; root login with injected keys (RunPod supplies PUBLIC_KEY).
 RUN mkdir -p /var/run/sshd /root/.ssh && chmod 700 /root/.ssh && \
     sed -i 's/#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && \
     sed -i 's/#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config
 
-# Entrypoint: install RunPod's injected PUBLIC_KEY, start sshd, keep the pod alive.
 COPY tools/opsim/pod-entrypoint.sh /usr/local/bin/pod-entrypoint.sh
 RUN chmod +x /usr/local/bin/pod-entrypoint.sh
 
