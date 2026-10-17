@@ -22,10 +22,16 @@ def main():
   follow = next(m for m in H.create_maneuvers({"e2e": False, "force_decel": False})
                 if m.title.startswith("steady state following a car at 20m/s, then lead decel to 0mph at 2m/s^2"))
 
-  sets = [
-    {"DELAY_LO": 0.5, "V_LO": 2.0, "A_REQ_MAX": 0.8, "MARGIN_SD": 0.3, "APPLY_TO_LATCH": False},
-    {"DELAY_LO": 0.65, "V_LO": 3.0, "A_REQ_MAX": 1.0, "MARGIN_SD": 0.6, "APPLY_TO_LATCH": True},
-  ]
+  # Default: one briefed set (V_LO 8.0 / DELAY_LO 0.65 / A_REQ_MAX 1.0 / M 0.3).
+  # Override any axis with SD_SMOKE_* env vars.
+  p = {
+    "DELAY_LO": float(os.environ.get("SD_SMOKE_DELAY_LO", 0.65)),
+    "V_LO": float(os.environ.get("SD_SMOKE_V_LO", 8.0)),
+    "A_REQ_MAX": float(os.environ.get("SD_SMOKE_A_REQ_MAX", 1.0)),
+    "MARGIN_SD": float(os.environ.get("SD_SMOKE_MARGIN_SD", 0.3)),
+    "APPLY_TO_LATCH": os.environ.get("SD_SMOKE_APPLY_TO_LATCH", "0") == "1",
+  }
+  sets = [p]
 
   print("=== SD H0 (disabled == landed) ===")
   for row in H.sd_h0_check():
@@ -46,7 +52,8 @@ def main():
     print(f"--- set {p} passes={passes} s1a={analysis['s1a_ok']} "
           f"s1a_mean={analysis['s1a_mean']:.4f} s1b={analysis['s1b_ok']} "
           f"stop_worse={analysis['stop_worse']:.4f} hard={len(hard)} comfort={len(comfort)}")
-    sample = ["stopped lead 40 km/h gap 60 m", "b1", "replica 445@7.27", follow.title]
+    sample = ["stopped lead 40 km/h gap 60 m", "b1", "replica 445@7.27",
+              "replica 445@8.52", "replica 44c@6.21", follow.title]
     for nm in sample:
       if nm not in by_name:
         continue
@@ -59,6 +66,14 @@ def main():
         if v is None:
           continue
         assert math.isfinite(v), f"{nm}:{k}={v} not finite"
+      # Follow scenarios must keep the stop-phase weight at 0.
+      if cls == "follow":
+        assert sdrow.get("w_max", 0.0) == 0.0, f"follow {nm} weight activated: {sdrow.get('w_max')}"
+    # Per-set nod table (B1 vs set).
+    nr = analysis["nod_report"]
+    print("SD NOD " + " ".join(
+      f"{k}:[{nr[k]['b1']}->{nr[k]['sd']}]" for k in nr if k.startswith("replica") or k == "b1"))
+    print(f"SD NOD a_group:[{nr['a_group']['b1']}->{nr['a_group']['sd']}]")
     print(f"SD {len(hard)} hard / {len(comfort)} comfort: "
           f"{(hard + comfort)[:3]}")
 

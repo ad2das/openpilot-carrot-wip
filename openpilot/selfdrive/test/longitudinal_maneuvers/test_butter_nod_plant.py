@@ -2164,6 +2164,12 @@ def _ad_metrics(trace, tag):
        "action_t": float(np.nanmax([r.get("action_t", np.nan) for r in trace])) if trace else None}
   if finite.any():
     m["min_gap_m"] = round(float(np.nanmin(gap)), 3)
+  # Private per-step traces (stripped from serialized rows); used by the SD H0
+  # identity check to compare the disabled SD path against the landed AD path.
+  m["_t"] = t
+  m["_v"] = v
+  m["_out"] = cmd
+  m["_plant"] = a
   if t.size > 1:
     jp = np.abs(np.gradient(a, t))
     m["peak_jerk_plant"] = round(float(np.nanmax(jp)) if np.isfinite(jp).any() else 0.0, 4)
@@ -2442,7 +2448,7 @@ import openpilot.selfdrive.controls.lib.stop_delay as _sd  # noqa: E402
 
 SD_GRID = {
   "DELAY_LO": [0.4, 0.5, 0.65, 0.8],
-  "V_LO": [1.0, 2.0, 3.0],
+  "V_LO": [1.0, 2.0, 3.0, 5.0, 8.0],
   "A_REQ_MAX": [0.6, 0.8, 1.0],
   "MARGIN_SD": [0.3, 0.6],
   "APPLY_TO_LATCH": [False, True],
@@ -2656,15 +2662,25 @@ def _sd_speed_phase_identity(b1, sd):
 def _sd_pair_failures(b1, sd, cls):
   out = []
   if cls == "stop":
-    if sd["final_gap_m"] is not None:
-      if sd["final_gap_m"] < SD_GAP_ABS - 1e-9:
-        out.append(f"H1 abs final gap {sd['final_gap_m']} < {SD_GAP_ABS}")
-    if sd["min_gap_m"] is not None:
-      if sd["min_gap_m"] < SD_GAP_ABS - 1e-9:
-        out.append(f"H1 abs min gap {sd['min_gap_m']} < {SD_GAP_ABS}")
-    if b1["final_gap_m"] is not None and sd["final_gap_m"] is not None:
-      if sd["final_gap_m"] < b1["final_gap_m"] - SD_GAP_CLOSER:
-        out.append(f"H1 closer {sd['final_gap_m']} < b1 {b1['final_gap_m']}-{SD_GAP_CLOSER}")
+    # H1 abs floor (option b): the >= 3.0 m absolute floor applies where B1
+    # itself reaches it; where B1 < 3.0 (short-gap scenarios) require no closer
+    # than B1 - 0.005 (the d_avail guard should keep w = 0 there).
+    b1_f, b1_m = b1["final_gap_m"], b1["min_gap_m"]
+    if b1_f is not None and sd["final_gap_m"] is not None:
+      if b1_f >= SD_GAP_ABS - 1e-9:
+        if sd["final_gap_m"] < SD_GAP_ABS - 1e-9:
+          out.append(f"H1 abs final gap {sd['final_gap_m']} < {SD_GAP_ABS}")
+      elif sd["final_gap_m"] < b1_f - SD_EPS:
+        out.append(f"H1 final gap {sd['final_gap_m']} < b1 {b1_f}-{SD_EPS}")
+    if b1_m is not None and sd["min_gap_m"] is not None:
+      if b1_m >= SD_GAP_ABS - 1e-9:
+        if sd["min_gap_m"] < SD_GAP_ABS - 1e-9:
+          out.append(f"H1 abs min gap {sd['min_gap_m']} < {SD_GAP_ABS}")
+      elif sd["min_gap_m"] < b1_m - SD_EPS:
+        out.append(f"H1 min gap {sd['min_gap_m']} < b1 {b1_m}-{SD_EPS}")
+    if b1_f is not None and sd["final_gap_m"] is not None:
+      if sd["final_gap_m"] < b1_f - SD_GAP_CLOSER:
+        out.append(f"H1 closer {sd['final_gap_m']} < b1 {b1_f}-{SD_GAP_CLOSER}")
     if b1["post_stop_travel"] is not None and sd["post_stop_travel"] is not None:
       if sd["post_stop_travel"] > b1["post_stop_travel"] + SD_POST_STOP_M + 1e-9:
         out.append(f"H4 post_stop {sd['post_stop_travel']} > b1 {b1['post_stop_travel']}+{SD_POST_STOP_M}")
@@ -2685,7 +2701,7 @@ def _sd_pair_failures(b1, sd, cls):
     out.append(f"H2 collision min_gap={sd['min_gap_m']}")
   if sd["fcw_steps"] > b1["fcw_steps"]:
     out.append(f"H2 fcw {sd['fcw_steps']} > b1 {b1['fcw_steps']}")
-  # H3 for follow scenarios.
+  # H3 for follow scenarios: min gap / TTC >= B1 - 0.005 and must not end closer.
   if cls == "follow":
     if b1["min_gap_m"] is not None and sd["min_gap_m"] is not None:
       if sd["min_gap_m"] < b1["min_gap_m"] - SD_EPS:
@@ -2693,6 +2709,9 @@ def _sd_pair_failures(b1, sd, cls):
     if b1["min_ttc"] is not None and sd["min_ttc"] is not None:
       if sd["min_ttc"] < b1["min_ttc"] - SD_EPS:
         out.append(f"H3 follow min_ttc {sd['min_ttc']} < b1 {b1['min_ttc']}")
+    if b1["final_gap_m"] is not None and sd["final_gap_m"] is not None:
+      if sd["final_gap_m"] < b1["final_gap_m"] - SD_EPS:
+        out.append(f"H3 follow final_gap {sd['final_gap_m']} < b1 {b1['final_gap_m']}")
   return out
 
 
@@ -2729,6 +2748,26 @@ def _sd_nod_groups(pairs):
   return big, mean, stop_worse
 
 
+def _sd_nod_report(pairs):
+  """Per-set B1 vs set nod_swing for the named replicas, b1, and the a-group mean."""
+  wanted = [f"replica {k}" for k in ("445@7.27", "445@8.52", "44c@6.21")] + ["b1"]
+  report = {}
+  for nm in wanted:
+    report[nm] = None
+  a_b1, a_sd = [], []
+  for name, b1, sd, cls in pairs:
+    if name in report and b1["nod_swing"] is not None and sd["nod_swing"] is not None:
+      report[name] = {"b1": b1["nod_swing"], "sd": sd["nod_swing"]}
+    if b1["group"] == "a" and b1["nod_swing"] is not None and sd["nod_swing"] is not None:
+      a_b1.append(b1["nod_swing"])
+      a_sd.append(sd["nod_swing"])
+  report["a_group"] = {
+    "b1": round(float(np.mean(a_b1)), 4) if a_b1 else None,
+    "sd": round(float(np.mean(a_sd)), 4) if a_sd else None,
+  }
+  return report
+
+
 def _sd_eval_params(p, plant_mode="real_sg", b1_cache=None, specs=None):
   if specs is None:
     specs = _sd_build_specs(plant_mode)
@@ -2754,6 +2793,7 @@ def _sd_eval_params(p, plant_mode="real_sg", b1_cache=None, specs=None):
   big, mean, stop_worse = _sd_nod_groups(pairs)
   s1a_ok = mean >= SD_NOD_REDUCE
   s1b_ok = stop_worse <= SD_NOD_WORSE + 1e-9
+  nod_report = _sd_nod_report(pairs)
   min_final = float("inf")
   for _n, _b1, sd, cls in pairs:
     if cls == "stop" and sd["final_gap_m"] is not None:
@@ -2761,7 +2801,8 @@ def _sd_eval_params(p, plant_mode="real_sg", b1_cache=None, specs=None):
   if not np.isfinite(min_final):
     min_final = None
   analysis = {"pairs": pairs, "big_nod": big, "s1a_mean": mean, "stop_worse": stop_worse,
-              "s1a_ok": bool(s1a_ok), "s1b_ok": bool(s1b_ok), "min_final_gap": min_final}
+              "s1a_ok": bool(s1a_ok), "s1b_ok": bool(s1b_ok), "min_final_gap": min_final,
+              "nod_report": nod_report}
   passes = (not hard) and (not comfort) and s1a_ok and s1b_ok
   return analysis, hard, comfort, passes
 
@@ -2799,54 +2840,37 @@ def sd_sweep(plant_mode="real_sg", only=None, shard=None, nshards=None):
 def sd_h0_check(plant_mode="real_sg"):
   """H0: STOP_DELAY_ENABLED False is bit-identical to the landed (AD) path.
 
-  Runs a few representative scenarios through the SD builder with the module
-  disabled and through the AD builder at the same base delay, and compares the
-  per-step command/plant/vehicle traces exactly.
+  Runs EVERY scenario+variant once through the SD builder with the module
+  disabled and through the landed AD builder at the same base delay, and
+  compares the per-step command/plant/vehicle traces exactly. Returns a list of
+  {"name", "identical"} rows; the sweep aborts if any is not identical.
   """
-  fixture = load_fixture("b1")
-  _d, stops = load_stops()
-  man40 = next(m for g, m in _CASES if m.title == "stopped lead 40 km/h gap 60 m")
-
-  def _rep_factory():
-    pr = RealStopReplicaProfile(_cs_find_stop(stops, "445@7.27"))
-    loop = _RealFixtureLoop({}, pr, _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)
-    loop.fixed_a_grade = pr.grade
-    return loop
-
-  checks = [
-    ("a:stopped lead 40 km/h gap 60 m",
-     lambda: _RealScenarioLoop(man40, 1, _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)),
-    ("b1",
-     lambda: _RealFixtureLoop(dict(fixture.get("params")), FixtureProfile(fixture),
-                              _cs_plant(None), plant_mode=plant_mode, grade_rad=0.0)),
-    ("replica 445@7.27", _rep_factory),
-  ]
+  ad_cache = ad_b1_cache(_ad_build_specs())          # landed path at delay 0.25
+  sd_restore_defaults()
+  sd_cache = _sd_b1_cache(_sd_build_specs(plant_mode))  # SD path, module disabled
   out = []
-  for name, loop_factory in checks:
-    identical = _sd_trace_identical_to_ad(loop_factory, plant_mode)
-    out.append({"name": name, "identical": identical})
+  for name in ad_cache:
+    ad_row = ad_cache.get(name)
+    sd_row = sd_cache.get(name)
+    if ad_row is None or sd_row is None:
+      out.append({"name": name, "identical": False, "skipped": True})
+      continue
+    out.append({"name": name, "identical": _sd_rows_trace_identical(sd_row, ad_row)})
   return out
 
 
-def _sd_trace_identical_to_ad(loop_factory, plant_mode="real_sg"):
-  """Run the same loop through SD (disabled) and AD builders; compare traces."""
-  sd_restore_defaults()
-  loop = loop_factory()
-  sd_trace = _sd_run(loop)
-  loop2 = loop_factory()
-  loop2._trace = []
-  params = Params()
-  _ad_apply(loop2, params, SD_B1_DELAY)
-  loop2.run()
-  ad_trace = loop2._trace
-  if len(sd_trace) != len(ad_trace):
-    return False
-  for rs, ra in zip(sd_trace, ad_trace):
-    for k in ("out", "plant_a", "v", "action_t"):
-      a, b = rs.get(k), ra.get(k)
-      if a == b:
-        continue
-      if isinstance(a, float) and isinstance(b, float) and np.isnan(a) and np.isnan(b):
-        continue
+def _sd_rows_trace_identical(sd_row, ad_row):
+  """Compare the SD builder (disabled) row against the landed AD row traces."""
+  for k in ("_out", "_plant", "_v", "_t"):
+    a, b = sd_row.get(k), ad_row.get(k)
+    if a is None or b is None:
+      if a is not None or b is not None:
+        return False
+      continue
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if a.shape != b.shape:
+      return False
+    if not np.array_equal(a, b):
       return False
   return True

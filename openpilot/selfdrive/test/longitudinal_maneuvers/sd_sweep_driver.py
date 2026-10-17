@@ -32,6 +32,7 @@ def _serialize(p, analysis, hard, comfort, passes):
     "stop_worse": analysis["stop_worse"],
     "min_final_gap": analysis["min_final_gap"],
     "s1a_ok": analysis["s1a_ok"],
+    "nod_report": analysis.get("nod_report", {}),
     "big_nod": [[n, round(r, 5)] for n, r in analysis["big_nod"]],
     "pairs": [{"name": n, "group": b1.get("group"), "class": cls,
                "b1": _clean(b1), "sd": _clean(sd)} for n, b1, sd, cls in analysis["pairs"]],
@@ -81,14 +82,21 @@ def _histogram(results):
 
 
 def main():
-  nproc = int(sys.argv[1]) if len(sys.argv) > 1 else 16
+  nproc = int(sys.argv[1]) if len(sys.argv) > 1 else 8
   out_path = os.environ.get("BUTTER_SD_OUT", "/tmp/stop_delay.json")
   plant_mode = os.environ.get("BUTTER_SD_PLANT", "real_sg")
   t0 = time.monotonic()
 
+  # Stage 0: H0 identity over EVERY scenario+variant; abort the whole job on any
+  # mismatch (the sweep would be meaningless on top of a broken off path).
   h0 = H.sd_h0_check(plant_mode=plant_mode)
-  h0_ok = all(r["identical"] for r in h0)
-  print(f"NOD-SD-H0 ok={h0_ok} rows={h0}", flush=True)
+  h0_bad = [r for r in h0 if not r.get("identical")]
+  h0_ok = not h0_bad
+  print(f"NOD-SD-H0 ok={h0_ok} n={len(h0)} bad={len(h0_bad)} "
+        f"{h0_bad[:5]}", flush=True)
+  if not h0_ok:
+    print("NOD-SD-ABORT H0 identity failed", flush=True)
+    sys.exit(2)
 
   grid = H.sd_grid()
   with mp.Pool(nproc) as pool:
@@ -117,29 +125,32 @@ def main():
   print(f"NOD-SD-DET ok={det_ok} sets={len(serial)}", flush=True)
 
   chosen = passing[0] if passing else None
+  all_results = [{"params": r["params"], "s1a_mean": round(r["s1a_mean"], 5),
+                  "min_final_gap": r["min_final_gap"], "s1b_ok": r["s1b_ok"],
+                  "stop_worse": round(r["stop_worse"], 5) if r["stop_worse"] != float("-inf") else None,
+                  "passes": r["passes"], "nod_report": r["nod_report"],
+                  "nfail": len(r["hard"]) + len(r["comfort"]) + (0 if r["s1b_ok"] else 1),
+                  "hard": r["hard"], "comfort": r["comfort"]}
+                 for r in results]
   table = {
     "plant_real": H.PLANT_REAL,
     "b1_delay": H.SD_B1_DELAY,
     "grid": {**H.SD_GRID, "n_combo": len(results), "V_FADE": H.SD_V_FADE,
              "SLEW_UP": H.SD_SLEW_UP},
-    "h0_ok": h0_ok, "h0": h0,
+    "h0_ok": h0_ok, "h0_bad": h0_bad,
     "determinism_ok": det_ok,
     "npassing": len(passing),
     "chosen": None if chosen is None else {"params": chosen["params"],
                                            "s1a_mean": round(chosen["s1a_mean"], 6),
                                            "min_final_gap": chosen["min_final_gap"],
+                                           "nod_report": chosen["nod_report"],
                                            "pairs": chosen["pairs"]},
     "top5": [{"params": r["params"], "s1a_mean": round(r["s1a_mean"], 6),
               "min_final_gap": r["min_final_gap"], "passes": r["passes"],
+              "nod_report": r["nod_report"],
               "hard": r["hard"][:5], "comfort": r["comfort"][:5], "s1b_ok": r["s1b_ok"]}
              for r in sorted(results, key=lambda r: rank(r))[:5]],
-    "all_results": [{"params": r["params"], "s1a_mean": round(r["s1a_mean"], 5),
-                     "min_final_gap": r["min_final_gap"], "s1b_ok": r["s1b_ok"],
-                     "stop_worse": round(r["stop_worse"], 5) if r["stop_worse"] != float("-inf") else None,
-                     "passes": r["passes"],
-                     "nfail": len(r["hard"]) + len(r["comfort"]) + (0 if r["s1b_ok"] else 1),
-                     "hard": r["hard"], "comfort": r["comfort"]}
-                    for r in results],
+    "all_results": all_results,
     "histogram": _histogram(results),
     "note": "desktop closed-loop simulation only; no vehicle validation",
   }
@@ -153,6 +164,10 @@ def main():
     print(f"NOD-SD-TOP{i} s1a={r['s1a_mean']:.4f} min_final={r['min_final_gap']} "
           f"passes={r['passes']} hard={len(r['hard'])} comfort={len(r['comfort'])} "
           f"params={r['params']}")
+    nr = r["nod_report"]
+    print(f"NOD-SD-TOP{i}-NOD " + " ".join(
+      f"{k}:b1={nr[k]['b1'] if nr.get(k) else None}->sd={nr[k]['sd'] if nr.get(k) else None}"
+      for k in ("replica 445@7.27", "replica 445@8.52", "replica 44c@6.21", "b1")))
   if chosen is None:
     print("NOD-SD-RESULT no set passed all gates")
   else:
