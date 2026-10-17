@@ -81,12 +81,22 @@ if "acados" not in sys.modules:
   sys.modules.setdefault("acados", acados_module)
   sys.modules.setdefault("acados.acados_template", acados_template_module)
 
+# Only substitute the generated solver when the real one is unavailable (e.g. a
+# Windows host without the compiled c_generated_code). Registering the stub
+# unconditionally would poison the module for every later test that imports the
+# real acados solver in the same process.
 _generated_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code")
 _generated_module.__path__ = []
-_solver_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx")
-_solver_module.AcadosOcpSolverCython = None
-sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code", _generated_module)
-sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
+try:
+  import openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx as _real_solver  # noqa: F401
+  _HAVE_REAL_SOLVER = getattr(_real_solver, "AcadosOcpSolverCython", None) is not None
+except Exception:
+  _HAVE_REAL_SOLVER = False
+if not _HAVE_REAL_SOLVER:
+  _solver_module = ModuleType("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx")
+  _solver_module.AcadosOcpSolverCython = None
+  sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code", _generated_module)
+  sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
 
 import openpilot.selfdrive.controls.lib.longcontrol as lc
 from openpilot.selfdrive.controls.lib import butter_stop
@@ -918,3 +928,121 @@ def test_state_sequence_identical_on_vs_off_but_output_differs(monkeypatch):
     if on_out != off_out:
       outputs_differ = True
   assert outputs_differ, "ButterStop=1 must change the stopping output somewhere"
+
+# ---------------------------------------------------------------------------
+# Chauffeur Stop (CS): lag-compensated taper
+# ---------------------------------------------------------------------------
+
+from openpilot.selfdrive.controls.lib.butter_stop import (  # noqa: E402
+  BUTTER_CS, K_CS, LEAD_SLACK_CS, T_LAG, V_TAPER_CS, butter_eligible_cs, butter_floor_cs,
+)
+import openpilot.selfdrive.controls.lib.butter_stop as _bs  # noqa: E402
+
+
+def _cs_plan(stop_v=2.0, plan_t=None):
+  plan_t = PLAN_T if plan_t is None else plan_t
+  return np.maximum(0.0, stop_v * (1.0 - plan_t / 2.0))
+
+
+def test_cs_prediction_math_v_p_and_d_lag(monkeypatch):
+  monkeypatch.setattr(_bs, "T_LAG", 1.0)
+  monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
+  monkeypatch.setattr(_bs, "K_CS", 0.5)
+  speeds = _cs_plan()
+  diag = {}
+  butter_floor_cs(2.0, -1.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5, diag=diag)
+  # a = -1, tau = 1: v_p = 2 - 1 = 1, d_lag = 2*1 + 0.5*(-1)*1 = 1.5
+  assert diag["v_p"] == pytest.approx(1.0)
+  assert diag["d_lag"] == pytest.approx(1.5)
+
+
+def test_cs_v_p_zero_branch_when_stopping_inside_lag(monkeypatch):
+  monkeypatch.setattr(_bs, "T_LAG", 1.0)
+  monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
+  speeds = _cs_plan()
+  diag = {}
+  # a = -5 over 1 s from v=2 stops inside the lag: v_p = 0, d_lag = v^2/(2|a|) = 0.4
+  floor = butter_floor_cs(2.0, -5.0, PLAN_T, speeds, SimpleNamespace(status=False), 5.5, diag=diag)
+  assert diag["v_p"] == 0.0
+  assert diag["d_lag"] == pytest.approx(0.4)
+  assert floor == pytest.approx(-A_MIN)
+
+
+def test_cs_none_when_no_room(monkeypatch):
+  monkeypatch.setattr(_bs, "T_LAG", 1.0)
+  monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
+  # The lag alone eats all the slack.
+  t = np.array([0.0, 0.1])
+  speeds = np.array([2.0, 0.0])
+  assert butter_floor_cs(2.0, -1.0, t, speeds, SimpleNamespace(status=False), 5.5) is None
+
+
+def test_cs_floor_never_positive(monkeypatch):
+  rng = np.random.default_rng(7)
+  for _ in range(200):
+    v = float(rng.uniform(0.06, 4.99))
+    a = float(rng.uniform(-3.0, 1.0))
+    speeds = np.maximum(0.0, v * (1.0 - PLAN_T / float(rng.uniform(1.5, 5.0))))
+    floor = butter_floor_cs(v, a, PLAN_T, speeds, SimpleNamespace(status=False),
+                            float(rng.uniform(3.0, 10.0)))
+    assert floor is None or floor <= 0.0
+
+
+def test_cs_parity_with_b1_at_default_params(monkeypatch):
+  monkeypatch.setattr(_bs, "T_LAG", 0.0)
+  monkeypatch.setattr(_bs, "V_TAPER_CS", _bs.V_TAPER)
+  monkeypatch.setattr(_bs, "K_CS", _bs.K_TAPER)
+  monkeypatch.setattr(_bs, "LEAD_SLACK_CS", _bs.LEAD_SLACK)
+  rng = np.random.default_rng(3)
+  for _ in range(400):
+    v = float(rng.uniform(0.05, 3.05))
+    a = float(rng.uniform(-3.0, 1.0))
+    speeds = np.maximum(0.0, v * (1.0 - PLAN_T / float(rng.uniform(1.5, 6.0))))
+    stop_d = float(rng.uniform(3.0, 9.0))
+    lead_ok = rng.random() < 0.5
+    lead = SimpleNamespace(status=lead_ok, dRel=float(rng.uniform(3.0, 20.0)))
+    d_eff = float(rng.uniform(3.0, 20.0)) if lead_ok else None
+    b1 = butter_floor(v, PLAN_T, speeds, lead, stop_d, d_rel_eff=d_eff)
+    cs = butter_floor_cs(v, a, PLAN_T, speeds, lead, stop_d, d_rel_eff=d_eff)
+    if b1 is None:
+      assert cs is None, (v, a, stop_d, lead.dRel if lead_ok else None, cs)
+    else:
+      assert cs == pytest.approx(b1, abs=1e-12), (v, a, stop_d, b1, cs)
+
+
+def test_cs_eligibility_uses_v_taper_cs(monkeypatch):
+  monkeypatch.setattr(_bs, "V_TAPER_CS", 5.0)
+  monkeypatch.setattr(_bs, "V_TAPER", 3.0)
+  lead = SimpleNamespace(status=False, dRel=float("nan"), aLeadK=0.0, vLead=0.0)
+  # v between V_TAPER and V_TAPER_CS is eligible for CS, not for B1.
+  assert butter_eligible_cs(True, 4.0, False, False, False, 0.0, lead) is True
+  assert butter_eligible(True, 4.0, False, False, False, 0.0, lead) is False
+
+
+def test_cs_longcontrol_flag_off_uses_b1(monkeypatch):
+  monkeypatch.setattr(_bs, "BUTTER_CS", False)
+  control, _ = make_control(monkeypatch)
+  assert not getattr(_bs, "BUTTER_CS")
+  # A plan-driven stop at low speed: B1 floor present, not CS.
+  v_profile, age = _scenario_stream()
+  saw_floor = False
+  for frame in range(len(v_profile)):
+    active, cs, plan, radar = _frame_inputs(frame, v_profile)
+    control.update(active, cs, plan, (-3.5, 2.0), age, radar)
+    if control.butter_floor_raw_last is not None:
+      saw_floor = True
+  assert saw_floor
+
+
+def test_cs_butter_off_identical(monkeypatch):
+  monkeypatch.setattr(_bs, "BUTTER_CS", True)
+  monkeypatch.setattr(_bs, "T_LAG", 1.0)
+  off, _ = make_control(monkeypatch, values={"ButterStop": 0})
+  legacy, _ = make_control(monkeypatch, values={"ButterStop": 0})
+  assert not off.butter_stop
+  v_profile, age = _scenario_stream()
+  for frame in range(len(v_profile)):
+    active, cs, plan, radar = _frame_inputs(frame, v_profile)
+    expected = legacy_update(legacy, active, cs, plan, (-3.5, 2.0), age, radar)
+    actual = off.update(active, cs, plan, (-3.5, 2.0), age, radar)
+    assert actual[0] == expected[0]

@@ -26,6 +26,18 @@ A_MAX = 1.0          # above this the taper is no softer than stock -> plan wins
 D_EXTRA = 0.4        # MPC stop-point shift (m) when ButterStop is on
 MARGIN = 0.0         # distance kept unused at the end of the slack (m)
 LEAD_SLACK = 1.2     # lead bound: final gap >= max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+
+# Chauffeur Stop (CS): lag-compensated taper. The taper is evaluated one plant
+# lag ahead and the distance the commanded accel still spends is banked, so the
+# ease reaches the wheels before the stop. The defaults are chosen to reproduce
+# the landed ButterStop (B1) bit-identically: T_LAG=0 means no prediction, and
+# the other slopes/slack match their B1 counterparts. The CP-H2 sweep patches
+# these at run time.
+V_TAPER_CS = 3.0     # eligibility/floor taper ceiling (replaces V_TAPER for CS)
+T_LAG = 0.0          # plant lag predicted ahead (s); 0 == B1 (no prediction)
+K_CS = 0.5           # CS taper slope (== K_TAPER at parity)
+LEAD_SLACK_CS = 1.2  # CS lead-bound slack (replaces LEAD_SLACK in the CS floor)
+BUTTER_CS = False    # when True, LongControl uses butter_floor_cs; else butter_floor
 SOLVE_ITERS = 30
 LEAD_JUMP_M = 1.5      # raw-lead jump that forces a filter reset (m)
 LEAD_RAW_ALLOW = 0.5   # d_eff may never exceed raw dRel by more than this (m)
@@ -209,13 +221,119 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff
   return -(a_end + K_TAPER * v_ego)
 
 
+def _cta_avail(plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff, lead_slack):
+  """Shared CS/B1 taper budget: min(plan + D_EXTRA - MARGIN, lead bound).
+
+  Returns (avail, bound) or (None, None) when there is no planned stop / a
+  non-finite lead gap. The lead bound is d_rel - max(MIN_FINAL_GAP_ABS,
+  stop_distance_orig - lead_slack); lead_slack is LEAD_SLACK for B1 and
+  LEAD_SLACK_CS for CS.
+  """
+  if stop_distance_orig is None or not math.isfinite(stop_distance_orig) or stop_distance_orig < 0.0:
+    return None, None
+  dist = plan_stop_distance(plan_t, plan_speeds)
+  if dist is None:
+    return None, None
+  avail = dist + D_EXTRA - MARGIN
+  bound = "plan"
+  if lead is not None and getattr(lead, "status", False):
+    if d_rel_eff is not None:
+      try:
+        d_rel = float(d_rel_eff)
+      except (TypeError, ValueError):
+        return None, None
+    else:
+      try:
+        d_rel = float(lead.dRel)
+      except (TypeError, ValueError, AttributeError):
+        return None, None
+    if not math.isfinite(d_rel):
+      return None, None
+    lead_avail = d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - lead_slack)
+    if lead_avail < avail:
+      bound = "lead"
+    avail = min(avail, lead_avail)
+  return avail, bound
+
+
+def butter_floor_cs(v_ego, a_ego, plan_t, plan_speeds, lead, stop_distance_orig,
+                    d_rel_eff=None, diag=None):
+  """Lag-compensated taper floor (Chauffeur Stop), or None to let the plan win.
+
+  The eater evaluates the taper at the PREDICTED speed one plant lag
+  (T_LAG) ahead and subtracts the distance the current accel still spends in
+  that lag, so the commanded ease reaches the wheels before the car stops. With
+  T_LAG == 0 and V_TAPER_CS/K_CS/LEAD_SLACK_CS equal to their B1 counterparts
+  this reproduces butter_floor exactly (bit-identical parity).
+
+  a_ego is the currently applied accel; only the braking part (min(a_ego, 0)) is
+  used for the prediction so the floor never assumes the car accelerates.
+  """
+  if diag is not None:
+    diag["bound"] = None
+    diag["a_end"] = None
+    diag["v_p"] = None
+    diag["d_lag"] = None
+    diag["avail_cs"] = None
+  if not math.isfinite(v_ego) or v_ego <= 0.0:
+    return None
+  avail, bound = _cta_avail(plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff,
+                            LEAD_SLACK_CS)
+  if avail is None:
+    return None
+  # Lag prediction: where will v be one lag ahead, and how far does the car
+  # still travel while a = min(a_ego, 0) acts over T_LAG?
+  try:
+    a = min(float(a_ego), 0.0) if a_ego is not None and math.isfinite(float(a_ego)) else 0.0
+  except (TypeError, ValueError):
+    a = 0.0
+  tau = T_LAG
+  if v_ego + a * tau > 0.0:
+    d_lag = v_ego * tau + 0.5 * a * tau * tau
+    v_p = v_ego + a * tau
+  else:
+    # The car reaches standstill inside the lag; spend v^2/(2|a|) then hold.
+    d_lag = v_ego * tau if a == 0.0 else v_ego * v_ego / (2.0 * abs(a))
+    v_p = 0.0
+  avail_cs = avail - d_lag
+  if diag is not None:
+    diag["v_p"] = v_p
+    diag["d_lag"] = d_lag
+    diag["avail_cs"] = avail_cs
+  if avail_cs <= AVAIL_MIN:
+    return None
+  if v_p <= STANDSTILL_V:
+    floor = -A_MIN
+  else:
+    a_end = solve_taper_a_end(v_p, avail_cs, K_CS)
+    if a_end is None:
+      return None
+    floor = -(a_end + K_CS * v_p)
+  if diag is not None:
+    diag["bound"] = bound
+    diag["a_end"] = a_end if v_p > STANDSTILL_V else A_MIN
+  return floor
+
+
+def butter_eligible_cs(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan, lead):
+  """CS eligibility: identical to butter_eligible except the taper ceiling."""
+  return butter_eligible_impl(active, v_ego, brake_pressed, gas_pressed, fcw,
+                              t_since_plan, lead, V_TAPER_CS)
+
+
 def butter_eligible(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan, lead):
   """All eligibility gates except plan-array finiteness (checked by butter_floor)."""
+  return butter_eligible_impl(active, v_ego, brake_pressed, gas_pressed, fcw,
+                              t_since_plan, lead, V_TAPER)
+
+
+def butter_eligible_impl(active, v_ego, brake_pressed, gas_pressed, fcw, t_since_plan,
+                         lead, v_taper):
   if not active:
     return False
   if not (math.isfinite(v_ego) and math.isfinite(t_since_plan)):
     return False
-  if not (STANDSTILL_V < v_ego < V_TAPER):
+  if not (STANDSTILL_V < v_ego < v_taper):
     return False
   if brake_pressed or gas_pressed or fcw:
     return False

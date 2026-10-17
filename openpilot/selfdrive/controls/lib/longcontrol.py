@@ -13,7 +13,8 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
   CREEP_ACCEL, CREEP_V, HOLD_RAMP, LeadPosFilter, STANDSTILL_T, STANDSTILL_V,
-  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_eligible_cs, butter_floor,
+  butter_floor_cs,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -150,7 +151,9 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       return None
     lead = getattr(radarState, "leadOne", None) if radarState is not None else None
-    if not butter_eligible(
+    use_cs = bool(getattr(butter_stop_module, "BUTTER_CS", False))
+    eligible = butter_eligible_cs if use_cs else butter_eligible
+    if not eligible(
         active=bool(active), v_ego=v_ego,
         brake_pressed=bool(getattr(CS, "brakePressed", False)),
         gas_pressed=bool(getattr(CS, "gasPressed", False)),
@@ -173,6 +176,10 @@ class LongControl:
         return None
     else:
       self._butter_lead_filter.reset()
+    if use_cs:
+      return butter_floor_cs(v_ego, self.last_output_accel, CONTROL_N_T_IDX, plan_speeds,
+                             lead, self.stop_distance_orig, d_rel_eff=d_eff,
+                             diag=self._butter_diag)
     return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig,
                         d_rel_eff=d_eff, diag=self._butter_diag)
 
