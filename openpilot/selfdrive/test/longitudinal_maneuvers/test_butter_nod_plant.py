@@ -2466,6 +2466,15 @@ SD_BIG_NOD = 0.7             # a stop scenario enters the big-nod group at/above
 SD_BIG_NOD_REPLICAS = ("445@7.27", "445@8.52")
 
 
+def _sd_class_for(name, tag):
+  """Gate class: 'start' (H5), 'follow' (H3 min gap/TTC), else 'stop' (H1/H4).
+
+  Delegates to the AD title-based classifier (c-group lead-decel maneuvers are
+  'follow'; the stopped-car approaches stay 'stop').
+  """
+  return _ad_class_for(name, tag)
+
+
 def sd_grid():
   return [{"DELAY_LO": dl, "V_LO": vl, "A_REQ_MAX": ar, "MARGIN_SD": mg,
            "APPLY_TO_LATCH": bool(at)}
@@ -2556,8 +2565,10 @@ def _sd_build_specs(plant_mode="real_sg"):
   fixture = load_fixture("b1")
 
   for group, maneuver in _CASES:
-    specs.append((maneuver.title, group, "stop",
-                  lambda m=maneuver, g=group: _sd_scenario_row(m, g, g, plant_mode=plant_mode)))
+    cls = _sd_class_for(maneuver.title, group)
+    specs.append((maneuver.title, group, cls,
+                  lambda m=maneuver, g=group, c=cls: _sd_scenario_row(m, g, c,
+                                                                       plant_mode=plant_mode)))
   specs.append(("b1", "b1", "stop",
                 lambda: _sd_fixture_row(FixtureProfile(fixture), "b1", "b1", "b1",
                                         header=fixture.get("params"), plant_mode=plant_mode)))
