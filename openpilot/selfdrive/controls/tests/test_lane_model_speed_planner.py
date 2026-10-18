@@ -29,11 +29,13 @@ class StubLaneCenterBlend:
     self.table = np.zeros(7)
     self.curvature = self.offset = self.w = self.r_dev = 0.0
     self.gates = 0
+    self.recenter_curvature = 0.0
+    self.recenter_active = False
 
   def reset(self):
     pass
 
-  def update(self, *args):
+  def update(self, *args, **kwargs):
     return 0.0
 
 
