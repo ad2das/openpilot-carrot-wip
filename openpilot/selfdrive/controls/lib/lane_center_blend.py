@@ -362,7 +362,9 @@ class LaneCenterBlend:
         sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
         rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
         if self.recenter_latched:
-          if sign_ok and R_OFF <= abs(r0) <= R_MAX and not rate_away and gates == 0 and v_ego >= V_OFF:
+          # The latch survives into the R_OFF..R_ON band so the state does not
+          # chatter, but the output is only ever non-zero at |r0| >= R_ON.
+          if sign_ok and R_ON <= abs(r0) <= R_MAX and not rate_away and gates == 0 and v_ego >= V_OFF:
             y_m = float(np.interp(REC_T_L, t, r))
             dy = (BOOST_S - 1.0) * y_m
             length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
@@ -371,7 +373,7 @@ class LaneCenterBlend:
             weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
             target_k = float(np.clip(k * weight, -k_cap, k_cap))
             active = target_k != 0.0
-          else:
+          if abs(r0) < R_OFF:
             self.recenter_latched = False
         if not self.recenter_latched:
           enter = (R_ON <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
@@ -393,4 +395,6 @@ class LaneCenterBlend:
     if abs(self.recenter_k) < 1e-9:
       self.recenter_k = 0.0
     self.recenter_curvature = self.recenter_k
-    self.recenter_active = bool(active and self.recenter_k != 0.0)
+    # `active` is the intent (assist requested this frame); the curvature itself
+    # can still be slewing down after the intent drops.
+    self.recenter_active = bool(active)
