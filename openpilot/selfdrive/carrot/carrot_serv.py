@@ -22,6 +22,16 @@ from openpilot.common.gps import get_gps_location_service
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
 from openpilot.selfdrive.carrot.tlv.tlvd import LEFT_INTENT_ATCTYPES
 
+try:
+  from openpilot.common.swaglog import cloudlog
+except ImportError:  # PC test environment has no zmq; the vehicle always imports it.
+  class _NullCloudlog:
+    @staticmethod
+    def event(name, **kwargs):
+      pass
+
+  cloudlog = _NullCloudlog()
+
 nav_type_mapping = {
   12: ("turn", "left", 1),
   16: ("turn", "sharp left", 1),
@@ -105,6 +115,10 @@ TLV_GRADED_TRAFFIC_STATE = 4
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
 # Hold a src-1 TLV state for this long since the last accepted message.
 TLV_HOLD_S = 0.8
+# W148: no TLV on expressways (NAVER roadCategory 0 = Expressway, 1 = CityExpressway).
+TLV_HIGHWAY_CATEGORIES = (0, 1)
+TLV_HIGHWAY_FRESH_S = 2.0   # carrotNavi is 2 Hz
+TLV_HIGHWAY_EXIT_S = 5.0    # non-expressway (or stale) this long before TLV comes back
 
 
 def tlv_state_color(state_raw: int, left_intent: bool) -> str | None:
@@ -227,6 +241,11 @@ class CarrotServ:
     self.tlv_hold_until = 0.0   # W143: src-1 TLV state held until this monotonic time
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
+    # W148: expressway gate, fed only by the carrotNavi roadCategory.
+    self.tlv_navi_road_category = None
+    self.tlv_navi_road_category_t = -1e9
+    self.tlv_highway_gate = False
+    self.tlv_highway_clear_since = None
 
     self.left_spd_sec = 100
     self.left_tbt_sec = 100
@@ -403,6 +422,37 @@ class CarrotServ:
     self.traffic_light_q.append((x,y,color,cnf))
 
 
+  def _update_tlv_highway_gate(self, now) -> bool:
+    """W148: True while the navi says the ego is on an expressway.
+
+    Expressways have no signals, so the TLV must not feed carrotMan at all.
+    carrotNavi repeats at 2 Hz; a stale category is treated as non-expressway.
+    Leaving takes TLV_HIGHWAY_EXIT_S so a single missing frame at an exit does
+    not immediately re-enable the TLV.
+    """
+    hwy = (getattr(self, "tlv_navi_road_category", None) in TLV_HIGHWAY_CATEGORIES
+           and now - getattr(self, "tlv_navi_road_category_t", -1e9) <= TLV_HIGHWAY_FRESH_S)
+    if hwy:
+      if not getattr(self, "tlv_highway_gate", False):
+        self.tlv_highway_gate = True
+        self._log_tlv_highway_gate()
+      self.tlv_highway_clear_since = None
+    elif getattr(self, "tlv_highway_gate", False):
+      clear_since = getattr(self, "tlv_highway_clear_since", None)
+      if clear_since is None:
+        clear_since = now
+        self.tlv_highway_clear_since = now
+      if now - clear_since >= TLV_HIGHWAY_EXIT_S:
+        self.tlv_highway_gate = False
+        self.tlv_highway_clear_since = None
+        self._log_tlv_highway_gate()
+    return getattr(self, "tlv_highway_gate", False)
+
+  def _log_tlv_highway_gate(self):
+    category = getattr(self, "tlv_navi_road_category", None)
+    cloudlog.event("tlv_highway_gate", on=bool(self.tlv_highway_gate),
+                   road_category=-99 if category is None else int(category))
+
   def _update_tlv_fusion(self, sm):
     """Feed the confirmed carrotTlv relevant track into the existing traffic_light()
     path (only when TrafficLightDetectMode >= 1; W129: vision is automatic while
@@ -423,6 +473,16 @@ class CarrotServ:
       except Exception:
         self.tlv_detect_mode = 0
     if self.tlv_detect_mode < 1:
+      return
+    # W148: on an expressway the TLV feeds nothing. Clear a held src-1 state so
+    # the coast cap, red stop/hold, starts and the green chime all turn off
+    # together; navi-sourced (src 0) states are not touched.
+    if self._update_tlv_highway_gate(now):
+      if self.traffic_state_src == 1:
+        self.traffic_state = 0
+        self.traffic_state_src = 0
+        self.tlv_hold_until = 0.0
+        self.traffic_light_count = -1
       return
     if not (sm.seen['carrotTlv'] and sm.alive['carrotTlv'] and sm.valid['carrotTlv']):
       return
@@ -1235,6 +1295,11 @@ class CarrotServ:
     if new_session or navi.route.sequence != self.carrot_navi_route_sequence:
       self._apply_carrot_navi_route(navi)
 
+    # W148: record the carrotNavi roadCategory (always, also when None) for the
+    # expressway gate. Do not use self.roadcate: the legacy JSON path defaults it
+    # to 0 and active_carrot <= 1 resets it to 8.
+    self.tlv_navi_road_category = navi.road_category
+    self.tlv_navi_road_category_t = time.monotonic()
     if navi.road_category is not None:
       self.roadcate = navi.road_category
     self._apply_carrot_navi_guidance(navi, force=new_session or off_route_changed)
