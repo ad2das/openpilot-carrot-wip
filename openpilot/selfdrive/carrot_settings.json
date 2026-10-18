@@ -169,7 +169,8 @@
                 "UseLaneLineSpeed",
                 "UseLaneLineCurveSpeed",
                 "AdjustLaneOffset",
-                "LaneCenterBlend"
+                "LaneCenterBlend",
+                "LaneRecenterAssist"
               ]
             },
             {
@@ -2438,6 +2439,22 @@
       "cgroup": "转向",
       "ctitle": "混合模式: 车道居中修正 (0)",
       "cdescr": "0: 关, 1: 开。无车道线模式行驶且两侧车道线清晰时，按直道和弯道曲率缓慢学习车辆平时偏离车道中央的量并修正（目标最多约0.3米，横向加速度0.25m/s²以内）。路径出现避障式移动、变道中或车道线不确定时立即退出并停止学习。车道模式运行时不使用。每次开启都会重新学习。",
+      "min": 0,
+      "max": 1,
+      "default": 0,
+      "unit": 1
+    },
+    {
+      "group": "레인모드",
+      "name": "LaneRecenterAssist",
+      "title": "차선 중앙 빠른 복귀 (실험):(0)",
+      "descr": "0: 끔, 1: 켬. 레인리스 주행에서 모델이 이미 차선 중앙 쪽으로 돌아오려는 경우에만 그 복귀를 약 2배 빠르게 돕습니다. 경로가 중앙에서 멀어지거나 좌우가 바뀌거나 회피처럼 움직이면 출력이 정확히 0이 됩니다. 추가 횡가속은 0.3m/s² 이내이고, 꺼질 때도 변화율 제한으로 단계적으로 사라집니다. 레인모드 동작 중에는 쓰이지 않으며 기본값은 꺼짐입니다.",
+      "egroup": "LANE",
+      "etitle": "Fast lane re-centre (experimental):(0)",
+      "edescr": "0: off, 1: on. Only while laneless, and only when the model already plans to return toward the lane centre, roughly doubling that return. Output is exactly 0 when the path holds or grows away from centre, flips sides, or moves like an avoidance. The extra lateral acceleration stays within 0.3 m/s^2 and is slew-limited on release. Not used in lane mode. Off by default.",
+      "cgroup": "转向",
+      "ctitle": "车道中央快速回正 (实验):(0)",
+      "cdescr": "0: 关, 1: 开。仅在无车道线模式且模型本身已计划向车道中央回正时，将该回正过程约加快一倍。路径偏离中央、左右反转或出现避障式移动时输出精确为 0。额外横向加速度不超过 0.3m/s²，退出时也按变化率限制逐步归零。车道模式运行时不使用，默认关闭。",
       "min": 0,
       "max": 1,
       "default": 0,

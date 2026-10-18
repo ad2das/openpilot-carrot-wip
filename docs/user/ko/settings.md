@@ -162,7 +162,7 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 | 중앙 보정 | `PathOffset`, `CameraYawTrimDeg` | 레인모드 경로의 좌우 위치와 카메라 YAW 미세 보정 |
 | 조향감 | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | 조향 시점, 평활화, 일시중지 각도와 조향비 |
 | [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건과 ATC 동작 |
-| 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset`, `LaneCenterBlend` | 레인모드 MPC 가중치와 차선 사용 조건 |
+| 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset`, `LaneCenterBlend`, `LaneRecenterAssist` | 레인모드 MPC 가중치와 차선 사용 조건 |
 | 고급 토크·토크 계수 | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | 커스텀 토크 제어 계수 |
 | 고급 토크·조향 제한 | `CustomSteerMax`, `CustomSteerDeltaUp`, `CustomSteerDeltaDown`, `CustomSteerDeltaUpLC`, `CustomSteerDeltaDownLC` | 최대 조향 토크와 토크 변화율 제한 |
 
@@ -171,6 +171,8 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 `UseLaneLineSpeed`로 레인모드를 사용하더라도 모델 속도 궤적의 시작값이 실제 차속의 70% 미만이거나 끝값이 시작값의 70% 미만이면 일시적으로 레인리스로 전환합니다. 속도 조건이 약 1초간 연속으로 정상이고 기존 차선·속도 조건도 충족해야 레인모드로 복귀합니다.
 
 `LaneCenterBlend`(혼합모드)를 켜면 레인리스 주행 중 양쪽 차선이 잘 보일 때 차가 차선 중앙에서 평소 치우치는 양을 직선·커브 곡률별로 천천히 학습해 보정합니다. 보정은 최대 약 0.3m 목표이고, 경로가 장애물 회피처럼 움직이거나 차선변경 중이거나 차선이 불확실하면 바로 빠집니다. 레인모드 동작 중에는 쓰이지 않으며 기본값은 꺼짐입니다.
+
+`LaneRecenterAssist`(빠른 복귀, 실험)는 레인리스 주행에서 모델이 스스로 차선 중앙으로 돌아오려는 경로를 낼 때만 그 복귀를 약 2배 빠르게 돕습니다. 모델 경로가 중앙에서 멀어지거나 좌우가 뒤집히거나 회피처럼 움직이면 출력은 정확히 0이고, `LaneCenterBlend`와 별개로 켜고 끌 수 있습니다. 추가 횡가속은 0.3m/s² 이내로 제한되며 보정이 꺼질 때도 변화율 제한으로 서서히 사라집니다. 레인모드 동작 중에는 쓰이지 않고 기본값은 꺼짐입니다.
 
 `SteerActuatorDelay`는 높을수록 더 일찍 조향하도록 보상하고, `LatSmoothSec`는 높을수록 부드러워지는 대신 반응이 늦어질 수 있습니다. 두 값을 동시에 바꾸면 원인을 구분하기 어렵습니다.
 
