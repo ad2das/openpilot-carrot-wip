@@ -80,6 +80,7 @@ class LateralPlanner:
     self.lane_center_blend = LaneCenterBlend(load_table(self.params.get("LaneCenterBlendMap")))
     self.lane_center_blend_saved = dump_table(self.lane_center_blend.table)
     self.lane_center_blend_save_frame = 0
+    self.lane_recenter_assist_enabled = self.params.get_int("LaneRecenterAssist") > 0
 
   def reset_mpc(self, x0=None):
     if x0 is None:
@@ -103,6 +104,7 @@ class LateralPlanner:
       if blend_enabled and not self.lane_center_blend_enabled:
         self.lane_center_blend.reset()
       self.lane_center_blend_enabled = blend_enabled
+      self.lane_recenter_assist_enabled = self.params.get_int("LaneRecenterAssist") > 0
 
     # clip speed , lateral planning is not possible at 0 speed
     measured_curvature = sm['controlsState'].curvature
@@ -170,10 +172,12 @@ class LateralPlanner:
       
     lane_change_active = (md.meta.desire != log.Desire.none or bool(carrot.atc_active) or
                           md.meta.laneChangeState != log.LaneChangeState.off)
+    rec_enabled = self.lane_recenter_assist_enabled and not self.lanelines_active and not self.useLaneLineMode
     self.lane_center_blend.update(self.lane_center_blend_enabled, self.lanelines_active, v_ego_car,
                                   self.LP.l_prob, self.LP.r_prob, self.LP.ll_x, self.LP.lll_y, self.LP.rll_y,
                                   self.t_idxs, model_path_x, model_path_y,
-                                  lane_change_active, sm['carState'].steeringPressed)
+                                  lane_change_active, sm['carState'].steeringPressed,
+                                  recenter_enabled=rec_enabled)
     self.lane_center_blend_save_frame += 1
     if self.lane_center_blend_save_frame >= int(30.0 / DT_MDL):
       self.lane_center_blend_save_frame = 0
@@ -271,11 +275,14 @@ class LateralPlanner:
     lateralPlan.laneChangeState = sm['modelV2'].meta.laneChangeState
     lateralPlan.laneChangeDirection = sm['modelV2'].meta.laneChangeDirection
     lateralPlan.laneWidth = float(self.LP.lane_width)
-    lateralPlan.laneCenterBlendCurvature = float(self.lane_center_blend.curvature)
+    recenter_curvature = float(self.lane_center_blend.recenter_curvature) if rec_enabled else 0.0
+    lateralPlan.laneCenterBlendCurvature = float(self.lane_center_blend.curvature) + recenter_curvature
     lateralPlan.laneCenterBlendOffset = float(self.lane_center_blend.offset)
     lateralPlan.laneCenterBlendWeight = float(self.lane_center_blend.w)
     lateralPlan.laneCenterBlendGates = int(self.lane_center_blend.gates)
     lateralPlan.laneCenterBlendAvoidDev = float(self.lane_center_blend.r_dev)
+    lateralPlan.laneRecenterCurvature = recenter_curvature
+    lateralPlan.laneRecenterActive = bool(rec_enabled and self.lane_center_blend.recenter_active)
 
     #plan_send.lateralPlan.dPathWLinesX = [float(x) for x in self.d_path_w_lines_xyz[:, 0]]
     #plan_send.lateralPlan.dPathWLinesY = [float(y) for y in self.d_path_w_lines_xyz[:, 1]]

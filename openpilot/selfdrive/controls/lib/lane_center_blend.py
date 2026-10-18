@@ -47,6 +47,21 @@ R_RATE_T = 1.5
 W_UP = 1.0               # output weight ramp, 1/s
 W_DOWN = 2.0
 
+# Lane recenter assist (LRA).  It only accelerates a return the model already
+# plans: a monotone path-to-centre offset that shrinks over the 3 s horizon.
+REC_HORIZON_S = 3.0
+R_ON = 0.15              # activation threshold, m
+R_OFF = 0.08             # hysteresis: stay on down to this offset, m
+R_MAX = 0.8              # larger offsets are not a normal lane-centre return, m
+R_NEAR = 0.05            # offsets below this may cross the sign without a flip, m
+R_MONO_TOL = 0.03        # allowed |r| growth between samples while returning, m
+RET_MIN = 0.05           # required |r0| - |r(3 s)| shrinkage, m
+REC_T_L = 1.5            # lookahead used to read the model's planned offset, s
+BOOST_S = 0.5            # aim at this fraction of the planned offset
+LRA_ACC_MAX = 0.3        # |k_lra| * v^2 cap, m/s^2
+LRA_JERK = 0.6           # |dk_lra| * v^2 per second cap, m/s^3
+LAT_ON = 1.0             # |kappa_road| * v^2 limit for assist, m/s^2
+
 GATE_OFF = 1
 GATE_LANE_MODE = 2
 GATE_SPEED = 4
@@ -85,6 +100,34 @@ def knot_weights(kappa: float) -> np.ndarray:
   return np.array([np.interp(k, KNOTS, np.eye(len(KNOTS))[i]) for i in range(len(KNOTS))])
 
 
+def recenter_profile(ll_x, centre, path_t, path_x, path_y, horizon=REC_HORIZON_S):
+  """Model path offset from lane centre, r(t) = path_y(t) - centre(path_x(t)).
+
+  Samples at the model's t_idxs up to `horizon`.  Positive r means the model
+  path (and so the car, at t=0) is right of the lane centre in path-y units.
+  Returns (t, r) or (None, None) when the horizon holds fewer than two samples.
+  """
+  near = path_t <= horizon
+  if np.count_nonzero(near) < 2:
+    return None, None
+  r = path_y[near] - np.interp(path_x[near], ll_x, centre)
+  return path_t[near], r
+
+
+def recenter_return_checks(t, r, r0):
+  """Monotone-return checks shared by the runtime assist and its tests.
+
+  Returns (sign_ok, mono_ok, retract_ok):
+    sign_ok    every sample keeps r0's sign, or is within R_NEAR of centre
+    mono_ok    |r| never grows by more than R_MONO_TOL between samples
+    retract_ok the horizon end is at least RET_MIN closer than r0
+  """
+  sign_ok = bool(np.all((np.sign(r) == np.sign(r0)) | (np.abs(r) < R_NEAR)))
+  mono_ok = bool(np.all(np.abs(r[1:]) <= np.abs(r[:-1]) + R_MONO_TOL))
+  retract_ok = abs(r0) - abs(float(r[-1])) >= RET_MIN
+  return sign_ok, mono_ok, retract_ok
+
+
 class LaneCenterBlend:
   def __init__(self, table=None):
     self.table = np.zeros_like(KNOTS) if table is None else np.clip(np.array(table, dtype=float), -OFFSET_MAX, OFFSET_MAX)
@@ -106,6 +149,12 @@ class LaneCenterBlend:
     self.steer_held_s = 0.0
     self.steer_block = False
     self.steer_release_s = 0.0
+    # Lane recenter assist (only used through update(..., recenter_enabled=True)).
+    self.recenter_curvature = 0.0
+    self.recenter_active = False
+    self.recenter_k = 0.0
+    self.recenter_latched = False
+    self.recenter_r0 = 0.0
 
   def reset(self):
     self.table = np.zeros_like(KNOTS)
@@ -113,10 +162,16 @@ class LaneCenterBlend:
     self.steer_held_s = 0.0
     self.steer_block = False
     self.steer_release_s = 0.0
+    self.recenter_curvature = 0.0
+    self.recenter_active = False
+    self.recenter_k = 0.0
+    self.recenter_latched = False
+    self.recenter_r0 = 0.0
 
   def update(self, enabled, lane_mode, v_ego, l_prob, r_prob, ll_x, lll_y, rll_y,
-             path_t, path_x, path_y, lane_change_active, steering_pressed) -> float:
-    if not enabled:
+             path_t, path_x, path_y, lane_change_active, steering_pressed,
+             recenter_enabled=False) -> float:
+    if not enabled and not recenter_enabled:
       self.w = 0.0
       self.offset = 0.0
       self.curvature = 0.0
@@ -124,6 +179,7 @@ class LaneCenterBlend:
       self.e_prev = None
       self.r_prev = None
       self.r_rate = 0.0
+      self._update_recenter(False, v_ego, 0, None, steering_pressed)
       return 0.0
 
     gates = 0
@@ -141,6 +197,50 @@ class LaneCenterBlend:
              math.isfinite(v_ego) and np.all(np.diff(ll_x) > 0))
 
     avoid_now = False
+    if not enabled:
+      # LaneCenterBlend=0. Every blend output keeps its OFF value, but the
+      # optional lane recenter assist still needs the same model geometry.
+      self.w = 0.0
+      self.offset = 0.0
+      self.curvature = 0.0
+      self.gates = GATE_OFF
+      geom = None
+      if valid:
+        centre = (lll_y + rll_y) / 2.0
+        self.e = float(centre[0])
+        width = float(rll_y[0] - lll_y[0])
+        fit = ll_x <= max(FIT_HORIZON_S * v_ego, FIT_MIN_M)
+        self.kappa_road = float(2.0 * np.polyfit(ll_x[fit], centre[fit], 2)[0]) if np.count_nonzero(fit) >= 3 else 0.0
+        if self.e_prev is not None and abs(self.e - self.e_prev) > JUMP_M:
+          self.jump_t = JUMP_HOLD_S
+        self.e_prev = self.e
+        if lane_mode:
+          gates |= GATE_LANE_MODE
+        if v_ego < V_OFF:
+          gates |= GATE_SPEED
+        if l_prob < PROB_MIN or r_prob < PROB_MIN:
+          gates |= GATE_PROB
+        if not (WIDTH_MIN <= width <= WIDTH_MAX):
+          gates |= GATE_WIDTH
+        if self.lane_change_t > 0.0:
+          gates |= GATE_LANE_CHANGE
+        r_mid = float(np.interp(R_RATE_T, path_t, path_y) - np.interp(np.interp(R_RATE_T, path_t, path_x), ll_x, centre))
+        if self.r_prev is not None:
+          alpha = DT_MDL / (AVOID_RATE_TAU + DT_MDL)
+          self.r_rate += alpha * ((r_mid - self.r_prev) / DT_MDL - self.r_rate)
+        self.r_prev = r_mid
+        if abs(self.kappa_road) * v_ego ** 2 >= LAT_ON:
+          geom = None
+        else:
+          geom = (centre, ll_x, path_t, path_x, path_y)
+      else:
+        gates |= GATE_INVALID
+        self.e_prev = None
+        self.r_prev = None
+        self.r_rate = 0.0
+      self._update_recenter(recenter_enabled, v_ego, gates, geom, steering_pressed)
+      return 0.0
+
     if valid:
       centre = (lll_y + rll_y) / 2.0
       self.e = float(centre[0])
@@ -181,6 +281,9 @@ class LaneCenterBlend:
       self.e_prev = None
       self.r_prev = None
       self.r_rate = 0.0
+      geom = None
+    if valid:
+      geom = (centre, ll_x, path_t, path_x, path_y)
 
     self.avoid_clear_t = 0.0 if (avoid_now or not valid) else self.avoid_clear_t + DT_MDL
     output_ok = gates == 0
@@ -227,4 +330,67 @@ class LaneCenterBlend:
     lookahead = float(np.clip(LOOKAHEAD_S * v_ego, LOOKAHEAD_MIN, LOOKAHEAD_MAX))
     k_max = LAT_ACCEL_MAX / max(v_ego, 1.0) ** 2
     self.curvature = float(np.clip(2.0 * self.w * self.offset / lookahead ** 2, -k_max, k_max))
+    recenter_gates = gates & ~(GATE_AVOID | GATE_CURVE)
+    if self.steer_block or self.jump_t > 0.0:
+      recenter_gates |= GATE_STEER
+    recenter_geom = geom if (valid and abs(self.kappa_road) * v_ego ** 2 < LAT_ON) else None
+    self._update_recenter(recenter_enabled, v_ego, recenter_gates, recenter_geom, steering_pressed)
     return self.curvature
+
+  def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
+    """Lane recenter assist: extra curvature that doubles an already-planned return.
+
+    Only ever runs when the caller asks for it and the laneless branch is used.
+    OFF leaves `recenter_curvature` exactly 0.0; when a gate closes the output is
+    slewed back to zero rather than stepped.
+    """
+    if not enabled:
+      self.recenter_curvature = 0.0
+      self.recenter_k = 0.0
+      self.recenter_active = False
+      self.recenter_latched = False
+      return
+
+    prev_k = self.recenter_k
+    target_k = 0.0
+    active = False
+    if geom is not None and not steering_pressed:
+      centre, ll_x, path_t, path_x, path_y = geom
+      t, r = recenter_profile(ll_x, centre, path_t, path_x, path_y)
+      if t is not None:
+        r0 = float(r[0])
+        sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
+        rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
+        if self.recenter_latched:
+          if sign_ok and R_OFF <= abs(r0) <= R_MAX and not rate_away and gates == 0 and v_ego >= V_OFF:
+            y_m = float(np.interp(REC_T_L, t, r))
+            dy = (BOOST_S - 1.0) * y_m
+            length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
+            k = 2.0 * dy / length ** 2
+            k_cap = LRA_ACC_MAX / max(v_ego, 1.0) ** 2
+            weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
+            target_k = float(np.clip(k * weight, -k_cap, k_cap))
+            active = target_k != 0.0
+          else:
+            self.recenter_latched = False
+        if not self.recenter_latched:
+          enter = (R_ON <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
+                   not rate_away and gates == 0 and v_ego >= V_OFF)
+          if enter:
+            self.recenter_latched = True
+            self.recenter_r0 = r0
+            y_m = float(np.interp(REC_T_L, t, r))
+            dy = (BOOST_S - 1.0) * y_m
+            length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
+            k = 2.0 * dy / length ** 2
+            k_cap = LRA_ACC_MAX / max(v_ego, 1.0) ** 2
+            weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
+            target_k = float(np.clip(k * weight, -k_cap, k_cap))
+            active = target_k != 0.0
+
+    slew = LRA_JERK / max(v_ego, 1.0) ** 2 * DT_MDL
+    self.recenter_k = float(np.clip(target_k, prev_k - slew, prev_k + slew))
+    if abs(self.recenter_k) < 1e-9:
+      self.recenter_k = 0.0
+    self.recenter_curvature = self.recenter_k
+    self.recenter_active = bool(active and self.recenter_k != 0.0)
