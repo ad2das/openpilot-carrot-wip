@@ -7,6 +7,7 @@ device the shims are no-ops and the tests run against the real modules.
 """
 import collections
 import sys
+import time
 import types
 from types import SimpleNamespace
 
@@ -191,6 +192,12 @@ def make_serv(detect_mode: int) -> CarrotServ:
   serv.traffic_state_src = 0
   serv.tlv_detect_mode = detect_mode
   serv.tlv_detect_mode_poll = 0.0
+  serv.tlv_det_support = 0
+  serv.tlv_hold_until = 0.0
+  serv.carrotCmdIndex = 0
+  serv.carrotCmdIndex_last = 0
+  serv.carrotCmd = ""
+  serv.carrotArg = ""
   serv.params = SimpleNamespace(get_int=lambda key, _mode=detect_mode: _mode if key == "TrafficLightDetectMode" else 0)
   return serv
 
@@ -338,6 +345,58 @@ def test_mode2_left_phases_without_intent_are_straight_phases():
   serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
   serv3._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("left")))
   assert serv3.traffic_state == 1
+
+
+def test_tlv_hold_keeps_src1_state_across_a_05s_carrotTlv_gap(monkeypatch):
+  # W143: a src-1 TLV state is held by wall time (0.8 s), not loop count, so the
+  # ~0.4 s tlvd inference gaps cannot drop trafficState while TLV red is active.
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red")))
+  assert serv.traffic_state == 1 and serv.traffic_state_src == 1
+  # 20 Hz loop stepping 0.05 s with no new carrotTlv: still held at 0.6 s.
+  for _ in range(12):
+    clock[0] += 0.05
+    serv._update_cmd()
+  assert serv.traffic_state == 1 and serv.traffic_state_src == 1
+  # At 0.85 s the hold has expired: state drops to none.
+  clock[0] += 0.25
+  serv._update_cmd()
+  assert serv.traffic_state == 0 and serv.traffic_state_src == 0
+
+
+def test_navi_detect_path_still_expires_after_five_loops(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  serv._handle_detect_command("Red Light,0.5,0.5,0.9")
+  assert serv.traffic_state_src == 0 and serv.traffic_light_count == 5
+  for _ in range(5):
+    serv._update_cmd()
+  assert serv.traffic_light_count == 0  # 5 loops of validity, no wall-time hold
+  serv._update_cmd()
+  assert serv.traffic_light_count == -1
+  assert serv.traffic_state == 0
+
+
+def test_hold_keeps_tlv_det_support_while_held(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  msg = tlv_message("red")
+  msg.relevantDetSupport = 3
+  serv._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  assert serv.tlv_det_support == 3
+  for _ in range(8):
+    clock[0] += 0.05
+    serv._update_cmd()
+  assert serv.traffic_state == 1 and serv.tlv_det_support == 3
 
 
 def test_tlv_detect_mode_is_cached_and_refreshed_at_most_once_per_second(monkeypatch):
@@ -493,6 +552,9 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   planner.tlv_log_veto_t = -1e9
   planner.tlv_log_clear_t = -1e9
   planner.tlv_log_coast_t = -1e9
+  # W143: model-clear timer. A model that is already clear has been clear for
+  # long enough unless a test explicitly simulates the transition.
+  planner.model_stop_clear_since = None if stop_sign else time.monotonic() - 10.0
   return planner
 
 
@@ -520,6 +582,7 @@ def test_tlv_green_starts_once_both_cues_agree():
   planner = planner_for_gate(stop_sign=True)
   planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
   planner.last_model_stop_sign = False
+  planner.model_stop_clear_since = time.monotonic() - 2.0  # clear for good
   assert planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0) == (60.0, False)
   assert planner.xState == XState.e2eCruise
   assert planner.traffic_starting_count == 10.0 / DT_MDL
@@ -545,6 +608,7 @@ def test_tlv_left_starts_once_both_cues_agree():
   planner = planner_for_gate(stop_sign=True)
   planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0)
   planner.last_model_stop_sign = False
+  planner.model_stop_clear_since = time.monotonic() - 2.0  # clear for good
   assert planner._update_carrot_man(gate_sm(carrot_man_message(state=3, src=1), left=True), 20.0, 60.0) == (60.0, False)
   assert planner.xState == XState.e2eCruise
   assert planner.traffic_starting_count == 10.0 / DT_MDL
@@ -675,6 +739,20 @@ def test_red_active_reader_requires_fresh_tlv_source():
   stale.recv_time['carrotMan'] = 50.0  # frozen clock at 100.0 -> 50 s old
   assert planner._read_tlv_red_active(stale) is False
   assert planner._read_tlv_red_active(FakeSM()) is False
+
+
+def test_coast_cap_stays_on_across_a_05s_tlv_gap_while_moving(monkeypatch):
+  # W143: while the held src-1 state keeps carrotMan.trafficState at 1, the
+  # moving counter must keep accumulating across a carrotTlv gap instead of
+  # resetting every second.
+  import openpilot.selfdrive.carrot.carrot_functions as carrot_functions
+  monkeypatch.setattr(carrot_functions.time, "monotonic", lambda: 100.0)
+  planner = accel_planner(2)
+  for _ in range(10):
+    planner.tlv_red_active = planner._read_tlv_red_active(FakeSM(carrotMan=carrot_man_message(state=1, src=1)))
+    planner._update_coast_cap(22.2)
+  assert planner.coast_cap_active is True
+  assert planner.tlv_coast_moving_frames == 10
 
 
 def test_coast_cap_ignores_model_start_sign_and_requires_mode2():
@@ -850,6 +928,7 @@ def test_check_model_stopping_records_start_sign():
     planner.trafficState = None
     planner.last_model_stop_sign = True
     planner.last_model_start_sign = False
+    planner.model_stop_clear_since = None
     return planner
 
   go = fresh_planner()
@@ -1158,6 +1237,7 @@ def test_tlv_start_veto_logs_one_event_per_blocked_edge(monkeypatch):
   assert planner.xState == XState.e2eStopped  # the start is still vetoed
   # The model stop cue clears: the held start fires once and is logged.
   planner.last_model_stop_sign = False
+  planner.model_stop_clear_since = time.monotonic() - 2.0
   planner._update_carrot_man(sm, 0.0, 60.0)
   cleared = [e for e in events if e[0] == 'tlv_start_veto_cleared']
   assert len(cleared) == 1
@@ -1176,6 +1256,7 @@ def test_tlv_start_veto_logs_left_edge_once(monkeypatch):
   assert vetoes[0][1]['state_in'] == 3
   assert vetoes[0][1]['left_intent'] is True
   planner.last_model_stop_sign = False
+  planner.model_stop_clear_since = time.monotonic() - 2.0
   planner._update_carrot_man(sm, 0.0, 60.0)
   assert planner.xState == XState.e2eCruise
   assert len([e for e in events if e[0] == 'tlv_start_veto_cleared']) == 1
@@ -1193,6 +1274,67 @@ def test_tlv_start_veto_rate_limited_within_2s(monkeypatch):
   planner._update_carrot_man(sm, 0.0, 60.0)
   assert planner.tlv_veto_active is True
   assert [e[0] for e in events] == ['tlv_start_veto']  # second event suppressed
+
+
+# ---------------------------------------------------------------------------
+# W143: sustained model-clear requirement for TLV starts
+# ---------------------------------------------------------------------------
+
+def test_tlv_green_edge_with_model_clear_09s_still_vetoed():
+  planner = planner_for_gate(stop_sign=False)
+  planner.model_stop_clear_since = time.monotonic() - 0.9
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+  assert planner.trafficState_carrot == 1  # the blocked edge keeps holding red
+
+
+def test_tlv_green_edge_with_model_clear_105s_triggers():
+  planner = planner_for_gate(stop_sign=False)
+  planner.model_stop_clear_since = time.monotonic() - 1.05
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert planner.trafficState_carrot == 2
+
+
+def test_model_stop_flicker_resets_the_clear_timer(monkeypatch):
+  planner = planner_for_gate(stop_sign=False)
+  planner.vFilter = MyMovingAverage(10)
+  planner.stopSignCount = 0
+  planner.startSignCount = 0
+  planner.model_stop_clear_since = time.monotonic() - 0.6
+  clock = [time.monotonic()]
+  monkeypatch.setattr(carrot_functions.time, "monotonic", lambda: clock[0])
+  # A model stop frame resets the timer to None.
+  planner.check_model_stopping(0.0, np.array([0.0] * 70 + [0.0]), 0.0, 0.0, 10.0,
+                               np.zeros(70), 100.0)
+  assert planner.model_stop_clear_since is None
+  # Two clear frames 0.3 s later restart it; the edge is still vetoed at 0.6 s.
+  clock[0] += 0.3
+  planner.check_model_stopping(0.0, np.array([0.0] * 70 + [0.0]), 0.0, 0.0, 60.0,
+                               np.zeros(70), 100.0)
+  assert planner.model_stop_clear_since is not None
+  clock[0] += 0.6
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
+  assert planner.xState == XState.e2eStopped
+
+
+def test_navi_start_is_unaffected_by_the_model_clear_guard():
+  planner = planner_for_gate(stop_sign=True)
+  planner.model_stop_clear_since = None
+  assert planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=0)), 20.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eCruise
+  assert planner.trafficState_carrot == 2
+
+
+def test_model_clear_guard_logs_one_veto_per_blocked_edge(monkeypatch):
+  events = _record_events(monkeypatch)
+  planner = planner_for_gate(stop_sign=False)
+  planner.model_stop_clear_since = time.monotonic() - 0.2
+  sm = gate_sm(carrot_man_message(state=2, src=1))
+  for _ in range(3):
+    planner._update_carrot_man(sm, 0.0, 60.0)
+  assert len([e for e in events if e[0] == 'tlv_start_veto']) == 1
+  assert planner.xState == XState.e2eStopped
 
 
 # ---------------------------------------------------------------------------

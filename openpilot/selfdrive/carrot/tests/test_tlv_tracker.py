@@ -246,16 +246,72 @@ def test_classifier_green_vote_blocks_red_confirmation():
   assert track.classifier_confirmed(1.7) == (red, 1.0)
 
 
-def test_classifier_green_needs_six_votes_in_1_2s():
+def test_classifier_green_needs_four_votes_in_1_6s_with_span():
+  # W143: 4 green votes inside 1.6 s spanning >= 0.6 s confirm.
   t = TrafficLightTracker()
   t.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
   track = t.tracks[0]
   green = int(LampClass.GREEN)
+  for i, when in enumerate((0.0, 0.3, 0.6, 0.9)):
+    t.record_votes(when, [(track.track_id, green, 0.8)])
+  assert track.classifier_confirmed(0.9) == (green, 1.0)
+  # Three votes are not enough.
+  t3 = TrafficLightTracker()
+  t3.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  tr3 = t3.tracks[0]
+  for when in (0.0, 0.3, 0.6):
+    t3.record_votes(when, [(tr3.track_id, green, 0.8)])
+  assert tr3.classifier_confirmed(0.6) is None
+  # Four votes spanning only 0.3 s are not enough.
+  t4 = TrafficLightTracker()
+  t4.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  tr4 = t4.tracks[0]
+  for when in (0.0, 0.1, 0.2, 0.3):
+    t4.record_votes(when, [(tr4.track_id, green, 0.8)])
+  assert tr4.classifier_confirmed(0.3) is None
+
+
+def test_classifier_green_rejects_red_family_in_window():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  green, red = int(LampClass.GREEN), int(LampClass.RED)
+  for when in (0.0, 0.3, 0.6, 0.9):
+    t.record_votes(when, [(track.track_id, green, 0.8)])
+  t.record_votes(1.0, [(track.track_id, red, 0.9)])
+  assert track.classifier_confirmed(1.0) is None
+
+
+def test_classifier_green_left_tie_uses_latest_vote():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.GREEN)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  green, green_left = int(LampClass.GREEN), int(LampClass.GREEN_LEFT)
+  for when, cls in ((0.0, green), (0.3, green), (0.6, green_left), (0.9, green_left)):
+    t.record_votes(when, [(track.track_id, cls, 0.9)])
+  assert track.classifier_confirmed(0.9) == (green_left, 1.0)
+
+
+def test_classifier_left_group_confirms_left():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.LEFT)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  left = int(LampClass.LEFT)
+  for when in (0.0, 0.3, 0.6, 0.9):
+    t.record_votes(when, [(track.track_id, left, 0.9)])
+  assert track.classifier_confirmed(0.9) == (left, 1.0)
+
+
+def test_classifier_yellow_still_needs_six_votes_in_1_2s():
+  t = TrafficLightTracker()
+  t.update(0, [det(LampClass.YELLOW)], "far", 2648.0, now=0.0)
+  track = t.tracks[0]
+  yellow = int(LampClass.YELLOW)
   for i in range(5):
-    t.record_votes(i * 0.2, [(track.track_id, green, 0.8)])
+    t.record_votes(i * 0.2, [(track.track_id, yellow, 0.9)])
   assert track.classifier_confirmed(0.8) is None
-  t.record_votes(1.0, [(track.track_id, green, 0.8)])
-  assert track.classifier_confirmed(1.0) == (green, 1.0)
+  t.record_votes(1.0, [(track.track_id, yellow, 0.9)])
+  assert track.classifier_confirmed(1.0) == (yellow, 1.0)
 
 
 def test_classifier_red_likely_uses_latest_strong_vote():

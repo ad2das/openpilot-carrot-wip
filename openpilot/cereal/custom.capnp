@@ -306,6 +306,10 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	relevantDetSupport @20 :UInt8;
 	# W139c cumulative frames an already-confirmed red was sustained by a red vote on the relevant track.
 	redSustain @21 :UInt32;
+	# W143 latest lamp vote of the relevant track at publish time (telemetry only).
+	relevantVoteCls @22 :Int8;
+	relevantVoteProb @23 :Float32;
+	relevantVoteAgeMs @24 :UInt16;
 
 	enum Status {
 		off @0;

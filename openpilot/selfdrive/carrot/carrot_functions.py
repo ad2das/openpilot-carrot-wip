@@ -99,6 +99,11 @@ TLV_FAST_GATE_MODEL_S = 3.0
 # the latched episode only after raw red has been inactive this long, so a
 # mid-approach flicker never drops the coast cap or re-arms the gate.
 TLV_FAST_GATE_RESET_S = 0.5
+# W143: a TLV red->green/left start also needs the model stop cue to have been
+# CLEAR for this long, so a momentary clear is not taken as the green. Measured
+# non-terminal model-clear runs at standstill during real reds on 44c/44d/44e/
+# 450: 3 runs, max 0.26 s. V1b: a 1.0 s guard removes all simulated false starts.
+TLV_START_MODEL_CLEAR_S = 1.0
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
 
@@ -264,6 +269,9 @@ class CarrotPlanner:
     self._fast_gate_opened_by = None
     self._raw_red_prev = False
     self._fast_gate_last_red_t = None
+    # W143: monotonic time since the model stop cue was last False (None while
+    # the model is signalling a stop).
+    self.model_stop_clear_since = None
 
   def _params_update(self):
     self.frame += 1
@@ -452,6 +460,11 @@ class CarrotPlanner:
 
     self.last_model_stop_sign = bool(stopSign)
     self.last_model_start_sign = bool(startSign)
+    # W143: track how long the model stop cue has been continuously clear.
+    if stopSign:
+      self.model_stop_clear_since = None
+    elif self.model_stop_clear_since is None:
+      self.model_stop_clear_since = time.monotonic()
     # W139c: remember when the model last signalled a stop (fast-road gate).
     if stopSign:
       self.model_stop_sign_t = time.monotonic()
@@ -616,7 +629,9 @@ class CarrotPlanner:
       tlv_start_disagrees = (
         tlv_src
         and state_in in (2, 3)
-        and getattr(self, 'last_model_stop_sign', False)
+        and (getattr(self, 'last_model_stop_sign', False)
+             or self.model_stop_clear_since is None
+             or time.monotonic() - self.model_stop_clear_since < TLV_START_MODEL_CLEAR_S)
       )
       # W74D (A): a TLV red->left start also needs a nearby routed left
       # (carrotMan.atcType; carrotMan.xDistToTurn <= 150 m, int metres from

@@ -656,6 +656,16 @@ class TlvRunner:
     # sustain frames, for the fast-road phantom gate downstream.
     out.relevantDetSupport = int(min(255, max(0, self.pipeline.last_relevant_det_support)))
     out.redSustain = int(self.pipeline.red_sustain_total)
+    # W143 vote telemetry: the relevant track's latest lamp vote at publish.
+    vote_cls, vote_prob, vote_age_ms = -1, 0.0, 0
+    if self.pipeline.last_track_id >= 0:
+      track = self.pipeline.tracker.track_by_id(self.pipeline.last_track_id)
+      if track is not None and track.votes:
+        t, vote_cls, vote_prob = track.votes[-1]
+        vote_age_ms = int(min(65535, max(0, int(round((now - t) * 1000.0)))))
+    out.relevantVoteCls = int(vote_cls)
+    out.relevantVoteProb = float(vote_prob)
+    out.relevantVoteAgeMs = int(vote_age_ms)
     self.pub.send("carrotTlv", msg)
 
   def _ordered_dets(self) -> list[tracker.Detection]:

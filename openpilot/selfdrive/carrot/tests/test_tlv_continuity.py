@@ -125,9 +125,9 @@ def test_continuity_never_creates_red_from_none():
 
 
 def test_green_confirm_still_transitions_from_red():
-  # Three red detect frames confirm red, then a green confirm (6 in 1.2 s via the
-  # detect M-of-N belt needs frames; use classifier votes) must move the machine
-  # to green even while continuity could hold red.
+  # Three red detect frames confirm red, then a green confirm (4 in 1.6 s via
+  # classifier votes) must move the machine to green even while continuity could
+  # hold red.
   from openpilot.selfdrive.carrot.tlv import backends
   stub = backends.StubClassifier(cls=RED, prob=0.9)
   pipe = pipeline.FramePipeline(_ScriptedBackend([_frame()]), decode.PlaceholderDecoder(), classifier=stub)
@@ -138,8 +138,52 @@ def test_green_confirm_still_transitions_from_red():
   # Feed a green-family tracked light directly.
   t = tracker.Track(track_id=1, first_frame=0, last_frame=0, cls=GREEN,
                     score=0.9, box=BOX, view="far", focal_px=2648.0)
-  for i in range(6):
-    t.votes.append((0.0 + i * 0.1, GREEN, 0.9))
+  for i in range(4):
+    t.votes.append((0.0 + i * 0.357, GREEN, 0.9))
   pipe.tracker.tracks = [t]
-  out = pipe.infer("far", _far_geom(), image_width=W, now=0.6, detect=True)
-  assert out.state == tracker.SignalState.green
+  out = pipe.infer("far", _far_geom(), image_width=W, now=1.1, detect=True)
+  assert out.state in (tracker.SignalState.green, tracker.SignalState.greenLeft)
+
+
+def test_green_confirm_at_field_cadence_within_1_3s():
+  from openpilot.selfdrive.carrot.tlv import backends
+  # W143: votes arrive at 2.8 Hz (0.357 s spacing); the machine must reach green
+  # within 1.3 s of the FIRST green vote.
+  stub = backends.StubClassifier(cls=GREEN, prob=0.9)
+  pipe = pipeline.FramePipeline(_ScriptedBackend([]), decode.PlaceholderDecoder(), classifier=stub)
+  pipe.machine.state = tracker.SignalState.red
+  pipe.machine.conf = 0.75
+  pipe.machine.last_lamp_time = 0.0
+  pipe._last_red_confirm_s = 0.0
+  t = tracker.Track(track_id=1, first_frame=0, last_frame=0, cls=GREEN,
+                    score=0.9, box=BOX, view="far", focal_px=2648.0)
+  t.red_confirmed_s = 0.0
+  pipe.tracker.tracks = [t]
+  state = None
+  for i in range(4):
+    vote_t = i * 0.357
+    t.votes.append((vote_t, GREEN, 0.9))
+    out = pipe.infer("far", _far_geom(), image_width=W, now=vote_t + 0.05, detect=False)
+    state = out.state
+  assert state in (tracker.SignalState.green, tracker.SignalState.greenLeft)
+  # The last vote at 3*0.357 = 1.071 s is within 1.3 s of the first (0.0).
+  assert 1.071 <= 1.3
+  assert pipe.tracker.go_after_red(1, 1.2) is True
+
+
+def test_green_on_a_different_track_does_not_give_go_after_red():
+  from openpilot.selfdrive.carrot.tlv import backends
+  stub = backends.StubClassifier(cls=GREEN, prob=0.9)
+  pipe = pipeline.FramePipeline(_ScriptedBackend([]), decode.PlaceholderDecoder(), classifier=stub)
+  pipe.machine.state = tracker.SignalState.red
+  pipe.machine.conf = 0.75
+  pipe.machine.last_lamp_time = 0.0
+  pipe._last_red_confirm_s = 0.0
+  red_track = _candidate_track(box=(300.0, 50.0, 340.0, 90.0), votes=((0.0, RED, 0.9),))
+  green_track = tracker.Track(track_id=99, first_frame=0, last_frame=0, cls=GREEN,
+                              score=0.9, box=BOX, view="far", focal_px=2648.0)
+  for i in range(4):
+    green_track.votes.append((i * 0.357, GREEN, 0.9))
+  pipe.tracker.tracks = [red_track, green_track]
+  pipe.infer("far", _far_geom(), image_width=W, now=1.2, detect=False)
+  assert pipe.tracker.go_after_red(99, 1.2) is False

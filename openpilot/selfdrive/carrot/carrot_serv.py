@@ -100,6 +100,11 @@ TLV_COLOR_LEFT = "Left turn"
 # 0 none / 1 red / 2 green / 3 left ordinals stay unchanged for every consumer.
 TLV_RED_LIKELY_STATE = 7
 TLV_GRADED_TRAFFIC_STATE = 4
+# W143: time-based TLV hold. carrot_serv runs at 20 Hz, so int(0.5 / 0.1) is
+# 5 loops = 0.25 s, but tlvd blocks during each detect inference (detHz ~1)
+# and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
+# Hold a src-1 TLV state for this long since the last accepted message.
+TLV_HOLD_S = 0.8
 
 
 def tlv_state_color(state_raw: int, left_intent: bool) -> str | None:
@@ -219,6 +224,7 @@ class CarrotServ:
     self.traffic_state = 0
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
     self.tlv_det_support = 0    # W139c: carrotTlv.relevantDetSupport passed through
+    self.tlv_hold_until = 0.0   # W143: src-1 TLV state held until this monotonic time
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
 
@@ -319,10 +325,16 @@ class CarrotServ:
     self.traffic_light_q.append((-1, -1, "none", 0.0))
     self.traffic_light_count -= 1
     if self.traffic_light_count < 0:
-      self.traffic_light_count = -1
-      self.traffic_state = 0
-      self.traffic_state_src = 0
-      self.tlv_det_support = 0
+      # W143: a src-1 TLV state is held by wall time, not loop count, so the
+      # ~0.4 s tlvd inference gaps cannot drop it. src 0 (navi DETECT) keeps
+      # the exact loop-count expiry.
+      if self.traffic_state_src == 1 and time.monotonic() < self.tlv_hold_until:
+        self.traffic_light_count = 0
+      else:
+        self.traffic_light_count = -1
+        self.traffic_state = 0
+        self.traffic_state_src = 0
+        self.tlv_det_support = 0
 
   def _handle_detect_command(self, xArg):
     elements = [e.strip() for e in xArg.split(',')]
@@ -433,6 +445,7 @@ class CarrotServ:
       self.traffic_state = TLV_GRADED_TRAFFIC_STATE
       self.traffic_state_src = 1
       self.tlv_det_support = int(msg.relevantDetSupport)
+      self.tlv_hold_until = now + TLV_HOLD_S
       self.traffic_light_count = int(0.5 / 0.1)
       return
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
@@ -449,6 +462,7 @@ class CarrotServ:
     y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.tlv_det_support = int(msg.relevantDetSupport)
+    self.tlv_hold_until = now + TLV_HOLD_S
     self.traffic_light_count = int(0.5 / 0.1)
 
   def _tlv_left_intent(self, sm) -> bool:

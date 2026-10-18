@@ -63,6 +63,18 @@ CLASSIFIER_SLOW_VOTES = 6
 CLASSIFIER_RED_CONFIRM_WINDOW_S = 1.2
 # Graded redLikely: one strong red vote (probability >= 0.6) is enough.
 RED_LIKELY_MIN_PROB = 0.6
+# W143: green/go confirmation is vote-based in a longer window. Field classify
+# cadence on route 450 is clsHz 2.6-3.2 (budget-limited), so the old 6-in-1.2 s
+# rule was nearly unreachable and the launch green arrived ~3.5 s late. 4 votes
+# in 1.6 s with a >= 0.6 s span and no red-family vote in the window confirms.
+# All 7 green-family votes seen while state was red in the tlvrec archive
+# (10-15..10-18) were real greens; never one on a lit red lamp.
+GREEN_CONFIRM_WINDOW_S = 1.6
+GREEN_CONFIRM_VOTES = 4
+GREEN_CONFIRM_MIN_SPAN_S = 0.6
+# Groups whose votes may confirm together (a green+left lamp alternates between
+# the plain and arrow class as the classifier sees it).
+GO_GROUPS = ((LampClass.GREEN, LampClass.GREEN_LEFT), (LampClass.LEFT,))
 # Classifier votes keep a track alive this long after the last detection, so a
 # slow detector cadence cannot drop a light the fast classifier still sees.
 VOTE_TRACK_KEEP_S = 0.75
@@ -252,21 +264,36 @@ class Track:
     """(cls, confidence) from classifier votes counted by TIME, else None.
 
     Red family: >= 3 votes within the last 1.2 s (CLASSIFIER_RED_CONFIRM_WINDOW_S)
-    and no green-family vote in that window. Yellow/green/left: the stricter
-    >= 6 votes in 1.2 s. Red is evaluated first so a stale green cannot delay a
-    safety stop.
+    and no green-family vote in that window. W143: green/left (GO_GROUPS) need
+    4 votes in 1.6 s spanning >= 0.6 s with no red-family vote in the window;
+    yellow keeps the strict >= 6 votes in 1.2 s. Red is evaluated first so a
+    stale green cannot delay a safety stop.
     """
     red_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in RED_FAMILY]
     green_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in GREEN_FAMILY]
     if len(red_votes) >= CLASSIFIER_RED_VOTES and not green_votes:
       return int(_most_common(red_votes)), min(1.0, len(red_votes) / CLASSIFIER_RED_VOTES)
     best: tuple[int, float] | None = None
-    for cls in SLOW_CLASSES:
-      hits = sum(1 for t, c, _ in self.votes if t > now - CLASSIFIER_SLOW_WINDOW_S and c == cls)
-      if hits >= CLASSIFIER_SLOW_VOTES:
-        conf = min(1.0, hits / CLASSIFIER_SLOW_VOTES)
+    win = [(t, c) for (t, c, _p) in self.votes if t > now - GREEN_CONFIRM_WINDOW_S]
+    no_red = not any(c in RED_FAMILY for _t, c in win)
+    for group in GO_GROUPS:
+      gv = [(t, c) for (t, c) in win if c in group]
+      if (no_red and len(gv) >= GREEN_CONFIRM_VOTES
+          and gv[-1][0] - gv[0][0] >= GREEN_CONFIRM_MIN_SPAN_S):
+        counts: dict[int, int] = {}
+        for _t, c in gv:
+          counts[c] = counts.get(c, 0) + 1
+        top = max(counts.values())
+        tied = [c for c, n in counts.items() if n == top]
+        cls = gv[-1][1] if len(tied) > 1 else tied[0]
+        conf = min(1.0, len(gv) / GREEN_CONFIRM_VOTES)
         if best is None or conf > best[1]:
           best = (int(cls), conf)
+    hits = sum(1 for t, c, _ in self.votes if t > now - CLASSIFIER_SLOW_WINDOW_S and c == LampClass.YELLOW)
+    if hits >= CLASSIFIER_SLOW_VOTES:
+      conf = min(1.0, hits / CLASSIFIER_SLOW_VOTES)
+      if best is None or conf > best[1]:
+        best = (int(LampClass.YELLOW), conf)
     return best
 
   def classifier_red_likely(self, now: float) -> bool:

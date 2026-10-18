@@ -78,13 +78,15 @@ def test_single_class_votes_confirm_red_and_green():
   conf = pipe._confirmed(0.4)
   assert len(conf) == 1 and conf[0][0] is track and conf[0][1] == RED
 
-  # A fresh track: 6 GREEN votes within 1.2 s confirm GREEN.
+  # A fresh track: 4 GREEN votes spanning >= 0.6 s inside 1.6 s confirm GREEN
+  # (W143: the field classify cadence is ~2.9 Hz, so the old 6-in-1.2 s rule was
+  # nearly unreachable at a launch).
   pipe, _backend = _make_pipe([_red_frame()], backends.NullClassifier(), nc=1)
   pipe.infer("far", far, image_width=W, now=0.0, detect=True)
   track = pipe.tracker.tracks[0]
   assert track.cls == 0
-  for k in range(6):
-    pipe.tracker.record_votes(0.1 + 0.1 * k, [(track.track_id, GREEN, 0.9)])
+  for when in (0.1, 0.3, 0.5, 0.7):
+    pipe.tracker.record_votes(when, [(track.track_id, GREEN, 0.9)])
   conf = pipe._confirmed(0.7)
   assert len(conf) == 1 and conf[0][0] is track and conf[0][1] == GREEN
 
