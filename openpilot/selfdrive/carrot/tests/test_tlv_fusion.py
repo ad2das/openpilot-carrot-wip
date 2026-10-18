@@ -555,6 +555,8 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   # W143: model-clear timer. A model that is already clear has been clear for
   # long enough unless a test explicitly simulates the transition.
   planner.model_stop_clear_since = None if stop_sign else time.monotonic() - 10.0
+  planner.tlv_green_chime_done = False
+  planner.add_event = lambda *_a, **_k: None
   return planner
 
 
@@ -1267,13 +1269,13 @@ def test_tlv_start_veto_rate_limited_within_2s(monkeypatch):
   planner = planner_for_gate(stop_sign=True)
   sm = gate_sm(carrot_man_message(state=2, src=1))
   planner._update_carrot_man(sm, 0.0, 60.0)
-  assert [e[0] for e in events] == ['tlv_start_veto']
+  assert [e[0] for e in events if e[0] == 'tlv_start_veto'] == ['tlv_start_veto']
   # The edge decays, then a new blocked edge appears inside the 2 s window.
   planner._update_carrot_man(gate_sm(carrot_man_message(state=0, src=0)), 0.0, 60.0)
   assert planner.tlv_veto_active is False
   planner._update_carrot_man(sm, 0.0, 60.0)
   assert planner.tlv_veto_active is True
-  assert [e[0] for e in events] == ['tlv_start_veto']  # second event suppressed
+  assert [e[0] for e in events if e[0] == 'tlv_start_veto'] == ['tlv_start_veto']  # second event suppressed
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1337,98 @@ def test_model_clear_guard_logs_one_veto_per_blocked_edge(monkeypatch):
     planner._update_carrot_man(sm, 0.0, 60.0)
   assert len([e for e in events if e[0] == 'tlv_start_veto']) == 1
   assert planner.xState == XState.e2eStopped
+
+
+# ---------------------------------------------------------------------------
+# W144: "green light" chime while the model guard holds a TLV start
+# ---------------------------------------------------------------------------
+
+def _record_chime(monkeypatch):
+  chimes = []
+  events = []
+  monkeypatch.setattr(carrot_functions, 'cloudlog',
+                      SimpleNamespace(event=lambda name, **kw: events.append((name, kw))))
+  monkeypatch.setattr(carrot_functions, 'EventName',
+                      SimpleNamespace(trafficSignChanged='trafficSignChanged'))
+  return chimes, events
+
+
+def _chime_planner(stop_sign: bool, monkeypatch):
+  planner = planner_for_gate(stop_sign)
+  chimes = []
+  planner.add_event = lambda ev: chimes.append(ev)
+  return planner, chimes
+
+
+def test_blocked_green_chimes_once_even_when_the_edge_persists(monkeypatch):
+  _chimes, events = _record_chime(monkeypatch)
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner.tlv_red_confirmed_at = time.monotonic() - 2.0
+  sm = gate_sm(carrot_man_message(state=2, src=1))
+  for _ in range(60):  # 3 s at 20 Hz
+    planner._update_carrot_man(sm, 0.0, 60.0)
+  assert chimes == ['trafficSignChanged']
+  assert planner.xState == XState.e2eStopped  # never starts the car
+  logged = [e for e in events if e[0] == 'tlv_green_chime']
+  assert len(logged) == 1
+  assert logged[0][1]['state_in'] == 2
+  assert logged[0][1]['red_age_s'] == pytest.approx(2.0, abs=0.2)
+
+
+def test_no_chime_when_the_start_fires(monkeypatch):
+  _chimes, events = _record_chime(monkeypatch)
+  planner, chimes = _chime_planner(False, monkeypatch)
+  planner.model_stop_clear_since = time.monotonic() - 2.0
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 0.0, 60.0)
+  assert planner.xState == XState.e2eCruise
+  assert chimes == []
+  assert [e for e in events if e[0] == 'tlv_green_chime'] == []
+
+
+def test_no_chime_when_moving_gas_disengaged_or_in_cooldown(monkeypatch):
+  _chimes, _events = _record_chime(monkeypatch)
+  sm = gate_sm(carrot_man_message(state=2, src=1))
+  # Moving: standstill is required.
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner._update_carrot_man(sm, 20.0, 60.0)
+  assert chimes == []
+  # Gas pressed.
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1), gas=True), 0.0, 60.0)
+  assert chimes == []
+  # Disengaged.
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1), enabled=False), 0.0, 60.0)
+  assert chimes == []
+  # Gas cooldown.
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner.tlv_gas_cooldown_frames = 5
+  planner._update_carrot_man(sm, 0.0, 60.0)
+  assert chimes == []
+
+
+def test_a_new_red_episode_chimes_again(monkeypatch):
+  _chimes, _events = _record_chime(monkeypatch)
+  planner, chimes = _chime_planner(True, monkeypatch)
+  sm_green = gate_sm(carrot_man_message(state=2, src=1))
+  planner._update_carrot_man(sm_green, 0.0, 60.0)
+  assert len(chimes) == 1
+  planner._update_carrot_man(sm_green, 0.0, 60.0)
+  assert len(chimes) == 1
+  # The car moves off (the episode ends), which resets the latch.
+  planner._update_carrot_man(sm_green, 5.0, 60.0)
+  assert planner.tlv_green_chime_done is False
+  # A new red episode with a blocked green edge chimes again.
+  planner._update_carrot_man(sm_green, 0.0, 60.0)
+  assert len(chimes) == 2
+
+
+def test_navi_source_does_not_chime(monkeypatch):
+  _chimes, events = _record_chime(monkeypatch)
+  planner, chimes = _chime_planner(True, monkeypatch)
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=0)), 0.0, 60.0)
+  assert chimes == []
+  assert [e for e in events if e[0] == 'tlv_green_chime'] == []
 
 
 # ---------------------------------------------------------------------------

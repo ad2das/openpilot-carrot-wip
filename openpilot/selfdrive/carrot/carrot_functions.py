@@ -272,6 +272,9 @@ class CarrotPlanner:
     # W143: monotonic time since the model stop cue was last False (None while
     # the model is signalling a stop).
     self.model_stop_clear_since = None
+    # W144: one "green light" chime per held red episode when the model guard is
+    # the only thing blocking a TLV green/left start.
+    self.tlv_green_chime_done = False
 
   def _params_update(self):
     self.frame += 1
@@ -681,6 +684,18 @@ class CarrotPlanner:
         self.tlv_veto_active = True
         self.tlv_veto_started = time.monotonic()
         self._log_tlv_start_veto(sm, state_in, v_ego_kph * CV.KPH_TO_MS, left_intent)
+      # W144: the lamp turned green but only the model guard holds the start.
+      # Raise the existing "traffic sign changed" alert (its chime) so the driver
+      # knows, at most once per held red episode. This never starts the car.
+      if (blocked_edge and v_stopped and engaged and not gas and not cooldown
+          and not self.tlv_green_chime_done):
+        self.add_event(EventName.trafficSignChanged)
+        self.tlv_green_chime_done = True
+        red_age = -1.0 if self.tlv_red_confirmed_at is None else time.monotonic() - self.tlv_red_confirmed_at
+        cloudlog.event("tlv_green_chime", state_in=int(state_in),
+                       v_ego=float(v_ego_kph * CV.KPH_TO_MS), red_age_s=float(red_age))
+      if self.trafficState_carrot != 1 or gas or not engaged or v_moving_end:
+        self.tlv_green_chime_done = False
       # B1: a confirmed TLV red at standstill survives an unknown (0) for up
       # to 120 s so a later green/left edge can still fire; unknown never
       # counts as go. Gas, disengage, > 1 m/s or expiry end the hold.
@@ -740,6 +755,7 @@ class CarrotPlanner:
       self.carrot_stay_stop = False
       self.tlv_red_confirmed_at = None
       self.tlv_veto_active = False
+      self.tlv_green_chime_done = False
       self.activeCarrot = 0
       self.xDistToTurn = 0
       self.atcType = ""
