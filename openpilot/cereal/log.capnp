@@ -1351,6 +1351,8 @@ struct LateralPlan @0xe1e9318e2ae8b51e {
   laneCenterBlendWeight @39 :Float32;
   laneCenterBlendGates @40 :UInt16;
   laneCenterBlendAvoidDev @41 :Float32;
+  laneRecenterCurvature @42 :Float32;
+  laneRecenterActive @43 :Bool;
 
   struct SolverState {
     x @0 :List(List(Float32));
