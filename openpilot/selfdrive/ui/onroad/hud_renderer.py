@@ -55,9 +55,10 @@ SPEED_BASE = 300
 UNIT_SIZE = 44
 SIGN_R = 100
 SIGN_RIGHT = 122
-SIGN_RIGHT_LIGHT = 212
-SIGN_Y = 180
-LIGHT_RIGHT = 62
+SIGN_Y = 190
+LIGHT_W = 150        # traffic light: a horizontal capsule in the card's top-right corner, so the sign never moves
+LIGHT_H = 62
+LIGHT_MID = 50
 STATUS_SIZE = 42
 NAV_W_MIN = 540
 NAV_W_MAX = 920
@@ -758,11 +759,12 @@ class HudRenderer(Widget):
     if engaged:
       hs.hgradient_line(x + 60, y, DRIVE_W - 120, 4, hs.LIVE_GREEN)
 
-    # Right column: limit sign, pushed left when a traffic light takes the edge.
+    # Right column: the limit sign keeps one place; a traffic light sits above it in the top-right corner.
     limit, _camera, alarm = self._limit_state()
     light = self._traffic_light()
-    sign_x = right - (SIGN_RIGHT_LIGHT if light else SIGN_RIGHT)
-    column = sign_x - SIGN_R - 20 if limit > 0 else (right - LIGHT_RIGHT - 50 if light else right - 32)
+    sign_x = right - SIGN_RIGHT
+    column = sign_x - SIGN_R - 20 if limit > 0 else right - 32
+    light_x = right - 32 - LIGHT_W
 
     # SET row: the label carries the engagement colour; an active override reads as a solid pill.
     sx = x + 32
@@ -775,7 +777,7 @@ class HudRenderer(Widget):
       ink = hs.TEXT if white else hs.INK
       mid = y + SET_BASE - SET_SIZE * hs.INTER_CAP / 2
       # The pill stops short of the sign's rim at its lower edge; the reason drops before the speed does.
-      limit_x = right - 32
+      limit_x = light_x - 16 if light else right - 32
       if limit > 0:
         dy = (y + SIGN_Y) - (mid + CHIP_H / 2)
         if dy < SIGN_R:
@@ -814,12 +816,13 @@ class HudRenderer(Widget):
         hs.glow(sign_x, y + SIGN_Y, 124 * SIGN_R / 86, hs.rgba(255, 69, 58, int(90 + 90 * pulse)))
       hs.regulatory_sign(sign_x, y + SIGN_Y, str(limit), t, SIGN_R / 86)
     if light:
-      lx = right - LIGHT_RIGHT
-      hs.card(lx - 32, y + SIGN_Y - 82, 64, 164, hs.rgba(0, 0, 0, 160), 32, hs.rgba(255, 255, 255, 46), 1.5)
-      for cy, color, on in ((y + SIGN_Y - 36, hs.WARN_RED, light == "red"), (y + SIGN_Y + 36, hs.LIVE_GREEN, light == "green")):
+      ly = y + LIGHT_MID
+      hs.card(light_x, ly - LIGHT_H / 2, LIGHT_W, LIGHT_H, hs.rgba(0, 0, 0, 160), LIGHT_H / 2, hs.rgba(255, 255, 255, 46), 1.5)
+      for cx, color, on in ((light_x + LIGHT_W * 0.28, hs.WARN_RED, light == "red"),
+                            (light_x + LIGHT_W * 0.72, hs.LIVE_GREEN, light == "green")):
         if on:
-          hs.glow(lx, cy, 44, hs.with_alpha(color, 130))
-        hs.dot(lx, cy, 23, color if on else hs.with_alpha(color, 46))
+          hs.glow(cx, ly, 50, hs.with_alpha(color, 150))
+        hs.dot(cx, ly, 21, color if on else hs.with_alpha(color, 46))
 
     # Status strip: a recessed band along the card's foot, split from the speed by a hairline.
     foot = y + DRIVE_H - DRIVE_FOOT_H

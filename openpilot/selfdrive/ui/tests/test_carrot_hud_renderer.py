@@ -865,3 +865,99 @@ def test_camera_card_resets_the_latch_when_the_camera_comes_back(hud_module, mon
   assert camera_card_draws(renderer, module, monkeypatch, 0, 0.4) is None  # camera gone: nothing drawn
   assert renderer._camera_dist_held is None
   assert camera_card_draws(renderer, module, monkeypatch, 250, 0.6) == "250"  # new camera shows at once
+
+
+def _drive_card_probe(module, monkeypatch, *, limit, light):
+  """Draw the drive card once and return what the speed/sign/light layout used.
+
+  The text drawer is replaced, so the size passed for the speed numerals is the
+  value under test rather than a rendered result.
+  """
+  renderer = object.__new__(module.HudRenderer)
+  renderer._debug_speed_panel = False
+  renderer.speed = 40.0
+  renderer.is_cruise_set = False
+  renderer._engaged = False
+  renderer._cruise_gap_levels = module.GAP_LEVELS_MAX
+
+  probed = {"speed_sizes": [], "sign_x": [], "chip_right": None, "light_rect": None}
+
+  def draw(text, x, y, size, *args, **kwargs):
+    if text == "40":
+      probed["speed_sizes"].append(size)
+    return 20.0
+
+  # Size-proportional metrics: the speed fit must see a real width, otherwise
+  # every branch clamps at the 1.0 ceiling and the shrink is invisible.
+  renderer._type = SimpleNamespace(
+    width=lambda text, size, weight, spacing=0.0: 0.55 * size * len(text),
+    draw=draw,
+    draw_mid=lambda text, *args, **kwargs: 20.0,
+  )
+  monkeypatch.setattr(renderer, "_cruise_text", lambda: "--")
+  monkeypatch.setattr(renderer, "_update_cruise_speed_animation", lambda text: None)
+  monkeypatch.setattr(renderer, "_limit_state", lambda: (limit, False, False))
+  monkeypatch.setattr(renderer, "_traffic_light", lambda: light)
+  monkeypatch.setattr(renderer, "_override_chip",
+                      lambda: ("accel", "50", module.hs.LIVE_GREEN, False))
+  monkeypatch.setattr(renderer, "_get_gear_text", lambda: "D")
+  monkeypatch.setattr(renderer, "_get_cruise_gap", lambda: 3)
+  monkeypatch.setattr(renderer, "_get_driving_mode_text_and_color", lambda: ("", module.hs.TEXT))
+
+  # Record the sign centre and the light capsule. The stub raylib has no
+  # draw_circle_gradient, so the real sign is not replayed; only its x matters.
+  real_card = module.hs.card
+
+  def sign(cx, cy, value, type_, k=1.0, glow_alarm=False):
+    probed["sign_x"].append(cx)
+
+  # The light's backing capsule is the only card filled with translucent black,
+  # which identifies it on both the old and the new layout.
+  light_fill = module.hs.rgba(0, 0, 0, 160)
+
+  def card(x, y, w, h, fill=None, *args, **kwargs):
+    if light is not None and fill == light_fill:
+      probed["light_rect"] = (x, y, w, h)
+    return real_card(x, y, w, h, fill, *args, **kwargs)
+
+  monkeypatch.setattr(module.hs, "regulatory_sign", sign)
+  monkeypatch.setattr(module.hs, "card", card)
+  # The stub raylib has no circle primitives; the light's glow and dots are not
+  # under test, only the geometry of the capsule and the chip.
+  monkeypatch.setattr(module.hs, "glow", lambda *a, **k: None)
+  monkeypatch.setattr(module.hs, "dot", lambda *a, **k: None)
+
+  real_draw_mid = renderer._type.draw_mid
+  def draw_mid(text, x, y, size, *args, **kwargs):
+    if text == "50":  # the override chip's value: record its right edge
+      probed["chip_right"] = x + 0.55 * size * len(text)
+    return real_draw_mid(text, x, y, size, *args, **kwargs)
+  renderer._type.draw_mid = draw_mid
+
+  renderer._draw_drive_card(module.rl.Rectangle(10, 20, 1000, 600))
+  return probed
+
+
+def test_traffic_light_never_resizes_the_speed_or_moves_the_limit_sign(hud_module, monkeypatch):
+  """U2: the light is a capsule in the corner; the sign and speed keep their place and size."""
+  module, _ = hud_module
+  without = _drive_card_probe(module, monkeypatch, limit=60, light=None)
+  with_light = _drive_card_probe(module, monkeypatch, limit=60, light="red")
+
+  assert without["speed_sizes"] and with_light["speed_sizes"]
+  assert without["speed_sizes"][-1] == with_light["speed_sizes"][-1], (
+    "the speed numerals resized when the traffic light appeared")
+  assert without["sign_x"] and with_light["sign_x"]
+  assert without["sign_x"][-1] == with_light["sign_x"][-1], (
+    "the limit sign moved when the traffic light appeared")
+
+
+def test_override_chip_stays_left_of_the_light_capsule(hud_module, monkeypatch):
+  module, _ = hud_module
+  probed = _drive_card_probe(module, monkeypatch, limit=60, light="red")
+
+  assert probed["light_rect"] is not None, "the light capsule was not drawn"
+  assert probed["chip_right"] is not None, "the override chip was not drawn"
+  chip_right = probed["chip_right"]
+  light_x = probed["light_rect"][0]
+  assert chip_right <= light_x, f"chip right {chip_right:.0f} overlaps the light at x={light_x:.0f}"
