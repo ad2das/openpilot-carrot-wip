@@ -340,7 +340,7 @@ def test_every_release_starts_the_hold_off(reason):
   assert blend.recenter_latched
 
   if reason == 'mono':
-    _update(blend, 0.4, 0.5)      # |r| grows
+    _settle(blend, 0.4, 0.9, frames=3)   # |r| grows across the horizon
   elif reason == 'sign':
     x = V * T
     centre = np.zeros_like(x)
@@ -348,7 +348,7 @@ def test_every_release_starts_the_hold_off(reason):
     blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
                  T, x, path_y, False, False, recenter_enabled=True)
   elif reason == 'retract':
-    _update(blend, 0.2, 0.19)
+    _settle(blend, 0.2, 0.19, frames=3)
   else:
     _update(blend, 0.9, 0.3)
 
