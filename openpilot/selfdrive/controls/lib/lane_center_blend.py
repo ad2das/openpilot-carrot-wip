@@ -448,10 +448,15 @@ class LaneCenterBlend:
             reason = 'steer'
           elif gates != 0:
             reason = 'gate_steer' if (gates & GATE_STEER) else 'gate'
-          if reason is None:
+          if reason is None and abs(r0) < R_ON:
+            # Hysteresis: the latch survives down to R_OFF, but ACTIVE is only
+            # legal above R_ON, so the intent drops here while the return
+            # continues to be watched (an unlatched re-entry would debounce).
+            active = False
+          elif reason is None:
             target_k = self._recenter_target_k(t, r, v_ego)
             active = target_k != 0.0
-          else:
+          elif reason is not None:
             self._release_recenter(reason)
         if not self.recenter_latched:
           enter_ok = (base_ok and R_ON <= abs(r0) <= R_MAX and
