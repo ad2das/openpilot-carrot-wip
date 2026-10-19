@@ -65,7 +65,8 @@ WIDTH_DELTA_MAX = 0.4    # lane-width change across the lookahead that blocks en
 BOOST_S = 0.5            # aim at this fraction of the planned offset
 LRA_ACC_MAX = 0.3        # |k_lra| * v^2 cap, m/s^2
 LRA_JERK = 0.6           # |dk_lra| * v^2 per second cap, m/s^3
-LAT_ON = 1.0             # |kappa_road| * v^2 limit for assist, m/s^2
+LAT_ON = 1.5             # |kappa_road| * v^2 limit for assist, m/s^2 (LRA-only;
+                         # the blend's own KAPPA_MAX/GATE_CURVE are independent)
 
 GATE_OFF = 1
 GATE_LANE_MODE = 2
@@ -177,6 +178,7 @@ class LaneCenterBlend:
     self.recenter_enter_s = 0.0
     self.recenter_soft_s = 0.0
     self.recenter_r_filt = None
+    self.recenter_curve_block = False
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -195,6 +197,7 @@ class LaneCenterBlend:
     self.recenter_enter_s = 0.0
     self.recenter_soft_s = 0.0
     self.recenter_r_filt = None
+    self.recenter_curve_block = False
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -249,6 +252,7 @@ class LaneCenterBlend:
       self.curvature = 0.0
       self.gates = GATE_OFF
       geom = None
+      curve_block = False
       self.recenter_width_delta = 0.0
       if valid:
         centre = (lll_y + rll_y) / 2.0
@@ -275,10 +279,8 @@ class LaneCenterBlend:
           self.r_rate += alpha * ((r_mid - self.r_prev) / DT_MDL - self.r_rate)
         self.r_prev = r_mid
         self.recenter_width_delta = recenter_width_delta(ll_x, lll_y, rll_y, v_ego)
-        if abs(self.kappa_road) * v_ego ** 2 >= LAT_ON:
-          geom = None
-        else:
-          geom = (centre, ll_x, path_t, path_x, path_y)
+        geom = (centre, ll_x, path_t, path_x, path_y)
+        curve_block = abs(self.kappa_road) * v_ego ** 2 >= LAT_ON
       else:
         gates |= GATE_INVALID
         self.e_prev = None
@@ -287,7 +289,8 @@ class LaneCenterBlend:
       self._update_steer_block(steering_pressed)
       if self.steer_block or self.jump_t > 0.0:
         gates |= GATE_STEER
-      self._update_recenter(recenter_enabled, v_ego, gates, geom, steering_pressed)
+      self._update_recenter(recenter_enabled, v_ego, gates, geom, steering_pressed,
+                            curve_block=curve_block)
       return 0.0
 
     if valid:
@@ -373,8 +376,10 @@ class LaneCenterBlend:
     recenter_gates = gates & ~(GATE_AVOID | GATE_CURVE)
     if self.steer_block or self.jump_t > 0.0:
       recenter_gates |= GATE_STEER
-    recenter_geom = geom if (valid and abs(self.kappa_road) * v_ego ** 2 < LAT_ON) else None
-    self._update_recenter(recenter_enabled, v_ego, recenter_gates, recenter_geom, steering_pressed)
+    recenter_curve_block = bool(valid and abs(self.kappa_road) * v_ego ** 2 >= LAT_ON)
+    self._update_recenter(recenter_enabled, v_ego, recenter_gates,
+                          geom if valid else None, steering_pressed,
+                          curve_block=recenter_curve_block)
     return self.curvature
 
   def _recenter_target_k(self, t, r, v_ego):
@@ -422,12 +427,13 @@ class LaneCenterBlend:
       t, self.recenter_r_filt, float(self.recenter_r_filt[0]))
     return mono_ok, retract_ok
 
-  def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
+  def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed, curve_block=False):
     """Lane recenter assist: extra curvature that doubles an already-planned return.
 
     Only ever runs when the caller asks for it, the laneless branch is used and
-    the road is not turning.  OFF leaves `recenter_curvature` exactly 0.0; when a
-    gate closes the output is slewed back to zero rather than stepped.
+    the road is not turning harder than LAT_ON.  OFF leaves
+    `recenter_curvature` exactly 0.0; when a gate closes the output is slewed
+    back to zero rather than stepped.
     """
     if not enabled:
       self.recenter_curvature = 0.0
@@ -438,15 +444,17 @@ class LaneCenterBlend:
       self.recenter_enter_s = 0.0
       self.recenter_soft_s = 0.0
       self.recenter_r_filt = None
+      self.recenter_curve_block = False
       return
 
+    self.recenter_curve_block = bool(curve_block)
     prev_k = self.recenter_k
     target_k = 0.0
     active = False
     self.recenter_hold_s = max(0.0, self.recenter_hold_s - DT_MDL)
 
     r0 = 0.0
-    if geom is not None:
+    if geom is not None and not curve_block:
       t, r = recenter_profile(geom[1], geom[0], geom[2], geom[3], geom[4])
       if t is not None:
         r0 = float(r[0])
@@ -531,7 +539,8 @@ class LaneCenterBlend:
       self.recenter_enter_s = 0.0
       self.recenter_r_filt = None
       if self.recenter_latched:
-        self._release_recenter('no_geometry')
+        # A curve-limit frame is its own hard reason; a missing profile is not.
+        self._release_recenter('curve' if curve_block else 'no_geometry')
 
     slew = LRA_JERK / max(v_ego, 1.0) ** 2 * DT_MDL
     self.recenter_k = float(np.clip(target_k, prev_k - slew, prev_k + slew))
