@@ -415,7 +415,7 @@ class LaneCenterBlend:
     self.recenter_hold_s = max(0.0, self.recenter_hold_s - DT_MDL)
 
     r0 = 0.0
-    if geom is not None and not steering_pressed:
+    if geom is not None:
       t, r = recenter_profile(geom[1], geom[0], geom[2], geom[3], geom[4])
       if t is not None:
         r0 = float(r[0])
