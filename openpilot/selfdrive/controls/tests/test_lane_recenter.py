@@ -842,7 +842,8 @@ def test_lane_recenter_assist_is_on_by_default():
   import json
   from pathlib import Path
 
-  root = Path(__file__).resolve().parents[4]
+  # parents: tests -> controls -> selfdrive -> openpilot
+  root = Path(__file__).resolve().parents[3]
   keys = (root / 'common' / 'params_keys.h').read_text(encoding='utf-8')
   assert '{"LaneRecenterAssist", {PERSISTENT, INT, "1"}}' in keys
 
