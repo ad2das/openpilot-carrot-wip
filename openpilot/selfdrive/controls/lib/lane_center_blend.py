@@ -448,15 +448,18 @@ class LaneCenterBlend:
             reason = 'steer'
           elif gates != 0:
             reason = 'gate_steer' if (gates & GATE_STEER) else 'gate'
-          if reason is None and abs(r0) < R_ON:
-            # Hysteresis: the latch survives down to R_OFF, but ACTIVE is only
-            # legal above R_ON, so the intent drops here while the return
-            # continues to be watched (an unlatched re-entry would debounce).
-            active = False
-          elif reason is None:
-            target_k = self._recenter_target_k(t, r, v_ego)
-            active = target_k != 0.0
-          elif reason is not None:
+          if reason is None:
+            # Same consecutive-frame rule for the intent as for entry: dropping
+            # below R_ON (still latched) stops the assist, and it only comes
+            # back after the full hold again, so the band cannot chatter.
+            if abs(r0) >= R_ON:
+              self.recenter_enter_s += DT_MDL
+            else:
+              self.recenter_enter_s = 0.0
+            if abs(r0) >= R_ON and self.recenter_enter_s >= ENTER_HOLD_S - 1e-12:
+              target_k = self._recenter_target_k(t, r, v_ego)
+              active = target_k != 0.0
+          else:
             self._release_recenter(reason)
         if not self.recenter_latched:
           enter_ok = (base_ok and R_ON <= abs(r0) <= R_MAX and
