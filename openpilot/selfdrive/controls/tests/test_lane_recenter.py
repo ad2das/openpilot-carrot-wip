@@ -133,6 +133,19 @@ def test_smoothed_soft_checks_latch_a_noisy_return(enabled):
   assert blend.recenter_r_filt is not None
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_filter_step_matches_the_ema_constant(enabled):
+  """R4-1: one frame moves the smoothed plan by DT/(tau+DT) of the gap."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _noisy_update(blend, _return_r(0.4, 1.0), enabled=enabled)
+  before = blend.recenter_r_filt.copy()
+  r_next = _return_r(0.4, 0.0)
+  _noisy_update(blend, r_next, enabled=enabled)
+  alpha = DT_MDL / (REC_FILT_TAU + DT_MDL)
+  expect = before + alpha * (r_next[T <= 3.0] - before)
+  assert np.allclose(blend.recenter_r_filt, expect, atol=1e-12)
+
+
 def test_smoothed_soft_checks_reject_a_holding_offset_with_noise():
   """A path that holds its offset (plus noise) is not a return, filtered or not."""
   for enabled in (False, True):
