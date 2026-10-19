@@ -276,6 +276,7 @@ class CarrotPlanner:
     self.hi_stop_red_frames = 0
     self.hi_stop_red_gap = 0
     self.hi_stop_model_frames = 0
+    self.hi_stop_support_ok = False
     # W139c fast-road phantom gate state.
     self.model_stop_sign_t = None
     self.tlv_fast_gate_open = False

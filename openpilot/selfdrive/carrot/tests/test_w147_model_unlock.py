@@ -31,6 +31,9 @@ def planner():
   p.tlv_gas_cooldown_frames = 0
   p.last_model_stop_sign = False
   p.last_model_start_sign = False
+  # __new__ skips __init__, so every attribute __init__ sets must be mirrored
+  # here. The guard test below builds a real CarrotPlanner() instead, which is
+  # what actually proves __init__ initialises the W147 state.
   p._hi_stop_carrot_man = None
   p.hi_stop_red_frames = 0
   p.hi_stop_red_gap = 0
@@ -167,3 +170,24 @@ def test_e2e_cruise_braking_exclusion_still_applies_above_82():
 def test_regen_v_cruise_zero_keeps_the_exclusion_off():
   p = planner()
   assert run(p, 40, v_kph=85.0, a_ego=-2.0, v_cruise=0.0, man_obj=man())[-1] is True
+
+
+# --- the real constructor must initialise the unlock state -------------------
+def test_real_constructor_initialises_hi_stop_state():
+  """plannerd can restart at >= 82 km/h on a highway with src 1 / red: the
+  first frame then reads hi_stop_support_ok before any slow frame reset it."""
+  # __init__ reads MyDrivingMode; DrivingMode(0) is not a member and a fresh
+  # test prefix holds no value, so seed the one the constructor requires.
+  from openpilot.common.params import Params
+  Params().put_int("MyDrivingMode", 3)
+  p = CarrotPlanner()
+  assert p.hi_stop_support_ok is False
+  assert p.hi_stop_red_frames == 0
+  assert p.hi_stop_red_gap == 0
+  assert p.hi_stop_model_frames == 0
+  p._hi_stop_carrot_man = man(support=3)
+  v = np.full(N, 0.5)
+  y = np.zeros(N)
+  p.check_model_stopping(60.0, v, 90.0 / 3.6, 0.0, 50.0, y, 1000.0)
+  assert p.last_model_stop_sign is False, "0.5 s of TLV red is not there yet"
+  assert p.hi_stop_red_frames == 1
