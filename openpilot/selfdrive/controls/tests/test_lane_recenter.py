@@ -485,7 +485,25 @@ def test_table_roundtrip_unchanged():
 
 
 def test_steer_gate_bit_is_used_in_both_branches():
-  blend = LaneCenterBlend()
+  """The blend gate field stays GATE_OFF when the blend is off; the assist must
+  still see the steer bit.  Latching then holding the wheel releases it."""
   assert GATE_STEER == 256
-  _settle(blend, 0.4, 0.0, frames=12, enabled=False, steering=True)
-  assert blend.gates & GATE_STEER
+  for enabled in (False, True):
+    blend = LaneCenterBlend(table=np.full(7, 0.1))
+    _settle(blend, 0.4, 0.0, enabled=enabled)
+    assert blend.recenter_latched
+    _settle(blend, 0.4, 0.0, frames=12, enabled=enabled, steering=True)
+    assert blend.steer_block
+    assert not blend.recenter_latched
+    assert blend.recenter_active is False
+    if enabled:
+      assert blend.gates & GATE_STEER
+    else:
+      assert blend.gates == GATE_OFF
+
+  # And the steer bit alone blocks entry from a fresh state.
+  for enabled in (False, True):
+    blend = LaneCenterBlend()
+    _settle(blend, 0.4, 0.0, frames=60, enabled=enabled, steering=True)
+    assert not blend.recenter_latched
+    assert blend.recenter_curvature == 0.0
