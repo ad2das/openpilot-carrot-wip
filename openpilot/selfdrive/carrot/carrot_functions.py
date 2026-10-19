@@ -106,6 +106,17 @@ TLV_FAST_GATE_RESET_S = 0.5
 TLV_START_MODEL_CLEAR_S = 1.0
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
+# W147 v2: the model stop cue is unlocked above 82 km/h only when the on-device
+# TLV detector confirms the red. The < 82 km/h branch keeps its 5 m lateral
+# bound byte-identically; only this branch widens it to 10 m, which is what
+# W147 S1/S2 measured (every extra fire was a real red).
+TLV_HI_STOP_Y_MAX_M = 10.0
+TLV_HI_STOP_MIN_SUPPORT = 2          # W139c semantics: distinct dets in 2.5 s
+TLV_HI_STOP_RED_S = 0.5              # TLV red continuously present this long
+TLV_HI_STOP_MODEL_S = 0.3            # model expression continuously true
+# Same flicker tolerance as the fast gate: the fusion latch can drop the red
+# for ~0.1-0.2 s inside one episode, which must not restart the 0.5 s clock.
+TLV_HI_STOP_RED_GAP_FRAMES = int(TLV_FAST_GATE_RESET_S / DT_MDL)
 
 class CarrotPlanner:
   def __init__(self, signal_assist=None, start_guard=None, stop_prepare=None):
@@ -260,6 +271,11 @@ class CarrotPlanner:
     self.tlv_log_veto_t = -1e9
     self.tlv_log_clear_t = -1e9
     self.tlv_log_coast_t = -1e9
+    # W147 v2: >= 82 km/h TLV-corroborated model stop state.
+    self._hi_stop_carrot_man = None
+    self.hi_stop_red_frames = 0
+    self.hi_stop_red_gap = 0
+    self.hi_stop_model_frames = 0
     # W139c fast-road phantom gate state.
     self.model_stop_sign_t = None
     self.tlv_fast_gate_open = False
@@ -442,10 +458,74 @@ class CarrotPlanner:
     stop_x = self.xStopFilter2.process(stop_x)
     return stop_x
 
+  def _reset_hi_stop_state(self) -> None:
+    """Forget the >= 82 km/h unlock state once the car is slower than 82 km/h."""
+    self.hi_stop_red_frames = 0
+    self.hi_stop_red_gap = 0
+    self.hi_stop_model_frames = 0
+    self.hi_stop_support_ok = False
+
+  def _check_model_stopping_hi(self, v_cruise, v, model_v, model_x, y, d_rel, a_ego) -> bool:
+    """W147 v2: model stop cue at >= 82 km/h, unlocked only by a TLV red.
+
+    Same expression as the < 82 km/h branch except the lateral bound, which is
+    TLV_HI_STOP_Y_MAX_M, and it only counts when the on-device detector
+    corroborates the red: carrotMan.trafficStateSrc == 1, trafficState == 1
+    (red) for TLV_HI_STOP_RED_S, and carrotMan.tlvDetSupport >= 2 somewhere in
+    that red episode (W139c semantics: latched until the red run ends; the
+    field is absent -> 0, so a route without it never unlocks). The model
+    expression itself must hold for TLV_HI_STOP_MODEL_S. Gas cooldown
+    suppresses it, as it suppresses every TLV control effect. The W148
+    expressway gate is upstream: it never lets a src-1 state reach carrotMan
+    there.
+    """
+    expr = (model_x < d_rel - 3.0 and
+            model_x < np.interp(v[0] * 3.6, [60, 80], [120.0, 150]) and
+            ((model_v < 3.0) or (model_v < v[0] * 0.7)) and
+            abs(y[-1]) < TLV_HI_STOP_Y_MAX_M)
+    if expr and v_cruise != 0 and self.xState == XState.e2eCruise and a_ego < -1.0:
+      expr = False
+
+    # Model persistence is counted on the expression alone: the corroboration
+    # gates the fire, not the evidence that the model saw the stop.
+    self.hi_stop_model_frames = self.hi_stop_model_frames + 1 if expr else 0
+
+    man = self._hi_stop_carrot_man
+    red = False
+    if man is not None:
+      # Absent/old fields read as 0: a route that never logged the detector
+      # state or the support can never unlock the >= 82 km/h branch.
+      red = (int(getattr(man, 'trafficStateSrc', 0)) == 1
+             and int(getattr(man, 'trafficState', 0)) == 1)
+      if red:
+        self.hi_stop_support_ok = self.hi_stop_support_ok or (
+          int(getattr(man, 'tlvDetSupport', 0)) >= TLV_HI_STOP_MIN_SUPPORT)
+
+    if red:
+      self.hi_stop_red_frames += 1
+      self.hi_stop_red_gap = 0
+    elif self.hi_stop_red_frames > 0 and self.hi_stop_red_gap < TLV_HI_STOP_RED_GAP_FRAMES:
+      # Tolerate the fusion latch's short drop inside one red episode: the run
+      # keeps its length but stops growing, and the support latch survives.
+      self.hi_stop_red_gap += 1
+    else:
+      self.hi_stop_red_frames = 0
+      self.hi_stop_red_gap = 0
+      self.hi_stop_support_ok = False
+
+    red_ok = self.hi_stop_red_frames * DT_MDL >= TLV_HI_STOP_RED_S
+    model_ok = self.hi_stop_model_frames * DT_MDL >= TLV_HI_STOP_MODEL_S
+    return bool(expr and red_ok and model_ok and self.hi_stop_support_ok
+                and self.tlv_gas_cooldown_frames == 0)
+
   def check_model_stopping(self, v_cruise, v, v_ego, a_ego, model_x, y, d_rel):
     v_ego_kph = v_ego * CV.MS_TO_KPH
     model_v = self.vFilter.process(v[-1])
     startSign = model_v > 5.0 or model_v > (v[0] + 2)
+
+    # W147 v2: the >= 82 km/h unlock has no memory across a slow phase.
+    if v_ego_kph < 82.0:
+      self._reset_hi_stop_state()
 
     if v_ego_kph < 1.0:
       stopSign = model_x < 20.0 and model_v < 10.0
@@ -459,7 +539,7 @@ class CarrotPlanner:
       if v_cruise != 0 and (self.xState == XState.e2eCruise and a_ego < -1.0):
         stopSign = False
     else:
-      stopSign = False
+      stopSign = self._check_model_stopping_hi(v_cruise, v, model_v, model_x, y, d_rel, a_ego)
 
     self.last_model_stop_sign = bool(stopSign)
     self.last_model_start_sign = bool(startSign)
@@ -615,6 +695,8 @@ class CarrotPlanner:
     carstate = sm['carState']
     self._update_left_blinker_pre_stop(carstate, v_ego_kph)
     carrot_man = get_carrot_man(sm)
+    # W147 v2: the >= 82 km/h unlock reads the fusion's own state + support.
+    self._hi_stop_carrot_man = carrot_man
     if carrot_man is not None:
       state_in = int(carrot_man.trafficState)
       src_in = int(getattr(carrot_man, 'trafficStateSrc', 0))
