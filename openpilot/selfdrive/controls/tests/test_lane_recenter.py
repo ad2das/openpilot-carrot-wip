@@ -42,8 +42,10 @@ def _geometry(r0, r_horizon=None, v=V, kappa=0.0, width=WIDTH, widen=0.0, centre
   r_end = r0 if r_horizon is None else r_horizon
   frac = np.clip(T / 3.0, 0.0, 1.0)
   r = r0 + (r_end - r0) * frac
+  # Symmetric widening: the width changes without moving the lane centre, so
+  # this test isolates the taper/gore guard from the sign/monotone releases.
   grow = widen * np.clip(x / 45.0, 0.0, 1.0)
-  return x, centre - width / 2.0, centre + width / 2.0 + grow, x, centre + r, centre
+  return x, centre - width / 2.0 - grow / 2.0, centre + width / 2.0 + grow / 2.0, x, centre + r, centre
 
 
 def _update(blend, r0, r_horizon=None, *, recenter=True, v=V, kappa=0.0, lane_mode=False,
