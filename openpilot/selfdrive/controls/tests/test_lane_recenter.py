@@ -333,7 +333,7 @@ def test_centre_jump_gives_zero_for_its_hold(enabled):
   assert blend.recenter_curvature != 0.0
 
 
-@pytest.mark.parametrize("reason", ['mono', 'sign', 'retract', 'r_max'])
+@pytest.mark.parametrize("reason", ['mono', 'sign', 'retract'])
 def test_every_release_starts_the_hold_off(reason):
   blend = LaneCenterBlend()
   _settle(blend, 0.4, 0.0)
@@ -347,10 +347,8 @@ def test_every_release_starts_the_hold_off(reason):
     path_y = np.where(T <= 1.5, 0.4, -0.3)
     blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
                  T, x, path_y, False, False, recenter_enabled=True)
-  elif reason == 'retract':
-    _settle(blend, 0.2, 0.19, frames=3)
   else:
-    _update(blend, 0.9, 0.3)
+    _settle(blend, 0.2, 0.19, frames=3)
 
   assert not blend.recenter_latched
   assert blend.recenter_releases.get(reason, 0) == 1
@@ -361,6 +359,21 @@ def test_every_release_starts_the_hold_off(reason):
   assert not blend.recenter_latched
   _settle(blend, 0.4, 0.0, frames=SETTLE)
   assert blend.recenter_latched
+
+
+def test_above_r_max_release_starts_the_hold_off():
+  blend = LaneCenterBlend()
+  _settle(blend, 0.4, 0.0)
+  assert blend.recenter_latched
+  # Prime r_rate with the new geometry first, so the release is r_max and not
+  # the rate criterion.
+  _settle(blend, 0.85, 0.3, frames=3, recenter=False)
+  blend.recenter_latched = True
+  blend.recenter_hold_s = 0.0
+  _settle(blend, 0.85, 0.3, frames=2)
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get('r_max', 0) == 1
+  assert 0.0 < blend.recenter_hold_s <= R_REENTER_S
 
 
 def test_assist_runs_with_blend_disabled_and_leaves_blend_outputs_off():
