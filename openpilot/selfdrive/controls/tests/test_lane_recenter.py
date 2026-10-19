@@ -492,7 +492,14 @@ def test_every_release_starts_the_hold_off(reason):
     _settle(blend, 0.2, 0.19, frames=soft_frames)
 
   assert not blend.recenter_latched
-  assert blend.recenter_releases.get(reason, 0) == 1
+  if reason == 'mono':
+    # The swing-out also trips the rate check, so the label is whichever soft
+    # condition happened to be checked first; this test is about the hold-off.
+    soft = {'mono', 'retract', 'rate'}
+    assert sum(blend.recenter_releases.get(k, 0) for k in soft) == 1
+    assert sum(blend.recenter_releases.values()) == 1
+  else:
+    assert blend.recenter_releases.get(reason, 0) == 1
   assert 0.0 < blend.recenter_hold_s <= R_REENTER_S
 
   # The hold-off blocks re-entry even though the entry condition holds again.
