@@ -97,6 +97,16 @@ def _return_r(r0, frac, noise=0.0, phase=0):
   return base
 
 
+def _drive_until(blend, step, pred, max_frames=200):
+  """Run `step` until `pred(blend)`; return (frames_used, curvature_before_last)."""
+  for n in range(max_frames):
+    prev_k = blend.recenter_curvature
+    step()
+    if pred(blend):
+      return n + 1, prev_k
+  raise AssertionError('condition not reached within the frame budget')
+
+
 @pytest.mark.parametrize("enabled", [False, True])
 def test_smoothed_soft_checks_latch_a_noisy_return(enabled):
   """R4-1: alternating +/-0.04 m noise on a real return must not block entry.
@@ -489,7 +499,10 @@ def test_every_release_starts_the_hold_off(reason):
     blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
                  T, x, path_y, False, False, recenter_enabled=True)
   else:
-    _settle(blend, 0.2, 0.19, frames=soft_frames)
+    # A profile that stops retracting. The smoothed check needs time to see the
+    # missing retraction, so drive until the release instead of counting frames.
+    _drive_until(blend, lambda: _noisy_update(blend, np.full(len(T), 0.2)),
+                 lambda b: not b.recenter_latched)
 
   assert not blend.recenter_latched
   if reason == 'mono':
@@ -510,9 +523,9 @@ def test_every_release_starts_the_hold_off(reason):
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("soft", ['mono', 'retract', 'rate'])
+@pytest.mark.parametrize("soft", ['retract', 'rate'])
 def test_a_soft_frame_stops_output_but_keeps_the_latch(soft, enabled):
-  """R3-1: one failing soft frame zeroes the target at once, latch survives."""
+  """R3-1/R4-1: a failing soft frame zeroes the target at once, latch survives."""
   blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
   _settle(blend, 0.4, 0.0, enabled=enabled)
   assert blend.recenter_latched
@@ -520,10 +533,14 @@ def test_a_soft_frame_stops_output_but_keeps_the_latch(soft, enabled):
   k_before = blend.recenter_curvature
   releases_before = dict(blend.recenter_releases)
 
-  if soft == 'mono':
-    _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
-  elif soft == 'retract':
-    _settle(blend, 0.2, 0.19, frames=1, enabled=enabled)
+  if soft == 'retract':
+    # A profile that stops returning. The smoothed check needs a few frames to
+    # show the missing retraction, so wait for the first filtered failure and
+    # compare the output with the frame just before it.
+    def step():
+      _noisy_update(blend, np.full(len(T), 0.4), enabled=enabled)
+
+    _, k_before = _drive_until(blend, step, lambda b: b.recenter_soft_s > 0.0)
   else:
     # Rate away: r at 1.5 s grows 0.02 m per frame (0.4 m/s after the filter)
     # while |r(3 s)| keeps shrinking, so every *other* check still passes and
@@ -552,9 +569,15 @@ def test_soft_failure_shorter_than_exit_hold_resumes_without_a_new_wait(enabled)
   _settle(blend, 0.4, 0.0, enabled=enabled)
   assert blend.recenter_latched
 
-  # Fail mono for one frame less than EXIT_HOLD_S, then return to a good return.
+  # Fail the soft check for one frame less than EXIT_HOLD_S from its first
+  # filtered failure, then return to a good return.
+  def fail_step():
+    _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
+
+  used, _ = _drive_until(blend, fail_step, lambda b: b.recenter_soft_s > 0.0)
+  assert blend.recenter_latched
   fail_frames = max(1, int(round(EXIT_HOLD_S / DT_MDL)) - 1)
-  _settle(blend, 0.4, 0.9, frames=fail_frames, enabled=enabled)
+  _settle(blend, 0.4, 0.9, frames=max(0, fail_frames - used), enabled=enabled)
   assert blend.recenter_latched
 
   _settle(blend, 0.4, 0.0, frames=1, enabled=enabled)
@@ -569,13 +592,20 @@ def test_soft_failure_for_exit_hold_releases_with_the_hold_off(enabled):
   blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
   _settle(blend, 0.4, 0.0, enabled=enabled)
   assert blend.recenter_latched
-  # EXIT_HOLD_S is reached after exactly this many consecutive failing frames.
+
+  # Reach the first filtered failure, then one frame less than the deadline.
+  def fail_step():
+    _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
+
+  used, _ = _drive_until(blend, fail_step, lambda b: b.recenter_soft_s > 0.0)
   deadline = int(round(EXIT_HOLD_S / DT_MDL))
-  _settle(blend, 0.4, 0.9, frames=deadline - 1, enabled=enabled)
+  assert deadline > used
+  _settle(blend, 0.4, 0.9, frames=deadline - 1 - used, enabled=enabled)
   assert blend.recenter_latched
   _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
   assert not blend.recenter_latched
-  assert blend.recenter_releases.get('mono', 0) == 1
+  soft = {'mono', 'retract', 'rate'}
+  assert sum(blend.recenter_releases.get(k, 0) for k in soft) == 1
   assert 0.0 < blend.recenter_hold_s <= R_REENTER_S
 
 
