@@ -96,6 +96,12 @@ SCHOOL_ZONE_GAS_OVERRIDE_TIMEOUT_S = 3.0
 TLV_CONF_MIN = 0.5
 TLV_FRAME_W = 1928.0  # C3X road camera native size (CONTRACT.md)
 TLV_FRAME_H = 1208.0
+# W150: model start cue. A released TLV red is cleared immediately only while
+# the model is asking to start; without a cue the hold + off_timeout stay as
+# they are, because the 5 camera-verified model starts on a real red (see the
+# W150 commit body) are exactly what that hold protects against.
+TLV_CUE_ACTIVE_S = 0.3   # trafficSignGreen has no duration
+TLV_XSTOPPED = 5         # carrot_functions.XState.e2eStopped
 # carrotTlv State ordinals -> the color strings traffic_light() already uses.
 # Korean left phases depend on turn intent: a left arrow means "Left turn"
 # only when the driver/navi intends to go left; otherwise the same lamp is the
@@ -239,6 +245,12 @@ class CarrotServ:
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
     self.tlv_det_support = 0    # W139c: carrotTlv.relevantDetSupport passed through
     self.tlv_hold_until = 0.0   # W143: src-1 TLV state held until this monotonic time
+    # W150: model start cue state for the released-red clear. The xState cue is
+    # an edge, so the previous sample's stopped flag is kept here.
+    self.tlv_last_stopped: bool | None = None
+    self.tlv_xstate_left_at = -1e9
+    self.tlv_green_event_at = -1e9
+    self.tlv_release_clears = 0
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
     # W148: expressway gate, fed only by the carrotNavi roadCategory.
@@ -499,6 +511,14 @@ class CarrotServ:
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
       return
     state_raw = int(msg.state.raw)
+    # W150: a released red arrives as state none, so this must run BEFORE the
+    # colour mapping (which returns early for none). Clear the held src-1 red
+    # at once when the model start cue is active; without a cue, today's hold
+    # and off_timeout are untouched.
+    if bool(getattr(msg, "relevantReleased", False)) and self._tlv_model_start_cue(sm):
+      self._clear_tlv_red()
+      self.tlv_release_clears += 1
+      return
     if state_raw == TLV_RED_LIKELY_STATE:  # graded redLikely: no confirmed color
       if float(msg.stateConf) < TLV_CONF_MIN:
         return
@@ -538,6 +558,60 @@ class CarrotServ:
     except Exception:
       return False
 
+
+  def _tlv_model_start_cue(self, sm) -> bool:
+    """True while the model is asking to start.
+
+    Sources, all in the same SubMaster carrot_man already passes (CarrotServ
+    runs inside the carrot_man process, so this is the same longitudinalPlan
+    the planner saw):
+      - longitudinalPlan.trafficState == 2 (the model start colour), or
+      - an onroadEvents trafficSignGreen within TLV_CUE_ACTIVE_S, or
+      - an xState edge out of e2eStopped within TLV_CUE_ACTIVE_S.
+
+    The xState cue is an EDGE, not a level: xState stays non-stopped for
+    minutes once the car moves, which would leave the gate permanently open.
+    """
+    now = time.monotonic()
+    seen = getattr(sm, "seen", {}) or {}
+    alive = getattr(sm, "alive", {}) or {}
+    valid = getattr(sm, "valid", {}) or {}
+    updated = getattr(sm, "updated", {}) or {}
+    try:
+      if (seen.get('longitudinalPlan', False) and alive.get('longitudinalPlan', False)
+          and valid.get('longitudinalPlan', False)):
+        ts = sm['longitudinalPlan'].trafficState
+        if int(ts.raw if hasattr(ts, "raw") else ts) == 2:
+          return True
+    except Exception:
+      pass
+    if updated.get('longitudinalPlan', False):
+      try:
+        xs = sm['longitudinalPlan'].xState
+        stopped = int(xs.raw if hasattr(xs, "raw") else xs) == TLV_XSTOPPED
+        if self.tlv_last_stopped is True and not stopped:
+          self.tlv_xstate_left_at = now
+        self.tlv_last_stopped = stopped
+      except Exception:
+        pass
+    if getattr(self, "tlv_xstate_left_at", -1e9) >= now - TLV_CUE_ACTIVE_S:
+      return True
+    if updated.get('onroadEvents', False) and seen.get('onroadEvents', False):
+      try:
+        for e in sm['onroadEvents'].events:
+          if "trafficSignGreen" in str(e.name):
+            self.tlv_green_event_at = now
+            break
+      except Exception:
+        pass
+    return getattr(self, "tlv_green_event_at", -1e9) >= now - TLV_CUE_ACTIVE_S
+
+  def _clear_tlv_red(self) -> None:
+    """W150: drop a released src-1 red now instead of waiting TLV_HOLD_S."""
+    self.traffic_state = 0
+    self.traffic_state_src = 0
+    self.tlv_hold_until = 0.0
+    self.tlv_det_support = 0
 
   def calculate_current_speed(self, left_dist, safe_speed_kph, safe_time, safe_decel_rate):
     safe_speed = safe_speed_kph / 3.6
@@ -1715,6 +1789,11 @@ class CarrotServ:
     self._update_countdown_alert(left_sec, source, v_ego_kph)
 
     self._update_cmd()
+    # W150: carrotTlv publishes at ~1 Hz but the cue is an EDGE (xState leaving
+    # e2eStopped); sample it at the 20 Hz loop so the 0.3 s window is not
+    # quantised to the publish cadence. The result is cached in the timestamp
+    # fields, which _update_tlv_fusion then reads.
+    self._tlv_model_start_cue(sm)
     self._update_tlv_fusion(sm)
     msg = messaging.new_message('carrotMan')
     msg.valid = True

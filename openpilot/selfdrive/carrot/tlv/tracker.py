@@ -63,6 +63,13 @@ CLASSIFIER_SLOW_VOTES = 6
 CLASSIFIER_RED_CONFIRM_WINDOW_S = 1.2
 # Graded redLikely: one strong red vote (probability >= 0.6) is enough.
 RED_LIKELY_MIN_PROB = 0.6
+# W150: release a held red when the newest 3 votes are all green-family/left at
+# prob >= 0.80 with no newer red vote. CP1 chose N=3/P=0.80: its modelled risk is
+# 0.68x the existing 4-vote confirm, and 1-2 vote releases were 4-27x riskier.
+# This lifts the red only (state -> none); green still needs the W143 confirm.
+GREEN_RELEASE_VOTES = 3
+GREEN_RELEASE_PROB = 0.80
+GREEN_RELEASE_CLASSES = (LampClass.GREEN, LampClass.GREEN_LEFT, LampClass.LEFT)
 # W143: green/go confirmation is vote-based in a longer window. Field classify
 # cadence on route 450 is clsHz 2.6-3.2 (budget-limited), so the old 6-in-1.2 s
 # rule was nearly unreachable and the launch green arrived ~3.5 s late. 4 votes
@@ -308,6 +315,24 @@ class Track:
   def det_support(self, now: float, window_s: float = DET_SUPPORT_WINDOW_S) -> int:
     """W139c: detector matches (and creation) within (now - window_s, now]."""
     return sum(1 for t in self.det_times if now - window_s < t <= now)
+
+  def released(self) -> bool:
+    """W150: the newest GREEN_RELEASE_VOTES votes are all release-class at
+    prob >= GREEN_RELEASE_PROB and no red-family vote is newer than them.
+
+    This is a release from a held red, NOT a green confirmation: the caller
+    turns the state machine to none, so the green still has to pass the W143
+    confirm before it can start anything.
+    """
+    votes = list(self.votes)
+    if len(votes) < GREEN_RELEASE_VOTES:
+      return False
+    run = votes[-GREEN_RELEASE_VOTES:]
+    run_start = run[0][0]
+    if any(cls not in GREEN_RELEASE_CLASSES or prob < GREEN_RELEASE_PROB
+           for _t, cls, prob in run):
+      return False
+    return not any(cls in RED_FAMILY and t > run_start for t, cls, _p in votes)
 
 
 def _most_common(values: list[int]) -> int:

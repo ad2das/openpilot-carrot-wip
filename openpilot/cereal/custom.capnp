@@ -310,6 +310,10 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	relevantVoteCls @22 :Int8;
 	relevantVoteProb @23 :Float32;
 	relevantVoteAgeMs @24 :UInt16;
+	# W150: the relevant track's newest 3 votes were all green-family/left at
+	# prob >= 0.80 with no newer red vote, so a held red was released this frame.
+	# A release only lifts the red (state -> none); it never starts the car.
+	relevantReleased @25 :Bool;
 
 	enum Status {
 		off @0;

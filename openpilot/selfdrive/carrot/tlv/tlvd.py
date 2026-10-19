@@ -656,6 +656,9 @@ class TlvRunner:
     # sustain frames, for the fast-road phantom gate downstream.
     out.relevantDetSupport = int(min(255, max(0, self.pipeline.last_relevant_det_support)))
     out.redSustain = int(self.pipeline.red_sustain_total)
+    # W150: this publish carries a fresh release of a held red. getattr keeps
+    # the many publish-level fakes (SimpleNamespace pipelines) working.
+    out.relevantReleased = bool(getattr(self.pipeline, "last_released", False))
     # W143 vote telemetry: the relevant track's latest lamp vote at publish.
     vote_cls, vote_prob, vote_age_ms = -1, 0.0, 0
     if self.pipeline.last_track_id >= 0:

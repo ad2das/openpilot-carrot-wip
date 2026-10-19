@@ -105,6 +105,8 @@ class FrameOutput:
   infer_ms: float
   proc_ms: float
   red_likely: bool = False
+  # W150: this frame released a held red (state machine went red -> none).
+  released: bool = False
   # Flat-road tail-light gate: detections dropped this frame (below the
   # horizon + margin while calibrated), full-frame boxes like dets.
   gated: list[tracker.Detection] = field(default_factory=list)
@@ -135,6 +137,8 @@ class FramePipeline:
     # infer() runs (tlvd._update_odometry then FramePipeline.ego is set).
     self.last_relevant_box: tuple[float, float, float, float] | None = None
     self.last_red_likely = False
+    # W150: the last infer() released a held red (see Track.released()).
+    self.last_released = False
     # W139c: monotonic time of the last confirmed red-family relevant track, and
     # cumulative frames a confirmed red was sustained by a red vote on the new
     # relevant track (telemetry), and the relevant track's detector support.
@@ -434,6 +438,23 @@ class FramePipeline:
       machine_conf = self.last_conf  # refresh only
       self.red_sustain_total += 1
     self.last_relevant_det_support = relevant[0].det_support(now) if relevant is not None else 0
+    # W150: release a held red when the newest 3 relevant-track votes are green
+    # at prob >= 0.80 (tracker.GREEN_RELEASE_*). This clears the state machine to
+    # none so the 2 s off-timeout cannot keep a red that the light left; it does
+    # NOT publish green, so a start still needs the W143 confirm. The carrotServ
+    # cue gate decides whether the held src-1 red is cleared immediately.
+    self.last_released = False
+    green_confirmed = lamp_state in (tracker.SignalState.green, tracker.SignalState.greenLeft,
+                                     tracker.SignalState.left)
+    if (relevant is not None and not green_confirmed
+        and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
+        and relevant[0].released()):
+      self.machine.state = tracker.SignalState.none
+      self.machine.conf = 0.0
+      self.machine.last_lamp_time = None
+      self.last_released = True
+      lamp_state = None
+      machine_conf = 0.0
     state, conf = self.machine.update(now, lamp_state, machine_conf)
 
     if detect:
@@ -451,6 +472,7 @@ class FramePipeline:
     return FrameOutput(
       view=view, dets=dets, matches=self.tracker.last_matches, state=state, state_conf=conf,
       track_id=self.last_track_id, infer_ms=infer_ms, proc_ms=self.proc_ms, red_likely=red_likely,
+      released=self.last_released,
       gated=self.last_gated,
     )
 
