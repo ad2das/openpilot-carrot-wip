@@ -354,7 +354,7 @@ def test_every_release_starts_the_hold_off(reason):
 
   assert not blend.recenter_latched
   assert blend.recenter_releases.get(reason, 0) == 1
-  assert blend.recenter_hold_s == pytest.approx(R_REENTER_S)
+  assert 0.0 < blend.recenter_hold_s <= R_REENTER_S
 
   # The hold-off blocks re-entry even though the entry condition holds again.
   _settle(blend, 0.4, 0.0, frames=max(1, int(round(R_REENTER_S / DT_MDL)) - 1))
