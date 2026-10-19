@@ -124,6 +124,15 @@ def make_planner(param_value=0, source=None):
   return namespace['LateralPlanner'](cp)
 
 
+class _Msg(dict):
+  """Subscriptable message dict that the planner also reads as attributes."""
+  def __getattr__(self, name):
+    try:
+      return self[name]
+    except KeyError as e:
+      raise AttributeError(name) from e
+
+
 def inputs(speed=30.0, start=30.0, end=30.0, lane_speed=1):
   model = SimpleNamespace(
     position=SimpleNamespace(x=np.linspace(0, 300, 33), y=np.zeros(33), z=np.zeros(33),
@@ -141,7 +150,8 @@ def inputs(speed=30.0, start=30.0, end=30.0, lane_speed=1):
     'carrotMan': SimpleNamespace(vTurnSpeed=200),
     'logMonoTime': {'modelV2': 123},
   }
-  return SimpleNamespace(**sm, all_checks=lambda service_list: True)
+  sm['all_checks'] = lambda service_list: True
+  return _Msg(sm)
 
 
 class RecordingPm:
