@@ -11,20 +11,16 @@ Two layers are tested separately:
 """
 from types import SimpleNamespace
 
-import pytest
-
-from test_tlv_fusion import FakeSM, make_serv as base_make_serv, tlv_message  # noqa: F401
+from test_tlv_fusion import FakeSM, make_serv as base_make_serv, tlv_message
 
 import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
-from openpilot.selfdrive.carrot.tlv import tracker
 from openpilot.selfdrive.carrot.tlv.tracker import (
   GREEN_RELEASE_PROB,
   GREEN_RELEASE_VOTES,
   LampClass,
   SignalState,
   Track,
-  TrafficLightTracker,
 )
 
 GREEN = int(LampClass.GREEN)
@@ -95,44 +91,95 @@ class _FakeDecoder:
   num_classes = 8
 
 
-def pipeline_with_machine():
-  from openpilot.selfdrive.carrot.tlv.pipeline import FramePipeline
-  pipe = FramePipeline.__new__(FramePipeline)
-  pipe.machine = tracker.SignalStateMachine()
-  pipe.last_released = False
-  pipe.tracker = TrafficLightTracker()
-  pipe.classifier = None
-  return pipe
+def _release_pipe(now, votes, machine_state=SignalState.red):
+  """Real FramePipeline driving infer(): the release must NOT move the machine."""
+  import numpy as np
+  from openpilot.selfdrive.carrot.tlv import decode, pipeline as pl
+  W, H = 1928, 1208
+
+  class _Backend:
+    def infer(self, model_input):
+      return (np.empty((0, 4), np.float32), np.empty(0, np.float32),
+              np.empty(0, dtype=np.int64))
+
+    def close(self):
+      pass
+
+  from openpilot.selfdrive.carrot.tlv import backends
+  # A classifier selects the candidate-only branch, so the track is relevant
+  # without detections; 3 green votes do not yet confirm a green either.
+  pipe = pl.FramePipeline(_Backend(), decode.PlaceholderDecoder(),
+                          classifier=backends.StubClassifier(cls=RED, prob=0.9))
+  pipe.machine.state = machine_state
+  pipe.machine.conf = 0.75
+  # A red confirmed just now: the machine must hold it through this frame.
+  pipe.machine.last_lamp_time = now
+  pipe._last_red_confirm_s = now
+  tr = Track(track_id=1, first_frame=0, last_frame=0, cls=GREEN, score=0.9,
+             box=(940.0, 50.0, 990.0, 90.0), view="far", focal_px=2648.0)
+  tr.red_confirmed_s = 0.0
+  for v in votes:
+    tr.votes.append(v)
+  pipe.tracker.tracks = [tr]
+  out = pipe.infer("far", pl.FramePipeline.geometry("far", 600.0, W, H, 2648.0),
+                   image_width=W, now=now, detect=False)
+  return pipe, out
 
 
-def test_pipeline_release_turns_red_into_none_not_green(monkeypatch):
+def test_release_flag_set_but_machine_stays_red():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  # Published state must stay red: without a cue today's off_timeout still holds.
+  assert out.state in (SignalState.red, SignalState.redLeft)
+  assert pipe.machine.state in (SignalState.red, SignalState.redLeft)
+
+
+def _geom():
   from openpilot.selfdrive.carrot.tlv import pipeline as pl
-  pipe = pipeline_with_machine()
-  pipe.machine.state = SignalState.red
-  pipe.machine.last_lamp_time = 99.0
-  now = 100.0
-  tr = track_with_votes([(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)])
-  # The release block in infer() is inline; exercise the same contract here.
-  assert tr.released()
-  if pipe.machine.state in (SignalState.red, SignalState.redLeft) and tr.released():
-    pipe.machine.state = SignalState.none
-    pipe.machine.conf = 0.0
-    pipe.machine.last_lamp_time = None
-    pipe.last_released = True
-  state, _conf = pipe.machine.update(now, None, 0.0)
-  assert state == SignalState.none
-  assert state != SignalState.green
-  assert pipe.last_released
-  assert pl is not None
+  return pl.FramePipeline.geometry("far", 600.0, 1928, 1208, 2648.0)
 
 
-def test_pipeline_does_not_release_without_three_votes():
-  pipe = pipeline_with_machine()
-  pipe.machine.state = SignalState.red
+def test_no_cue_keeps_the_red_until_the_usual_off_timeout():
+  """Spec: without a cue the red must end exactly when it does today.
+
+  The release flag goes True as soon as the 3 green votes land, but nothing is
+  cleared: the machine keeps red and expires off_timeout_s after the last lamp,
+  which is the pre-W150 behaviour.
+  """
   now = 100.0
-  tr = track_with_votes([(now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)])
-  assert not tr.released()
-  assert pipe.machine.state == SignalState.red
+  votes = [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)]
+  pipe, out = _release_pipe(now, votes)
+  assert out.released
+  assert out.state in (SignalState.red, SignalState.redLeft)
+  # Same pipeline, same votes, but the red was last lit at `now`: off_timeout_s
+  # is 2.0 s, so one tick before that keeps red and one after expires it.
+  pipe.machine.last_lamp_time = now
+  pipe._last_red_confirm_s = now
+  pipe.tracker.tracks[0].votes.clear()
+  for v in votes:
+    pipe.tracker.tracks[0].votes.append(v)
+  out_before = pipe.infer("far", _geom(), image_width=1928, now=now + 1.9, detect=False)
+  assert out_before.state in (SignalState.red, SignalState.redLeft)
+  out_after = pipe.infer("far", _geom(), image_width=1928, now=now + 2.1, detect=False)
+  assert out_after.state == SignalState.none
+
+
+def test_no_release_flag_without_three_votes():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)])
+  assert not out.released
+  assert out.state in (SignalState.red, SignalState.redLeft)
+
+
+def test_no_release_flag_when_machine_is_not_red():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)], machine_state=SignalState.none)
+  # The run is there, but the machine was not red, so this is not a release.
+  assert not out.released
+
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +196,8 @@ def make_serv(detect_mode: int = 2) -> CarrotServ:
   serv.tlv_xstate_left_at = -1e9
   serv.tlv_green_event_at = -1e9
   serv.tlv_release_clears = 0
+  serv.tlv_release_latched = False
+  serv.tlv_release_track_id = -1
   return serv
 
 
@@ -232,10 +281,14 @@ def test_xstate_level_does_not_keep_the_gate_open(monkeypatch):
   clock[0] += 0.05
   serv._update_tlv_fusion(sm_with_cue(ts=1, xstate=2))   # edge: clears
   clock[0] += 1.0
-  # Re-arm a red, then a long non-stopped level must NOT clear it.
-  serv._update_tlv_fusion(sm_with_cue(ts=1, xstate=2))
+  # Re-arm a red (release flag gone), then a long non-stopped xState LEVEL must
+  # NOT clear it: only the edge out of e2eStopped is a cue.
+  level = FakeSM(carrotTlv=tlv_message("red", conf=0.9),
+                 longitudinalPlan=SimpleNamespace(trafficState=1,
+                                                  xState=SimpleNamespace(raw=2)))
+  serv._update_tlv_fusion(level)
   clock[0] += 1.0
-  serv._update_tlv_fusion(sm_with_cue(ts=1, xstate=2))
+  serv._update_tlv_fusion(level)
   assert serv.traffic_state == 1
 
 
@@ -293,6 +346,109 @@ def test_w143_green_confirm_is_unchanged(monkeypatch):
   assert serv.traffic_state == 2
 
 
-def test_release_flag_defaults_false_on_old_messages():
-  msg = tlv_message("red")
+def test_release_flag_defaults_false_on_old_messages():
+  msg = tlv_message("red")
   assert not bool(msg.relevantReleased)
+
+
+
+# ---------------------------------------------------------------------------
+# W150 latch: the red stays lifted across publishes, and only the specified
+# events end it.
+# ---------------------------------------------------------------------------
+
+def _released(state="red", rel_id=1, conf=0.9):
+  return released_message(state, conf=conf, rel_id=rel_id)
+
+
+def _publish(serv, clock, msg, ts=2, **kw):
+  services = {"carrotTlv": msg}
+  services["longitudinalPlan"] = SimpleNamespace(
+    trafficState=ts, xState=SimpleNamespace(raw=kw.get("xstate", 5)))
+  clock[0] += kw.get("dt", 0.05)
+  serv._update_tlv_fusion(FakeSM(**services))
+
+
+def test_latch_keeps_the_red_lifted_after_the_cue_window_expires(monkeypatch):
+  """After the 0.3 s cue, a still-releasing track must not re-arm the red."""
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  for _ in range(2):
+    _publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  _publish(serv, clock, _released("red"), ts=2)
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+  assert serv.tlv_release_latched
+  # The cue is long gone, yet tlvd still publishes red (it keeps the machine
+  # red), so the latch is what keeps the cleared red from coming back.
+  for _ in range(10):
+    _publish(serv, clock, _released("red"), ts=0, dt=0.1)
+    assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+  assert serv.tlv_release_clears == 1
+
+
+def test_latch_suppresses_graded_red_likely_too(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  _publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  _publish(serv, clock, _released("red"), ts=2)
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+  _publish(serv, clock, _released("redLikely", conf=0.9), ts=0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_a_new_red_vote_unlatches_and_red_returns(monkeypatch):
+  """release flag False = a newer red vote broke the run."""
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  _publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  _publish(serv, clock, _released("red"), ts=2)
+  assert serv.tlv_release_latched
+  _publish(serv, clock, tlv_message("red", conf=0.9))
+  assert not serv.tlv_release_latched
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  assert serv.tlv_hold_until > clock[0]
+
+
+def test_a_track_id_change_unlatches(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  _publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  _publish(serv, clock, _released("red", rel_id=1), ts=2)
+  assert serv.tlv_release_latched
+  # A different light is relevant now: the old latch must not suppress it.
+  _publish(serv, clock, _released("red", rel_id=2), ts=0)
+  assert not serv.tlv_release_latched
+  # With no cue the new track's red is accepted as today.
+  for _ in range(2):
+    _publish(serv, clock, tlv_message("red", conf=0.9, rel_id=2), ts=0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_green_state_unlatches_and_takes_the_w143_path(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  _publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  _publish(serv, clock, _released("red"), ts=2)
+  assert serv.tlv_release_latched
+  _publish(serv, clock, tlv_message("green", conf=0.9, go_after_red=True), ts=2)
+  assert not serv.tlv_release_latched
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+
+
+def test_no_cue_never_latches(monkeypatch):
+  """The exact spec case: without a cue the red is accepted as today."""
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = make_serv(2)
+  for _ in range(5):
+    _publish(serv, clock, _released("red", conf=0.9), ts=1)
+  assert not serv.tlv_release_latched
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  assert serv.tlv_release_clears == 0
+  assert serv.tlv_hold_until > clock[0]

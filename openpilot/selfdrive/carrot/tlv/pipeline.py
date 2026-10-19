@@ -438,23 +438,18 @@ class FramePipeline:
       machine_conf = self.last_conf  # refresh only
       self.red_sustain_total += 1
     self.last_relevant_det_support = relevant[0].det_support(now) if relevant is not None else 0
-    # W150: release a held red when the newest 3 relevant-track votes are green
-    # at prob >= 0.80 (tracker.GREEN_RELEASE_*). This clears the state machine to
-    # none so the 2 s off-timeout cannot keep a red that the light left; it does
-    # NOT publish green, so a start still needs the W143 confirm. The carrotServ
-    # cue gate decides whether the held src-1 red is cleared immediately.
-    self.last_released = False
+    # W150: report a release of a held red when the newest 3 relevant-track votes
+    # are green at prob >= 0.80 (tracker.GREEN_RELEASE_*). This does NOT touch
+    # the state machine: the published state stays red, so without a model cue
+    # the car keeps today's off_timeout + 0.8 s hold exactly. carrotServ decides,
+    # per publish and only while the model start cue is active, whether that red
+    # is lifted at once.
     green_confirmed = lamp_state in (tracker.SignalState.green, tracker.SignalState.greenLeft,
                                      tracker.SignalState.left)
-    if (relevant is not None and not green_confirmed
-        and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
-        and relevant[0].released()):
-      self.machine.state = tracker.SignalState.none
-      self.machine.conf = 0.0
-      self.machine.last_lamp_time = None
-      self.last_released = True
-      lamp_state = None
-      machine_conf = 0.0
+    self.last_released = bool(
+      relevant is not None and not green_confirmed
+      and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
+      and relevant[0].released())
     state, conf = self.machine.update(now, lamp_state, machine_conf)
 
     if detect:

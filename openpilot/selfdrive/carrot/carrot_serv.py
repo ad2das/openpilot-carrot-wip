@@ -116,6 +116,10 @@ TLV_COLOR_LEFT = "Left turn"
 # 0 none / 1 red / 2 green / 3 left ordinals stay unchanged for every consumer.
 TLV_RED_LIKELY_STATE = 7
 TLV_GRADED_TRAFFIC_STATE = 4
+# W150: carrotTlv State ordinals that are a red the release latch may suppress,
+# and the green/left ones that end it (the normal W143 path then takes over).
+TLV_RED_FAMILY_STATES = (1, 5)          # red, redLeft
+TLV_GREEN_FAMILY_STATES = (3, 4, 6)     # green, left, greenLeft
 # W143: time-based TLV hold. carrot_serv runs at 20 Hz, so int(0.5 / 0.1) is
 # 5 loops = 0.25 s, but tlvd blocks during each detect inference (detHz ~1)
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
@@ -145,6 +149,15 @@ def tlv_state_color(state_raw: int, left_intent: bool) -> str | None:
 
 
 class CarrotServ:
+  # W150: release-latch defaults, so a CarrotServ built with __new__ by tests
+  # and tools (which skips __init__) reads a defined value.
+  tlv_release_latched = False
+  tlv_release_track_id = -1
+  tlv_release_clears = 0
+  tlv_last_stopped = None
+  tlv_xstate_left_at = -1e9
+  tlv_green_event_at = -1e9
+
   def __init__(self):
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
@@ -251,6 +264,10 @@ class CarrotServ:
     self.tlv_xstate_left_at = -1e9
     self.tlv_green_event_at = -1e9
     self.tlv_release_clears = 0
+    # W150: a cue-gated release latches until the release flag drops, a newer
+    # red vote breaks the run, the track changes, or the light goes green/left.
+    self.tlv_release_latched = False
+    self.tlv_release_track_id = -1
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
     # W148: expressway gate, fed only by the carrotNavi roadCategory.
@@ -511,22 +528,39 @@ class CarrotServ:
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
       return
     state_raw = int(msg.state.raw)
-    # W150: a released red arrives as state none, so this must run BEFORE the
-    # colour mapping (which returns early for none). Clear the held src-1 red
-    # at once when the model start cue is active; without a cue, today's hold
-    # and off_timeout are untouched.
-    if bool(getattr(msg, "relevantReleased", False)) and self._tlv_model_start_cue(sm):
+    released_flag = bool(getattr(msg, "relevantReleased", False))
+    track_id = int(msg.relevantTrackId)
+    # W150: the latch survives only while the same track keeps reporting a
+    # release. A newer red vote (flag False), a broken run, or a track switch
+    # ends it, and so does a confirmed green/left (the W143 path takes over).
+    if (self.tlv_release_latched
+        and (not released_flag or track_id != self.tlv_release_track_id
+             or state_raw in TLV_GREEN_FAMILY_STATES)):
+      self._release_unlatch()
+    # W150(a): lift the held src-1 red at once, but ONLY while the model is
+    # asking to start. Without a cue nothing is cleared and the red below is
+    # accepted exactly as before.
+    if released_flag and self._tlv_model_start_cue(sm):
+      keep_latch = self.tlv_release_latched and track_id == self.tlv_release_track_id
       self._clear_tlv_red()
-      self.tlv_release_clears += 1
-      return
+      self.tlv_release_latched = True
+      self.tlv_release_track_id = track_id
+      if not keep_latch:
+        self.tlv_release_clears += 1
+    # W150(b): while latched, a still-releasing track may not re-arm the red it
+    # just lifted. The published state stays red (tlvd keeps the machine red),
+    # so without this the very same publish would put traffic_state back to 1.
+    red_suppressed = self.tlv_release_latched and released_flag
     if state_raw == TLV_RED_LIKELY_STATE:  # graded redLikely: no confirmed color
-      if float(msg.stateConf) < TLV_CONF_MIN:
+      if float(msg.stateConf) < TLV_CONF_MIN or red_suppressed:
         return
       self.traffic_state = TLV_GRADED_TRAFFIC_STATE
       self.traffic_state_src = 1
       self.tlv_det_support = int(msg.relevantDetSupport)
       self.tlv_hold_until = now + TLV_HOLD_S
       self.traffic_light_count = int(0.5 / 0.1)
+      return
+    if red_suppressed and state_raw in TLV_RED_FAMILY_STATES:
       return
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
@@ -612,6 +646,11 @@ class CarrotServ:
     self.traffic_state_src = 0
     self.tlv_hold_until = 0.0
     self.tlv_det_support = 0
+
+  def _release_unlatch(self) -> None:
+    """W150: end a cue-gated release; the red is accepted again as today."""
+    self.tlv_release_latched = False
+    self.tlv_release_track_id = -1
 
   def calculate_current_speed(self, left_dist, safe_speed_kph, safe_time, safe_decel_rate):
     safe_speed = safe_speed_kph / 3.6
