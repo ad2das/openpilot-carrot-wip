@@ -835,3 +835,21 @@ def test_curve_limit_is_lra_only():
   assert lcb.LAT_ON == 1.5
   assert lcb.KAPPA_MAX == 0.02
   assert lcb.GATE_CURVE == 64
+
+
+def test_lane_recenter_assist_is_on_by_default():
+  """L1: the shipped default must read as enabled in the runtime and the UI."""
+  import json
+  from pathlib import Path
+
+  root = Path(__file__).resolve().parents[4]
+  keys = (root / 'common' / 'params_keys.h').read_text(encoding='utf-8')
+  assert '{"LaneRecenterAssist", {PERSISTENT, INT, "1"}}' in keys
+
+  catalog = json.loads((root / 'selfdrive' / 'carrot_settings.json').read_text(encoding='utf-8'))
+  entry = next(p for p in catalog['params'] if p['name'] == 'LaneRecenterAssist')
+  assert entry['default'] == 1
+  # The title carries the default in parentheses, as the settings UI shows it.
+  assert entry['title'].endswith('(1)') and entry['etitle'].endswith('(1)')
+  # The planner reads > 0, so the shipped default enables the assist.
+  assert int(entry['default']) > 0
