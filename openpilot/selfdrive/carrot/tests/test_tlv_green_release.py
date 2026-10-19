@@ -136,6 +136,82 @@ def test_release_flag_set_but_machine_stays_red():
   assert pipe.machine.state in (SignalState.red, SignalState.redLeft)
 
 
+def _step(pipe, now, detect=False):
+  """Run one more infer() on the same pipeline at `now`."""
+  from openpilot.selfdrive.carrot.tlv import pipeline as pl
+  return pipe.infer("far", pl.FramePipeline.geometry("far", 600.0, 1928, 1208, 2648.0),
+                    image_width=1928, now=now, detect=detect)
+
+
+def test_sticky_survives_a_sub_threshold_green_vote():
+  """W150b: p<0.80 breaks the 3-vote run; the release must stay sticky.
+
+  The low-probability vote lands after the W143 green window, so it breaks the
+  release run without also confirming a green (4 greens in 1.6 s would).
+  """
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  tr = pipe.tracker.tracks[0]
+  later = now + 2.0                      # outside GREEN_CONFIRM_WINDOW_S
+  tr.votes.append((later, GREEN, 0.70))
+  pipe.machine.last_lamp_time = later     # keep the machine red
+  pipe._last_red_confirm_s = later
+  out2 = _step(pipe, later)
+  assert not tr.released()               # the raw run really is broken
+  assert out2.released                   # ... but the release is sticky
+  assert out2.state in (SignalState.red, SignalState.redLeft)
+
+
+def test_sticky_survives_votes_ageing_out():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  tr = pipe.tracker.tracks[0]
+  tr.votes.clear()                       # fewer than 3 votes left
+  pipe.machine.last_lamp_time = now
+  out2 = _step(pipe, now + 0.1)
+  assert out2.released
+  assert out2.state in (SignalState.red, SignalState.redLeft)
+
+
+def test_one_red_vote_drops_the_sticky_release():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  pipe.tracker.tracks[0].votes.append((now + 0.2, RED, 0.9))
+  pipe.machine.last_lamp_time = now
+  out2 = _step(pipe, now + 0.2)
+  assert not out2.released
+
+
+def test_a_track_change_drops_the_sticky_release():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  other = Track(track_id=2, first_frame=0, last_frame=0, cls=GREEN, score=0.9,
+                box=(940.0, 50.0, 990.0, 90.0), view="far", focal_px=2648.0)
+  other.red_confirmed_s = 0.0
+  pipe.tracker.tracks = [other]
+  pipe.machine.last_lamp_time = now
+  out2 = _step(pipe, now + 0.1)
+  assert not out2.released
+
+
+def test_the_machine_leaving_red_drops_the_sticky_release():
+  now = 100.0
+  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
+                                  (now, GREEN, 0.9)])
+  assert out.released
+  pipe.machine.state = SignalState.none
+  out2 = _step(pipe, now + 0.1)
+  assert not out2.released
+
+
 def _geom():
   from openpilot.selfdrive.carrot.tlv import pipeline as pl
   return pl.FramePipeline.geometry("far", 600.0, 1928, 1208, 2648.0)

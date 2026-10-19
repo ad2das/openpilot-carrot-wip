@@ -139,6 +139,11 @@ class FramePipeline:
     self.last_red_likely = False
     # W150: the last infer() released a held red (see Track.released()).
     self.last_released = False
+    # W150b: sticky release state -- the track it applies to and the first
+    # vote of the run that released it.
+    self.release_sticky = False
+    self.release_track_id = -1
+    self.release_run_start = 0.0
     # W139c: monotonic time of the last confirmed red-family relevant track, and
     # cumulative frames a confirmed red was sustained by a red vote on the new
     # relevant track (telemetry), and the relevant track's detector support.
@@ -444,12 +449,35 @@ class FramePipeline:
     # the car keeps today's off_timeout + 0.8 s hold exactly. carrotServ decides,
     # per publish and only while the model start cue is active, whether that red
     # is lifted at once.
+    #
+    # W150b: the release is STICKY. A sub-threshold green vote or votes ageing
+    # out of the deque breaks the 3-vote run, which used to drop the flag while
+    # the machine was still red -- carrotServ then unlatched and the red came
+    # back (a start-then-brake jerk). Once a run has been released it holds
+    # until a red-family vote arrives on the same track, the track changes, the
+    # machine leaves red, or a green is confirmed.
     green_confirmed = lamp_state in (tracker.SignalState.green, tracker.SignalState.greenLeft,
                                      tracker.SignalState.left)
-    self.last_released = bool(
-      relevant is not None and not green_confirmed
-      and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
-      and relevant[0].released())
+    machine_red = self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
+    run_start = relevant[0].release_run_start() if relevant is not None else None
+    if run_start is not None and machine_red and not green_confirmed:
+      if (not getattr(self, "release_sticky", False)
+          or self.release_track_id != relevant[0].track_id):
+        self.release_track_id = relevant[0].track_id
+        self.release_run_start = run_start
+      self.release_sticky = True
+    sticky_ok = bool(
+      getattr(self, "release_sticky", False)
+      and relevant is not None
+      and relevant[0].track_id == self.release_track_id
+      and machine_red
+      and not green_confirmed
+      and not relevant[0].red_vote_since(self.release_run_start))
+    if not sticky_ok:
+      self.release_sticky = False
+      self.release_track_id = -1
+      self.release_run_start = 0.0
+    self.last_released = sticky_ok
     state, conf = self.machine.update(now, lamp_state, machine_conf)
 
     if detect:

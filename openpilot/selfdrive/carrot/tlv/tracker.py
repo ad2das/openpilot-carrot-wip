@@ -320,9 +320,10 @@ class Track:
     """W150: the newest GREEN_RELEASE_VOTES votes are all release-class at
     prob >= GREEN_RELEASE_PROB and no red-family vote is newer than them.
 
-    This is a release from a held red, NOT a green confirmation: the caller
-    turns the state machine to none, so the green still has to pass the W143
-    confirm before it can start anything.
+    A release lifts a held red; it is NOT a green confirmation. The state
+    machine is left alone (FramePipeline only reports the flag), so the green
+    still has to pass the W143 confirm before it can start anything, and
+    without a model cue the red keeps its normal off_timeout.
     """
     votes = list(self.votes)
     if len(votes) < GREEN_RELEASE_VOTES:
@@ -333,6 +334,24 @@ class Track:
            for _t, cls, prob in run):
       return False
     return not any(cls in RED_FAMILY and t > run_start for t, cls, _p in votes)
+
+  def release_run_start(self) -> float | None:
+    """W150b: timestamp of the first vote of the current release run, or None
+    when the newest GREEN_RELEASE_VOTES votes do not form one."""
+    votes = list(self.votes)
+    if len(votes) < GREEN_RELEASE_VOTES:
+      return None
+    run = votes[-GREEN_RELEASE_VOTES:]
+    if any(cls not in GREEN_RELEASE_CLASSES or prob < GREEN_RELEASE_PROB
+           for _t, cls, prob in run):
+      return None
+    if any(cls in RED_FAMILY and t > run[0][0] for t, cls, _p in votes):
+      return None
+    return run[0][0]
+
+  def red_vote_since(self, t: float) -> bool:
+    """W150b: a red-family vote newer than `t` is on this track."""
+    return any(cls in RED_FAMILY and vt > t for vt, cls, _p in self.votes)
 
 
 def _most_common(values: list[int]) -> int:
