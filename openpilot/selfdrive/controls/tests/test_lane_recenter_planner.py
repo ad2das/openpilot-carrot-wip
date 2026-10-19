@@ -141,7 +141,8 @@ def inputs(speed=30.0, start=30.0, end=30.0, lane_speed=1):
     orientationRate=SimpleNamespace(z=np.zeros(33)),
     velocity=SimpleNamespace(x=np.linspace(start, end, 33), y=np.zeros(33), z=np.zeros(33)),
     acceleration=SimpleNamespace(x=np.zeros(33)),
-    meta=SimpleNamespace(desire=0, laneChangeState=0, laneWidthLeft=3.5, laneWidthRight=3.5),
+    meta=SimpleNamespace(desire=0, laneChangeState=0, laneChangeDirection=0,
+                         laneWidthLeft=3.5, laneWidthRight=3.5),
   )
   sm = {
     'modelV2': model,
