@@ -470,7 +470,9 @@ class LaneCenterBlend:
             if self.recenter_enter_s >= ENTER_HOLD_S - 1e-12:
               self.recenter_latched = True
               self.recenter_r0 = r0
-              self.recenter_enter_s = 0.0
+              # The intent is already through the debounce; keep the counter
+              # saturated so the latched branch does not drop it next frame.
+              self.recenter_enter_s = ENTER_HOLD_S
               target_k = self._recenter_target_k(t, r, v_ego)
               active = target_k != 0.0
           else:
