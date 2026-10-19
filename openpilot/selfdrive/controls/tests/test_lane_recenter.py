@@ -18,6 +18,7 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
   BOOST_S, ENTER_HOLD_S, EXIT_HOLD_S, GATE_OFF, GATE_STEER, JUMP_HOLD_S, LRA_ACC_MAX, LRA_JERK,
+  REC_FILT_TAU,
   R_MONO_TOL, R_OFF, R_ON, R_REENTER_S, RET_MIN, STEER_BLOCK_HOLD_S, WIDTH_DELTA_MAX,
   LaneCenterBlend, dump_table, load_table, recenter_profile, recenter_return_checks,
   recenter_width_delta,
@@ -74,6 +75,105 @@ def _update_path(blend, r_curve, *, v=V, enabled=False, lane_mode=False, lane_ch
   rll = centre + width / 2.0
   return blend.update(enabled, lane_mode, v, l_prob, r_prob, x, lll, rll,
                       T, x, centre + r, lane_change, steering, recenter_enabled=True)
+
+
+def _noisy_update(blend, r_series, *, enabled=False, v=V, width=WIDTH):
+  """Feed an explicit per-frame raw r(t) profile with no noise of its own."""
+  x = v * T
+  centre = np.zeros_like(x)
+  r = np.asarray(r_series, dtype=float)
+  lll = centre - width / 2.0
+  rll = centre + width / 2.0
+  return blend.update(enabled, False, v, 0.9, 0.9, x, lll, rll,
+                      T, x, centre + r, False, False, recenter_enabled=True)
+
+
+def _return_r(r0, frac, noise=0.0, phase=0):
+  """Monotone return from r0 over the horizon, plus alternating noise."""
+  base = r0 * (1.0 - frac * np.clip(T / 3.0, 0.0, 1.0))
+  if noise:
+    sign = np.where((np.arange(len(T)) + phase) % 2 == 0, 1.0, -1.0)
+    return base + noise * sign
+  return base
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_smoothed_soft_checks_latch_a_noisy_return(enabled):
+  """R4-1: alternating +/-0.04 m noise on a real return must not block entry.
+
+  The raw mono/retract checks fail on the noise; the filtered plan still shows
+  a monotone, sufficient retraction.
+  """
+  r0 = 0.4
+  frac = 1.0
+  # Confirm the premise: the raw checks fail on at least one frame.
+  raw_failed = 0
+  for phase in range(2):
+    r_raw = _return_r(r0, frac, noise=0.04, phase=phase)
+    _, mono_raw, retract_raw = recenter_return_checks(T, r_raw, float(r_raw[0]))
+    if not mono_raw or not retract_raw:
+      raw_failed += 1
+  assert raw_failed, 'the test premise needs the raw checks to fail'
+
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  frames = int(round(ENTER_HOLD_S / DT_MDL)) + 3
+  for k in range(frames * 3):
+    _noisy_update(blend, _return_r(r0, frac, noise=0.04, phase=k % 2), enabled=enabled)
+  assert blend.recenter_latched, 'the smoothed plan is a real return; it must latch'
+  assert blend.recenter_r_filt is not None
+
+
+def test_smoothed_soft_checks_reject_a_holding_offset_with_noise():
+  """A path that holds its offset (plus noise) is not a return, filtered or not."""
+  for enabled in (False, True):
+    blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+    for k in range(120):
+      _noisy_update(blend, _return_r(0.4, 0.0, noise=0.04, phase=k % 2), enabled=enabled)
+    assert not blend.recenter_latched
+    assert blend.recenter_curvature == 0.0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sign_flip_still_releases_on_the_same_frame_with_the_filter(enabled):
+  """The sign guard is raw: the filter must not delay a flip release."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  for k in range(20):
+    _noisy_update(blend, _return_r(0.4, 1.0, noise=0.04, phase=k % 2), enabled=enabled)
+  assert blend.recenter_latched
+
+  # Flip the far end of the horizon's sign on this single frame.
+  r = _return_r(0.4, 1.0, noise=0.0)
+  r[T > 1.5] = -0.3
+  _noisy_update(blend, r, enabled=enabled)
+  assert not blend.recenter_latched, 'a raw sign flip must release immediately'
+  assert blend.recenter_releases.get('sign', 0) == 1
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_filter_resets_after_a_hard_release(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  for k in range(20):
+    _noisy_update(blend, _return_r(0.4, 1.0, noise=0.04, phase=k % 2), enabled=enabled)
+  assert blend.recenter_latched
+  assert blend.recenter_r_filt is not None
+
+  # Hard release by width: widen the lane beyond WIDTH_DELTA_MAX.
+  x = V * T
+  centre = np.zeros_like(x)
+  r = _return_r(0.4, 1.0)
+  grow = (WIDTH_DELTA_MAX + 0.3) * np.clip(x / 45.0, 0.0, 1.0)
+  blend.update(enabled, False, V, 0.9, 0.9, x, centre - WIDTH / 2.0 - grow / 2.0,
+               centre + WIDTH / 2.0 + grow / 2.0, T, x, centre + r, False, False,
+               recenter_enabled=True)
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get('width', 0) == 1
+  assert blend.recenter_r_filt is None, 'a hard release must drop the filter state'
+
+  # And the next valid frame seeds it from the raw profile again.
+  r_seed = _return_r(0.4, 1.0, noise=0.0)
+  _noisy_update(blend, r_seed, enabled=enabled)
+  assert blend.recenter_r_filt is not None
+  assert np.allclose(blend.recenter_r_filt, r_seed)
 
 
 def test_profile_and_checks_match_sign_convention():

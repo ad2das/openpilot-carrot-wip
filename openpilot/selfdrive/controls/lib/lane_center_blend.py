@@ -60,6 +60,7 @@ REC_T_L = 1.5            # lookahead used to read the model's planned offset, s
 ENTER_HOLD_S = 0.2       # the full entry condition must hold this long first, s
 R_REENTER_S = 0.5        # hold-off after any release before the latch may re-enter, s
 EXIT_HOLD_S = 0.2        # soft conditions must fail this long before the latch drops, s
+REC_FILT_TAU = 0.25      # EMA time constant for the soft-check offset profile, s
 WIDTH_DELTA_MAX = 0.4    # lane-width change across the lookahead that blocks entry, m
 BOOST_S = 0.5            # aim at this fraction of the planned offset
 LRA_ACC_MAX = 0.3        # |k_lra| * v^2 cap, m/s^2
@@ -175,6 +176,7 @@ class LaneCenterBlend:
     self.recenter_hold_s = 0.0
     self.recenter_enter_s = 0.0
     self.recenter_soft_s = 0.0
+    self.recenter_r_filt = None
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -192,6 +194,7 @@ class LaneCenterBlend:
     self.recenter_hold_s = 0.0
     self.recenter_enter_s = 0.0
     self.recenter_soft_s = 0.0
+    self.recenter_r_filt = None
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -396,6 +399,23 @@ class LaneCenterBlend:
     self.recenter_hold_s = R_REENTER_S
     self.recenter_enter_s = 0.0
     self.recenter_soft_s = 0.0
+    self.recenter_r_filt = None
+
+  def _soft_return_checks(self, t, r, r0):
+    """mono/retract on the EMA-smoothed offset; sign stays on the raw profile.
+
+    Per-frame model noise (vision jitter, knot re-fitting) makes a genuinely
+    monotone return fail `|r|` non-increase and the retraction margin on raw
+    samples.  The soft checks only decide whether the assist is *allowed*, so
+    they run on a 0.25 s EMA.  The output target and the sign guard stay raw.
+    """
+    if self.recenter_r_filt is None or len(self.recenter_r_filt) != len(r):
+      self.recenter_r_filt = np.array(r, dtype=float)
+    else:
+      alpha = DT_MDL / (REC_FILT_TAU + DT_MDL)
+      self.recenter_r_filt += alpha * (np.asarray(r, dtype=float) - self.recenter_r_filt)
+    _, mono_ok, retract_ok = recenter_return_checks(t, self.recenter_r_filt, float(r0))
+    return mono_ok, retract_ok
 
   def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
     """Lane recenter assist: extra curvature that doubles an already-planned return.
@@ -412,6 +432,7 @@ class LaneCenterBlend:
       self.recenter_hold_s = 0.0
       self.recenter_enter_s = 0.0
       self.recenter_soft_s = 0.0
+      self.recenter_r_filt = None
       return
 
     prev_k = self.recenter_k
@@ -424,7 +445,10 @@ class LaneCenterBlend:
       t, r = recenter_profile(geom[1], geom[0], geom[2], geom[3], geom[4])
       if t is not None:
         r0 = float(r[0])
-        sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
+        # Sign and the r0 band are RAW: the |r0| < R_ON = 0 guarantee is on the
+        # real, instantaneous offset.  Only mono/retract use the smoothed plan.
+        sign_ok = bool(np.all((np.sign(r) == np.sign(r0)) | (np.abs(r) < R_NEAR)))
+        mono_ok, retract_ok = self._soft_return_checks(t, r, r0)
         rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
         base_ok = (sign_ok and mono_ok and retract_ok and not rate_away and
                    gates == 0 and not steering_pressed and v_ego >= V_OFF)
