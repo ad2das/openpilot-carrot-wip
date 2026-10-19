@@ -51,7 +51,8 @@ W_DOWN = 2.0
 # plans: a monotone path-to-centre offset that shrinks over the 3 s horizon.
 REC_HORIZON_S = 3.0
 R_ON = 0.15              # activation threshold, m
-R_OFF = 0.08             # hysteresis: stay on down to this offset, m
+R_ENTER = 0.17           # latch threshold; stays on between R_ON and this, m
+R_OFF = 0.08             # hysteresis: release the latch below this offset, m
 R_MAX = 0.8              # larger offsets are not a normal lane-centre return, m
 R_NEAR = 0.05            # offsets below this may cross the sign without a flip, m
 R_MONO_TOL = 0.03        # allowed |r| growth between samples while returning, m
@@ -376,7 +377,7 @@ class LaneCenterBlend:
           if abs(r0) < R_OFF:
             self.recenter_latched = False
         if not self.recenter_latched:
-          enter = (R_ON <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
+          enter = (R_ENTER <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
                    not rate_away and gates == 0 and v_ego >= V_OFF)
           if enter:
             self.recenter_latched = True
