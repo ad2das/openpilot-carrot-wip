@@ -18,7 +18,7 @@ import pytest
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
   BOOST_S, ENTER_HOLD_S, EXIT_HOLD_S, GATE_OFF, GATE_STEER, JUMP_HOLD_S, LRA_ACC_MAX, LRA_JERK,
-  REC_FILT_TAU,
+  LAT_ON, REC_FILT_TAU,
   R_MONO_TOL, R_OFF, R_ON, R_REENTER_S, RET_MIN, STEER_BLOCK_HOLD_S, WIDTH_DELTA_MAX,
   LaneCenterBlend, dump_table, load_table, recenter_profile, recenter_return_checks,
   recenter_width_delta,
@@ -768,3 +768,68 @@ def test_steer_gate_bit_is_used_in_both_branches():
     _settle(blend, 0.4, 0.0, frames=60, enabled=enabled, steering=True)
     assert not blend.recenter_latched
     assert blend.recenter_curvature == 0.0
+
+
+def _curved_update(blend, r0, *, lat_on, v=V, enabled=False, frames=1, side=1.0):
+  """Feed a straight road whose |kappa_road| * v^2 equals `lat_on` and return the last out."""
+  # centre = kappa * x^2 / 2, so the model needs the matching path-y curve.
+  kappa = side * lat_on / v ** 2
+  x = v * T
+  centre = kappa * x ** 2 / 2.0
+  frac = np.clip(T / 3.0, 0.0, 1.0)
+  r = r0 * (1.0 - frac)
+  lll = centre - WIDTH / 2.0
+  rll = centre + WIDTH / 2.0
+  out = 0.0
+  for _ in range(frames):
+    out = blend.update(enabled, False, v, 0.9, 0.9, x, lll, rll, T, x, path_y_from(r, centre),
+                       False, False, recenter_enabled=True)
+  return out
+
+
+def path_y_from(r, centre):
+  return centre + r
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_medium_curve_allows_the_assist(enabled):
+  """R5-1: a medium curve (1.2 m/s^2 with LAT_ON = 1.5) is inside the LRA limit."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _curved_update(blend, 0.4, lat_on=LAT_ON - 0.3, enabled=enabled, frames=SETTLE + 2)
+  assert blend.recenter_latched
+  assert blend.recenter_curvature != 0.0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sharp_curve_blocks_entry(enabled):
+  """R5-1: 1.6 m/s^2 (above LAT_ON = 1.5) is still a hold."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _curved_update(blend, 0.4, lat_on=LAT_ON + 0.1, enabled=enabled, frames=SETTLE + 2)
+  assert not blend.recenter_latched
+  assert blend.recenter_curvature == 0.0
+  assert blend.recenter_curve_block is True
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_sharp_curve_releases_with_the_curve_reason(enabled):
+  """R5-2: a latched assist entering a sharp curve releases as 'curve' and slews out."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _curved_update(blend, 0.4, lat_on=LAT_ON - 0.3, enabled=enabled, frames=SETTLE + 2)
+  assert blend.recenter_latched
+  k_before = blend.recenter_curvature
+  assert k_before != 0.0
+  _curved_update(blend, 0.4, lat_on=LAT_ON + 0.1, enabled=enabled, frames=1)
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get('curve', 0) == 1
+  assert blend.recenter_active is False
+  assert blend.recenter_curvature == 0.0
+  _curved_update(blend, 0.4, lat_on=LAT_ON + 0.1, enabled=enabled, frames=3)
+  assert blend.recenter_curvature == 0.0
+
+
+def test_curve_limit_is_lra_only():
+  """KAPPA_MAX/GATE_CURVE belong to the blend and must not move with LAT_ON."""
+  from openpilot.selfdrive.controls.lib import lane_center_blend as lcb
+  assert lcb.LAT_ON == 1.5
+  assert lcb.KAPPA_MAX == 0.02
+  assert lcb.GATE_CURVE == 64
