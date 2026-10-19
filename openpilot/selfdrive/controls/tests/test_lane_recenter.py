@@ -423,7 +423,8 @@ def test_a_soft_frame_stops_output_but_keeps_the_latch(soft, enabled):
       fall = 0.1 * np.clip((t - 1.5) / 1.5, 0.0, 1.0)
       return r0[0] + rise - fall
 
-    for _ in range(6):
+    # EXIT_HOLD_S is 0.2 s (4 frames); stay strictly under it.
+    for _ in range(int(round(EXIT_HOLD_S / DT_MDL)) - 1):
       r0[0] += 0.02
       _update_path(blend, r_curve, enabled=enabled)
 
