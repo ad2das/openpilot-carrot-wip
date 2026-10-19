@@ -259,6 +259,28 @@ def test_boost_is_stronger_than_the_model_alone():
   assert blend.recenter_curvature == pytest.approx(expected, rel=1e-6)
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_inside_the_hysteresis_band_the_intent_drops_but_the_latch_holds(enabled):
+  """R_ON..R_OFF is a dead band: no ACTIVE (that would leak) but no release."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1))
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+  assert blend.recenter_active
+  k_prev = blend.recenter_curvature
+
+  r_in_band = (R_ON + R_OFF) / 2.0
+  _settle(blend, r_in_band, 0.0, frames=1, enabled=enabled)
+  assert blend.recenter_latched, 'the latch must survive between R_OFF and R_ON'
+  assert blend.recenter_active is False
+  assert abs(blend.recenter_curvature) <= abs(k_prev) + 1e-12
+  assert 'r_off' not in blend.recenter_releases
+
+  # Still latched a second later: this is hysteresis, not a release.
+  _settle(blend, r_in_band, 0.0, frames=1, enabled=enabled)
+  assert blend.recenter_latched
+  assert abs(r_in_band) < R_ON and abs(r_in_band) > R_OFF
+
+
 def test_turn_off_is_slewed_not_stepped():
   blend = LaneCenterBlend()
   _settle(blend, 0.4, 0.0, frames=200)
