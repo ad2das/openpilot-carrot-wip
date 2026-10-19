@@ -394,7 +394,7 @@ class TlvRunner:
     out = self.pipeline.infer(
       view, geom, image_width=width, path_x=self._path_x(), path_y=self._path_y(),
       left_intent=self._left_intent(), now=time.monotonic(), detect=detect,
-      horizon_y=horizon, gate_enabled=self._gate_enabled,
+      horizon_y=horizon, gate_enabled=self._gate_enabled, v_ego_kph=v_ego_kph,
     )
     self.last_view = out.view
     self.processed += 1
@@ -739,6 +739,7 @@ class TlvRunner:
       f"det_hz={self._frame_rate('detect', now):.2f}",
       f"cls_hz={self._frame_rate('classify', now):.2f}",
       f"tail_gated={self.pipeline.tail_gated_total}",
+      f"ss_box_votes={self.pipeline.standstill_box_votes}",
       f"rss={rss_mb:.0f}MB",
       f"infer={self.pipeline.infer_ms:.0f}ms",
       f"proc={self.pipeline.proc_ms:.0f}ms",

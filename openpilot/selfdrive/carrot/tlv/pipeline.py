@@ -23,6 +23,21 @@ FAR_RATE_V_KPH = 50.0
 NEAR_RATE_V_KPH = 20.0
 STANDSTILL_V_KPH = 5.0
 MAX_CLASSIFY_TRACKS = crops.MAX_LAMP_CROPS
+# W153: at standstill the camera does not move, so the ego-motion predicted box
+# equals the stored box and the W134 Addendum C "verified on this frame" rule
+# cannot protect against drift that does not exist. After a red->green change
+# the lit spot moves inside the housing, so the NCC refine fails and the track
+# gets no vote until the next detector match (~1 s). This lets the relevant
+# track vote on its LAST-VERIFIED box instead.
+#
+# The vote is recorded ONLY when it is green-family at high confidence. Any
+# other class is discarded: a stale-box red/OFF vote would count as "a
+# red-family vote newer than run_start" and break the W150b sticky release,
+# which would DELAY starts versus today. Discarding it also makes a passing
+# vehicle (which can only produce a non-green class) harmless.
+STANDSTILL_BOX_KEEP_S = 3.0
+STANDSTILL_BOX_MIN_S = 0.5
+STANDSTILL_BOX_VOTE_PROB = 0.80
 # W134 Addendum C: the real-frame device CPU estimate for 4 refines (~12.9 ms)
 # exceeds the 12 ms budget, so refine only the 2 relevance-first tracks.
 REFINE_TRACKS_2 = True
@@ -164,6 +179,13 @@ class FramePipeline:
     # Track IDs whose position on THIS frame is verified (detector match or
     # accepted refine). Only these get a lamp crop and a vote (W134 Addendum C).
     self._verified_ids: set[int] = set()
+    # W153: monotonic time the ego has been continuously at standstill (None
+    # when moving or when the speed is unknown), the resulting duration, and
+    # the tracks voting on a stale box this frame (non-green votes discarded).
+    self._standstill_since: float | None = None
+    self._standstill_s = 0.0
+    self._stale_box_ids: set[int] = set()
+    self.standstill_box_votes = 0
 
   def capture_luma(self, y, width: int) -> None:
     """Copy the full-resolution luma of this frame (y is [height, stride])."""
@@ -180,6 +202,7 @@ class FramePipeline:
       track.anchor_s = self.ego.odo.s
       track.anchor_psi = self.ego.odo.psi
       track.anchor_t = float(now)
+    track.last_verified_s = float(now)
 
   def _relocalize(self, now: float, detect: bool) -> None:
     """NCC template re-localisation (W134 Addendum A 2A).
@@ -218,6 +241,20 @@ class FramePipeline:
           locks += 1
       self.refine_locks = locks
     self.refine_ms = (time.perf_counter() - started) * 1000.0
+    # W153: a classify-only frame at standstill lets the relevant track vote on
+    # its last verified box when the refine missed it (the lit spot moved inside
+    # the housing on a red->green change). The camera does not move, so the
+    # predicted box IS the stored box; nothing is refreshed -- not the box, the
+    # template, the anchor or the expiry counters.
+    self._stale_box_ids = set()
+    if not detect and self._standstill_s >= STANDSTILL_BOX_MIN_S and self.last_track_id >= 0:
+      track = self.tracker.track_by_id(self.last_track_id)
+      if (track is not None
+          and track.track_id not in self._verified_ids
+          and track.last_verified_s is not None
+          and now - track.last_verified_s <= STANDSTILL_BOX_KEEP_S):
+        self._verified_ids.add(track.track_id)
+        self._stale_box_ids.add(track.track_id)
 
   @staticmethod
   def geometry(view: str, horizon_y: float, width: int, height: int, focal_px: float,
@@ -344,12 +381,23 @@ class FramePipeline:
     for i in range(min(count, len(ordered))):
       row = self._classifier_probs[i]
       cls = vote_class(row)
-      votes.append((ordered[i].track_id, cls, float(row[cls])))
+      prob = float(row[cls])
+      if ordered[i].track_id in self._stale_box_ids:
+        # W153: a standstill stale-box vote is recorded ONLY when it is a
+        # confident green. Red/yellow/OFF/low-p votes are dropped: a stale red
+        # would count as "a red-family vote newer than run_start" and break the
+        # W150b sticky release (delaying the start), and a passing vehicle can
+        # only produce a non-green class.
+        if cls not in tracker.GREEN_RELEASE_CLASSES or prob < STANDSTILL_BOX_VOTE_PROB:
+          continue
+        self.standstill_box_votes += 1
+      votes.append((ordered[i].track_id, cls, prob))
     self.tracker.record_votes(now, votes)
 
   def infer(self, view: str, geom: crops.ViewGeometry, *, image_width: int, path_x=(), path_y=(),
             left_intent: bool = False, now: float | None = None, detect: bool = True,
-            horizon_y: float | None = None, gate_enabled: bool = False) -> FrameOutput:
+            horizon_y: float | None = None, gate_enabled: bool = False,
+            v_ego_kph: float | None = None) -> FrameOutput:
     started = time.perf_counter()
     infer_started = time.perf_counter()
     raw = self.backend.infer(self.preprocess.model_input) if detect else []
@@ -379,6 +427,15 @@ class FramePipeline:
 
     if now is None:
       now = time.monotonic()
+    # W153: how long the ego has been continuously at standstill (unknown speed
+    # is never standstill). Only the classify-only stale-box vote uses this.
+    if v_ego_kph is not None and float(v_ego_kph) < STANDSTILL_V_KPH:
+      if self._standstill_since is None:
+        self._standstill_since = float(now)
+      self._standstill_s = max(0.0, float(now) - self._standstill_since)
+    else:
+      self._standstill_since = None
+      self._standstill_s = 0.0
     if detect:
       predict = None
       anchor = None

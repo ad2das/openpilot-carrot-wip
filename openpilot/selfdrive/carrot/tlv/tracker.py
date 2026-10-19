@@ -240,6 +240,10 @@ class Track:
   # W139c: monotonic times of the detector matches (and creation) of this track,
   # used by the fast-road phantom gate (det_support). Bounded deque.
   det_times: deque[float] = field(default_factory=lambda: deque(maxlen=8))
+  # W153: monotonic time this track's box was last verified (detector match or
+  # accepted NCC refine). None until the first verification; the standstill
+  # stale-box vote needs this to bound how old the box it votes on can be.
+  last_verified_s: float | None = None
 
   @property
   def cx(self) -> float:
@@ -501,6 +505,7 @@ class TrafficLightTracker:
         track.history.append((frame_idx, int(det.cls)))
         if now is not None:
           track.det_times.append(float(now))
+          track.last_verified_s = float(now)
         matched_track_ids.add(track.track_id)
         self.last_matches.append((det, track.track_id))
       else:
@@ -513,6 +518,7 @@ class TrafficLightTracker:
         track.history.append((frame_idx, int(det.cls)))
         if now is not None:
           track.det_times.append(float(now))
+          track.last_verified_s = float(now)
         self._next_id += 1
         self.tracks.append(track)
         matched_track_ids.add(track.track_id)
