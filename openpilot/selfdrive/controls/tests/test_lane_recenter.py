@@ -477,7 +477,11 @@ def test_every_release_starts_the_hold_off(reason):
   # Soft reasons (mono/retract) only release after EXIT_HOLD_S of failure.
   soft_frames = int(round(EXIT_HOLD_S / DT_MDL)) + 1
   if reason == 'mono':
-    _settle(blend, 0.4, 0.9, frames=soft_frames)   # |r| grows across the horizon
+    # A swing-out that still retracts overall: retract_ok passes, mono fails.
+    for _ in range(soft_frames):
+      r = np.where(T <= 1.0, 0.4 + 0.12 * np.clip(T / 1.0, 0.0, 1.0),
+                   0.52 - 0.42 * np.clip((T - 1.0) / 2.0, 0.0, 1.0))
+      _noisy_update(blend, r)
   elif reason == 'sign':
     x = V * T
     centre = np.zeros_like(x)
