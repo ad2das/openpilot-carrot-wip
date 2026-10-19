@@ -173,7 +173,8 @@ def test_filter_resets_after_a_hard_release(enabled):
   r_seed = _return_r(0.4, 1.0, noise=0.0)
   _noisy_update(blend, r_seed, enabled=enabled)
   assert blend.recenter_r_filt is not None
-  assert np.allclose(blend.recenter_r_filt, r_seed)
+  # The profile only spans the 3 s horizon, so compare on that sub-grid.
+  assert np.allclose(blend.recenter_r_filt, r_seed[T <= 3.0])
 
 
 def test_profile_and_checks_match_sign_convention():
