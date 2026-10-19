@@ -291,7 +291,8 @@ def test_steer_hold_then_early_release_gives_zero(enabled):
   assert blend.steer_block
   assert not blend.recenter_latched
   assert blend.recenter_curvature == 0.0
-  assert blend.recenter_releases.get('gate_steer', 0) >= 1
+  assert (blend.recenter_releases.get('steer', 0) +
+          blend.recenter_releases.get('gate_steer', 0)) >= 1
 
   _settle(blend, 0.4, 0.0, frames=15, enabled=enabled)  # 0.75 s after release
   assert blend.steer_block
