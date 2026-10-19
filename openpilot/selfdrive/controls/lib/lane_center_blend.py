@@ -367,9 +367,11 @@ class LaneCenterBlend:
         sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
         rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
         if self.recenter_latched:
-          # The latch survives into the R_OFF..R_ON band so the state does not
-          # chatter, but the output is only ever non-zero at |r0| >= R_ON.
-          if sign_ok and R_ON <= abs(r0) <= R_MAX and not rate_away and gates == 0 and v_ego >= V_OFF:
+          # The latch only spans the R_ON..R_MAX band; the monotone-return test
+          # still runs every frame so the assist cannot continue into a path that
+          # stops returning or starts growing away from centre.
+          if (sign_ok and mono_ok and retract_ok and R_ON <= abs(r0) <= R_MAX and
+              not rate_away and gates == 0 and v_ego >= V_OFF):
             y_m = float(np.interp(REC_T_L, t, r))
             dy = (BOOST_S - 1.0) * y_m
             length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
@@ -378,6 +380,8 @@ class LaneCenterBlend:
             weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
             target_k = float(np.clip(k * weight, -k_cap, k_cap))
             active = target_k != 0.0
+          else:
+            self.recenter_latched = False
           if abs(r0) < R_OFF:
             self.recenter_latched = False
             self.recenter_hold_s = R_REENTER_S
