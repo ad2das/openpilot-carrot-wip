@@ -522,8 +522,14 @@ class LaneCenterBlend:
               active = target_k != 0.0
           else:
             self.recenter_enter_s = 0.0
+      else:
+        # No usable profile on this frame: seed the smoothed plan from scratch
+        # rather than carrying a stale EMA across the gap.
+        self.recenter_enter_s = 0.0
+        self.recenter_r_filt = None
     else:
       self.recenter_enter_s = 0.0
+      self.recenter_r_filt = None
       if self.recenter_latched:
         self._release_recenter('no_geometry')
 
