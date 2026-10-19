@@ -822,7 +822,8 @@ def test_sharp_curve_releases_with_the_curve_reason(enabled):
   assert not blend.recenter_latched
   assert blend.recenter_releases.get('curve', 0) == 1
   assert blend.recenter_active is False
-  assert blend.recenter_curvature == 0.0
+  # The output slews down at the jerk cap rather than stepping to zero.
+  assert abs(blend.recenter_curvature) < abs(k_before)
   _curved_update(blend, 0.4, lat_on=LAT_ON + 0.1, enabled=enabled, frames=3)
   assert blend.recenter_curvature == 0.0
 
