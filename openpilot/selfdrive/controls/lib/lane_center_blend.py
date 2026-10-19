@@ -51,13 +51,15 @@ W_DOWN = 2.0
 # plans: a monotone path-to-centre offset that shrinks over the 3 s horizon.
 REC_HORIZON_S = 3.0
 R_ON = 0.15              # activation threshold and hard output gate, m
-R_REENTER_S = 0.5        # hold-off after a release before the latch may re-enter, s
-R_OFF = 0.08             # hysteresis: release the latch below this offset, m
+R_OFF = 0.08             # release the latch below this offset, m
 R_MAX = 0.8              # larger offsets are not a normal lane-centre return, m
 R_NEAR = 0.05            # offsets below this may cross the sign without a flip, m
 R_MONO_TOL = 0.03        # allowed |r| growth between samples while returning, m
 RET_MIN = 0.05           # required |r0| - |r(3 s)| shrinkage, m
 REC_T_L = 1.5            # lookahead used to read the model's planned offset, s
+ENTER_HOLD_S = 0.3       # the full entry condition must hold this long first, s
+R_REENTER_S = 0.5        # hold-off after any release before the latch may re-enter, s
+WIDTH_DELTA_MAX = 0.4    # lane-width change across the lookahead that blocks entry, m
 BOOST_S = 0.5            # aim at this fraction of the planned offset
 LRA_ACC_MAX = 0.3        # |k_lra| * v^2 cap, m/s^2
 LRA_JERK = 0.6           # |dk_lra| * v^2 per second cap, m/s^3
@@ -129,6 +131,19 @@ def recenter_return_checks(t, r, r0):
   return sign_ok, mono_ok, retract_ok
 
 
+def recenter_width_delta(ll_x, lll_y, rll_y, v_ego):
+  """Lane-width change from the bumper to the lane-recenter lookahead, m.
+
+  Tapers and gores widen (or narrow) the lane ahead, which moves the estimated
+  lane centre and makes a model return look real.  The width is interpolated at
+  x_L = clip(v*REC_T_L, 15, 45) m and compared with the width at x=0.
+  """
+  x_l = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
+  width0 = float(rll_y[0] - lll_y[0])
+  width_l = float(np.interp(x_l, ll_x, rll_y - lll_y))
+  return width_l - width0
+
+
 class LaneCenterBlend:
   def __init__(self, table=None):
     self.table = np.zeros_like(KNOTS) if table is None else np.clip(np.array(table, dtype=float), -OFFSET_MAX, OFFSET_MAX)
@@ -157,6 +172,9 @@ class LaneCenterBlend:
     self.recenter_latched = False
     self.recenter_r0 = 0.0
     self.recenter_hold_s = 0.0
+    self.recenter_enter_s = 0.0
+    self.recenter_releases = {}
+    self.recenter_width_delta = 0.0
 
   def reset(self):
     self.table = np.zeros_like(KNOTS)
@@ -170,6 +188,23 @@ class LaneCenterBlend:
     self.recenter_latched = False
     self.recenter_r0 = 0.0
     self.recenter_hold_s = 0.0
+    self.recenter_enter_s = 0.0
+    self.recenter_releases = {}
+    self.recenter_width_delta = 0.0
+
+  def _update_steer_block(self, steering_pressed):
+    """Debounced driver-steering latch shared by both blend branches."""
+    if steering_pressed:
+      self.steer_held_s += DT_MDL
+      if self.steer_held_s >= STEER_BLOCK_MIN_S:
+        self.steer_block = True
+      self.steer_release_s = 0.0
+    else:
+      self.steer_held_s = 0.0
+      if self.steer_block:
+        self.steer_release_s += DT_MDL
+        if self.steer_release_s >= STEER_BLOCK_HOLD_S:
+          self.steer_block = False
 
   def update(self, enabled, lane_mode, v_ego, l_prob, r_prob, ll_x, lll_y, rll_y,
              path_t, path_x, path_y, lane_change_active, steering_pressed,
@@ -208,6 +243,7 @@ class LaneCenterBlend:
       self.curvature = 0.0
       self.gates = GATE_OFF
       geom = None
+      self.recenter_width_delta = 0.0
       if valid:
         centre = (lll_y + rll_y) / 2.0
         self.e = float(centre[0])
@@ -232,6 +268,7 @@ class LaneCenterBlend:
           alpha = DT_MDL / (AVOID_RATE_TAU + DT_MDL)
           self.r_rate += alpha * ((r_mid - self.r_prev) / DT_MDL - self.r_rate)
         self.r_prev = r_mid
+        self.recenter_width_delta = recenter_width_delta(ll_x, lll_y, rll_y, v_ego)
         if abs(self.kappa_road) * v_ego ** 2 >= LAT_ON:
           geom = None
         else:
@@ -241,6 +278,9 @@ class LaneCenterBlend:
         self.e_prev = None
         self.r_prev = None
         self.r_rate = 0.0
+      self._update_steer_block(steering_pressed)
+      if self.steer_block or self.jump_t > 0.0:
+        gates |= GATE_STEER
       self._update_recenter(recenter_enabled, v_ego, gates, geom, steering_pressed)
       return 0.0
 
@@ -259,6 +299,7 @@ class LaneCenterBlend:
       self.r_prev = r_mid
       self.r_far = float(np.interp(R_HORIZON_S, path_t, path_y) - np.interp(np.interp(R_HORIZON_S, path_t, path_x), ll_x, centre))
       self.r_dev = self.r_far - float(knot_weights(self.kappa_road) @ self.r_base)
+      self.recenter_width_delta = recenter_width_delta(ll_x, lll_y, rll_y, v_ego)
       avoid_now = (float(np.max(np.abs(r))) > AVOID_R_MAX or abs(self.r_rate) > AVOID_RATE_MAX or
                    abs(self.r_dev) > AVOID_DEV_MAX)
       if self.e_prev is not None and abs(self.e - self.e_prev) > JUMP_M:
@@ -296,17 +337,7 @@ class LaneCenterBlend:
     else:
       self.w = max(w_target, self.w - W_DOWN * DT_MDL)
 
-    if steering_pressed:
-      self.steer_held_s += DT_MDL
-      if self.steer_held_s >= STEER_BLOCK_MIN_S:
-        self.steer_block = True
-      self.steer_release_s = 0.0
-    else:
-      self.steer_held_s = 0.0
-      if self.steer_block:
-        self.steer_release_s += DT_MDL
-        if self.steer_release_s >= STEER_BLOCK_HOLD_S:
-          self.steer_block = False
+    self._update_steer_block(steering_pressed)
 
     learn_block = 0
     if self.steer_block:
@@ -340,12 +371,34 @@ class LaneCenterBlend:
     self._update_recenter(recenter_enabled, v_ego, recenter_gates, recenter_geom, steering_pressed)
     return self.curvature
 
+  def _recenter_target_k(self, t, r, v_ego):
+    """Curvature that makes the model's planned offset shrink twice as fast.
+
+    The planned offset at REC_T_L is `y_m`; aiming at `BOOST_S * y_m` over the
+    same distance needs k = 2 * dy / L^2.  Returns the speed-weighted, capped k.
+    """
+    y_m = float(np.interp(REC_T_L, t, r))
+    dy = (BOOST_S - 1.0) * y_m
+    length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
+    k = 2.0 * dy / length ** 2
+    k_cap = LRA_ACC_MAX / max(v_ego, 1.0) ** 2
+    weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
+    return float(np.clip(k * weight, -k_cap, k_cap))
+
+  def _release_recenter(self, reason):
+    """Drop the latch and start the re-entry hold-off for *every* release kind."""
+    if self.recenter_latched:
+      self.recenter_releases[reason] = self.recenter_releases.get(reason, 0) + 1
+    self.recenter_latched = False
+    self.recenter_hold_s = R_REENTER_S
+    self.recenter_enter_s = 0.0
+
   def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
     """Lane recenter assist: extra curvature that doubles an already-planned return.
 
-    Only ever runs when the caller asks for it and the laneless branch is used.
-    OFF leaves `recenter_curvature` exactly 0.0; when a gate closes the output is
-    slewed back to zero rather than stepped.
+    Only ever runs when the caller asks for it, the laneless branch is used and
+    the road is not turning.  OFF leaves `recenter_curvature` exactly 0.0; when a
+    gate closes the output is slewed back to zero rather than stepped.
     """
     if not enabled:
       self.recenter_curvature = 0.0
@@ -353,52 +406,69 @@ class LaneCenterBlend:
       self.recenter_active = False
       self.recenter_latched = False
       self.recenter_hold_s = 0.0
+      self.recenter_enter_s = 0.0
       return
 
     prev_k = self.recenter_k
     target_k = 0.0
     active = False
     self.recenter_hold_s = max(0.0, self.recenter_hold_s - DT_MDL)
-    if geom is not None and not steering_pressed:
-      centre, ll_x, path_t, path_x, path_y = geom
-      t, r = recenter_profile(ll_x, centre, path_t, path_x, path_y)
+
+    r0 = 0.0
+    if geom is not None:
+      t, r = recenter_profile(geom[1], geom[0], geom[2], geom[3], geom[4])
       if t is not None:
         r0 = float(r[0])
         sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
         rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
+        base_ok = (sign_ok and mono_ok and retract_ok and not rate_away and
+                   gates == 0 and v_ego >= V_OFF)
         if self.recenter_latched:
-          # The latch only spans the R_ON..R_MAX band; the monotone-return test
-          # still runs every frame so the assist cannot continue into a path that
-          # stops returning or starts growing away from centre.
-          if (sign_ok and mono_ok and retract_ok and R_ON <= abs(r0) <= R_MAX and
-              not rate_away and gates == 0 and v_ego >= V_OFF):
-            y_m = float(np.interp(REC_T_L, t, r))
-            dy = (BOOST_S - 1.0) * y_m
-            length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
-            k = 2.0 * dy / length ** 2
-            k_cap = LRA_ACC_MAX / max(v_ego, 1.0) ** 2
-            weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
-            target_k = float(np.clip(k * weight, -k_cap, k_cap))
+          # The latch holds only inside R_ON..R_MAX, and the monotone-return test
+          # still runs every frame: the assist never continues into a path that
+          # stops returning, grows out again, or turns into a taper/gore.
+          reason = None
+          if not sign_ok:
+            reason = 'sign'
+          elif not mono_ok:
+            reason = 'mono'
+          elif not retract_ok:
+            reason = 'retract'
+          elif rate_away:
+            reason = 'rate'
+          elif abs(r0) < R_OFF:
+            reason = 'r_off'
+          elif abs(r0) > R_MAX:
+            reason = 'r_max'
+          elif v_ego < V_OFF:
+            reason = 'speed'
+          elif abs(self.recenter_width_delta) > WIDTH_DELTA_MAX:
+            reason = 'width'
+          elif gates != 0:
+            reason = 'gate_steer' if (gates & GATE_STEER) else 'gate'
+          if reason is None:
+            target_k = self._recenter_target_k(t, r, v_ego)
             active = target_k != 0.0
           else:
-            self.recenter_latched = False
-          if abs(r0) < R_OFF:
-            self.recenter_latched = False
-            self.recenter_hold_s = R_REENTER_S
-        if not self.recenter_latched and self.recenter_hold_s <= 0.0:
-          enter = (R_ON <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
-                   not rate_away and gates == 0 and v_ego >= V_OFF)
-          if enter:
-            self.recenter_latched = True
-            self.recenter_r0 = r0
-            y_m = float(np.interp(REC_T_L, t, r))
-            dy = (BOOST_S - 1.0) * y_m
-            length = float(np.clip(v_ego * REC_T_L, 15.0, 45.0))
-            k = 2.0 * dy / length ** 2
-            k_cap = LRA_ACC_MAX / max(v_ego, 1.0) ** 2
-            weight = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0]))
-            target_k = float(np.clip(k * weight, -k_cap, k_cap))
-            active = target_k != 0.0
+            self._release_recenter(reason)
+        if not self.recenter_latched:
+          enter_ok = (base_ok and R_ON <= abs(r0) <= R_MAX and
+                      abs(self.recenter_width_delta) <= WIDTH_DELTA_MAX)
+          if enter_ok and self.recenter_hold_s <= 0.0:
+            # Consecutive-frame debounce: one failing frame restarts the count.
+            self.recenter_enter_s += DT_MDL
+            if self.recenter_enter_s >= ENTER_HOLD_S - 1e-12:
+              self.recenter_latched = True
+              self.recenter_r0 = r0
+              self.recenter_enter_s = 0.0
+              target_k = self._recenter_target_k(t, r, v_ego)
+              active = target_k != 0.0
+          else:
+            self.recenter_enter_s = 0.0
+    else:
+      self.recenter_enter_s = 0.0
+      if self.recenter_latched:
+        self._release_recenter('no_geometry')
 
     slew = LRA_JERK / max(v_ego, 1.0) ** 2 * DT_MDL
     self.recenter_k = float(np.clip(target_k, prev_k - slew, prev_k + slew))

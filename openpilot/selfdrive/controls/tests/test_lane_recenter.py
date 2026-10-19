@@ -5,38 +5,61 @@ monotonically over its 3 s horizon.  These are pure-function and single-frame
 state tests, not closed-loop vehicle validation.
 """
 import copy
+import importlib.util
+import math
+import os
+import shutil
+import subprocess
+import tempfile
 
 import numpy as np
 import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
-  BOOST_S, GATE_OFF, LRA_ACC_MAX, LRA_JERK, R_MONO_TOL, R_OFF, R_ON, RET_MIN,
-  LaneCenterBlend, recenter_profile, recenter_return_checks,
+  BOOST_S, ENTER_HOLD_S, GATE_OFF, GATE_STEER, JUMP_HOLD_S, LRA_ACC_MAX, LRA_JERK,
+  R_MONO_TOL, R_OFF, R_ON, R_REENTER_S, RET_MIN, STEER_BLOCK_HOLD_S, WIDTH_DELTA_MAX,
+  LaneCenterBlend, dump_table, load_table, recenter_profile, recenter_return_checks,
+  recenter_width_delta,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
 T = np.array(ModelConstants.T_IDXS)
 V = 25.0
 WIDTH = 3.5
+SETTLE = int(math.ceil(ENTER_HOLD_S / DT_MDL)) + 2
+BASE_COMMIT = '0f68e5624'
 
 
-def _geometry(r0, r_horizon=None, v=V, kappa=0.0, width=WIDTH):
-  """Lane centre and a model path whose offset ramps from r0 to r_horizon."""
+def _geometry(r0, r_horizon=None, v=V, kappa=0.0, width=WIDTH, widen=0.0, centre_shift=0.0):
+  """Lane centre and a model path whose offset ramps from r0 to r_horizon.
+
+  `widen` grows the right line over the first ~45 m (a taper/gore), and
+  `centre_shift` moves the whole lane sideways (a lane-centre jump).
+  """
   x = v * T
-  centre = kappa * x ** 2 / 2.0
+  centre = centre_shift + kappa * x ** 2 / 2.0
   r_end = r0 if r_horizon is None else r_horizon
-  t_end = 3.0
-  frac = np.clip(T / t_end, 0.0, 1.0)
+  frac = np.clip(T / 3.0, 0.0, 1.0)
   r = r0 + (r_end - r0) * frac
-  return x, centre - width / 2.0, centre + width / 2.0, x, centre + r, centre
+  grow = widen * np.clip(x / 45.0, 0.0, 1.0)
+  return x, centre - width / 2.0, centre + width / 2.0 + grow, x, centre + r, centre
 
 
 def _update(blend, r0, r_horizon=None, *, recenter=True, v=V, kappa=0.0, lane_mode=False,
-            lane_change=False, steering=False, l_prob=0.9, r_prob=0.9, width=WIDTH):
-  ll_x, lll, rll, path_x, path_y, centre = _geometry(r0, r_horizon, v, kappa, width)
-  return blend.update(False, lane_mode, v, l_prob, r_prob, ll_x, lll, rll,
+            lane_change=False, steering=False, l_prob=0.9, r_prob=0.9, width=WIDTH,
+            widen=0.0, centre_shift=0.0, enabled=False):
+  ll_x, lll, rll, path_x, path_y, centre = _geometry(r0, r_horizon, v, kappa, width, widen,
+                                                     centre_shift)
+  return blend.update(enabled, lane_mode, v, l_prob, r_prob, ll_x, lll, rll,
                       T, path_x, path_y, lane_change, steering, recenter_enabled=recenter)
+
+
+def _settle(blend, r0, r_horizon=None, frames=SETTLE, **kwargs):
+  out = 0.0
+  for _ in range(frames):
+    out = _update(blend, r0, r_horizon, **kwargs)
+  return out
 
 
 def test_profile_and_checks_match_sign_convention():
@@ -49,12 +72,12 @@ def test_profile_and_checks_match_sign_convention():
 
   # A positive r0 is a path right of centre; the correction must steer left.
   blend = LaneCenterBlend()
-  _update(blend, 0.4, 0.1)
+  _settle(blend, 0.4, 0.1)
   assert blend.recenter_active
   assert blend.recenter_curvature < 0.0
 
   blend = LaneCenterBlend()
-  _update(blend, -0.4, -0.1)
+  _settle(blend, -0.4, -0.1)
   assert blend.recenter_active
   assert blend.recenter_curvature > 0.0
 
@@ -72,11 +95,35 @@ def test_off_is_identical_and_exact_zero():
 
   # Turning the assist off after it was active steps it to exactly zero.
   blend = LaneCenterBlend()
-  _update(blend, 0.4, 0.1)
+  _settle(blend, 0.4, 0.1)
   assert blend.recenter_curvature != 0.0
   _update(blend, 0.4, 0.1, recenter=False)
   assert blend.recenter_curvature == 0.0
   assert blend.recenter_k == 0.0
+
+
+def test_enter_debounce_requires_the_full_hold():
+  blend = LaneCenterBlend()
+  hold_frames = int(round(ENTER_HOLD_S / DT_MDL))
+  _update(blend, 0.4, 0.1)
+  assert not blend.recenter_latched
+  for _ in range(hold_frames - 2):
+    _update(blend, 0.4, 0.1)
+    assert not blend.recenter_latched
+  _update(blend, 0.4, 0.1)
+  assert blend.recenter_latched
+  assert blend.recenter_curvature != 0.0
+
+  # One failing frame restarts the count.
+  blend = LaneCenterBlend()
+  for _ in range(hold_frames - 1):
+    _update(blend, 0.4, 0.1)
+  _update(blend, 0.05, 0.0)  # resets the streak
+  for _ in range(hold_frames - 1):
+    _update(blend, 0.4, 0.1)
+  assert not blend.recenter_latched
+  _update(blend, 0.4, 0.1)
+  assert blend.recenter_latched
 
 
 def test_hold_offset_does_not_activate():
@@ -99,7 +146,7 @@ def test_sign_flip_inside_horizon_does_not_activate():
   centre = np.zeros_like(x)
   path_y = np.where(T <= 1.5, 0.4, -0.3)
   blend = LaneCenterBlend()
-  for _ in range(30):
+  for _ in range(SETTLE):
     blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
                  T, x, path_y, False, False, recenter_enabled=True)
     assert blend.recenter_curvature == 0.0
@@ -109,17 +156,15 @@ def test_sign_flip_inside_horizon_does_not_activate():
 def test_below_r_on_does_not_activate(r0):
   assert r0 < R_ON
   blend = LaneCenterBlend()
-  for _ in range(30):
-    _update(blend, r0, 0.0)
-    assert blend.recenter_curvature == 0.0
+  _settle(blend, r0, 0.0, frames=60)
+  assert blend.recenter_curvature == 0.0
 
 
 @pytest.mark.parametrize("r0", [0.81, 1.0])
 def test_above_r_max_does_not_activate(r0):
   blend = LaneCenterBlend()
-  for _ in range(30):
-    _update(blend, r0, 0.2)
-    assert blend.recenter_curvature == 0.0
+  _settle(blend, r0, 0.2, frames=60)
+  assert blend.recenter_curvature == 0.0
 
 
 def test_gates_block_activation():
@@ -141,6 +186,36 @@ def test_gates_block_activation():
     assert not blend.recenter_latched, kwargs
 
 
+def test_width_delta_helper():
+  ll_x, lll, rll, path_x, path_y, centre = _geometry(0.0, 0.0)
+  assert recenter_width_delta(ll_x, lll, rll, V) == pytest.approx(0.0)
+  ll_x, lll, rll, path_x, path_y, centre = _geometry(0.0, 0.0, widen=0.8)
+  x_l = float(np.clip(V * 1.5, 15.0, 45.0))
+  expected = 0.8 * np.clip(x_l / 45.0, 0.0, 1.0)
+  assert recenter_width_delta(ll_x, lll, rll, V) == pytest.approx(expected)
+  assert abs(recenter_width_delta(ll_x, lll, rll, V)) > WIDTH_DELTA_MAX
+
+
+def test_widening_lane_blocks_entry():
+  blend = LaneCenterBlend()
+  _settle(blend, 0.4, 0.0, frames=60, widen=0.8)
+  assert blend.recenter_curvature == 0.0
+  assert not blend.recenter_latched
+  assert blend.recenter_width_delta > WIDTH_DELTA_MAX
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_widening_lane_releases_a_latched_assist(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1))
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+  before = blend.recenter_releases.get('width', 0)
+  _settle(blend, 0.4, 0.0, frames=2, enabled=enabled, widen=0.8)
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get('width', 0) == before + 1
+  assert blend.recenter_hold_s > 0.0
+
+
 def test_monotone_tolerance_boundary():
   t = np.array([0.0, 1.0, 2.0, 3.0])
   r0 = 0.4
@@ -155,14 +230,11 @@ def test_monotone_tolerance_boundary():
 
 def test_insufficient_retraction_does_not_activate():
   blend = LaneCenterBlend()
-  for _ in range(30):
-    _update(blend, 0.20, 0.20 - RET_MIN + 0.01)
-    assert blend.recenter_curvature == 0.0
+  _settle(blend, 0.20, 0.20 - RET_MIN + 0.01, frames=60)
+  assert blend.recenter_curvature == 0.0
 
 
 def test_caps_hold():
-  blend = LaneCenterBlend()
-  prev = 0.0
   for v in (11.2, 20.0, 33.3):
     blend = LaneCenterBlend()
     prev = 0.0
@@ -177,8 +249,7 @@ def test_caps_hold():
 
 def test_boost_is_stronger_than_the_model_alone():
   blend = LaneCenterBlend()
-  for _ in range(200):
-    _update(blend, 0.4, 0.1)
+  _settle(blend, 0.4, 0.1, frames=200)
   assert blend.recenter_active
   y_m = 0.4 + (0.1 - 0.4) * 1.5 / 3.0
   length = float(np.clip(V * 1.5, 15.0, 45.0))
@@ -188,8 +259,7 @@ def test_boost_is_stronger_than_the_model_alone():
 
 def test_turn_off_is_slewed_not_stepped():
   blend = LaneCenterBlend()
-  for _ in range(200):
-    _update(blend, 0.4, 0.0)
+  _settle(blend, 0.4, 0.0, frames=200)
   active_k = blend.recenter_curvature
   assert abs(active_k) > 0.0
 
@@ -209,18 +279,90 @@ def test_turn_off_is_slewed_not_stepped():
   assert blend.recenter_curvature == 0.0
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_steer_hold_then_early_release_gives_zero(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1))
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+
+  _settle(blend, 0.4, 0.0, frames=12, enabled=enabled, steering=True)  # 0.6 s hold
+  assert blend.steer_block
+  assert not blend.recenter_latched
+  assert blend.recenter_curvature == 0.0
+  assert blend.recenter_releases.get('gate_steer', 0) >= 1
+
+  _settle(blend, 0.4, 0.0, frames=15, enabled=enabled)  # 0.75 s after release
+  assert blend.steer_block
+  assert not blend.recenter_latched
+  assert blend.recenter_curvature == 0.0
+
+  _settle(blend, 0.4, 0.0, frames=int(math.ceil(STEER_BLOCK_HOLD_S / DT_MDL)) + 25,
+          enabled=enabled)
+  assert not blend.steer_block
+  assert blend.recenter_latched
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_centre_jump_gives_zero_for_its_hold(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1))
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+
+  _settle(blend, 0.4, 0.0, frames=2, enabled=enabled, centre_shift=0.4)  # centre jumps 0.4 m
+  assert blend.jump_t > 0.0
+  assert not blend.recenter_latched
+  assert blend.recenter_curvature == 0.0
+
+  frames = int(round(JUMP_HOLD_S / DT_MDL)) - 5
+  _settle(blend, 0.4, 0.0, frames=frames, enabled=enabled)
+  assert not blend.recenter_latched
+  assert blend.recenter_curvature == 0.0
+
+  _settle(blend, 0.4, 0.0, frames=SETTLE + 5, enabled=enabled)
+  assert blend.recenter_latched
+  assert blend.recenter_curvature != 0.0
+
+
+@pytest.mark.parametrize("reason", ['mono', 'sign', 'retract', 'r_max'])
+def test_every_release_starts_the_hold_off(reason):
+  blend = LaneCenterBlend()
+  _settle(blend, 0.4, 0.0)
+  assert blend.recenter_latched
+
+  if reason == 'mono':
+    _update(blend, 0.4, 0.5)      # |r| grows
+  elif reason == 'sign':
+    x = V * T
+    centre = np.zeros_like(x)
+    path_y = np.where(T <= 1.5, 0.4, -0.3)
+    blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
+                 T, x, path_y, False, False, recenter_enabled=True)
+  elif reason == 'retract':
+    _update(blend, 0.2, 0.19)
+  else:
+    _update(blend, 0.9, 0.3)
+
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get(reason, 0) == 1
+  assert blend.recenter_hold_s == pytest.approx(R_REENTER_S)
+
+  # The hold-off blocks re-entry even though the entry condition holds again.
+  _settle(blend, 0.4, 0.0, frames=max(1, int(round(R_REENTER_S / DT_MDL)) - 1))
+  assert not blend.recenter_latched
+  _settle(blend, 0.4, 0.0, frames=SETTLE)
+  assert blend.recenter_latched
+
+
 def test_assist_runs_with_blend_disabled_and_leaves_blend_outputs_off():
   blend = LaneCenterBlend(table=np.full(7, 0.1))
-  for _ in range(30):
-    _update(blend, 0.4, 0.1)
+  _settle(blend, 0.4, 0.1)
   assert blend.recenter_curvature != 0.0
   assert blend.curvature == 0.0
   assert blend.offset == 0.0
   assert blend.w == 0.0
 
   ref = LaneCenterBlend(table=np.full(7, 0.1))
-  for _ in range(30):
-    _update(ref, 0.4, 0.1, recenter=False)
+  _settle(ref, 0.4, 0.1, recenter=False)
   assert ref.curvature == blend.curvature == 0.0
   assert np.array_equal(ref.table, blend.table)
 
@@ -235,3 +377,92 @@ def test_blend_enabled_output_unchanged_by_assist_off():
     b = off.update(True, False, V, 0.9, 0.9, x, lll, rll, T, path_x, path_y, False, False)
     assert a == b
   assert on.recenter_curvature == 0.0
+
+
+def _load_base(repo_root):
+  """Load the 0f68e5624 LaneCenterBlend, or skip when git cannot provide it."""
+  git = shutil.which('git')
+  if git is None:
+    pytest.skip('git not available')
+  try:
+    src = subprocess.run(
+      [git, '-C', str(repo_root), 'show',
+       f'{BASE_COMMIT}:openpilot/selfdrive/controls/lib/lane_center_blend.py'],
+      check=True, capture_output=True, text=True).stdout
+  except (subprocess.CalledProcessError, OSError) as exc:
+    pytest.skip(f'base commit unavailable: {exc}')
+
+  # The file only imports numpy and DT_MDL, both already imported here.
+  work = tempfile.mkdtemp(prefix='lcb_base_')
+  path = os.path.join(work, 'lane_center_blend_base.py')
+  with open(path, 'w', encoding='utf-8', newline='\n') as f:
+    f.write(src)
+  spec = importlib.util.spec_from_file_location('lane_center_blend_base', path)
+  mod = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(mod)
+  return mod
+
+
+BLEND_FIELDS = ('w', 'offset', 'curvature', 'gates', 'e', 'kappa_road', 'e_prev', 'r_prev',
+                'r_rate', 'r_far', 'r_dev', 'lane_change_t', 'jump_t', 'avoid_clear_t',
+                'steer_held_s', 'steer_block', 'steer_release_s', 'table', 'r_base')
+
+
+def test_random_two_thousand_frames_match_the_base_blend_path():
+  repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
+  base = _load_base(repo_root)
+  rng = np.random.default_rng(146)
+  cur = LaneCenterBlend(table=np.full(7, 0.05))
+  ref = base.LaneCenterBlend(table=np.full(7, 0.05))
+
+  r0 = 0.0
+  r_h = 0.0
+  kappa = 0.0
+  width = WIDTH
+  for frame in range(2000):
+    if frame % 20 == 0:
+      r0 = float(rng.uniform(-0.6, 0.6))
+      r_h = float(r0 + rng.uniform(-0.25, 0.05))
+      kappa = float(rng.choice([0.0, 0.0, 0.0005, -0.0005, 0.003, -0.003, 0.025]))
+      width = float(rng.uniform(2.2, 4.6))
+    v = float(rng.uniform(4.0, 34.0))
+    l_prob = float(rng.uniform(0.3, 1.0))
+    r_prob = float(rng.uniform(0.3, 1.0))
+    lane_mode = bool(rng.random() < 0.15)
+    lane_change = bool(rng.random() < 0.10)
+    steering = bool(rng.random() < 0.10)
+    enabled = bool(rng.random() < 0.80)
+    x = v * T
+    centre = kappa * x ** 2 / 2.0
+    frac = np.clip(T / 3.0, 0.0, 1.0)
+    path_y = centre + r0 + (r_h - r0) * frac
+    lll = centre - width / 2.0
+    rll = centre + width / 2.0
+
+    a = cur.update(enabled, lane_mode, v, l_prob, r_prob, x, lll, rll, T, x, path_y,
+                   lane_change, steering, recenter_enabled=False)
+    b = ref.update(enabled, lane_mode, v, l_prob, r_prob, x, lll, rll, T, x, path_y,
+                   lane_change, steering)
+    assert a == b, frame
+    for name in BLEND_FIELDS:
+      av, bv = getattr(cur, name), getattr(ref, name)
+      if isinstance(av, np.ndarray):
+        assert np.array_equal(av, bv), (frame, name)
+      else:
+        assert av == bv, (frame, name)
+
+  assert cur.recenter_curvature == 0.0
+
+
+def test_table_roundtrip_unchanged():
+  table = np.array([0.1, -0.2, 0.3, 0.0, -0.1, 0.25, -0.05])
+  assert np.allclose(load_table(dump_table(table)), table)
+  assert np.array_equal(load_table(''), np.zeros(7))
+  assert np.allclose(load_table('[0.9,0.9,0.9,0.9,0.9,0.9,0.9]'), np.full(7, 0.30))
+
+
+def test_steer_gate_bit_is_used_in_both_branches():
+  blend = LaneCenterBlend()
+  assert GATE_STEER == 256
+  _settle(blend, 0.4, 0.0, frames=12, enabled=False, steering=True)
+  assert blend.gates & GATE_STEER
