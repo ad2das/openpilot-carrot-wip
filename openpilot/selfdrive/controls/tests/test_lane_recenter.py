@@ -457,9 +457,9 @@ def test_soft_failure_for_exit_hold_releases_with_the_hold_off(enabled):
   blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
   _settle(blend, 0.4, 0.0, enabled=enabled)
   assert blend.recenter_latched
-  frames = int(round(EXIT_HOLD_S / DT_MDL)) + 1
-  # Just before the deadline the latch is still there.
-  _settle(blend, 0.4, 0.9, frames=frames - 1, enabled=enabled)
+  # EXIT_HOLD_S is reached after exactly this many consecutive failing frames.
+  deadline = int(round(EXIT_HOLD_S / DT_MDL))
+  _settle(blend, 0.4, 0.9, frames=deadline - 1, enabled=enabled)
   assert blend.recenter_latched
   _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
   assert not blend.recenter_latched
