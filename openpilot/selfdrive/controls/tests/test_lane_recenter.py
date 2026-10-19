@@ -290,6 +290,8 @@ def test_steer_hold_then_early_release_gives_zero(enabled):
   _settle(blend, 0.4, 0.0, frames=12, enabled=enabled, steering=True)  # 0.6 s hold
   assert blend.steer_block
   assert not blend.recenter_latched
+  assert blend.recenter_active is False
+  _settle(blend, 0.4, 0.0, frames=2, enabled=enabled, steering=True)
   assert blend.recenter_curvature == 0.0
   assert (blend.recenter_releases.get('steer', 0) +
           blend.recenter_releases.get('gate_steer', 0)) >= 1
@@ -314,7 +316,12 @@ def test_centre_jump_gives_zero_for_its_hold(enabled):
   _settle(blend, 0.4, 0.0, frames=2, enabled=enabled, centre_shift=0.4)  # centre jumps 0.4 m
   assert blend.jump_t > 0.0
   assert not blend.recenter_latched
-  assert blend.recenter_curvature == 0.0
+  assert blend.recenter_active is False
+  # The intent is already 0; the previous curvature only slews down.
+  for _ in range(2):
+    _settle(blend, 0.4, 0.0, frames=1, enabled=enabled, centre_shift=0.4)
+    assert blend.recenter_active is False
+    assert blend.recenter_curvature == 0.0
 
   frames = int(round(JUMP_HOLD_S / DT_MDL)) - 5
   _settle(blend, 0.4, 0.0, frames=frames, enabled=enabled)
