@@ -182,9 +182,9 @@ def _blend(planner):
 def test_assist_on_laneless_publishes_blend_plus_recenter():
   planner = make_planner(param_value=1)
   for _ in range(25):
-    planner.update(inputs(), SimpleNamespace(atc_active=False))
+    planner.update(inputs(lane_speed=0), SimpleNamespace(atc_active=False))
   assert not planner.lanelines_active, 'the laneless branch is the assist case'
-  published = run_frames(planner, 3)
+  published = run_frames(planner, 3, lane_speed=0)
   for msg in published:
     lp = msg.lateralPlan
     blend = _blend(planner)
@@ -196,9 +196,9 @@ def test_assist_on_laneless_publishes_blend_plus_recenter():
 def test_assist_off_laneless_publishes_blend_only():
   planner = make_planner(param_value=0)
   for _ in range(25):
-    planner.update(inputs(), SimpleNamespace(atc_active=False))
+    planner.update(inputs(lane_speed=0), SimpleNamespace(atc_active=False))
   assert not planner.lanelines_active
-  published = run_frames(planner, 3)
+  published = run_frames(planner, 3, lane_speed=0)
   for msg in published:
     lp = msg.lateralPlan
     blend = _blend(planner)
