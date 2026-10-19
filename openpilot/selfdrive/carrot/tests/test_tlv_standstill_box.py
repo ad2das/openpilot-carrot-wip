@@ -161,13 +161,24 @@ def test_box_template_anchor_and_expiry_are_untouched():
   assert dict(pipe.relocalizer._templates) == before_templates
 
 
-def test_both_vote_with_verified_frame_and_stale_frame():
-  """A verified frame still votes normally: the filter applies to stale boxes only."""
+def test_a_verified_frame_still_votes_non_green():
+  """The filter applies to stale boxes only: a box verified by an accepted
+  refine this frame votes RED exactly like before."""
+  luma = np.full((H, W), 60, np.uint8)
+  x1, y1, x2, y2 = [int(v) for v in BOX]
+  luma[y1:y2, x1:x2] = 210
   pipe, tr = _pipe(RED, 0.95, verified_at=0.0)
-  # Simulate a detector match on this frame: matched ids come from last_matches.
-  pipe.tracker.last_matches = [(None, 1)]
-  pipe.infer("far", _geom(), image_width=W, now=0.6, detect=True, v_ego_kph=0.0)
+  pipe.capture_luma(luma, W)
+  pipe.relocalizer.refresh(pipe.luma, tr)
+  pipe.ego = tracker.EgoFrame(odo=tracker.EgoOdometry(), focal_px=FOCAL,
+                              foe_x=964.0, foe_y=600.0, image_w=W, image_h=H)
+  pipe.capture_luma(luma, W)
+  pipe._relocalize(now=0.6, detect=False)
+  assert pipe._verified_ids == {1}          # verified by the refine...
+  assert pipe._stale_box_ids == set()       # ...so it is not a stale box
+  pipe._classify_tracks(now=0.6, geom=_geom())
   assert [v[1] for v in _votes(tr)] == [RED]
+  assert pipe.standstill_box_votes == 0
 
 
 # -- the sticky release must never be broken by a stale-box vote --------------
