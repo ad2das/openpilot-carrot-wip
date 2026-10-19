@@ -17,7 +17,7 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
-  BOOST_S, ENTER_HOLD_S, GATE_OFF, GATE_STEER, JUMP_HOLD_S, LRA_ACC_MAX, LRA_JERK,
+  BOOST_S, ENTER_HOLD_S, EXIT_HOLD_S, GATE_OFF, GATE_STEER, JUMP_HOLD_S, LRA_ACC_MAX, LRA_JERK,
   R_MONO_TOL, R_OFF, R_ON, R_REENTER_S, RET_MIN, STEER_BLOCK_HOLD_S, WIDTH_DELTA_MAX,
   LaneCenterBlend, dump_table, load_table, recenter_profile, recenter_return_checks,
   recenter_width_delta,
@@ -361,8 +361,10 @@ def test_every_release_starts_the_hold_off(reason):
   _settle(blend, 0.4, 0.0)
   assert blend.recenter_latched
 
+  # Soft reasons (mono/retract) only release after EXIT_HOLD_S of failure.
+  soft_frames = int(round(EXIT_HOLD_S / DT_MDL)) + 1
   if reason == 'mono':
-    _settle(blend, 0.4, 0.9, frames=3)   # |r| grows across the horizon
+    _settle(blend, 0.4, 0.9, frames=soft_frames)   # |r| grows across the horizon
   elif reason == 'sign':
     x = V * T
     centre = np.zeros_like(x)
@@ -370,7 +372,7 @@ def test_every_release_starts_the_hold_off(reason):
     blend.update(False, False, V, 0.9, 0.9, x, centre - WIDTH / 2, centre + WIDTH / 2,
                  T, x, path_y, False, False, recenter_enabled=True)
   else:
-    _settle(blend, 0.2, 0.19, frames=3)
+    _settle(blend, 0.2, 0.19, frames=soft_frames)
 
   assert not blend.recenter_latched
   assert blend.recenter_releases.get(reason, 0) == 1
@@ -381,6 +383,66 @@ def test_every_release_starts_the_hold_off(reason):
   assert not blend.recenter_latched
   _settle(blend, 0.4, 0.0, frames=SETTLE)
   assert blend.recenter_latched
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("soft", ['mono', 'retract', 'rate'])
+def test_a_soft_frame_stops_output_but_keeps_the_latch(soft, enabled):
+  """R3-1: one failing soft frame zeroes the target at once, latch survives."""
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+  assert blend.recenter_curvature != 0.0
+  k_before = blend.recenter_curvature
+  releases_before = dict(blend.recenter_releases)
+
+  if soft == 'mono':
+    _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
+  elif soft == 'retract':
+    _settle(blend, 0.2, 0.19, frames=1, enabled=enabled)
+  else:
+    # Rate away: the model path only moves away from centre at 1.5 s.
+    _settle(blend, 0.4, 0.45, frames=6, enabled=enabled)
+    blend.recenter_latched = True
+    _settle(blend, 0.4, 0.45, frames=1, enabled=enabled)
+
+  assert blend.recenter_latched, f'{soft}: a single soft frame must not release'
+  assert blend.recenter_active is False, f'{soft}: intent must be False when target_k is 0'
+  assert abs(blend.recenter_curvature) < abs(k_before), f'{soft}: output must slew down at once'
+  assert blend.recenter_releases == releases_before
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_soft_failure_shorter_than_exit_hold_resumes_without_a_new_wait(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+
+  # Fail mono for one frame less than EXIT_HOLD_S, then return to a good return.
+  fail_frames = max(1, int(round(EXIT_HOLD_S / DT_MDL)) - 1)
+  _settle(blend, 0.4, 0.9, frames=fail_frames, enabled=enabled)
+  assert blend.recenter_latched
+
+  _settle(blend, 0.4, 0.0, frames=1, enabled=enabled)
+  # No new 0.2 s entry wait: the latch never dropped.
+  assert blend.recenter_latched
+  assert blend.recenter_active is True
+  assert abs(blend.recenter_curvature) > 0.0
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_soft_failure_for_exit_hold_releases_with_the_hold_off(enabled):
+  blend = LaneCenterBlend(table=np.full(7, 0.1)) if enabled else LaneCenterBlend()
+  _settle(blend, 0.4, 0.0, enabled=enabled)
+  assert blend.recenter_latched
+  frames = int(round(EXIT_HOLD_S / DT_MDL)) + 1
+  # Just before the deadline the latch is still there.
+  _settle(blend, 0.4, 0.9, frames=frames - 1, enabled=enabled)
+  assert blend.recenter_latched
+  _settle(blend, 0.4, 0.9, frames=1, enabled=enabled)
+  assert not blend.recenter_latched
+  assert blend.recenter_releases.get('mono', 0) == 1
+  assert 0.0 < blend.recenter_hold_s <= R_REENTER_S
 
 
 def test_above_r_max_release_starts_the_hold_off():

@@ -57,8 +57,9 @@ R_NEAR = 0.05            # offsets below this may cross the sign without a flip,
 R_MONO_TOL = 0.03        # allowed |r| growth between samples while returning, m
 RET_MIN = 0.05           # required |r0| - |r(3 s)| shrinkage, m
 REC_T_L = 1.5            # lookahead used to read the model's planned offset, s
-ENTER_HOLD_S = 0.3       # the full entry condition must hold this long first, s
+ENTER_HOLD_S = 0.2       # the full entry condition must hold this long first, s
 R_REENTER_S = 0.5        # hold-off after any release before the latch may re-enter, s
+EXIT_HOLD_S = 0.2        # soft conditions must fail this long before the latch drops, s
 WIDTH_DELTA_MAX = 0.4    # lane-width change across the lookahead that blocks entry, m
 BOOST_S = 0.5            # aim at this fraction of the planned offset
 LRA_ACC_MAX = 0.3        # |k_lra| * v^2 cap, m/s^2
@@ -173,6 +174,7 @@ class LaneCenterBlend:
     self.recenter_r0 = 0.0
     self.recenter_hold_s = 0.0
     self.recenter_enter_s = 0.0
+    self.recenter_soft_s = 0.0
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -189,6 +191,7 @@ class LaneCenterBlend:
     self.recenter_r0 = 0.0
     self.recenter_hold_s = 0.0
     self.recenter_enter_s = 0.0
+    self.recenter_soft_s = 0.0
     self.recenter_releases = {}
     self.recenter_width_delta = 0.0
 
@@ -392,6 +395,7 @@ class LaneCenterBlend:
     self.recenter_latched = False
     self.recenter_hold_s = R_REENTER_S
     self.recenter_enter_s = 0.0
+    self.recenter_soft_s = 0.0
 
   def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
     """Lane recenter assist: extra curvature that doubles an already-planned return.
@@ -407,6 +411,7 @@ class LaneCenterBlend:
       self.recenter_latched = False
       self.recenter_hold_s = 0.0
       self.recenter_enter_s = 0.0
+      self.recenter_soft_s = 0.0
       return
 
     prev_k = self.recenter_k
@@ -424,18 +429,12 @@ class LaneCenterBlend:
         base_ok = (sign_ok and mono_ok and retract_ok and not rate_away and
                    gates == 0 and not steering_pressed and v_ego >= V_OFF)
         if self.recenter_latched:
-          # The latch holds only inside R_ON..R_MAX, and the monotone-return test
-          # still runs every frame: the assist never continues into a path that
-          # stops returning, grows out again, or turns into a taper/gore.
+          # Hard conditions drop the latch at once; soft ones only stop this
+          # frame's output and must fail EXIT_HOLD_S of consecutive frames
+          # before the latch goes, so one noisy sample cannot end a real return.
           reason = None
           if not sign_ok:
             reason = 'sign'
-          elif not mono_ok:
-            reason = 'mono'
-          elif not retract_ok:
-            reason = 'retract'
-          elif rate_away:
-            reason = 'rate'
           elif abs(r0) < R_OFF:
             reason = 'r_off'
           elif abs(r0) > R_MAX:
@@ -448,7 +447,26 @@ class LaneCenterBlend:
             reason = 'steer'
           elif gates != 0:
             reason = 'gate_steer' if (gates & GATE_STEER) else 'gate'
-          if reason is None:
+
+          soft_reason = None
+          if not mono_ok:
+            soft_reason = 'mono'
+          elif not retract_ok:
+            soft_reason = 'retract'
+          elif rate_away:
+            soft_reason = 'rate'
+
+          if reason is not None:
+            self._release_recenter(reason)
+          elif soft_reason is not None:
+            # Output stops immediately (slew down); the latch survives.
+            target_k = 0.0
+            active = False
+            self.recenter_soft_s += DT_MDL
+            if self.recenter_soft_s >= EXIT_HOLD_S - 1e-12:
+              self._release_recenter(soft_reason)
+          else:
+            self.recenter_soft_s = 0.0
             # Same consecutive-frame rule for the intent as for entry: dropping
             # below R_ON (still latched) stops the assist, and it only comes
             # back after the full hold again, so the band cannot chatter.
@@ -459,8 +477,6 @@ class LaneCenterBlend:
             if abs(r0) >= R_ON and self.recenter_enter_s >= ENTER_HOLD_S - 1e-12:
               target_k = self._recenter_target_k(t, r, v_ego)
               active = target_k != 0.0
-          else:
-            self._release_recenter(reason)
         if not self.recenter_latched:
           enter_ok = (base_ok and R_ON <= abs(r0) <= R_MAX and
                       abs(self.recenter_width_delta) <= WIDTH_DELTA_MAX)
