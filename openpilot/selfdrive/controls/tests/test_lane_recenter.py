@@ -310,7 +310,8 @@ def test_gates_block_activation():
     {"lane_change": True},
     {"steering": True},
     {"v": 8.0},
-    {"kappa": 0.002},
+    # 0.0026 * 25^2 = 1.63 m/s^2, above the widened LAT_ON = 1.5
+    {"kappa": 0.0026},
     {"l_prob": 0.5},
     {"r_prob": 0.5},
     {"width": 2.0},
