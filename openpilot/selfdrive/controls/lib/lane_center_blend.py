@@ -422,7 +422,7 @@ class LaneCenterBlend:
         sign_ok, mono_ok, retract_ok = recenter_return_checks(t, r, r0)
         rate_away = bool(np.sign(self.r_rate) == np.sign(r0)) and abs(self.r_rate) >= 0.05
         base_ok = (sign_ok and mono_ok and retract_ok and not rate_away and
-                   gates == 0 and v_ego >= V_OFF)
+                   gates == 0 and not steering_pressed and v_ego >= V_OFF)
         if self.recenter_latched:
           # The latch holds only inside R_ON..R_MAX, and the monotone-return test
           # still runs every frame: the assist never continues into a path that
@@ -444,6 +444,8 @@ class LaneCenterBlend:
             reason = 'speed'
           elif abs(self.recenter_width_delta) > WIDTH_DELTA_MAX:
             reason = 'width'
+          elif steering_pressed:
+            reason = 'steer'
           elif gates != 0:
             reason = 'gate_steer' if (gates & GATE_STEER) else 'gate'
           if reason is None:
