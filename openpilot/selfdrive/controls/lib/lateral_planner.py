@@ -275,6 +275,8 @@ class LateralPlanner:
     lateralPlan.laneChangeState = sm['modelV2'].meta.laneChangeState
     lateralPlan.laneChangeDirection = sm['modelV2'].meta.laneChangeDirection
     lateralPlan.laneWidth = float(self.LP.lane_width)
+    rec_enabled = (self.lane_recenter_assist_enabled and
+                   not self.lanelines_active and not self.useLaneLineMode)
     recenter_curvature = float(self.lane_center_blend.recenter_curvature) if rec_enabled else 0.0
     lateralPlan.laneCenterBlendCurvature = float(self.lane_center_blend.curvature) + recenter_curvature
     lateralPlan.laneCenterBlendOffset = float(self.lane_center_blend.offset)
