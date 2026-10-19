@@ -11,7 +11,7 @@ import pytest
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
-  BOOST_S, GATE_OFF, LRA_ACC_MAX, LRA_JERK, R_MAX, R_MONO_TOL, R_OFF, R_ON, RET_MIN,
+  BOOST_S, GATE_OFF, LRA_ACC_MAX, LRA_JERK, R_MONO_TOL, R_OFF, R_ON, RET_MIN,
   LaneCenterBlend, recenter_profile, recenter_return_checks,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
@@ -107,6 +107,7 @@ def test_sign_flip_inside_horizon_does_not_activate():
 
 @pytest.mark.parametrize("r0", [0.10, 0.149])
 def test_below_r_on_does_not_activate(r0):
+  assert r0 < R_ON
   blend = LaneCenterBlend()
   for _ in range(30):
     _update(blend, r0, 0.0)
@@ -188,7 +189,7 @@ def test_boost_is_stronger_than_the_model_alone():
 def test_turn_off_is_slewed_not_stepped():
   blend = LaneCenterBlend()
   for _ in range(200):
-    _update(blend, 0.4, 0.1)
+    _update(blend, 0.4, 0.0)
   active_k = blend.recenter_curvature
   assert abs(active_k) > 0.0
 
@@ -196,7 +197,7 @@ def test_turn_off_is_slewed_not_stepped():
   prev = active_k
   steps = 0
   for _ in range(400):
-    _update(blend, 0.05, 0.0)  # below R_OFF: latch releases
+    _update(blend, R_OFF * 0.5, 0.0)  # below R_OFF: latch releases
     k = blend.recenter_curvature
     assert abs(k - prev) <= slew + 1e-12
     assert abs(k) <= abs(prev) + 1e-12
