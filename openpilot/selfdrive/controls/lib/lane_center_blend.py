@@ -408,13 +408,18 @@ class LaneCenterBlend:
     monotone return fail `|r|` non-increase and the retraction margin on raw
     samples.  The soft checks only decide whether the assist is *allowed*, so
     they run on a 0.25 s EMA.  The output target and the sign guard stay raw.
+
+    The retraction margin is measured on the smoothed plan's own start, not on
+    the raw `r0`: the EMA lags the raw offset, and comparing a lagged endpoint
+    with an unlagged start would charge that lag as missing retraction.
     """
     if self.recenter_r_filt is None or len(self.recenter_r_filt) != len(r):
       self.recenter_r_filt = np.array(r, dtype=float)
     else:
       alpha = DT_MDL / (REC_FILT_TAU + DT_MDL)
       self.recenter_r_filt += alpha * (np.asarray(r, dtype=float) - self.recenter_r_filt)
-    _, mono_ok, retract_ok = recenter_return_checks(t, self.recenter_r_filt, float(r0))
+    _, mono_ok, retract_ok = recenter_return_checks(
+      t, self.recenter_r_filt, float(self.recenter_r_filt[0]))
     return mono_ok, retract_ok
 
   def _update_recenter(self, enabled, v_ego, gates, geom, steering_pressed):
