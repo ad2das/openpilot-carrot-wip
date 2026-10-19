@@ -50,8 +50,8 @@ W_DOWN = 2.0
 # Lane recenter assist (LRA).  It only accelerates a return the model already
 # plans: a monotone path-to-centre offset that shrinks over the 3 s horizon.
 REC_HORIZON_S = 3.0
-R_ON = 0.15              # activation threshold, m
-R_ENTER = 0.17           # latch threshold; stays on between R_ON and this, m
+R_ON = 0.15              # activation threshold and hard output gate, m
+R_REENTER_S = 0.5        # hold-off after a release before the latch may re-enter, s
 R_OFF = 0.08             # hysteresis: release the latch below this offset, m
 R_MAX = 0.8              # larger offsets are not a normal lane-centre return, m
 R_NEAR = 0.05            # offsets below this may cross the sign without a flip, m
@@ -156,6 +156,7 @@ class LaneCenterBlend:
     self.recenter_k = 0.0
     self.recenter_latched = False
     self.recenter_r0 = 0.0
+    self.recenter_hold_s = 0.0
 
   def reset(self):
     self.table = np.zeros_like(KNOTS)
@@ -168,6 +169,7 @@ class LaneCenterBlend:
     self.recenter_k = 0.0
     self.recenter_latched = False
     self.recenter_r0 = 0.0
+    self.recenter_hold_s = 0.0
 
   def update(self, enabled, lane_mode, v_ego, l_prob, r_prob, ll_x, lll_y, rll_y,
              path_t, path_x, path_y, lane_change_active, steering_pressed,
@@ -350,11 +352,13 @@ class LaneCenterBlend:
       self.recenter_k = 0.0
       self.recenter_active = False
       self.recenter_latched = False
+      self.recenter_hold_s = 0.0
       return
 
     prev_k = self.recenter_k
     target_k = 0.0
     active = False
+    self.recenter_hold_s = max(0.0, self.recenter_hold_s - DT_MDL)
     if geom is not None and not steering_pressed:
       centre, ll_x, path_t, path_x, path_y = geom
       t, r = recenter_profile(ll_x, centre, path_t, path_x, path_y)
@@ -376,8 +380,9 @@ class LaneCenterBlend:
             active = target_k != 0.0
           if abs(r0) < R_OFF:
             self.recenter_latched = False
-        if not self.recenter_latched:
-          enter = (R_ENTER <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
+            self.recenter_hold_s = R_REENTER_S
+        if not self.recenter_latched and self.recenter_hold_s <= 0.0:
+          enter = (R_ON <= abs(r0) <= R_MAX and sign_ok and mono_ok and retract_ok and
                    not rate_away and gates == 0 and v_ego >= V_OFF)
           if enter:
             self.recenter_latched = True
