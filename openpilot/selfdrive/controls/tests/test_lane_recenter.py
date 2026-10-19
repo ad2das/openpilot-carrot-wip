@@ -64,6 +64,18 @@ def _settle(blend, r0, r_horizon=None, frames=SETTLE, **kwargs):
   return out
 
 
+def _update_path(blend, r_curve, *, v=V, enabled=False, lane_mode=False, lane_change=False,
+                 steering=False, l_prob=0.9, r_prob=0.9, width=WIDTH):
+  """Drive the blend with an explicit r(t) profile instead of a linear ramp."""
+  x = v * T
+  centre = np.zeros_like(x)
+  r = np.array([r_curve(float(t)) for t in T])
+  lll = centre - width / 2.0
+  rll = centre + width / 2.0
+  return blend.update(enabled, lane_mode, v, l_prob, r_prob, x, lll, rll,
+                      T, x, centre + r, lane_change, steering, recenter_enabled=True)
+
+
 def test_profile_and_checks_match_sign_convention():
   ll_x, lll, rll, path_x, path_y, centre = _geometry(0.4, 0.1)
   t, r = recenter_profile(ll_x, (lll + rll) / 2.0, T, path_x, path_y)
@@ -401,10 +413,19 @@ def test_a_soft_frame_stops_output_but_keeps_the_latch(soft, enabled):
   elif soft == 'retract':
     _settle(blend, 0.2, 0.19, frames=1, enabled=enabled)
   else:
-    # Rate away: the model path only moves away from centre at 1.5 s.
-    _settle(blend, 0.4, 0.45, frames=6, enabled=enabled)
-    blend.recenter_latched = True
-    _settle(blend, 0.4, 0.45, frames=1, enabled=enabled)
+    # Rate away: r at 1.5 s grows 0.02 m per frame (0.4 m/s after the filter)
+    # while |r(3 s)| keeps shrinking, so every *other* check still passes and
+    # rate_away is the only failing condition.
+    r0 = [0.4]
+
+    def r_curve(t):
+      rise = 0.02 * np.clip(t / 1.5, 0.0, 1.0)
+      fall = 0.1 * np.clip((t - 1.5) / 1.5, 0.0, 1.0)
+      return r0[0] + rise - fall
+
+    for _ in range(6):
+      r0[0] += 0.02
+      _update_path(blend, r_curve, enabled=enabled)
 
   assert blend.recenter_latched, f'{soft}: a single soft frame must not release'
   assert blend.recenter_active is False, f'{soft}: intent must be False when target_k is 0'
