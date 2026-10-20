@@ -152,6 +152,9 @@ class FramePipeline:
     # infer() runs (tlvd._update_odometry then FramePipeline.ego is set).
     self.last_relevant_box: tuple[float, float, float, float] | None = None
     self.last_red_likely = False
+    # W175: monotonic time of the last publish of a red-family value (redLikely
+    # or state red/redLeft); gates the onset-strict red rules off mid-red.
+    self._last_red_pub_s: float | None = None
     # W150: the last infer() released a held red (see Track.released()).
     self.last_released = False
     # W150b: sticky release state -- the track it applies to and the first
@@ -298,15 +301,18 @@ class FramePipeline:
         return False
     return True
 
-  def _confirmed(self, now: float) -> list[tuple[tracker.Track, int, float]]:
-    """Per-track confirmation: classifier votes OR the detector M-of-N belt."""
+  def _confirmed(self, now: float, onset_strict: bool = False) -> list[tuple[tracker.Track, int, float]]:
+    """Per-track confirmation: classifier votes OR the detector M-of-N belt.
+
+    onset_strict (W175) is passed to the classifier vote rules only.
+    """
     if self.single_class_detector:
       # Single-class detector (class 0 for every lamp): the detector M-of-N belt
       # would publish RED for green lights (W115 A6), so only lamp-classifier
       # votes may confirm. No classifier/NullClassifier -> nothing confirms.
       out = []
       for track in self.tracker.tracks:
-        result = track.classifier_confirmed(now)
+        result = track.classifier_confirmed(now, onset_strict=onset_strict)
         if result is not None:
           out.append((track, result[0], result[1]))
       self.tracker.note_red_confirmations(now, out)
@@ -316,7 +322,8 @@ class FramePipeline:
     else:
       out: list[tuple[tracker.Track, int, float]] = []
       for track in self.tracker.tracks:
-        result = self.tracker.confirm_track(track, self.frame_idx, now, use_classifier=True)
+        result = self.tracker.confirm_track(track, self.frame_idx, now, use_classifier=True,
+                                            onset_strict=onset_strict)
         if result is not None:
           out.append((track, result[0], result[1]))
     # Same-track green (W74D): remember red-family confirmations per track.
@@ -460,8 +467,15 @@ class FramePipeline:
 
     live = [(t, int(t.cls), float(t.score)) for t in self.tracker.tracks
             if int(t.cls) != int(tracker.LampClass.OFF)]
+    # W175: tlvd republishes the last infer's state every loop, so a red-family
+    # result counts as published right up to this infer.
+    if self.last_red_likely or self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft):
+      self._last_red_pub_s = now
+    # W175: onset-strict red only for a NEW red (machine not red, no red-family
+    # publish in the last tracker.ONSET_GATE_S).
+    onset_strict = tracker.onset_strict_active(self.machine.state, self._last_red_pub_s, now)
     confirmed_relevant = tracker.select_relevant_tiered(
-      self._confirmed(now), self.frame_idx, near_candidates=live,
+      self._confirmed(now, onset_strict), self.frame_idx, near_candidates=live,
       image_width=image_width,
       path_x=path_x, path_y=path_y, left_intent=left_intent,
       odo=self.ego.odo if self.ego is not None else None,
@@ -473,7 +487,7 @@ class FramePipeline:
     if self.classifier is not None:
       if confirmed_relevant is not None:
         red_likely = (int(confirmed_relevant[1]) not in tracker.RED_FAMILY
-                      and confirmed_relevant[0].classifier_red_likely(now))
+                      and confirmed_relevant[0].classifier_red_likely(now, onset_strict=onset_strict))
       else:
         # Candidate-only frame: relevant selection for crop ordering and the
         # graded redLikely state; the state machine stays on confirmed input.
@@ -484,7 +498,7 @@ class FramePipeline:
         )
         if candidate is not None:
           relevant = candidate
-          red_likely = candidate[0].classifier_red_likely(now)
+          red_likely = candidate[0].classifier_red_likely(now, onset_strict=onset_strict)
 
     # W139c red continuity: remember when the relevant track last confirmed red.
     if confirmed_relevant is not None and int(confirmed_relevant[1]) in tracker.RED_FAMILY:
@@ -495,7 +509,7 @@ class FramePipeline:
     # already-red machine; it never creates red from none.
     if (lamp_state is None and self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)
         and self._last_red_confirm_s is not None and now - self._last_red_confirm_s <= RED_SUSTAIN_MAX_S
-        and relevant is not None and relevant[0].classifier_red_likely(now)):
+        and relevant is not None and relevant[0].classifier_red_likely(now, onset_strict=onset_strict)):
       lamp_state = self.machine.state
       machine_conf = self.last_conf  # refresh only
       self.red_sustain_total += 1

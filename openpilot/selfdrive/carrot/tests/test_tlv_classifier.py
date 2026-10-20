@@ -155,7 +155,8 @@ def test_pipeline_low_green_mass_votes_non_green():
   votes = [vote for track in pipe.tracker.tracks for vote in track.votes]
   assert votes  # the gate still records votes
   assert all(v[1] == RED_CLASS for v in votes)  # 0.45 green mass -> RED fallback
-  assert out2.state == tracker.SignalState.red  # 3 red votes in 0.6 s, no green
+  # W175: weak (p < 0.6) red votes block green but do not START a red from none.
+  assert out2.state == tracker.SignalState.none
 
 
 def test_pipeline_without_classifier_keeps_detector_belt():

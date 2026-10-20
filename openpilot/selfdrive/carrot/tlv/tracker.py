@@ -63,6 +63,14 @@ CLASSIFIER_SLOW_VOTES = 6
 CLASSIFIER_RED_CONFIRM_WINDOW_S = 1.2
 # Graded redLikely: one strong red vote (probability >= 0.6) is enough.
 RED_LIKELY_MIN_PROB = 0.6
+# W175 onset-strict red (W172/W174 replay): a NEW red needs straight/left red
+# votes at p >= 0.6, and RED_YELLOW counts as neither red nor a green veto. The
+# pipeline applies it only while the machine is not red and nothing red-family
+# was published in the last ONSET_GATE_S, so a red already in progress keeps
+# today's rules. RED_FAMILY itself is unchanged.
+ONSET_RED_CLASSES = (LampClass.RED, LampClass.RED_LEFT)
+ONSET_RED_MIN_PROB = 0.6
+ONSET_GATE_S = 2.0
 # W150: release a held red when the newest 3 votes are all green-family/left at
 # prob >= 0.80 with no newer red vote. CP1 chose N=3/P=0.80: its modelled risk is
 # 0.68x the existing 4-vote confirm, and 1-2 vote releases were 4-27x riskier.
@@ -271,22 +279,27 @@ class Track:
           best = (int(cls), conf)
     return best
 
-  def classifier_confirmed(self, now: float) -> tuple[int, float] | None:
+  def classifier_confirmed(self, now: float, onset_strict: bool = False) -> tuple[int, float] | None:
     """(cls, confidence) from classifier votes counted by TIME, else None.
 
     Red family: >= 3 votes within the last 1.2 s (CLASSIFIER_RED_CONFIRM_WINDOW_S)
     and no green-family vote in that window. W143: green/left (GO_GROUPS) need
     4 votes in 1.6 s spanning >= 0.6 s with no red-family vote in the window;
     yellow keeps the strict >= 6 votes in 1.2 s. Red is evaluated first so a
-    stale green cannot delay a safety stop.
+    stale green cannot delay a safety stop. W175: with onset_strict, only
+    ONSET_RED_CLASSES at p >= ONSET_RED_MIN_PROB count as red, and RED_YELLOW is
+    not a green veto either.
     """
-    red_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in RED_FAMILY]
+    red_set = ONSET_RED_CLASSES if onset_strict else RED_FAMILY
+    min_p = ONSET_RED_MIN_PROB if onset_strict else 0.0
+    red_votes = [c for t, c, p in self.votes
+                 if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in red_set and p >= min_p]
     green_votes = [c for t, c, _ in self.votes if t > now - CLASSIFIER_RED_CONFIRM_WINDOW_S and c in GREEN_FAMILY]
     if len(red_votes) >= CLASSIFIER_RED_VOTES and not green_votes:
       return int(_most_common(red_votes)), min(1.0, len(red_votes) / CLASSIFIER_RED_VOTES)
     best: tuple[int, float] | None = None
     win = [(t, c) for (t, c, _p) in self.votes if t > now - GREEN_CONFIRM_WINDOW_S]
-    no_red = not any(c in RED_FAMILY for _t, c in win)
+    no_red = not any(c in red_set for _t, c in win)
     for group in GO_GROUPS:
       gv = [(t, c) for (t, c) in win if c in group]
       if (no_red and len(gv) >= GREEN_CONFIRM_VOTES
@@ -307,14 +320,15 @@ class Track:
         best = (int(LampClass.YELLOW), conf)
     return best
 
-  def classifier_red_likely(self, now: float) -> bool:
+  def classifier_red_likely(self, now: float, onset_strict: bool = False) -> bool:
     """True when the LATEST vote is a strong red vote inside the red window."""
     if not self.votes:
       return False
     t, cls, prob = self.votes[-1]
     if t <= now - CLASSIFIER_RED_WINDOW_S:
       return False
-    return cls in RED_FAMILY and prob >= RED_LIKELY_MIN_PROB
+    red_set = ONSET_RED_CLASSES if onset_strict else RED_FAMILY
+    return cls in red_set and prob >= RED_LIKELY_MIN_PROB
 
   def det_support(self, now: float, window_s: float = DET_SUPPORT_WINDOW_S) -> int:
     """W139c: detector matches (and creation) within (now - window_s, now]."""
@@ -363,6 +377,13 @@ def _most_common(values: list[int]) -> int:
   for value in values:
     counts[value] = counts.get(value, 0) + 1
   return max(counts, key=lambda value: (counts[value], value))
+
+
+def onset_strict_active(machine_state, last_red_pub_s: float | None, now: float) -> bool:
+  """W175: True when a NEW red must pass the onset-strict vote rules."""
+  if machine_state in (SignalState.red, SignalState.redLeft):
+    return False
+  return last_red_pub_s is None or now - last_red_pub_s > ONSET_GATE_S
 
 
 class EgoOdometry:
@@ -567,13 +588,14 @@ class TrafficLightTracker:
         track.votes.append((float(now), int(cls), float(prob)))
 
   def confirm_track(self, track: Track, frame_idx: int, now: float,
-                    use_classifier: bool) -> tuple[int, float] | None:
+                    use_classifier: bool, onset_strict: bool = False) -> tuple[int, float] | None:
     """Best confirmation for one track: classifier votes OR the detector belt.
 
     Red-family results win over non-red ones (safety), otherwise the higher
     confidence wins. With no classifier this is exactly track.confirmed().
+    onset_strict (W175) only narrows the classifier vote rules.
     """
-    vote = track.classifier_confirmed(now) if use_classifier else None
+    vote = track.classifier_confirmed(now, onset_strict=onset_strict) if use_classifier else None
     det = track.confirmed(frame_idx)
     candidates = [c for c in (vote, det) if c is not None]
     if not candidates:
