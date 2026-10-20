@@ -89,12 +89,12 @@ SYS_R = 30
 SYS_PAD = 26
 SYS_LINK_H = 66
 SYS_LINK_SIZE = 34
-SYS_DEVICE_H = 112
-SYS_VALUE_SIZE = 48
-SYS_VALUE_MID = 44
+SYS_DEVICE_H = 150
+SYS_VALUE_SIZE = 80    # only CPU temperature and memory, large
+SYS_VALUE_MID = 62
 SYS_MIN_GAP = 14
 SYS_LABEL_SIZE = 26
-SYS_LABEL_MID = 86
+SYS_LABEL_MID = 124
 TRIP_STATS_H = 172     # three-column stats row
 TRIP_HEAD_H = 74       # road-name header above it
 TRIP_COL_MIN = 224
@@ -904,11 +904,7 @@ class HudRenderer(Widget):
     return bottom + STACK_GAP if bottom is not None else rect.y + M_TOP
 
   def _device_items(self) -> tuple[tuple[str, str, bool], ...]:
-    if self._disp_timer < 32:
-      last = ("DISK", self._disk_usage_text, False)
-    else:
-      last = ("VOLT", self._voltage_text, False)
-    return (("CPU", f"{self._cpu_temp:.0f}°", self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85), last)
+    return (("CPU", f"{self._cpu_temp:.0f}°", self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85))
 
   def _draw_system_card(self, rect: rl.Rectangle) -> None:
     """Link dots over the device readings in one card under the tyre card, never wider than it."""
@@ -949,7 +945,7 @@ class HudRenderer(Widget):
               for label, value, _hot in device]
       room = inner - SYS_MIN_GAP * (len(cols) - 1)
       if sum(cols) > room:
-        # Only extreme readings together (100°, 100%, 14.1V) overrun the card; the values then narrow to fit.
+        # Only extreme readings together (100°, 100%) overrun the card; the values then narrow to fit.
         size *= room / sum(cols)
         cols = [max(t.width(value, size, hs.SEMI), t.width(label, SYS_LABEL_SIZE, hs.BOLD, 1.5))
                 for label, value, _hot in device]

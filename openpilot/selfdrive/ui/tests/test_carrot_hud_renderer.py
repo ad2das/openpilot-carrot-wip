@@ -1051,11 +1051,11 @@ def test_system_card_height_follows_its_rows(hud_module, monkeypatch, links_on, 
 
 
 def test_system_card_text_stays_inside_the_card(hud_module, monkeypatch):
-  """Worst case (100°, 100%, 14.1V with every badge lit) still fits the card's padding."""
+  """Worst case (100° and 100% with every badge lit) still fits the card's padding."""
   module, fake_ui_state = hud_module
 
   probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=1, gps_fix=True, vertices=2,
-                             device=True, cpu_temp=100.0, memory_usage=100, volt_text="14.1V", disp_timer=32)
+                             device=True, cpu_temp=100.0, memory_usage=100, disp_timer=32)
 
   x, _, w, _ = probe.cards[0]
   lo, hi = x + module.SYS_PAD - 1, x + module.SYS_W - module.SYS_PAD + 1
@@ -1064,8 +1064,8 @@ def test_system_card_text_stays_inside_the_card(hud_module, monkeypatch):
     assert lo <= item.left and item.right <= hi, (
       f"{item.text!r} spans {item.left:.0f}..{item.right:.0f}, outside {lo:.0f}..{hi:.0f}")
 
-  values = [item for item in probe.texts if item.text in ("100°", "100%", "14.1V")]
-  assert [item.text for item in values] == ["100°", "100%", "14.1V"]
+  values = [item for item in probe.texts if item.text in ("100°", "100%")]
+  assert [item.text for item in values] == ["100°", "100%"]
   for i in range(len(values) - 1):
     left, right = values[i], values[i + 1]
     assert right.left - left.right >= module.SYS_MIN_GAP - 1, (
@@ -1077,12 +1077,26 @@ def test_normal_readings_keep_the_full_value_size(hud_module, monkeypatch):
   """Everyday readings have room to spare, so the shrinking path never touches them."""
   module, fake_ui_state = hud_module
 
-  probe = _system_card_probe(module, fake_ui_state, monkeypatch, device=True, cpu_temp=48.0,
-                             memory_usage=42, disk_text="45%")
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, device=True, cpu_temp=48.0, memory_usage=42)
 
-  values = [item for item in probe.texts if item.text in ("48°", "42%", "45%")]
-  assert [item.text for item in values] == ["48°", "42%", "45%"]
-  assert [item.size for item in values] == [module.SYS_VALUE_SIZE] * 3
+  values = [item for item in probe.texts if item.text in ("48°", "42%")]
+  assert [item.text for item in values] == ["48°", "42%"]
+  assert [item.size for item in values] == [module.SYS_VALUE_SIZE] * 2
+
+
+def test_system_card_shows_only_cpu_and_memory(hud_module, monkeypatch):
+  """Disk and voltage are still measured, but the card draws neither, on any timer tick."""
+  module, fake_ui_state = hud_module
+
+  for disp_timer in (0, 32):
+    probe = _system_card_probe(module, fake_ui_state, monkeypatch, device=True, cpu_temp=55.0, memory_usage=48,
+                               disk_text="91%", volt_text="12.2V", disp_timer=disp_timer)
+    drawn = [item.text for item in probe.texts]
+    for gone in ("DISK", "VOLT", "91%", "12.2V"):
+      assert gone not in drawn, f"{gone!r} is still drawn at disp_timer={disp_timer}"
+
+    tags = [item.text for item in probe.texts if item.size == module.SYS_LABEL_SIZE]
+    assert tags == ["CPU", "MEM"], f"tags drawn at disp_timer={disp_timer}: {tags}"
 
 
 def test_hot_values_blink_red_and_links_keep_their_colour(hud_module, monkeypatch):
@@ -1096,7 +1110,7 @@ def test_hot_values_blink_red_and_links_keep_their_colour(hud_module, monkeypatc
   assert drawn["APM"].color == module.NAV_BLUE
   assert drawn["GPS"].color == module.hs.LIVE_GREEN
   assert drawn["ROUTE"].color == module.hs.LIVE_GREEN
-  for tag in ("CPU", "MEM", "DISK"):
+  for tag in ("CPU", "MEM"):
     assert drawn[tag].color == module.hs.TEXT_2, f"the {tag} tag is not drawn bright"
 
   probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=2, gps_fix=True, vertices=2,
