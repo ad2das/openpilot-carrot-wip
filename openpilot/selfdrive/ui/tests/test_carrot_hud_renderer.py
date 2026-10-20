@@ -690,8 +690,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   monkeypatch.setattr(renderer, "_get_turn_info_hud_data", lambda: (calls.append("turns"), {})[1])
   monkeypatch.setattr(renderer, "_draw_guidance_card", lambda rect, info: calls.append("guide"))
   monkeypatch.setattr(renderer, "_draw_tpms", lambda rect, top: calls.append(("tpms", top)))
-  monkeypatch.setattr(renderer, "_draw_status_capsule", lambda rect: calls.append("status"))
-  monkeypatch.setattr(renderer, "_draw_device_state", lambda rect: calls.append("device"))
+  monkeypatch.setattr(renderer, "_draw_system_card", lambda rect: calls.append("system"))
   monkeypatch.setattr(renderer, "_draw_trip", lambda rect, info: calls.append("trip"))
   monkeypatch.setattr(renderer, "_draw_drive_card", lambda rect: calls.append("drive"))
   monkeypatch.setattr(renderer, "_draw_clock", lambda rect: calls.append("clock"))
@@ -709,8 +708,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
     "turns",
     "guide",
     ("tpms", True),
-    "status",
-    "device",
+    "system",
     "trip",
     ("tpms", False),
     "drive",
@@ -961,3 +959,149 @@ def test_override_chip_stays_left_of_the_light_capsule(hud_module, monkeypatch):
   chip_right = probed["chip_right"]
   light_x = probed["light_rect"][0]
   assert chip_right <= light_x, f"chip right {chip_right:.0f} overlaps the light at x={light_x:.0f}"
+
+
+def _system_card_probe(module, fake_ui_state, monkeypatch, *, active_carrot=0, gps_fix=False, vertices=0,
+                       device=True, cpu_temp=55.0, memory_usage=48, disk_text="91%", volt_text="12.2V",
+                       disp_timer=0, blink_timer=0, zones=None, rect=None):
+  """Draw the right-column system card once and return its card box, rules and text runs.
+
+  `active_carrot`, `gps_fix` and `vertices` are the real inputs of `_system_links`, so the
+  badges under test are the ones the renderer decides on. The text drawer is replaced with
+  size-proportional metrics, so the sizes are the values under test rather than a render.
+  """
+  fake_ui_state.sm = {
+    "carrotMan": SimpleNamespace(activeCarrot=active_carrot, navPathVertexCount=vertices),
+    "gpsLocationExternal": SimpleNamespace(hasFix=gps_fix),
+  }
+  renderer = object.__new__(module.HudRenderer)
+  renderer._show_device_state = 1 if device else 0
+  renderer._blink_timer = blink_timer
+  renderer._disp_timer = disp_timer
+  renderer._cpu_temp = cpu_temp
+  renderer._memory_usage = memory_usage
+  renderer._memory_usage_text = f"{memory_usage}%"
+  renderer._disk_usage_text = disk_text
+  renderer._voltage_text = volt_text
+
+  texts = []
+
+  def draw_mid(text, x, middle, size, color, weight, align=0.0, spacing=0.0):
+    width = 0.55 * size * len(text)
+    left = x - width * align
+    texts.append(SimpleNamespace(text=text, left=left, right=left + width, size=size, color=color))
+    return width
+
+  renderer._type = SimpleNamespace(
+    width=lambda text, size, weight=None, spacing=0.0: 0.55 * size * len(text),
+    draw_mid=draw_mid,
+  )
+  module.hs.zones.clear()
+  module.hs.top_boxes.clear()
+  module.hs.zones.update(zones or {})
+  cards, rules = [], []
+  monkeypatch.setattr(module.hs, "glass_card", lambda x, y, w, h, *args, **kwargs: cards.append((x, y, w, h)))
+  monkeypatch.setattr(module.hs, "card", lambda *args, **kwargs: rules.append(args))
+
+  renderer._draw_system_card(rect if rect is not None else module.rl.Rectangle(10, 50, 1000, 750))
+  return SimpleNamespace(cards=cards, rules=rules, texts=texts, renderer=renderer)
+
+
+def test_system_card_is_exactly_tpms_width_and_right_aligned(hud_module, monkeypatch):
+  """The merged card takes the tyre card's width and stacks under it, not beside the road."""
+  module, fake_ui_state = hud_module
+  rect = module.rl.Rectangle(10, 50, 1000, 750)
+  tpms = (rect.x + rect.width - module.M_X - module.TPMS_W, rect.y + module.M_TOP, module.TPMS_W, module.TPMS_H)
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=1, gps_fix=True, vertices=2,
+                             device=True, zones={"tpms": tpms}, rect=rect)
+
+  assert len(probe.cards) == 1, "the card was not drawn exactly once"
+  x, top, w, h = probe.cards[0]
+  assert w == module.TPMS_W
+  assert x + w == rect.x + rect.width - module.M_X
+  assert top == tpms[1] + tpms[3] + module.STACK_GAP, "the card does not stack under the tyre card"
+  assert module.hs.zones["status"] == (x, top, w, h)
+  assert module.hs.top_boxes == [(x, top, w, h)]
+
+
+@pytest.mark.parametrize(("links_on", "device", "rows"), (
+  (True, False, "links"),
+  (False, True, "device"),
+  (True, True, "both"),
+  (False, False, None),
+))
+def test_system_card_height_follows_its_rows(hud_module, monkeypatch, links_on, device, rows):
+  module, fake_ui_state = hud_module
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=1 if links_on else 0,
+                             gps_fix=links_on, vertices=2 if links_on else 0, device=device)
+  expected = {
+    "links": module.SYS_LINK_H,
+    "device": module.SYS_DEVICE_H,
+    "both": module.SYS_LINK_H + module.SYS_DEVICE_H,
+  }
+
+  if rows is None:
+    assert probe.cards == [], "an empty card was drawn"
+    assert "status" not in module.hs.zones
+  else:
+    assert len(probe.cards) == 1
+    assert probe.cards[0][3] == expected[rows]
+
+
+def test_system_card_text_stays_inside_the_card(hud_module, monkeypatch):
+  """Worst case (100°, 100%, 14.1V with every badge lit) still fits the card's padding."""
+  module, fake_ui_state = hud_module
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=1, gps_fix=True, vertices=2,
+                             device=True, cpu_temp=100.0, memory_usage=100, volt_text="14.1V", disp_timer=32)
+
+  x, _, w, _ = probe.cards[0]
+  lo, hi = x + module.SYS_PAD - 1, x + module.SYS_W - module.SYS_PAD + 1
+  assert probe.texts
+  for item in probe.texts:
+    assert lo <= item.left and item.right <= hi, (
+      f"{item.text!r} spans {item.left:.0f}..{item.right:.0f}, outside {lo:.0f}..{hi:.0f}")
+
+  values = [item for item in probe.texts if item.text in ("100°", "100%", "14.1V")]
+  assert [item.text for item in values] == ["100°", "100%", "14.1V"]
+  for i in range(len(values) - 1):
+    left, right = values[i], values[i + 1]
+    assert right.left - left.right >= module.SYS_MIN_GAP - 1, (
+      f"{left.text!r} and {right.text!r} are {right.left - left.right:.1f} px apart")
+  assert max(item.size for item in values) < module.SYS_VALUE_SIZE, "the worst case kept the full value size"
+
+
+def test_normal_readings_keep_the_full_value_size(hud_module, monkeypatch):
+  """Everyday readings have room to spare, so the shrinking path never touches them."""
+  module, fake_ui_state = hud_module
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, device=True, cpu_temp=48.0,
+                             memory_usage=42, disk_text="45%")
+
+  values = [item for item in probe.texts if item.text in ("48°", "42%", "45%")]
+  assert [item.text for item in values] == ["48°", "42%", "45%"]
+  assert [item.size for item in values] == [module.SYS_VALUE_SIZE] * 3
+
+
+def test_hot_values_blink_red_and_links_keep_their_colour(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=1, gps_fix=True, vertices=2,
+                             device=True, cpu_temp=85.0, blink_timer=0)
+  drawn = {item.text: item for item in probe.texts}
+
+  assert drawn["85°"].color == module.hs.WARN_RED, "a hot CPU did not blink red"
+  assert drawn["APM"].color == module.NAV_BLUE
+  assert drawn["GPS"].color == module.hs.LIVE_GREEN
+  assert drawn["ROUTE"].color == module.hs.LIVE_GREEN
+  for tag in ("CPU", "MEM", "DISK"):
+    assert drawn[tag].color == module.hs.TEXT_2, f"the {tag} tag is not drawn bright"
+
+  probe = _system_card_probe(module, fake_ui_state, monkeypatch, active_carrot=2, gps_fix=True, vertices=2,
+                             device=True, cpu_temp=85.0, blink_timer=0)
+  drawn = {item.text: item for item in probe.texts}
+
+  assert "APM" not in drawn, "the blue APM badge stayed up once APN took over"
+  assert drawn["APN"].color == module.hs.LIVE_GREEN

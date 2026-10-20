@@ -84,8 +84,17 @@ BADGE_H = 80
 TPMS_W = 340
 TPMS_H = 250
 TPMS_SIZE = 62
-DEVICE_LABEL_SIZE = 34
-DEVICE_SIZE = 54
+SYS_W = TPMS_W         # link + device card: the tyre card's width, so the right column stays out of the road
+SYS_R = 30
+SYS_PAD = 26
+SYS_LINK_H = 66
+SYS_LINK_SIZE = 34
+SYS_DEVICE_H = 112
+SYS_VALUE_SIZE = 48
+SYS_VALUE_MID = 44
+SYS_MIN_GAP = 14
+SYS_LABEL_SIZE = 26
+SYS_LABEL_MID = 86
 TRIP_STATS_H = 172     # three-column stats row
 TRIP_HEAD_H = 74       # road-name header above it
 TRIP_COL_MIN = 224
@@ -373,8 +382,7 @@ class HudRenderer(Widget):
     info = self._get_turn_info_hud_data()
     self._draw_guidance_card(rect, info)
     self._draw_tpms(rect, top=True)
-    self._draw_status_capsule(rect)
-    self._draw_device_state(rect)
+    self._draw_system_card(rect)
     self._draw_trip(rect, info)
     self._draw_tpms(rect, top=False)
     if self.is_cruise_available:
@@ -895,33 +903,63 @@ class HudRenderer(Widget):
         bottom = max(bottom or 0.0, zone[1] + zone[3])
     return bottom + STACK_GAP if bottom is not None else rect.y + M_TOP
 
-  def _draw_device_state(self, rect: rl.Rectangle) -> None:
-    if self._show_device_state <= 0:
-      return
-
-    blink = self._blink_timer <= 8
+  def _device_items(self) -> tuple[tuple[str, str, bool], ...]:
     if self._disp_timer < 32:
       last = ("DISK", self._disk_usage_text, False)
     else:
       last = ("VOLT", self._voltage_text, False)
-    items = (("CPU", self._cpu_temp_text, self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85), last)
+    return (("CPU", f"{self._cpu_temp:.0f}°", self._cpu_temp > 80), ("MEM", self._memory_usage_text, self._memory_usage > 85), last)
 
-    # A capsule in the right-hand status column, clear of the road beside the drive card.
+  def _draw_system_card(self, rect: rl.Rectangle) -> None:
+    """Link dots over the device readings in one card under the tyre card, never wider than it."""
+    links = self._system_links()
+    device = self._device_items() if self._show_device_state > 0 else ()
+    if not links and not device:
+      return
+
     t = self._type
-    width = 0.0
-    for label, value, _hot in items:
-      width += t.width(label, DEVICE_LABEL_SIZE, hs.BOLD, 1.5) + 12 + t.width(value, DEVICE_SIZE, hs.SEMI) + 32
-    w, h = width + 32, BADGE_H
+    h = (SYS_LINK_H if links else 0) + (SYS_DEVICE_H if device else 0)
     right = rect.x + rect.width - M_X
-    top = self._right_column_top(rect)
-    hs.chip(right - w, top, w, h)
-    hs.top_boxes.append((right - w, top, w, h))
-    hs.zones["device"] = (right - w, top, w, h)
-    x = right - w + 32
-    mid = top + h / 2
-    for label, value, hot in items:
-      x += t.draw_mid(label, x, mid, DEVICE_LABEL_SIZE, hs.TEXT_3, hs.BOLD, spacing=1.5) + 12
-      x += t.draw_mid(value, x, mid, DEVICE_SIZE, hs.WARN_RED if hot and blink else hs.TEXT, hs.SEMI) + 32
+    x, top = right - SYS_W, self._right_column_top(rect)
+    hs.glass_card(x, top, SYS_W, h, SYS_R)
+    box = (x, top, SYS_W, h)
+    hs.top_boxes.append(box)
+    hs.zones["status"] = box
+    inner = SYS_W - 2 * SYS_PAD
+
+    y = top
+    if links:
+      # Justified across the card, each active link lit in its own colour (APM keeps its blue).
+      widths = [t.width(label, SYS_LINK_SIZE, hs.BOLD, 1.5) for label, _ in links]
+      space = (inner - sum(widths)) / (len(widths) - 1) if len(widths) > 1 else 0.0
+      lx = x + SYS_PAD if len(widths) > 1 else x + (SYS_W - widths[0]) / 2
+      mid = y + SYS_LINK_H / 2 + (2 if device else 0)
+      for (label, color), item_w in zip(links, widths, strict=True):
+        t.draw_mid(label, lx, mid, SYS_LINK_SIZE, color, hs.BOLD, spacing=1.5)
+        lx += item_w + space
+      y += SYS_LINK_H
+      if device:
+        hs.card(x + SYS_PAD, y - 1, inner, 2, hs.rgba(255, 255, 255, 40), 1, None)
+
+    if device:
+      # Value over its tag, columns justified edge to edge; a hot value blinks red.
+      blink = self._blink_timer <= 8
+      size = SYS_VALUE_SIZE
+      cols = [max(t.width(value, size, hs.SEMI), t.width(label, SYS_LABEL_SIZE, hs.BOLD, 1.5))
+              for label, value, _hot in device]
+      room = inner - SYS_MIN_GAP * (len(cols) - 1)
+      if sum(cols) > room:
+        # Only extreme readings together (100°, 100%, 14.1V) overrun the card; the values then narrow to fit.
+        size *= room / sum(cols)
+        cols = [max(t.width(value, size, hs.SEMI), t.width(label, SYS_LABEL_SIZE, hs.BOLD, 1.5))
+                for label, value, _hot in device]
+      space = (inner - sum(cols)) / (len(cols) - 1)
+      cx = x + SYS_PAD
+      for (label, value, hot), col in zip(device, cols, strict=True):
+        t.draw_mid(value, cx + col / 2, y + SYS_VALUE_MID, size, hs.WARN_RED if hot and blink else hs.TEXT,
+                   hs.SEMI, align=0.5)
+        t.draw_mid(label, cx + col / 2, y + SYS_LABEL_MID, SYS_LABEL_SIZE, hs.TEXT_2, hs.BOLD, align=0.5, spacing=1.5)
+        cx += col + space
 
   # ---- clock and link badges (top-centre) -------------------------------------------------------
 
@@ -961,15 +999,7 @@ class HudRenderer(Widget):
       t.draw(date, x, mid + DATE_SIZE * 0.39, DATE_SIZE, hs.TEXT_2, hs.SEMI)
     hs.top_boxes.append((cx - w / 2, top, w, CLOCK_H))
 
-  def _draw_status_capsule(self, rect: rl.Rectangle) -> None:
-    """Link status in the top-right column, under the TPMS card when it is up there."""
-    box = self._draw_system_badges(rect.x + rect.width - M_X, self._right_column_top(rect))
-    if box is not None:
-      hs.top_boxes.append(box)
-      hs.zones["status"] = box
-
-  def _draw_system_badges(self, right: float, top: float) -> tuple[float, float, float, float] | None:
-    """One glass capsule, right-aligned: a lit dot per active link (APM keeps its blue); absent when all are off."""
+  def _system_links(self) -> list[tuple[str, rl.Color]]:
     items = []
     active_carrot = self._get_active_carrot()
     if active_carrot >= 1:
@@ -978,26 +1008,7 @@ class HudRenderer(Widget):
       items.append(("GPS", hs.LIVE_GREEN))
     if self._get_nav_path_vertex_count() > 1:
       items.append(("ROUTE", hs.LIVE_GREEN))
-    if not items:
-      return None
-
-    t = self._type
-    dot, pad, sep = 13.0, 32.0, 24.0
-    widths = [2 * dot + 11 + t.width(label, BADGE_SIZE, hs.BOLD, 1.5) for label, _ in items]
-    w = sum(widths) + 2 * pad + 2 * sep * (len(items) - 1)
-    x = right - w
-    mid = top + BADGE_H / 2
-    hs.chip(x, top, w, BADGE_H)
-    x += pad
-    for index, ((label, color), item_w) in enumerate(zip(items, widths, strict=True)):
-      if index:
-        hs.card(x + sep - 1, mid - 14, 2, 28, hs.rgba(255, 255, 255, 46), 1, None)
-        x += 2 * sep
-      hs.glow(x + dot, mid, dot * 2.8, hs.with_alpha(color, 150))
-      hs.dot(x + dot, mid, dot, color)
-      t.draw_mid(label, x + 2 * dot + 11, mid, BADGE_SIZE, hs.TEXT, hs.BOLD, spacing=1.5)
-      x += item_w
-    return right - w, top, w, BADGE_H
+    return items
 
   def _refresh_date_time_text(self, now: time.struct_time) -> None:
     minute_key = (now.tm_year, now.tm_yday, now.tm_hour, now.tm_min, now.tm_isdst)
