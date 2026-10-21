@@ -79,6 +79,12 @@ def notice_module(monkeypatch):
   }
   for name, stub in stubs.items():
     monkeypatch.setitem(sys.modules, name, stub)
+    # `from pkg import mod` resolves the attribute on the already-imported
+    # package object, so a sys.modules entry alone does not shadow a module
+    # another test imported first (the renderer test really imports hud_style).
+    parent, _, leaf = name.rpartition(".")
+    if parent and parent in sys.modules:
+      monkeypatch.setattr(sys.modules[parent], leaf, stub, raising=False)
 
   module_name = f"_test_tlv_dsp_notice_{id(fake_ui_state)}"
   spec = importlib.util.spec_from_file_location(module_name, NOTICE_PATH)

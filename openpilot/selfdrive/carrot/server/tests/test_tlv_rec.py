@@ -230,7 +230,7 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       assert "DSP 시험 결과" in page
       assert "통과" in page
       assert "실패" in page
-      assert "SNPE op unsupported" in page
+      assert "runtime_unavailable" in page
       assert "SNPE 파일/툴체인" in page
       assert "러너 빌드" in page
       assert "SNPE CPU(플로트)" in page
