@@ -251,6 +251,39 @@ def test_enable_tlvd_unchanged_when_signal_color_not_requested(monkeypatch):
         assert result == (started and tld >= 1 and not disabled), (started, tld, disabled)
 
 
+# -- tlv_dsp_probe process registration ---------------------------------------
+
+def test_tlv_dsp_probe_process_registered():
+  proc = process_config.managed_processes["tlv_dsp_probe"]
+  assert proc.module == "openpilot.selfdrive.carrot.tlv.dsp_probe"
+  assert proc.should_run is process_config.enable_tlv_dsp_probe
+
+
+def test_tlv_dsp_probe_delegates_to_should_run(monkeypatch):
+  from openpilot.selfdrive.carrot.tlv import dsp_probe
+  seen = []
+
+  def fake_should_run(started, params):
+    seen.append((started, params))
+    return started
+
+  monkeypatch.setattr(dsp_probe, "should_run", fake_should_run)
+  params = FakeParams({"TrafficLightDetectMode": 1})
+  assert process_config.enable_tlv_dsp_probe(True, params, None) is True
+  assert process_config.enable_tlv_dsp_probe(False, params, None) is False
+  assert seen == [(True, params), (False, params)]
+
+
+def test_tlv_dsp_probe_false_when_should_run_raises(monkeypatch):
+  from openpilot.selfdrive.carrot.tlv import dsp_probe
+
+  def boom(started, params):
+    raise RuntimeError("boom")
+
+  monkeypatch.setattr(dsp_probe, "should_run", boom)
+  assert process_config.enable_tlv_dsp_probe(True, FakeParams({"TrafficLightDetectMode": 1}), None) is False
+
+
 # -- crash_loop_guard --------------------------------------------------------
 
 def test_crash_loop_guard_five_starts_ok_sixth_sets_latch():

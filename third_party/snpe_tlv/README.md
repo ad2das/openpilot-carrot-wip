@@ -94,7 +94,7 @@ needs only `GLIBC_2.17` and `GLIBCXX_3.4` … `GLIBCXX_3.4.20`.
 ## Runner
 
 ```
-tlv_snpe_bench --dlc <path> --runtime cpu|dsp --runs <N> --out <result.json> [--dump <out.f32>]
+tlv_snpe_bench --dlc <path> --runtime cpu|dsp --runs <N> --out <result.json> [--dump <out.f32>] [--input <tensor>=<raw.f32>]... [--input_list <file>]
 ```
 
 - Loads the DLC via `IDlContainer::open`, builds with `SNPEBuilder`
@@ -104,11 +104,28 @@ tlv_snpe_bench --dlc <path> --runtime cpu|dsp --runs <N> --out <result.json> [--
 - Every input tensor (all of them, not just the first) is a float user buffer fed
   from a fixed xorshift32 generator seeded 7, values uniform in `[0, 1)`. Every
   output is a float user buffer, sized from `getInputOutputBufferAttributes`.
+- `--input <tensor>=<path>` (repeatable) overrides one named input with a raw
+  little-endian float32 file. The file's byte size must equal 4 × the element
+  count of that input's dims, else `error` is `input_size_mismatch:<name>` and the
+  exit code is 1; an unknown tensor name gives `unknown_input:<name>`, exit 1.
+  Inputs not given keep the xorshift fill.
 - `--dump` writes all outputs concatenated as little-endian float32, in
   output-name order.
+- `--input_list <file>` runs one frame per non-empty line of `<file>`, each line
+  `<raw.f32> <dump.f32>` separated by one space: load once, then for line k
+  (0-based) read the raw into the single input (the DLC must have exactly one
+  input, else `error` is `input_list_needs_one_input` and the exit code is 1),
+  execute once and write every output, in output-name order, to that line's
+  dump. A wrong raw size gives `input_size_mismatch:<name>@<k>` (other read
+  errors `<err>:<name>@<k>`), a bad dump path `dump_open:<path>` /
+  `dump_write:<path>`, all exit 1. `--input_list` cannot be combined with
+  `--input` or `--dump` (usage error, exit 64). `--runs` is ignored: `runs`
+  becomes the line count. Timing: `first_ms` is line 0, `median_ms` / `p90_ms`
+  cover lines 1..N-1 as for `--runs`; the JSON also carries `frames` (N) and
+  `frame_ms` (N per-frame numbers, 3 decimals).
 - `--out` is written atomically (`.tmp` + rename) with keys `status`, `error`,
   `snpe_version`, `runtime`, `runtime_available`, `inputs`, `outputs`, `load_s`,
-  `first_ms`, `median_ms`, `p90_ms`, `runs`.
+  `first_ms`, `median_ms`, `p90_ms`, `runs`, `frames`, `frame_ms`.
 - Exit codes: `0` pass, `2` requested runtime unavailable (`error: runtime_unavailable`),
   `1` SNPE error (`error` carries `zdl::DlSystem::getLastErrorString()`), `64` bad arguments.
 - `build()` is attempted exactly once; a failure is reported, never retried.

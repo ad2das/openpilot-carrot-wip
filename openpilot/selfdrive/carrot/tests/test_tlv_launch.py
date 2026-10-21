@@ -1,8 +1,8 @@
 """Launcher tests for tlvd (W102 field fix: mid-drive start froze the manager).
 
 Covers:
-  - process_config wiring: tlvd -> tlv.tlvd_launch with spawn=True, and no
-    entry importing tlv.tlvd directly.
+  - process_config wiring: tlvd -> tlv.tlvd_launch with spawn=True,
+    tlv_dsp_probe spawn=True, and no entry importing tlv.tlvd directly.
   - Fresh-interpreter import purity: importing tlvd_launch must not pull
     numpy/tinygrad/backends or touch os.environ (module level stays stdlib-only,
     the manager preimports every process module).
@@ -168,6 +168,12 @@ def test_tlvd_process_uses_launcher_with_spawn():
   # No entry may import tlv.tlvd directly: that is the module whose import chain
   # (and old module-level env writes) leaked into the manager.
   assert all(getattr(p, "module", None) != "openpilot.selfdrive.carrot.tlv.tlvd" for p in process_config.procs)
+
+
+def test_tlv_dsp_probe_process_uses_spawn():
+  proc = process_config.managed_processes["tlv_dsp_probe"]
+  assert proc.module == "openpilot.selfdrive.carrot.tlv.dsp_probe"
+  assert proc.process_factory is get_context("spawn").Process
 
 
 # -- import purity in a fresh interpreter ------------------------------------

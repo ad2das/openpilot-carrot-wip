@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import io
+import json
 import os
 import zipfile
 from pathlib import Path
@@ -164,6 +165,119 @@ def test_page_is_korean_and_self_contained(tmp_path):
       assert "20260101-120000" in html
       assert "/api/tlv_rec/sessions/20260101-120000.zip" in html
       assert "http://" not in html and "https://" not in html
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_api_and_page_without_result(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(tmp_path / "dsp_probe"))
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.get("/api/tlv_rec/dsp_probe")
+      assert resp.status == 200
+      assert await resp.json() == {"ok": True, "probe": None}
+      page = await (await client.get("/tlv_rec")).text()
+      assert "DSP 시험 결과" in page
+      assert "아직 결과가 없습니다" in page
+      assert "DSP 시험 다시 하기" in page
+      assert "주행 중 정차(신호 대기)할 때마다 자동으로 조금씩 시험합니다. 따로 할 일은 없습니다." in page
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  probe_root = tmp_path / "dsp_probe"
+  probe_root.mkdir()
+  payload = {
+    "commit": "abc1234",
+    "timestamp": "2026-10-13T08:00:00+09:00",
+    "device_type": "tici",
+    "agnos_version": "19.8",
+    "ok": False,
+    "error": None,
+    "steps": {
+      "presence": {"name": "presence", "status": "pass", "clangxx": "/usr/bin/clang++",
+                   "cdsprpc": ["/usr/lib/libcdsprpc.so"]},
+      "build": {"name": "build", "status": "pass", "duration_s": 41.5},
+      "frames": {"name": "frames", "status": "pass", "n_far": 30, "n_near": 30, "bad_shape": 0},
+      "cpu_f32": {"name": "cpu_f32", "status": "pass", "frames": 60, "first_ms": 12.0,
+                  "median_ms": 3.0, "p90_ms": 4.0, "n_dets": 71},
+      "dsp_q": {"name": "dsp_q", "status": "fail", "error": "runtime_unavailable"},
+    },
+    "compare": {"ref": "cpu_f32", "steps": {"dsp_q": {"status": "fail"}}, "views": {}},
+  }
+  (probe_root / "snpe2.json").write_text(json.dumps(payload), encoding="utf-8")
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.get("/api/tlv_rec/dsp_probe")
+      data = await resp.json()
+      assert data["ok"] is True
+      assert data["probe"]["commit"] == "abc1234"
+      assert data["probe"]["file"] == "snpe2.json"
+      assert data["probe"]["steps"]["dsp_q"]["status"] == "fail"
+      page = await (await client.get("/tlv_rec")).text()
+      assert "DSP 시험 결과" in page
+      assert "통과" in page
+      assert "실패" in page
+      assert "SNPE op unsupported" in page
+      assert "SNPE 파일/툴체인" in page
+      assert "러너 빌드" in page
+      assert "SNPE CPU(플로트)" in page
+      assert "DSP(int8)" in page
+      assert "DSP(플로트)" in page
+      assert "프레임 수집" in page
+      assert "far 30 / near 30 / 제외 0" in page
+      assert "41.5 s" in page
+      assert "3.0" in page
+      assert "DSP 시험 다시 하기" in page
+      assert "주행 중 정차(신호 대기)할 때마다 자동으로 조금씩 시험합니다. 따로 할 일은 없습니다." in page
+    finally:
+      await client.close()
+
+  asyncio.run(scenario())
+
+
+def test_dsp_probe_retry_clears_the_single_run(tmp_path, monkeypatch):
+  module = _load_module(tmp_path)
+  probe_root = tmp_path / "dsp_probe"
+  probe_root.mkdir()
+  for suffix in (".json", ".attempt", ".progress", ".steps.json"):
+    (probe_root / f"snpe2{suffix}").write_text("{}", encoding="utf-8")
+  (probe_root / "other.json").write_text("{}", encoding="utf-8")
+  (probe_root / "bin" / "snpe2").mkdir(parents=True)
+  (probe_root / "bin" / "snpe2" / "tlv_snpe_bench").write_bytes(b"bin")
+  monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
+  monkeypatch.setattr(module, "_probe_key", lambda: "snpe2")
+
+  async def scenario():
+    client = await _start_client(module)
+    try:
+      resp = await client.post("/api/tlv_rec/dsp_probe/retry")
+      assert resp.status == 200
+      data = await resp.json()
+      assert data["ok"] is True
+      assert sorted(data["removed"]) == ["bin/snpe2", "snpe2.attempt", "snpe2.json",
+                                         "snpe2.progress", "snpe2.steps.json"]
+      assert not (probe_root / "snpe2.json").exists()
+      assert not (probe_root / "snpe2.attempt").exists()
+      assert not (probe_root / "snpe2.progress").exists()
+      assert not (probe_root / "snpe2.steps.json").exists()
+      assert not (probe_root / "bin" / "snpe2").exists()
+      assert (probe_root / "other.json").exists()
+      # idempotent: a second retry finds nothing left to remove
+      resp = await client.post("/api/tlv_rec/dsp_probe/retry")
+      assert (await resp.json())["removed"] == []
     finally:
       await client.close()
 

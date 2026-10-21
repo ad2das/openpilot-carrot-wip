@@ -680,6 +680,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   renderer._font_display = object()
   renderer._blink_timer = 0
   renderer._disp_timer = 0
+  renderer._tlv_dsp_notice = SimpleNamespace(draw=lambda rect: False)
   calls = []
 
   renderer._plot_renderer = SimpleNamespace(
