@@ -1,0 +1,16 @@
+# Mirrors carrot-tl-vision/.venv pins (torch/torchvision come from the cu126
+# index in the Dockerfile). opencv-python and -headless are pinned to the same
+# version as the local venv so ultralytics cannot pull a second, different cv2.
+onnxruntime-gpu==1.31.0
+opencv-python==5.0.0.93
+opencv-python-headless==5.0.0.93
+ultralytics==8.4.175
+albumentations==2.0.8
+onnx==1.23.2
+numpy==2.4.6
+scipy==1.17.1
+pillow==12.3.0
+onnxsim==0.8.1
+PyYAML==6.0.3
+tqdm==4.70.1
+matplotlib==3.11.2
