@@ -1,0 +1,7 @@
+# Vendored SNPE payload: every byte must match carrot-openpilot 08445d018 exactly
+# (see SHA256SUMS), so no EOL conversion, no filters, no diff/merge drivers.
+larch64/** -text -filter -diff -merge
+dsp/** -text -filter -diff -merge
+include/** -text -filter -diff -merge
+models/** -text -filter -diff -merge
+SHA256SUMS -text -filter
