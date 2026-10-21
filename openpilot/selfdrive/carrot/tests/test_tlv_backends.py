@@ -34,8 +34,9 @@ def test_null_backend_and_factory():
     backends.make_backend("banana", "")
 
 
-def test_dsp_backend_is_a_clear_stub():
-  with pytest.raises(NotImplementedError, match="W70"):
+def test_dsp_backend_refuses_a_missing_or_custom_model():
+  # WSNPE13: dsp is a real backend now; it only runs the bundled detector DLC.
+  with pytest.raises(backends.BackendError, match="bundled detector"):
     backends.make_backend("dsp", "")
 
 
@@ -249,11 +250,11 @@ def test_tinygrad_backend_overrides_inherited_gpu_dev(tmp_path, monkeypatch):
 
 def test_resolve_backend_name_defaults():
   from openpilot.selfdrive.carrot.tlv import tlvd
-  # W132: "" and "onnx" resolve to onnx on PC and on TICI (bundled offline
-  # wheel); the TICI->tinygrad fallback happens in TlvRunner, not here.
+  # WSNPE13: "" resolves to the Hexagon DSP detector on TICI and to onnxruntime
+  # on PC; an explicit "onnx" always means onnxruntime.
   assert tlvd.resolve_backend_name("", False) == "onnx"
   assert tlvd.resolve_backend_name("onnx", False) == "onnx"
-  assert tlvd.resolve_backend_name("", True) == "onnx"
+  assert tlvd.resolve_backend_name("", True) == "dsp"
   assert tlvd.resolve_backend_name("onnx", True) == "onnx"
   assert tlvd.resolve_backend_name("tinygrad", True) == "tinygrad"
   assert tlvd.resolve_backend_name("null", True) == "null"
@@ -337,10 +338,12 @@ def test_make_classifier_falls_back_to_null_without_model():
   assert backends.make_classifier("tinygrad", "").enabled is False
 
 
-def test_make_classifier_rejects_unknown_and_dsp_model():
+def test_make_classifier_rejects_unknown_and_maps_dsp_to_onnx():
   with pytest.raises(backends.BackendError):
     backends.make_classifier("banana", "some.onnx")
-  with pytest.raises(NotImplementedError, match="W70"):
+  # WSNPE13: the lamp classifier stays on onnx CPU for the dsp backend; the
+  # model check still applies, so a fake path is rejected the onnx way.
+  with pytest.raises(backends.BackendError, match="model not found"):
     backends.make_classifier("dsp", "some.onnx")
 
 

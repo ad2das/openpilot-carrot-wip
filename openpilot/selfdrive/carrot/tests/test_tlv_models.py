@@ -130,8 +130,8 @@ def test_detector_warmup_runs_before_budget_creation(monkeypatch):
 
   class RecordingBudget(real_budget_cls):
     def __init__(self, **kwargs):
-      if kwargs == {}:
-        events.append("budget")
+      # WSNPE13: tlvd now passes cpu_clock, so any construction is the event.
+      events.append("budget")
       super().__init__(**kwargs)
 
   monkeypatch.setattr(resources, "CpuCreditBudget", RecordingBudget)

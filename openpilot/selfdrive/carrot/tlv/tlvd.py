@@ -138,6 +138,19 @@ def _as_float(value):
   return None if value is None else float(value)
 
 
+def _child_cpu(backend) -> float:
+  """CPU seconds of a backend's child processes (the SNPE server); 0.0 when the
+  backend has no such hook or it fails. Never raises: this runs inside the
+  budget's clock."""
+  getter = getattr(backend, "child_cpu_seconds", None)
+  if getter is None:
+    return 0.0
+  try:
+    return float(getter())
+  except Exception:
+    return 0.0
+
+
 def _enum_ordinal(value) -> int:
   """Ordinal for a capnp enum field (int() on _DynamicEnum raises TypeError).
 
@@ -149,14 +162,14 @@ def _enum_ordinal(value) -> int:
 
 
 def resolve_backend_name(value: str, is_tici: bool) -> str:
-  """Resolve CarrotTlvBackend. "" and "onnx" mean the onnxruntime CPU backend
-  everywhere, TICI included (W132: the runtime now ships as a bundled offline
-  wheel; a failed import falls back to tinygrad in TlvRunner). 'null'/'dsp' and
-  any explicit other name are untouched."""
+  """Resolve CarrotTlvBackend. "" means the Hexagon DSP detector on TICI (the
+  WSNPE13 default: the DLC runs at 16 ms per frame there) and onnxruntime CPU
+  everywhere else; "onnx" always means the onnxruntime CPU backend, TICI
+  included. 'dsp', 'null' and any explicit other name are untouched."""
   name = (value or "").strip()
-  if name in ("", "onnx"):
-    return "onnx"
-  return name
+  if name:
+    return name
+  return "dsp" if is_tici else "onnx"
 
 
 def apply_cpu_policy() -> list[str]:
@@ -201,30 +214,40 @@ class TlvRunner:
     def _build_backend(backend_name: str):
       """Build detector+classifier+warmups for one runtime name; raises on error."""
       backend, decoder = backends.make_backend(backend_name, model_path)
-      classifier = backends.NullClassifier()
-      classifier_error = ""
       try:
-        classifier = backends.make_classifier(backend_name, lamp_path)
-        classifier.warmup()
-      except Exception as exc:
-        # On TICI with the onnx runtime, the lamp classifier IS the colour
-        # source (the detector is single-class); swallowing its failure would
-        # silently lose all red/green, so raise to trigger the tinygrad
-        # fallback, which rebuilds BOTH models. tinygrad and PC keep the old
-        # swallow: a bad lamp model then costs only the classifier
-        # (CONTRACT.md detect-then-track).
-        if backend_name == "onnx" and is_tici:
-          raise backends.BackendError(f"onnx classifier failed: {exc!r}") from exc
-        classifier_error = str(exc)
         classifier = backends.NullClassifier()
-      # Detector warm-up BEFORE the run loop and before the budget exists:
-      # the first real detect frame otherwise pays the one-time compile
-      # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
-      try:
-        backend.warmup()
-      except Exception as exc:
-        raise backends.BackendError(f"detector warmup failed: {exc!r}") from exc
-      return backend, decoder, classifier, classifier_error
+        classifier_error = ""
+        try:
+          classifier = backends.make_classifier(backend_name, lamp_path)
+          classifier.warmup()
+        except Exception as exc:
+          # On TICI with the onnx runtime, the lamp classifier IS the colour
+          # source (the detector is single-class); swallowing its failure would
+          # silently lose all red/green, so raise to trigger the tinygrad
+          # fallback, which rebuilds BOTH models. tinygrad and PC keep the old
+          # swallow: a bad lamp model then costs only the classifier
+          # (CONTRACT.md detect-then-track). The dsp backend keeps the lamp on
+          # onnx CPU (WSNPE13), so it needs the same protection.
+          if backend_name in ("onnx", "dsp") and is_tici:
+            raise backends.BackendError(f"{backend_name} classifier failed: {exc!r}") from exc
+          classifier_error = str(exc)
+          classifier = backends.NullClassifier()
+        # Detector warm-up BEFORE the run loop and before the budget exists:
+        # the first real detect frame otherwise pays the one-time compile
+        # (route 00000443: 12.2 s, credit -9.0, then rss_soft forever).
+        try:
+          backend.warmup()
+        except Exception as exc:
+          raise backends.BackendError(f"detector warmup failed: {exc!r}") from exc
+        return backend, decoder, classifier, classifier_error
+      except Exception:
+        # A backend that will not be used must release what it holds (the dsp
+        # backend's server process and /dev/shm files) before the next try.
+        try:
+          backend.close()
+        except Exception:
+          pass
+        raise
 
     def _fallback_to_tinygrad(reason) -> None:
       """On TICI, rebuild BOTH models with tinygrad after an onnx failure."""
@@ -243,10 +266,21 @@ class TlvRunner:
       self.backend_error = str(exc)
     except Exception as exc:
       # BackendError and unexpected runtime errors (session/warmup) share one
-      # path. On TICI an onnx failure falls back to tinygrad; on PC it stays an
-      # error so the tests keep their meaning.
+      # path. On TICI a dsp failure first retries the onnx CPU backend (the
+      # WSNPE13 rule: every DSP failure ends on onnx, never on nothing), then
+      # the tinygrad fallback; an onnx failure goes straight to tinygrad. On PC
+      # it stays an error so the tests keep their meaning.
       self.backend_error = str(exc) if isinstance(exc, backends.BackendError) else f"detector build failed: {exc!r}"
-      if name == "onnx" and is_tici:
+      if name == "dsp" and is_tici:
+        print(f"tlvd: dsp backend unavailable ({exc}); retrying with the onnx CPU detector", flush=True)
+        try:
+          self.backend, self.decoder, self.classifier, self.classifier_error = _build_backend("onnx")
+          self.runtime_name = "onnx"
+          self.backend_error = ""
+        except Exception as onnx_exc:
+          self.backend_error = f"onnx fallback failed after dsp error ({exc}): {onnx_exc!r}"
+          _fallback_to_tinygrad(onnx_exc)
+      elif name == "onnx" and is_tici:
         _fallback_to_tinygrad(exc)
     self.pipeline = pipeline.FramePipeline(self.backend, self.decoder, classifier=self.classifier)
 
@@ -263,7 +297,9 @@ class TlvRunner:
     # ego-motion odometry used for track-box prediction between detect frames.
     # W127: built only AFTER both model warm-ups; the budget's accounting
     # baseline is taken at creation, so warm-up CPU is never charged to frames.
-    self.budget = resources.CpuCreditBudget()
+    # WSNPE13: the SNPE server is a separate process, so its CPU is added to
+    # the process total (a missing hook costs 0.0, never a crash).
+    self.budget = resources.CpuCreditBudget(cpu_clock=lambda: resources.os_cpu_seconds() + _child_cpu(self.backend))
     self.odo = tracker.EgoOdometry()
     self.last_detect = -float("inf")
     self.last_classify = -float("inf")
@@ -728,6 +764,7 @@ class TlvRunner:
     det_nc_text = "-" if decoder_nc is None else str(decoder_nc)
     parts = (
       f"runtime={self.runtime_name or 'none'}",
+      f"det_rt={getattr(self.backend, 'active', None) or self.runtime_name or 'none'}",
       f"frames={self.processed}",
       f"dropped={self.dropped}",
       f"skipped_budget={self.skipped_budget}",
