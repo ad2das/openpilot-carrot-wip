@@ -2,25 +2,33 @@
 
 Runs as the manager process "tlv_dsp_probe" while the car is started
 (onroad). The manager starts it when started AND TrafficLightDetectMode >= 1
-(W129: no separate vision toggle) and the result file snpe2.json does not
+(W129: no separate vision toggle) and the result file snpe3.json does not
 exist; after the result is written the process exits 0 and the manager does not
 restart it. The probe runs ONCE in total, not once per commit. There is no offroad window (the car cuts OBD power at ignition
 off), so the probe works during ordinary STOPS of a normal drive.
 
 The probe benchmarks SNPE, not tinygrad: presence checks the DSP nodes, the
 SNPE bundle under third_party/snpe_tlv, the two detector DLCs with their head
-spec and clang++; build compiles src/tlv_snpe_bench.cc on the device; frames
-samples up to 30 far + 30 near JPEGs from the newest tlvrec sessions (still
-encode the model input 640x320 RGB) and writes them as float32 NHWC raws;
+spec and clang++; build compiles src/tlv_snpe_bench.cc on the device.
+
+The frames step ALWAYS has the 8 tlvrec JPEGs bundled under
+models/dsp_probe_frames/ (the same files the tests use), so a parked probe
+proves the DSP runs, its latency and DSP-vs-CPU head agreement with no driving
+at all. As a bonus the parent copies new tlvrec JPEGs into its own pool while
+driving (collect_pool_tick, at most every POOL_TICK_S); whatever the pool holds
+at the stop is appended after the bundle, capped at POOL_PER_VIEW per view.
+Nothing ever waits: the pool only ever adds frames. Both sources are decoded
+into float32 NHWC raws (the model input, 640x320 RGB);
 cpu_f32, dsp_q and dsp_f32 run the float DLC on the SNPE CPU runtime and both
 DLCs on the Hexagon DSP over that same frame list, decode every dump with the
 production decoder and record detection agreement against cpu_f32.
 
-Steps resume across stops: snpe2.steps.json stores each step's result as soon
+Steps resume across stops: snpe3.steps.json stores each step's result as soon
 as it finishes, and a final status (pass/fail/timeout) is never re-run. The
-built runner and the dumps persist under bin/snpe2/, so a cpu run from one red
-light still diffs against a dsp run from the next. The result JSON is written
-only once every step is final; steps.json and bin/snpe2 are then removed.
+pool, the built runner and the dumps persist under bin/snpe3/, so a cpu run
+from one red light still diffs against a dsp run from the next. The result JSON
+is written only once every step is final; steps.json and bin/snpe3 are then
+removed.
 
 Parent gate loop (2 Hz, tiny idle cost while driving): the parent idles on
 short sleeps and only checks
@@ -50,8 +58,8 @@ params_memory (arming -> running step 1..6 -> done/failed, aborted when STOPPED
 drops) for the onroad HUD capsule; contract in ui/onroad/tlv_dsp_notice.py.
 Every notice write is best-effort and never affects the probe outcome.
 
-Lost-step latch: the child writes snpe2.progress (step name + monotonic
-start, atomic) before each step. At startup an existing snpe2.attempt means
+Lost-step latch: the child writes snpe3.progress (step name + monotonic
+start, atomic) before each step. At startup an existing snpe3.attempt means
 the previous run was lost (power cut or device reset): the .progress step is
 appended to its "lost_steps" list and consumed immediately (the updated
 .attempt is persisted and .progress removed before the latch check), so a cut
@@ -65,6 +73,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -80,7 +89,7 @@ from openpilot.selfdrive.carrot.tlv import resources
 PROBE_ROOT = "/data/media/0/carrot_tlv_rec/dsp_probe"
 # One probe run in total (not one per commit): every path below hangs off this
 # key, so a later openpilot update does not re-run the benchmark.
-PROBE_KEY = "snpe2"
+PROBE_KEY = "snpe3"
 TOTAL_TIMEOUT_S = 600.0
 STEP_TIMEOUTS = {"presence": 15.0, "build": 150.0, "frames": 60.0, "cpu_f32": 150.0,
                  "dsp_q": 120.0, "dsp_f32": 240.0}
@@ -96,9 +105,13 @@ HEADS_CANON = ("p3_box", "p3_cls", "p4_box", "p4_cls", "p5_box", "p5_cls")
 SCORE_THRESHOLD = 0.25
 HEADS_TOTAL = 273000
 INPUT_BYTES = 320 * 640 * 3 * 4
-FRAMES_PER_VIEW = 30
+# The pool is the bonus frame source: new tlvrec JPEGs copied while driving,
+# capped per view so a long drive cannot grow the frame list without bound.
+POOL_PER_VIEW = 26
+POOL_TICK_S = 2.0
+BUNDLE_FRAMES = 8
+TLVREC_SESSION_RE = re.compile(r"^\d{8}-\d{6}$")
 FRAME_STRIDE = 3
-MIN_FRAMES = 10
 MODEL_H, MODEL_W = 320, 640
 IOU_MATCH = 0.5
 CONF_SCORE = 0.5
@@ -610,6 +623,18 @@ def frames_json_path() -> str:
   return os.path.join(bin_dir(), "frames.json")
 
 
+def pool_dir() -> str:
+  return os.path.join(bin_dir(), "pool")
+
+
+def pool_path() -> str:
+  return os.path.join(pool_dir(), "pool.jsonl")
+
+
+def bundled_frames_dir() -> str:
+  return os.path.join(models_dir(), "dsp_probe_frames")
+
+
 def _read_index(path: str) -> list[dict]:
   rows: list[dict] = []
   try:
@@ -626,95 +651,188 @@ def _read_index(path: str) -> list[dict]:
   return rows
 
 
-def _read_active(root: str) -> str | None:
+def read_pool(path: str | None = None) -> list[dict]:
+  """The pool index in copy order; a missing or half-written file is no pool."""
+  return _read_index(path or pool_path())
+
+
+def _pool_counts(rows: list[dict]) -> dict[str, int]:
+  counts = {"far": 0, "near": 0}
+  for row in rows:
+    view = row.get("view")
+    if view in counts:
+      counts[view] += 1
+  return counts
+
+
+def _recorder_default_root() -> str:
   from openpilot.selfdrive.carrot.tlv import recorder
+  return recorder.DEFAULT_ROOT
+
+
+def collect_pool_tick(root: str | None = None, *, stride: int = FRAME_STRIDE) -> int:
+  """Copy up to POOL_PER_VIEW far + near tlvrec JPEGs into the pool; return n.
+
+  Runs from the parent's 2 Hz gate loop while driving, where the tlvrec
+  sessions are still being written: the session named in .active IS scanned,
+  because carrot_log_sync deletes every session right after uploading it and
+  the recorder rotates every 60 s, so a finished session is usually already
+  gone. Rows whose index i is a multiple of `stride` are candidates. Each
+  copy goes through a tmp file + os.replace and its size is checked against
+  the source before the pool.jsonl line is appended, so a half-written JPEG
+  can never enter the pool. One unreadable or vanished session/file is skipped;
+  this never raises.
+  """
+  import hashlib
+
+  root = root or _recorder_default_root()
+  rows = read_pool()
+  counts = _pool_counts(rows)
+  if counts["far"] >= POOL_PER_VIEW and counts["near"] >= POOL_PER_VIEW:
+    return 0
+  seen = {str(row.get("key")) for row in rows}
   try:
-    with open(os.path.join(root, recorder.ACTIVE_NAME), encoding="utf-8") as f:
-      return f.read().strip() or None
+    names = sorted(n for n in os.listdir(root) if TLVREC_SESSION_RE.match(n))
   except OSError:
-    return None
+    return 0
 
-
-def tlvrec_sessions(root: str) -> list[str]:
-  """Finished sessions: sub-dirs with index.jsonl, newest name first.
-
-  The session named in root/.active is still being written and dsp_probe
-  itself lives under root, so both are excluded."""
-  active = _read_active(root)
+  added = 0
   try:
-    names = sorted(os.listdir(root), reverse=True)
+    os.makedirs(pool_dir(), exist_ok=True)
   except OSError:
-    return []
-  out = []
-  for name in names:
-    if name == active or name == "dsp_probe":
+    return 0
+
+  for session in names:
+    if counts["far"] >= POOL_PER_VIEW and counts["near"] >= POOL_PER_VIEW:
+      break
+    session_dir = os.path.join(root, session)
+    index_path = os.path.join(session_dir, "index.jsonl")
+    try:
+      if not os.path.isdir(session_dir) or not os.path.isfile(index_path):
+        continue
+      with open(index_path, encoding="utf-8") as f:
+        raw_lines = f.readlines()
+    except OSError:
       continue
-    path = os.path.join(root, name)
-    if os.path.isdir(path) and os.path.isfile(os.path.join(path, "index.jsonl")):
-      out.append(path)
+    for index in range(0, len(raw_lines), max(1, stride)):
+      try:
+        row = json.loads(raw_lines[index])
+      except ValueError:
+        continue
+      if not isinstance(row, dict):
+        continue
+      view = row.get("view")
+      name = row.get("file")
+      if view not in counts or counts[view] >= POOL_PER_VIEW:
+        continue
+      if not isinstance(name, str) or not name:
+        continue
+      key = f"{session}/{name}"
+      if key in seen:
+        continue
+      src = os.path.join(session_dir, name)
+      dst_name = f"{len(rows) + added:04d}.jpg"
+      dst = os.path.join(pool_dir(), dst_name)
+      tmp = dst + ".tmp"
+      try:
+        with open(src, "rb") as f:
+          data = f.read()
+        with open(tmp, "wb") as f:
+          f.write(data)
+        os.replace(tmp, dst)
+        if os.path.getsize(dst) != len(data):
+          raise OSError(f"short copy {dst_name}")
+      except OSError:
+        try:
+          os.remove(tmp)
+        except OSError:
+          pass
+        continue
+      entry = {"i": len(rows) + added, "key": key, "session": session, "src_file": name,
+               "file": dst_name, "view": view,
+               "jpeg_sha256": hashlib.sha256(data).hexdigest()}
+      try:
+        with open(pool_path(), "a", encoding="utf-8", newline="\n") as f:
+          f.write(json.dumps(entry) + "\n")
+      except OSError:
+        try:
+          os.remove(dst)
+        except OSError:
+          pass
+        continue
+      seen.add(key)
+      counts[view] += 1
+      added += 1
+  return added
+
+
+def _frame_sources(pool_path_arg: str | None, bundle_path: str) -> list[dict]:
+  """Bundle rows first (always the 8 JPEGs), then the pool in copy order."""
+  out: list[dict] = []
+  for row in _read_index(os.path.join(bundle_path, "index.jsonl")):
+    name = row.get("file")
+    view = row.get("view")
+    if isinstance(name, str) and name and view in ("far", "near"):
+      out.append({"source": "bundle", "session": "", "src_file": name,
+                  "path": os.path.join(bundle_path, name), "view": view})
+  pool = pool_path_arg or pool_dir()
+  for row in _read_index(os.path.join(pool, "pool.jsonl")):
+    name = row.get("file")
+    view = row.get("view")
+    if isinstance(name, str) and name and view in ("far", "near"):
+      out.append({"source": "pool", "session": str(row.get("session") or ""),
+                  "src_file": str(row.get("src_file") or ""),
+                  "path": os.path.join(pool, name), "view": view})
   return out
 
 
-def step_frames(*, root: str | None = None, work: str | None = None) -> dict:
-  """Up to FRAMES_PER_VIEW far + near JPEGs from the newest tlvrec sessions."""
+def step_frames(*, pool_dir: str | None = None, bundle_dir: str | None = None,
+                work: str | None = None) -> dict:
+  """Decode the bundled frames plus the pool into float32 NHWC raws.
+
+  The 8 bundled JPEGs are always present, so this step never waits for a
+  drive; the pool only adds frames collected while driving."""
   import hashlib
 
   import cv2
   import numpy as np
 
-  from openpilot.selfdrive.carrot.tlv import recorder
-
-  root = root or recorder.DEFAULT_ROOT
   raw_dir = work or frame_work_dir()
   os.makedirs(raw_dir, exist_ok=True)
 
+  sources = _frame_sources(pool_dir, bundle_dir or bundled_frames_dir())
   picked: list[dict] = []
   counts = {"far": 0, "near": 0}
+  by_source = {"bundle": 0, "pool": 0}
   bad_shape = 0
-  sessions_used: list[str] = []
-  for session in tlvrec_sessions(root):
-    if counts["far"] >= FRAMES_PER_VIEW and counts["near"] >= FRAMES_PER_VIEW:
-      break
-    rows = _read_index(os.path.join(session, "index.jsonl"))
-    used_here = False
-    for index in range(0, len(rows), FRAME_STRIDE):
-      row = rows[index]
-      view = row.get("view")
-      if view not in ("far", "near") or counts[view] >= FRAMES_PER_VIEW:
-        continue
-      name = row.get("file")
-      if not isinstance(name, str) or not name:
-        continue
-      path = os.path.join(session, name)
-      if not os.path.isfile(path):
-        continue
-      bgr = cv2.imread(path, cv2.IMREAD_COLOR)
-      if bgr is None:
-        bad_shape += 1
-        continue
-      if bgr.shape[:2] != (MODEL_H, MODEL_W):
-        bad_shape += 1
-        continue
-      rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-      i = len(picked)
-      raw_name = f"{i:04d}.raw"
-      with open(os.path.join(raw_dir, raw_name), "wb") as f:
-        f.write(rgb.astype(np.float32).tobytes())
-      size = os.path.getsize(os.path.join(raw_dir, raw_name))
-      if size != INPUT_BYTES:
-        return {"status": "fail", "error": f"raw_size:{raw_name}:{size}"}
-      with open(path, "rb") as f:
-        digest = hashlib.sha256(f.read()).hexdigest()
-      picked.append({"i": i, "session": os.path.basename(session), "file": name,
-                     "view": view, "jpeg_sha256": digest})
-      counts[view] += 1
-      used_here = True
-    if used_here:
-      sessions_used.append(os.path.basename(session))
+  for src in sources:
+    bgr = cv2.imread(src["path"], cv2.IMREAD_COLOR)
+    if bgr is None:
+      bad_shape += 1
+      continue
+    if bgr.shape[:2] != (MODEL_H, MODEL_W):
+      bad_shape += 1
+      continue
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    i = len(picked)
+    raw_name = f"{i:04d}.raw"
+    with open(os.path.join(raw_dir, raw_name), "wb") as f:
+      f.write(rgb.astype(np.float32).tobytes())
+    size = os.path.getsize(os.path.join(raw_dir, raw_name))
+    if size != INPUT_BYTES:
+      return {"status": "fail", "error": f"raw_size:{raw_name}:{size}"}
+    with open(src["path"], "rb") as f:
+      digest = hashlib.sha256(f.read()).hexdigest()
+    picked.append({"i": i, "source": src["source"], "session": src["session"],
+                   "file": src["src_file"], "view": src["view"], "jpeg_sha256": digest})
+    counts[src["view"]] += 1
+    by_source[src["source"]] += 1
 
-  if len(picked) < MIN_FRAMES:
-    return {"status": "fail", "error": f"too_few_frames:{len(picked)}",
-            "n_far": counts["far"], "n_near": counts["near"], "bad_shape": bad_shape}
+  if by_source["bundle"] < BUNDLE_FRAMES:
+    return {"status": "fail", "error": f"too_few_frames:{by_source['bundle']}",
+            "n_far": counts["far"], "n_near": counts["near"],
+            "n_bundle": by_source["bundle"], "n_pool": by_source["pool"],
+            "bad_shape": bad_shape}
 
   write_result_atomic(frames_json_path(), picked)
   for step in DET_MODELS:
@@ -725,7 +843,8 @@ def step_frames(*, root: str | None = None, work: str | None = None) -> dict:
       f.write("\n".join(lines) + "\n")
 
   return {"status": "pass", "n_far": counts["far"], "n_near": counts["near"],
-          "bad_shape": bad_shape, "sessions_used": sessions_used}
+          "n_bundle": by_source["bundle"], "n_pool": by_source["pool"],
+          "bad_shape": bad_shape}
 
 
 # ---------------------------------------------------------------------------
@@ -993,7 +1112,7 @@ def compare_steps(steps: dict) -> dict:
   if ref.get("status") != "pass":
     return {"ref": "cpu_f32", "status": "unavailable"}
   frames = read_frames()
-  out: dict = {"ref": "cpu_f32", "steps": {}, "views": {}}
+  out: dict = {"ref": "cpu_f32", "steps": {}, "views": {}, "sources": {}}
   ref_dets = ref.get("dets") or []
   views = list(dict.fromkeys(str(row.get("view") or "far") for row in frames))
   for step in ("dsp_q", "dsp_f32"):
@@ -1006,12 +1125,19 @@ def compare_steps(steps: dict) -> dict:
       out["steps"][step] = {"status": "frames_mismatch",
                             "ref_frames": len(ref_dets), "cand_frames": len(cand_dets)}
       continue
-    entry = {"status": "pass", "total": _agreement(ref_dets, cand_dets), "views": {}}
+    entry = {"status": "pass", "total": _agreement(ref_dets, cand_dets), "views": {},
+             "sources": {}}
     for view in views:
       idx = [i for i, row in enumerate(frames) if str(row.get("view") or "far") == view]
       entry["views"][view] = _agreement([ref_dets[i] for i in idx], [cand_dets[i] for i in idx])
+    for source in ("bundle", "pool"):
+      idx = [i for i, row in enumerate(frames) if str(row.get("source") or "bundle") == source]
+      if idx:
+        entry["sources"][source] = _agreement([ref_dets[i] for i in idx],
+                                             [cand_dets[i] for i in idx])
     out["steps"][step] = entry
     out["views"][step] = entry["views"]
+    out["sources"][step] = entry["sources"]
   return out
 
 
@@ -1263,17 +1389,29 @@ def _stopped(sm, now: float) -> bool:
 
 
 def wait_for_stop(sm, *, clock=time.monotonic, sleep=time.sleep,
-                  stop_hold_s: float = STOP_HOLD_S, notice=None) -> None:
+                  stop_hold_s: float = STOP_HOLD_S, notice=None,
+                  collect=None, pool_tick_s: float = POOL_TICK_S) -> None:
   """Block at GATE_HZ until STOPPED held continuously for stop_hold_s.
 
   While arming, refreshes the on-screen notice at 2 Hz once STOPPED has held
   ARMING_SHOW_S. If STOPPED drops before the child spawns, the notice is
-  marked aborted only when it had been shown; otherwise the key is removed."""
+  marked aborted only when it had been shown; otherwise the key is removed.
+
+  `collect` (collect_pool_tick) is called at most every pool_tick_s while
+  waiting, so the frame pool fills during ordinary driving; its exceptions are
+  swallowed because a frame-collecting failure must never stop the gate."""
   since: float | None = None
   shown = False
+  next_collect: float | None = None
   while True:
     sm.update(0)
     now = clock()
+    if collect is not None and (next_collect is None or now >= next_collect):
+      next_collect = now + pool_tick_s
+      try:
+        collect()
+      except Exception:
+        pass
     if _stopped(sm, now):
       if since is None:
         since = now
@@ -1342,7 +1480,7 @@ def run_probe(result_path: str, *, sm, attempt_file: str, pre_state: dict | None
               progress_file: str, total_timeout_s: float = TOTAL_TIMEOUT_S,
               popen_factory=None, child_cmd=None, clock=time.monotonic,
               sleep=time.sleep, rss_reader=None, meta: dict | None = None,
-              notice=None) -> dict:
+              notice=None, collect=None) -> dict:
   """Gate loop: spawn the child only while STOPPED and watch STOPPED + RSS.
 
   A non-STOPPED sample (the car pulls away) kills the child without a result
@@ -1358,7 +1496,14 @@ def run_probe(result_path: str, *, sm, attempt_file: str, pre_state: dict | None
   factory = popen_factory or _default_popen
   cmd = child_cmd or _default_child_cmd(result_path)
   while True:
-    wait_for_stop(sm, clock=clock, sleep=sleep, notice=notice)
+    wait_for_stop(sm, clock=clock, sleep=sleep, notice=notice, collect=collect)
+    # One last sweep right before the child reads the pool, so frames recorded
+    # during this stop's approach are included.
+    if collect is not None:
+      try:
+        collect()
+      except Exception:
+        pass
     state = pre_state or {"count": 0, "lost_steps": []}
     write_attempt_state(attempt_file, {"count": int(state.get("count", 0)) + 1,
                                        "lost_steps": list(state.get("lost_steps", []))})
@@ -1507,7 +1652,8 @@ def main() -> None:
 
   try:
     status = run_probe(result_path, sm=sm, attempt_file=attempt_file, pre_state=pre_state,
-                       progress_file=progress_file, notice=notice)
+                       progress_file=progress_file, notice=notice,
+                       collect=collect_pool_tick)
     print(f"dsp_probe: {status.get('status')} -> {result_path}", flush=True)
   except SystemExit:
     raise  # manager stop: no failure result, latch restored by the handler

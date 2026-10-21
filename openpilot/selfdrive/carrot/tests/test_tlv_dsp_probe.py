@@ -11,6 +11,7 @@ probe hit), and T-B samples real tlvrec JPEGs through cv2.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import signal
@@ -220,10 +221,10 @@ def test_should_run_unchanged_when_signal_color_not_requested(probe_root, monkey
 
 def test_result_and_latch_paths_use_probe_key(probe_root):
   result = dsp_probe.probe_result_path()
-  assert result == os.path.join(str(probe_root), "snpe2.json")
-  assert dsp_probe.attempt_path(result) == os.path.join(str(probe_root), "snpe2.attempt")
-  assert dsp_probe.progress_path(result) == os.path.join(str(probe_root), "snpe2.progress")
-  assert dsp_probe.steps_path(result) == os.path.join(str(probe_root), "snpe2.steps.json")
+  assert result == os.path.join(str(probe_root), "snpe3.json")
+  assert dsp_probe.attempt_path(result) == os.path.join(str(probe_root), "snpe3.attempt")
+  assert dsp_probe.progress_path(result) == os.path.join(str(probe_root), "snpe3.progress")
+  assert dsp_probe.steps_path(result) == os.path.join(str(probe_root), "snpe3.steps.json")
 
 
 def test_probe_paths_do_not_depend_on_commit(probe_root, monkeypatch):
@@ -231,12 +232,12 @@ def test_probe_paths_do_not_depend_on_commit(probe_root, monkeypatch):
   first = dsp_probe.probe_result_path()
   monkeypatch.setattr(dsp_probe, "current_commit_short", lambda: "def5678")
   assert dsp_probe.probe_result_path() == first
-  assert dsp_probe.bin_dir() == os.path.join(str(probe_root), "bin", "snpe2")
+  assert dsp_probe.bin_dir() == os.path.join(str(probe_root), "bin", "snpe3")
 
 
 def test_main_skips_when_result_exists(probe_root, monkeypatch):
   probe_root.mkdir(parents=True, exist_ok=True)
-  (probe_root / "snpe2.json").write_text("{}", encoding="utf-8")
+  (probe_root / "snpe3.json").write_text("{}", encoding="utf-8")
   called = []
   monkeypatch.setattr(dsp_probe, "run_probe", lambda *a, **k: called.append(1))
   dsp_probe.main()
@@ -647,7 +648,7 @@ def test_step_timeouts_fit_the_total_budget():
 def test_import_does_not_load_cv2_or_recorder():
   # The manager imports this module through enable_tlv_dsp_probe, so importing
   # it must stay cheap: cv2 (and recorder, which imports cv2 at module level)
-  # are only allowed inside step_frames / _read_active.
+  # are only allowed inside step_frames / collect_pool_tick.
   code = "; ".join([
     "import sys, openpilot.selfdrive.carrot.tlv.dsp_probe",
     "assert 'cv2' not in sys.modules, 'cv2'",
@@ -768,11 +769,11 @@ def test_child_main_writes_result_and_cleans_stores(probe_root, monkeypatch):
     "dsp_q": {"name": "dsp_q", "status": "fail", "error": "runtime_unavailable"},
     "dsp_f32": {"name": "dsp_f32", "status": "fail", "error": "boom"},
   })
-  steps = os.path.join(str(probe_root), "snpe2.steps.json")
+  steps = os.path.join(str(probe_root), "snpe3.steps.json")
   dsp_probe.write_steps(steps, {"cpu_f32": {"status": "pass"}})
   bin_root = os.path.join(str(probe_root), "bin", dsp_probe.PROBE_KEY)
   os.makedirs(bin_root, exist_ok=True)
-  path = os.path.join(str(probe_root), "snpe2.json")
+  path = os.path.join(str(probe_root), "snpe3.json")
 
   dsp_probe._child_main(path)
 
@@ -791,7 +792,7 @@ def test_child_main_without_all_steps_writes_no_result(probe_root, monkeypatch):
     "build": {"name": "build", "status": "pass"},
     "cpu_f32": {"name": "cpu_f32", "status": "pass"},
   })
-  path = os.path.join(str(probe_root), "snpe2.json")
+  path = os.path.join(str(probe_root), "snpe3.json")
   dsp_probe._child_main(path)
   assert not os.path.exists(path)
 
@@ -1314,7 +1315,7 @@ def test_latched_step_requires_same_step_three_times():
 
 def test_main_latches_after_three_same_step_losses(probe_root, monkeypatch):
   probe_root.mkdir(parents=True, exist_ok=True)
-  result = os.path.join(str(probe_root), "snpe2.json")
+  result = os.path.join(str(probe_root), "snpe3.json")
   dsp_probe.write_attempt_state(dsp_probe.attempt_path(result), {"count": 2, "lost_steps": ["build", "build"]})
   dsp_probe.write_progress(dsp_probe.progress_path(result), "build")
   monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", False)
@@ -1335,7 +1336,7 @@ def test_main_latches_after_three_same_step_losses(probe_root, monkeypatch):
 
 def test_main_does_not_latch_on_mixed_losses(probe_root, monkeypatch):
   probe_root.mkdir(parents=True, exist_ok=True)
-  result = os.path.join(str(probe_root), "snpe2.json")
+  result = os.path.join(str(probe_root), "snpe3.json")
   dsp_probe.write_attempt_state(dsp_probe.attempt_path(result), {"count": 3, "lost_steps": ["build", "cpu_f32"]})
   dsp_probe.write_progress(dsp_probe.progress_path(result), "build")
   monkeypatch.setattr(dsp_probe, "_probe_disabled_by_lost_attempts", False)
@@ -1384,7 +1385,7 @@ def test_main_retries_messaging_then_runs_probe(probe_root, monkeypatch):
 
 def test_main_consumes_progress_once_without_false_latch(probe_root, monkeypatch):
   probe_root.mkdir(parents=True, exist_ok=True)
-  result = os.path.join(str(probe_root), "snpe2.json")
+  result = os.path.join(str(probe_root), "snpe3.json")
   attempt = dsp_probe.attempt_path(result)
   progress = dsp_probe.progress_path(result)
   dsp_probe.write_attempt_state(attempt, {"count": 1, "lost_steps": []})
@@ -1408,7 +1409,7 @@ def test_main_consumes_progress_once_without_false_latch(probe_root, monkeypatch
 
 def test_main_still_latches_three_separate_lost_runs(probe_root, monkeypatch):
   probe_root.mkdir(parents=True, exist_ok=True)
-  result = os.path.join(str(probe_root), "snpe2.json")
+  result = os.path.join(str(probe_root), "snpe3.json")
   attempt = dsp_probe.attempt_path(result)
   progress = dsp_probe.progress_path(result)
   dsp_probe.write_attempt_state(attempt, {"count": 1, "lost_steps": []})
@@ -1678,106 +1679,294 @@ def test_wait_for_stop_blocks_while_moving_on_a_real_submaster():
 
 
 # ---------------------------------------------------------------------------
-# T-B: step_frames on real tlvrec JPEGs
+# P1/P2/P3/P4: bundled frames always, pool as a bonus, nothing waits
 # ---------------------------------------------------------------------------
 
 FIXTURE_FRAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures", "tlvrec_frames")
+BUNDLED_FRAMES = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "tlv",
+                              "models", "dsp_probe_frames")
 
-# (fixture jpg, view) in the order the sessions below reference them
-REAL_FRAMES = [("0000023.jpg", "far"), ("0000025.jpg", "near"), ("0000026.jpg", "far"),
-               ("0000029.jpg", "near"), ("0000035.jpg", "far"), ("0000036.jpg", "near"),
-               ("0000038.jpg", "far"), ("0000041.jpg", "near")]
+# (fixture jpg, view) in the order models/dsp_probe_frames/index.jsonl lists them
+BUNDLE_ORDER = [("0000023.jpg", "far"), ("0000025.jpg", "near"), ("0000026.jpg", "far"),
+                ("0000029.jpg", "near"), ("0000035.jpg", "far"), ("0000036.jpg", "near"),
+                ("0000038.jpg", "far"), ("0000041.jpg", "near")]
 
 
-def _make_session(root, name, picks):
-  """A tlvrec session whose every-3rd row (0, 3, 6, ...) is one of `picks`."""
+def _write_session(root, name, picks, filler=None):
+  """A tlvrec session: one index row per pick, its fixture copied in.
+
+  `filler` pads the index with non-sampled rows so the stride lands where the
+  test wants it."""
   session = os.path.join(str(root), name)
   os.makedirs(session, exist_ok=True)
+  for jpg, _view in picks:
+    dst = os.path.join(session, jpg)
+    if not os.path.exists(dst):
+      shutil.copyfile(os.path.join(FIXTURE_FRAMES, jpg), dst)
   rows = []
-  for i, (jpg, view) in enumerate(picks):
-    if i:
-      rows.append({"file": "0000000.jpg", "view": "far"})
-      rows.append({"file": "0000000.jpg", "view": "near"})
+  for jpg, view in picks:
     rows.append({"file": jpg, "view": view})
-    shutil.copyfile(os.path.join(FIXTURE_FRAMES, jpg), os.path.join(session, jpg))
+    for _ in range(filler or 0):
+      rows.append({"file": jpg, "view": "side"})
   with open(os.path.join(session, "index.jsonl"), "w", encoding="utf-8", newline="\n") as f:
     for row in rows:
       f.write(json.dumps(row) + "\n")
   return session
 
 
-def test_step_frames_samples_finished_sessions_only(probe_root, tmp_path):
+def _pool_rows(probe_root):
+  return dsp_probe.read_pool()
+
+
+def test_collect_pool_tick_copies_strided_rows_from_every_session(probe_root, tmp_path):
   root = tmp_path / "tlvrec"
   root.mkdir()
-  _make_session(root, "20261020-200300", [REAL_FRAMES[0], REAL_FRAMES[1], REAL_FRAMES[2]])
-  _make_session(root, "20261020-200200", [REAL_FRAMES[3], REAL_FRAMES[4], REAL_FRAMES[5]])
-  _make_session(root, "20261020-200100", [REAL_FRAMES[6], REAL_FRAMES[7], REAL_FRAMES[0]])
-  _make_session(root, "20261020-195900", [REAL_FRAMES[1], REAL_FRAMES[2]])
-  _make_session(root, "20261020-200400", [REAL_FRAMES[3], REAL_FRAMES[4]])
+  # every sampled row (index 0, 3, 6 - two filler rows per pick) is one copy
+  _write_session(root, "20261020-200100", [("0000023.jpg", "far"), ("0000025.jpg", "near"),
+                                           ("0000026.jpg", "far")], filler=2)
+  _write_session(root, "20261020-200200", [("0000029.jpg", "near"), ("0000035.jpg", "far"),
+                                           ("0000036.jpg", "near")], filler=2)
+  _write_session(root, "20261020-200300", [("0000038.jpg", "far"), ("0000041.jpg", "near"),
+                                           ("0000023.jpg", "far")], filler=2)
   from openpilot.selfdrive.carrot.tlv import recorder
-  (root / recorder.ACTIVE_NAME).write_text("20261020-200400", encoding="utf-8")
-  # dsp_probe itself lives under the root and must never be scanned
-  _make_session(root, "dsp_probe", [REAL_FRAMES[5]])
+  (root / recorder.ACTIVE_NAME).write_text("20261020-200300", encoding="utf-8")
 
-  result = dsp_probe.step_frames(root=str(root))
+  added = dsp_probe.collect_pool_tick(str(root))
+  assert added == 9
+  rows = _pool_rows(probe_root)
+  assert len(rows) == 9
+  assert {row["session"] for row in rows} == {"20261020-200100", "20261020-200200",
+                                              "20261020-200300"}
+  # the active session IS scanned: log_sync deletes finished sessions at once
+  active_rows = [row for row in rows if row["session"] == "20261020-200300"]
+  assert len(active_rows) == 3
+  assert all(row["view"] in ("far", "near") for row in rows)
+  assert [row["i"] for row in rows] == list(range(9))
+  assert [row["file"] for row in rows] == [f"{i:04d}.jpg" for i in range(9)]
+  for row in rows:
+    assert row["key"] == f"{row['session']}/{row['src_file']}"
+    dst = os.path.join(dsp_probe.pool_dir(), row["file"])
+    src = os.path.join(str(root), row["session"], row["src_file"])
+    assert os.path.getsize(dst) == os.path.getsize(src)
+    assert row["jpeg_sha256"] == hashlib.sha256(open(src, "rb").read()).hexdigest()
+
+  # idempotent: the same rows never enter the pool twice
+  assert dsp_probe.collect_pool_tick(str(root)) == 0
+  assert len(_pool_rows(probe_root)) == 9
+
+
+def test_collect_pool_tick_caps_each_view(probe_root, tmp_path):
+  root = tmp_path / "tlvrec"
+  root.mkdir()
+  session = os.path.join(str(root), "20261020-200100")
+  os.makedirs(session)
+  shutil.copyfile(os.path.join(FIXTURE_FRAMES, "0000023.jpg"), os.path.join(session, "0000023.jpg"))
+  with open(os.path.join(session, "index.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+    for _ in range(100):
+      f.write(json.dumps({"file": "0000023.jpg", "view": "far"}) + "\n")
+
+  added = dsp_probe.collect_pool_tick(str(root), stride=1)
+  assert added == dsp_probe.POOL_PER_VIEW == 26
+  assert _pool_counts_of(probe_root) == {"far": 26, "near": 0}
+  assert dsp_probe.collect_pool_tick(str(root), stride=1) == 0
+
+
+def _pool_counts_of(probe_root):
+  return dsp_probe._pool_counts(_pool_rows(probe_root))
+
+
+def test_collect_pool_tick_survives_a_session_deleted_mid_scan(probe_root, tmp_path, monkeypatch):
+  root = tmp_path / "tlvrec"
+  root.mkdir()
+  _write_session(root, "20261020-200100", [("0000023.jpg", "far")], filler=2)
+  doomed = _write_session(root, "20261020-200200", [("0000025.jpg", "near")], filler=2)
+  _write_session(root, "20261020-200300", [("0000026.jpg", "far")], filler=2)
+
+  real_open = open
+  gone = os.path.join(doomed, "index.jsonl")
+
+  def flaky_open(path, *args, **kwargs):
+    if os.path.abspath(str(path)) == os.path.abspath(gone):
+      raise FileNotFoundError(2, "No such file or directory", str(path))
+    return real_open(path, *args, **kwargs)
+
+  monkeypatch.setattr("builtins.open", flaky_open)
+  added = dsp_probe.collect_pool_tick(str(root))
+  monkeypatch.undo()
+  assert added == 2  # the vanished session is skipped, the others still copy
+  assert {row["session"] for row in _pool_rows(probe_root)} == {"20261020-200100",
+                                                               "20261020-200300"}
+
+
+def test_collect_pool_tick_survives_a_missing_root(probe_root, tmp_path):
+  assert dsp_probe.collect_pool_tick(str(tmp_path / "does-not-exist")) == 0
+  assert _pool_rows(probe_root) == []
+
+
+def test_step_frames_always_has_the_bundle_and_adds_the_pool(probe_root, tmp_path):
+  empty_pool = tmp_path / "pool_empty"
+  empty_pool.mkdir()
+  result = dsp_probe.step_frames(pool_dir=str(empty_pool))
   assert result["status"] == "pass", result
-  assert result["n_far"] == 6 and result["n_near"] == 5
+  assert result["n_bundle"] == 8 and result["n_pool"] == 0
+  assert result["n_far"] == 4 and result["n_near"] == 4
   assert result["bad_shape"] == 0
-  assert "dsp_probe" not in result["sessions_used"]
-  assert "20261020-200400" not in result["sessions_used"]
 
   frames = dsp_probe.read_frames()
-  assert len(frames) == 11
-  assert all(row["session"] != "20261020-200400" for row in frames)
-  assert all(row["session"] != "dsp_probe" for row in frames)
-  assert [row["i"] for row in frames] == list(range(11))
-  assert {(row["file"], row["view"]) for row in frames} <= set(REAL_FRAMES)
-
-  import cv2
+  assert len(frames) == 8
+  assert [row["source"] for row in frames] == ["bundle"] * 8
+  assert [(row["file"], row["view"]) for row in frames] == BUNDLE_ORDER
+  assert [row["i"] for row in frames] == list(range(8))
+  for row in frames:
+    assert row["session"] == ""
+    assert row["jpeg_sha256"] == hashlib.sha256(
+      open(os.path.join(FIXTURE_FRAMES, row["file"]), "rb").read()).hexdigest()
 
   raw_dir = dsp_probe.frame_work_dir()
   for row in frames:
     path = os.path.join(raw_dir, f"{row['i']:04d}.raw")
     assert os.path.getsize(path) == dsp_probe.INPUT_BYTES == 2457600
     raw = np.fromfile(path, dtype="<f4").reshape(dsp_probe.MODEL_H, dsp_probe.MODEL_W, 3)
-    bgr = cv2.imread(os.path.join(str(root), row["session"], row["file"]), cv2.IMREAD_COLOR)
+    import cv2
+    bgr = cv2.imread(os.path.join(dsp_probe.bundled_frames_dir(), row["file"]), cv2.IMREAD_COLOR)
     assert np.array_equal(raw[10, 20], bgr[10, 20][::-1].astype(np.float32))
 
   for step in dsp_probe.DET_MODELS:
     lines = open(dsp_probe.list_path(step), encoding="utf-8").read().splitlines()
-    assert len(lines) == 11
+    assert len(lines) == 8
     assert lines[0].split(" ") == [os.path.join(raw_dir, "0000.raw"),
                                    os.path.join(dsp_probe.dump_dir(step), "0000.f32")]
 
 
-def test_step_frames_fails_below_min_frames(probe_root, tmp_path):
-  root = tmp_path / "tlvrec"
-  root.mkdir()
-  _make_session(root, "20261020-200300", REAL_FRAMES[:3])
+def test_step_frames_appends_the_pool_after_the_bundle(probe_root, tmp_path):
+  pool = tmp_path / "pool"
+  pool.mkdir()
+  picks = [("0000025.jpg", "near"), ("0000035.jpg", "far"), ("0000038.jpg", "far"),
+           ("0000041.jpg", "near"), ("0000029.jpg", "near")]
+  rows = []
+  for i, (jpg, view) in enumerate(picks):
+    shutil.copyfile(os.path.join(FIXTURE_FRAMES, jpg), str(pool / f"{i:04d}.jpg"))
+    rows.append({"i": i, "key": f"20261020-200100/{jpg}", "session": "20261020-200100",
+                 "src_file": jpg, "file": f"{i:04d}.jpg", "view": view,
+                 "jpeg_sha256": "0" * 64})
+  with open(str(pool / "pool.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+    for row in rows:
+      f.write(json.dumps(row) + "\n")
 
-  result = dsp_probe.step_frames(root=str(root))
+  result = dsp_probe.step_frames(pool_dir=str(pool))
+  assert result["status"] == "pass", result
+  assert result["n_bundle"] == 8 and result["n_pool"] == 5
+  frames = dsp_probe.read_frames()
+  assert len(frames) == 13
+  assert [row["source"] for row in frames] == ["bundle"] * 8 + ["pool"] * 5
+  assert [(row["file"], row["view"]) for row in frames[8:]] == picks
+  assert all(row["session"] == "20261020-200100" for row in frames[8:])
+  for step in dsp_probe.DET_MODELS:
+    assert len(open(dsp_probe.list_path(step), encoding="utf-8").read().splitlines()) == 13
+
+
+def test_step_frames_fails_only_when_the_bundle_is_broken(probe_root, tmp_path):
+  bundle = tmp_path / "bundle"
+  bundle.mkdir()
+  rows = [{"file": "0000023.jpg", "view": "far"}, {"file": "0000025.jpg", "view": "near"}]
+  for row in rows:
+    shutil.copyfile(os.path.join(FIXTURE_FRAMES, row["file"]), str(bundle / row["file"]))
+  with open(str(bundle / "index.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+    for row in rows:
+      f.write(json.dumps(row) + "\n")
+
+  result = dsp_probe.step_frames(pool_dir=str(tmp_path / "empty"), bundle_dir=str(bundle))
   assert result["status"] == "fail"
-  assert result["error"] == "too_few_frames:3"
+  assert result["error"] == "too_few_frames:2"
+  assert result["n_bundle"] == 2 and result["n_pool"] == 0
 
 
-def test_step_frames_counts_bad_shapes(probe_root, tmp_path):
-  root = tmp_path / "tlvrec"
-  root.mkdir()
-  _make_session(root, "20261020-200300", REAL_FRAMES[:1])
-  session = os.path.join(str(root), "20261020-200300")
-  with open(os.path.join(session, "broken.jpg"), "wb") as f:
-    f.write(b"not a jpeg")
-  # rows 0 and 3 are the sampled ones: both are unreadable JPEGs
-  with open(os.path.join(session, "index.jsonl"), "w", encoding="utf-8", newline="\n") as f:
-    f.write(json.dumps({"file": "broken.jpg", "view": "far"}) + "\n")
-    f.write(json.dumps({"file": "0000000.jpg", "view": "far"}) + "\n")
-    f.write(json.dumps({"file": "0000000.jpg", "view": "near"}) + "\n")
-    f.write(json.dumps({"file": "broken.jpg", "view": "near"}) + "\n")
+def test_step_frames_counts_bad_shapes_in_the_pool(probe_root, tmp_path):
+  pool = tmp_path / "pool"
+  pool.mkdir()
+  (pool / "0000.jpg").write_bytes(b"not a jpeg")
+  with open(str(pool / "pool.jsonl"), "w", encoding="utf-8", newline="\n") as f:
+    f.write(json.dumps({"file": "0000.jpg", "view": "far"}) + "\n")
 
-  result = dsp_probe.step_frames(root=str(root))
-  assert result["status"] == "fail"
-  assert result["error"] == "too_few_frames:0"
-  assert result["bad_shape"] == 2
+  result = dsp_probe.step_frames(pool_dir=str(pool))
+  assert result["status"] == "pass"  # the bundle still carries the step
+  assert result["n_bundle"] == 8 and result["n_pool"] == 0
+  assert result["bad_shape"] == 1
+
+
+def test_bundled_frames_are_byte_identical_to_the_test_fixtures():
+  rows = dsp_probe._read_index(os.path.join(BUNDLED_FRAMES, "index.jsonl"))
+  assert [(row["file"], row["view"]) for row in rows] == BUNDLE_ORDER
+  for row in rows:
+    bundled = open(os.path.join(BUNDLED_FRAMES, row["file"]), "rb").read()
+    fixture = open(os.path.join(FIXTURE_FRAMES, row["file"]), "rb").read()
+    assert hashlib.sha256(bundled).hexdigest() == hashlib.sha256(fixture).hexdigest()
+    assert bundled == fixture
+
+
+def test_compare_steps_splits_agreement_by_source(probe_root):
+  frames = [{"i": 0, "source": "bundle", "file": "a.jpg", "view": "far", "session": ""},
+            {"i": 1, "source": "bundle", "file": "b.jpg", "view": "near", "session": ""},
+            {"i": 2, "source": "pool", "file": "c.jpg", "view": "far",
+             "session": "20261020-200100"}]
+  dsp_probe.write_result_atomic(dsp_probe.frames_json_path(), frames)
+  ref = [[_det(0, 0.9)], [_det(0, 0.8)], [_det(0, 0.7), _det(0, 0.6, 200.0, 200.0, 240.0, 240.0)]]
+  cand = [[_det(0, 0.9)], [_det(0, 0.8)], [_det(0, 0.7), _det(0, 0.95, 400.0, 100.0, 440.0, 140.0)]]
+  out = dsp_probe.compare_steps({"cpu_f32": {"status": "pass", "dets": ref},
+                                 "dsp_q": {"status": "pass", "dets": cand}})
+  q = out["steps"]["dsp_q"]
+  assert set(q["sources"]) == {"bundle", "pool"}
+  assert q["sources"]["bundle"]["ref"] == 2 and q["sources"]["bundle"]["matched"] == 2
+  assert q["sources"]["pool"]["ref"] == 2 and q["sources"]["pool"]["matched"] == 1
+  assert q["sources"]["pool"]["miss_pct"] == 50.0
+  assert (q["sources"]["bundle"]["matched"] + q["sources"]["pool"]["matched"]) == q["total"]["matched"]
+  assert out["sources"]["dsp_q"] == q["sources"]
+
+
+def test_wait_for_stop_collects_the_pool_at_a_fixed_interval():
+  clock = FakeClock()
+  sm = FakeSM(clock)
+  calls = []
+
+  def sleep(dt):
+    clock.advance(dt)
+
+  dsp_probe.wait_for_stop(sm, clock=clock, sleep=sleep, collect=lambda: calls.append(clock()))
+  assert clock() == pytest.approx(dsp_probe.STOP_HOLD_S)
+  assert calls == pytest.approx([0.0, dsp_probe.POOL_TICK_S])
+  gaps = [b - a for a, b in zip(calls, calls[1:])]
+  assert all(gap >= dsp_probe.POOL_TICK_S for gap in gaps)
+
+
+def test_wait_for_stop_survives_a_failing_collect():
+  clock = FakeClock()
+  sm = FakeSM(clock)
+  calls = []
+
+  def boom():
+    calls.append(clock())
+    raise RuntimeError("pool on fire")
+
+  def sleep(dt):
+    clock.advance(dt)
+
+  dsp_probe.wait_for_stop(sm, clock=clock, sleep=sleep, collect=boom)
+  assert clock() == pytest.approx(dsp_probe.STOP_HOLD_S)
+  assert len(calls) == 2
+
+
+def test_wait_for_stop_without_collect_never_collects():
+  clock = FakeClock()
+  sm = FakeSM(clock)
+  sleeps = []
+
+  def sleep(dt):
+    sleeps.append(dt)
+    clock.advance(dt)
+
+  dsp_probe.wait_for_stop(sm, clock=clock, sleep=sleep)
+  assert clock() == pytest.approx(dsp_probe.STOP_HOLD_S)
+  assert len(sleeps) == int(round(dsp_probe.STOP_HOLD_S / dsp_probe.GATE_PERIOD_S))
 
 
 # ---------------------------------------------------------------------------

@@ -207,14 +207,15 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       "presence": {"name": "presence", "status": "pass", "clangxx": "/usr/bin/clang++",
                    "cdsprpc": ["/usr/lib/libcdsprpc.so"]},
       "build": {"name": "build", "status": "pass", "duration_s": 41.5},
-      "frames": {"name": "frames", "status": "pass", "n_far": 30, "n_near": 30, "bad_shape": 0},
+      "frames": {"name": "frames", "status": "pass", "n_bundle": 8, "n_pool": 22,
+                 "n_far": 15, "n_near": 15, "bad_shape": 0},
       "cpu_f32": {"name": "cpu_f32", "status": "pass", "frames": 60, "first_ms": 12.0,
                   "median_ms": 3.0, "p90_ms": 4.0, "n_dets": 71},
       "dsp_q": {"name": "dsp_q", "status": "fail", "error": "runtime_unavailable"},
     },
     "compare": {"ref": "cpu_f32", "steps": {"dsp_q": {"status": "fail"}}, "views": {}},
   }
-  (probe_root / "snpe2.json").write_text(json.dumps(payload), encoding="utf-8")
+  (probe_root / "snpe3.json").write_text(json.dumps(payload), encoding="utf-8")
   monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
 
   async def scenario():
@@ -224,7 +225,7 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       data = await resp.json()
       assert data["ok"] is True
       assert data["probe"]["commit"] == "abc1234"
-      assert data["probe"]["file"] == "snpe2.json"
+      assert data["probe"]["file"] == "snpe3.json"
       assert data["probe"]["steps"]["dsp_q"]["status"] == "fail"
       page = await (await client.get("/tlv_rec")).text()
       assert "DSP 시험 결과" in page
@@ -237,7 +238,7 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       assert "DSP(int8)" in page
       assert "DSP(플로트)" in page
       assert "프레임 수집" in page
-      assert "far 30 / near 30 / 제외 0" in page
+      assert "bundle 8 / pool 22 / far 15 / near 15 / 제외 0" in page
       assert "41.5 s" in page
       assert "3.0" in page
       assert "DSP 시험 다시 하기" in page
@@ -253,12 +254,12 @@ def test_dsp_probe_retry_clears_the_single_run(tmp_path, monkeypatch):
   probe_root = tmp_path / "dsp_probe"
   probe_root.mkdir()
   for suffix in (".json", ".attempt", ".progress", ".steps.json"):
-    (probe_root / f"snpe2{suffix}").write_text("{}", encoding="utf-8")
+    (probe_root / f"snpe3{suffix}").write_text("{}", encoding="utf-8")
   (probe_root / "other.json").write_text("{}", encoding="utf-8")
-  (probe_root / "bin" / "snpe2").mkdir(parents=True)
-  (probe_root / "bin" / "snpe2" / "tlv_snpe_bench").write_bytes(b"bin")
+  (probe_root / "bin" / "snpe3").mkdir(parents=True)
+  (probe_root / "bin" / "snpe3" / "tlv_snpe_bench").write_bytes(b"bin")
   monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
-  monkeypatch.setattr(module, "_probe_key", lambda: "snpe2")
+  monkeypatch.setattr(module, "_probe_key", lambda: "snpe3")
 
   async def scenario():
     client = await _start_client(module)
@@ -267,13 +268,13 @@ def test_dsp_probe_retry_clears_the_single_run(tmp_path, monkeypatch):
       assert resp.status == 200
       data = await resp.json()
       assert data["ok"] is True
-      assert sorted(data["removed"]) == ["bin/snpe2", "snpe2.attempt", "snpe2.json",
-                                         "snpe2.progress", "snpe2.steps.json"]
-      assert not (probe_root / "snpe2.json").exists()
-      assert not (probe_root / "snpe2.attempt").exists()
-      assert not (probe_root / "snpe2.progress").exists()
-      assert not (probe_root / "snpe2.steps.json").exists()
-      assert not (probe_root / "bin" / "snpe2").exists()
+      assert sorted(data["removed"]) == ["bin/snpe3", "snpe3.attempt", "snpe3.json",
+                                         "snpe3.progress", "snpe3.steps.json"]
+      assert not (probe_root / "snpe3.json").exists()
+      assert not (probe_root / "snpe3.attempt").exists()
+      assert not (probe_root / "snpe3.progress").exists()
+      assert not (probe_root / "snpe3.steps.json").exists()
+      assert not (probe_root / "bin" / "snpe3").exists()
       assert (probe_root / "other.json").exists()
       # idempotent: a second retry finds nothing left to remove
       resp = await client.post("/api/tlv_rec/dsp_probe/retry")

@@ -318,7 +318,8 @@ def _probe_detail(step: dict, probe_compare: dict | None = None) -> str:
   if name == "build":
     return f"{step.get('duration_s', '?')} s"
   if name == "frames":
-    return (f"far {step.get('n_far', '?')} / near {step.get('n_near', '?')} / "
+    return (f"bundle {step.get('n_bundle', '?')} / pool {step.get('n_pool', '?')} / "
+            f"far {step.get('n_far', '?')} / near {step.get('n_near', '?')} / "
             f"\uc81c\uc678 {step.get('bad_shape', '?')}")
   if name in _PROBE_BENCH_STEPS:
     detail = (f"{step.get('frames', '?')}\ud504\ub808\uc784 / \uccab {step.get('first_ms', '?')} ms / "
