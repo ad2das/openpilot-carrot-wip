@@ -1,27 +1,39 @@
-"""Onroad-while-parked one-time Hexagon DSP probe for the carrot TLV detector.
+"""Onroad one-time Hexagon DSP probe for the carrot TLV detector.
 
 Runs as the manager process "tlv_dsp_probe" while the car is started
 (onroad). The manager starts it when started AND TrafficLightDetectMode >= 1
-(W129: no separate vision toggle) and the result file for the current git commit does
-not exist; after the result is written the process exits 0 and the manager does
-not restart it. There is no offroad window (the car cuts OBD power at ignition
-off), so the probe runs while PARKED during a normal drive.
+(W129: no separate vision toggle) and the result file snpe1.json does not
+exist; after the result is written the process exits 0 and the manager does not
+restart it. The probe runs ONCE in total, not once per commit. There is no offroad window (the car cuts OBD power at ignition
+off), so the probe works during ordinary STOPS of a normal drive.
+
+The probe benchmarks SNPE, not tinygrad: presence checks the DSP nodes, the
+SNPE bundle under third_party/snpe_tlv and clang++; build compiles
+src/tlv_snpe_bench.cc on the device; snpe_cpu and snpe_dsp run comma's
+quantized DM model on both SNPE runtimes and compare their dumps.
+
+Steps resume across stops: snpe1.steps.json stores each step's result as soon
+as it finishes, and a final status (pass/fail/timeout) is never re-run. The
+built runner and the dumps persist under bin/snpe1/, so a cpu run from one red
+light still diffs against a dsp run from the next. The result JSON is written
+only once every step is final; steps.json and bin/snpe1 are then removed.
 
 Parent gate loop (2 Hz, tiny idle cost while driving): the parent idles on
 short sleeps and only checks
 
-  PARKED = carState.gearShifter == park AND carState.standstill AND
-           vEgo < 0.1 AND not selfdriveState.enabled,
-           with both messages fresh (< 1 s old).
+  STOPPED = carState.standstill AND vEgo < 0.1,
+            with both messages fresh (< 1 s old); the gear and
+            selfdriveState.enabled are irrelevant.
 
-The child is spawned only after PARKED held continuously for 5 s. While the
-child runs, the parent re-checks every 0.1 s: the first non-PARKED sample (or
-stale message) SIGKILLs the child immediately, writes no result and restores
-the attempt latch, then goes back to waiting. Every 0.5 s it reads
-/proc/<child>/statm; over 300 MB RSS the child is killed and the result is
-written with error="child_rss_limit". The 180 s hard total timeout and the
-per-step timeouts are unchanged; a child that exits without a result gets a
-child_exit_<code> result.
+The child is spawned only after STOPPED held continuously for 3 s. While the
+child runs, the parent re-checks every 0.1 s: the first non-STOPPED sample (or
+stale message) SIGKILLs the child immediately, writes no result, restores the
+attempt latch and goes back to waiting - whatever the child already persisted
+in steps.json is kept. Every 0.5 s it reads /proc/<child>/statm; over 300 MB
+RSS the child is killed and the result is written with error="child_rss_limit".
+The 360 s cap is per child spawn (paused while driving); a child that exits 0
+with steps still pending just waits for the next stop, while a nonzero exit
+gets a child_exit_<code> result.
 
 Orphan protection: the child is spawned with a Linux PR_SET_PDEATHSIG=SIGKILL
 preexec hook (best-effort), and main() installs SIGINT/SIGTERM handlers that
@@ -30,12 +42,12 @@ result - a manager stop is not a probe failure. All results are written
 atomically (tmp + fsync + rename), so a kill never leaves a partial file.
 
 UI notice: while it works the parent publishes CarrotTlvDspNotice in
-params_memory (arming -> running step 1..3 -> done/failed, aborted when PARKED
+params_memory (arming -> running step 1..4 -> done/failed, aborted when STOPPED
 drops) for the onroad HUD capsule; contract in ui/onroad/tlv_dsp_notice.py.
 Every notice write is best-effort and never affects the probe outcome.
 
-Lost-step latch: the child writes <commit>.progress (step name + monotonic
-start, atomic) before each step. At startup an existing <commit>.attempt means
+Lost-step latch: the child writes snpe1.progress (step name + monotonic
+start, atomic) before each step. At startup an existing snpe1.attempt means
 the previous run was lost (power cut or device reset): the .progress step is
 appended to its "lost_steps" list and consumed immediately (the updated
 .attempt is persisted and .progress removed before the latch check), so a cut
@@ -43,7 +55,7 @@ without a signal cannot count the same loss twice. A 3rd loss of the SAME
 step writes the final result error="lost_in_step:<step>" and sets
 _probe_disabled_by_lost_attempts. Losses spread over different steps (random
 power cuts) never latch. A clean finish deletes .attempt and .progress; a
-clean kill (unparked or signal) restores .attempt to its pre-spawn content.
+clean kill (stop ended or signal) restores .attempt to its pre-spawn content.
 """
 from __future__ import annotations
 
@@ -51,7 +63,6 @@ import json
 import os
 import shutil
 import signal
-import statistics
 import subprocess
 import sys
 import tempfile
@@ -60,39 +71,49 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
-
-from openpilot.selfdrive.carrot.tlv import backends, resources
+from openpilot.selfdrive.carrot.tlv import resources
 
 PROBE_ROOT = "/data/media/0/carrot_tlv_rec/dsp_probe"
-TOTAL_TIMEOUT_S = 180.0
-STEP_TIMEOUTS = {"presence": 30.0, "smoke": 60.0, "detector": 90.0}
+# One probe run in total (not one per commit): every path below hangs off this
+# key, so a later openpilot update does not re-run the benchmark.
+PROBE_KEY = "snpe1"
+TOTAL_TIMEOUT_S = 360.0
+STEP_TIMEOUTS = {"presence": 15.0, "build": 150.0, "snpe_cpu": 60.0, "snpe_dsp": 90.0}
+BUILD_TIMEOUT_S = 140.0
+RUNNER_TIMEOUT_S = {"cpu": 50.0, "dsp": 80.0}
+SNPE_RUNS = {"cpu": 10, "dsp": 20}
+CDSPRPC_DIRS = ("/usr/lib/aarch64-linux-gnu", "/usr/lib", "/usr/lib64", "/vendor/lib64",
+                "/system/vendor/lib64", "/system/lib64", "/odm/lib64")
 PRESENCE_PATHS = ("/dev/adsprpc-smd", "/dsp/cdsp/fastrpc_shell_3", "/dev/ion")
-CLANG_FLAGS = ("--target=hexagon", "-mcpu=hexagonv65", "-mhvx=v65", "-mhvx-length=128b", "-shared", "-fPIC")
-CLANG_SOURCE = b"int tlv_dsp_probe_add(int a, int b) { return a + b; }\n"
-CLANG_TIMEOUT_S = 20.0
+
+
+def snpe_paths(basedir: str | None = None) -> dict[str, str]:
+  root = os.path.join(basedir or _basedir(), "third_party", "snpe_tlv")
+  return {"root": root, "lib": os.path.join(root, "larch64"), "dsp": os.path.join(root, "dsp"),
+          "include": os.path.join(root, "include"), "src": os.path.join(root, "src", "tlv_snpe_bench.cc"),
+          "dlc": os.path.join(root, "models", "dmonitoring_model_q.dlc")}
+
+
+SNPE_REQUIRED = (("lib", "libSNPE.so"), ("dsp", "libsnpe_dsp_v65_domains_v2_skel.so"),
+                 ("include", os.path.join("SNPE", "SNPE.hpp")), ("src", ""), ("dlc", ""))
 MAX_ERROR_CHARS = 2048
-STEADY_RUNS_SMOKE = 10
-STEADY_RUNS_DETECTOR = 20
-DETECTOR_INPUT_SHAPE = (1, 3, 320, 640)
-DSP_DEVICE = "DSP"
-# Anything accelerators-specific that is NOT the Hexagon DSP is forbidden here
-# (same guard spirit as tlvd's DEV=CPU pin; backends.TINYGRAD_GPU_DEVICES
-# includes DSP itself, which this probe is allowed to open).
-FORBIDDEN_DEVICES = tuple(d for d in backends.TINYGRAD_GPU_DEVICES if d != DSP_DEVICE)
 
 MB = 1024 * 1024
-# Parked gate (item values are the contract with the manager-side review).
+# Stop gate: any ordinary stop (red light, traffic) while driving is enough.
 SD_SERVICE = "selfdriveState"  # this tree publishes selfdriveState (not controlsState)
-PARK_SERVICES = ("carState", SD_SERVICE)
-PARK_FRESH_S = 1.0
-PARK_HOLD_S = 5.0
+STOP_SERVICES = ("carState", SD_SERVICE)
+STOP_FRESH_S = 1.0
+STOP_HOLD_S = 3.0
 GATE_HZ = 2.0
 GATE_PERIOD_S = 1.0 / GATE_HZ
 RUN_POLL_S = 0.1
 RSS_POLL_S = 0.5
 CHILD_RSS_LIMIT_BYTES = 300 * MB
 LOST_STEP_LIMIT = 3
+# Steps whose stored status is final: they are never re-run across stops.
+# "skipped" is final too: it only arises when a dependency already ended in a
+# final non-pass status, and that decision must not be re-litigated per stop.
+FINAL_STATUSES = ("pass", "fail", "timeout", "skipped")
 # On-screen notice contract with ui/onroad/tlv_dsp_notice.py (params_memory).
 NOTICE_KEY = "CarrotTlvDspNotice"
 NOTICE_PERIOD_S = 0.5
@@ -202,7 +223,11 @@ def current_commit_short() -> str:
 
 
 def probe_result_path() -> str:
-  return os.path.join(PROBE_ROOT, f"{current_commit_short()}.json")
+  return os.path.join(PROBE_ROOT, f"{PROBE_KEY}.json")
+
+
+def steps_path(result_path: str) -> str:
+  return os.path.splitext(result_path)[0] + ".steps.json"
 
 
 def attempt_path(result_path: str) -> str:
@@ -392,7 +417,7 @@ def _timed(name: str, fn, timeout_s: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# step a: DSP presence + clang toolchain
+# step a: DSP presence + SNPE bundle + toolchain
 # ---------------------------------------------------------------------------
 
 def _path_status(path: str) -> str:
@@ -403,234 +428,197 @@ def _path_status(path: str) -> str:
   return "ok"
 
 
-def step_presence(*, path_status=None, which=None, run=None, workdir=None) -> dict:
+def _cdsprpc_candidates(listdir=None) -> list[str]:
+  listdir = listdir or os.listdir
+  found: list[str] = []
+  for directory in CDSPRPC_DIRS:
+    try:
+      names = listdir(directory)
+    except OSError:
+      continue
+    found.extend(os.path.join(directory, name) for name in names if name.startswith("libcdsprpc"))
+  return sorted(found)
+
+
+def step_presence(*, path_status=None, which=None, listdir=None, paths=None) -> dict:
   path_status = path_status or _path_status
   which = which or shutil.which
-  run = run or subprocess.run
+  p = paths or snpe_paths()
 
-  paths = {path: path_status(path) for path in PRESENCE_PATHS}
-  ok = all(status == "ok" for status in paths.values())
-  clang: dict = {"path": which("clang") or "missing"}
-  if clang["path"] == "missing":
-    clang["status"] = "fail"
-    clang["error"] = "clang not found on PATH"
-    ok = False
+  nodes = {path: path_status(path) for path in PRESENCE_PATHS}
+  clangxx = which("clang++") or "missing"
+  cdsprpc = _cdsprpc_candidates(listdir)
+
+  snpe_files = {}
+  for key, name in SNPE_REQUIRED:
+    target = os.path.join(p[key], name) if name else p[key]
+    snpe_files[f"{key}/{name}" if name else key] = path_status(target)
+
+  error = None
+  if any(status != "ok" for status in nodes.values()):
+    error = f"DSP node missing: {next(k for k, v in nodes.items() if v != 'ok')}"
+  elif clangxx == "missing":
+    error = "clang++ not found on PATH"
   else:
-    tmp = workdir or tempfile.mkdtemp(prefix="tlv_dsp_probe_")
-    try:
-      src = os.path.join(tmp, "probe.c")
-      out = os.path.join(tmp, "probe.so")
-      with open(src, "wb") as f:
-        f.write(CLANG_SOURCE)
-      try:
-        proc = run([clang["path"], *CLANG_FLAGS, "-o", out, src],
-                   capture_output=True, timeout=CLANG_TIMEOUT_S)
-        clang["returncode"] = int(getattr(proc, "returncode", 1))
-        stderr = getattr(proc, "stderr", b"") or b""
-        stderr_text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr)
-        if clang["returncode"] == 0:
-          clang["status"] = "pass"
-        else:
-          clang["status"] = "fail"
-          clang["error"] = _truncate(stderr_text or "clang returned nonzero")
-      except subprocess.TimeoutExpired:
-        clang["status"] = "fail"
-        clang["error"] = f"clang timed out after {CLANG_TIMEOUT_S:.0f} s"
-      except Exception as exc:
-        clang["status"] = "fail"
-        clang["error"] = _truncate(repr(exc))
-      if clang.get("status") != "pass":
-        ok = False
-    finally:
-      if workdir is None:
-        shutil.rmtree(tmp, ignore_errors=True)
+    bad = [key for key, status in snpe_files.items() if status != "ok"]
+    if bad:
+      error = f"SNPE file missing: {bad[0]}"
 
   return {
-    "status": "pass" if ok else "fail",
-    "paths": paths,
-    "clang": clang,
-    "error": None if ok else "DSP presence or clang toolchain check failed",
+    "status": "pass" if error is None else "fail",
+    "paths": nodes,
+    "clangxx": clangxx,
+    "cdsprpc": cdsprpc,
+    "snpe_files": snpe_files,
+    "error": error,
   }
 
 
 # ---------------------------------------------------------------------------
-# step b: tinygrad DSP smoke
+# step b: compile the SNPE runner on the device
 # ---------------------------------------------------------------------------
 
-def _smoke_ops(Tensor, dtypes, device: str) -> tuple[bool, str]:
-  a = Tensor([[1, 2], [3, 4]], dtype=dtypes.uint8, device=device)
-  b = Tensor([[1, 0], [0, 1]], dtype=dtypes.uint8, device=device)
-  elementwise = (a + b).numpy().tolist()
-  matmul = a.matmul(b).numpy().tolist()
-  if elementwise != [[2, 2], [3, 5]]:
-    return False, f"elementwise mismatch: {elementwise}"
-  if matmul != [[1, 2], [3, 4]]:
-    return False, f"matmul mismatch: {matmul}"
-  return True, ""
+_WORK: dict = {}
 
 
-def _load_dsp_tensors():
-  """(Tensor, dtypes, default device, opened-devices getter) on DEV=DSP."""
-  os.environ["DEV"] = DSP_DEVICE
+def bin_dir() -> str:
+  return os.path.join(PROBE_ROOT, "bin", PROBE_KEY)
+
+
+def bin_path() -> str:
+  return os.path.join(bin_dir(), "tlv_snpe_bench")
+
+
+def dump_path(runtime: str) -> str:
+  return os.path.join(bin_dir(), f"{runtime}.f32")
+
+
+def _preexec():
+  """Death signal for the build/runner grandchildren: a pull-away SIGKILLs the
+  child, and the compiler or SNPE runner must not outlive it while driving."""
+  return _child_preexec if IS_LINUX else None
+
+
+def _new_work() -> dict:
+  """Per-child state: a throwaway dir for --out JSON plus the persistent bin."""
+  _WORK.clear()
+  _WORK["dir"] = tempfile.mkdtemp(prefix="tlv_snpe_")
+  _WORK["bin"] = bin_path()
+  return _WORK
+
+
+def build_argv(clangxx: str, p: dict[str, str], out_bin: str) -> list[str]:
+  # SNPE 1.41 exports the pre-cxx11 libstdc++ ABI; every zdl:: API taking a
+  # std::string fails to link without the ABI flag.
+  return [clangxx, "-std=c++17", "-O2", "-D_GLIBCXX_USE_CXX11_ABI=0", "-I", p["include"], p["src"],
+          "-L", p["lib"], "-lSNPE", f"-Wl,-rpath,{p['lib']}", "-o", out_bin]
+
+
+def step_build(*, run=None, which=None, paths=None, work=None) -> dict:
+  run = run or subprocess.run
+  which = which or shutil.which
+  p = paths or snpe_paths()
+  work = work if work is not None else (_WORK or _new_work())
+  clangxx = which("clang++") or "clang++"
+  out_bin = work.get("bin") or bin_path()
+  work["bin"] = out_bin
   try:
-    import tinygrad
-  except ImportError:
-    repo = backends._tinygrad_repo_path()
-    if repo not in sys.path:
-      sys.path.append(repo)
-    import tinygrad  # noqa: F401
-  from tinygrad import Device, Tensor, dtypes
-  return Tensor, dtypes, str(Device.DEFAULT), lambda: [str(d) for d in getattr(Device, "_opened_devices", ())]
-
-
-def _forbidden_opened(opened) -> list[str]:
-  bases = {str(device).split(":")[0] for device in opened}
-  return sorted(bases & set(FORBIDDEN_DEVICES))
-
-
-def step_smoke(*, load_tensors=None, runs: int = STEADY_RUNS_SMOKE) -> dict:
-  load = load_tensors or _load_dsp_tensors
+    os.makedirs(os.path.dirname(out_bin), exist_ok=True)
+  except OSError as exc:
+    return {"status": "fail", "error": _truncate(f"cannot create {os.path.dirname(out_bin)}: {exc!r}")}
+  cmd = build_argv(clangxx, p, out_bin)
   try:
-    Tensor, dtypes, default_device, opened = load()
+    proc = run(cmd, capture_output=True, timeout=BUILD_TIMEOUT_S, preexec_fn=_preexec())
+  except subprocess.TimeoutExpired:
+    return {"status": "fail", "cmd": cmd, "error": f"build timed out after {BUILD_TIMEOUT_S:.0f} s"}
   except Exception as exc:
-    return {"status": "fail", "error": _truncate(f"tinygrad DSP load failed: {exc!r}")}
-  base = str(default_device).split(":")[0]
-  if base != DSP_DEVICE:
-    return {"status": "fail", "default_device": base, "error": f"tinygrad default device is {base!r}, expected DSP"}
-  try:
-    started = time.perf_counter()
-    ok, message = _smoke_ops(Tensor, dtypes, DSP_DEVICE)
-    first_ms = (time.perf_counter() - started) * 1000.0
-    if not ok:
-      return {"status": "fail", "default_device": base, "error": message}
-    times = []
-    for _ in range(int(runs)):
-      started = time.perf_counter()
-      ok, message = _smoke_ops(Tensor, dtypes, DSP_DEVICE)
-      times.append((time.perf_counter() - started) * 1000.0)
-      if not ok:
-        return {"status": "fail", "default_device": base, "error": message}
-  except Exception as exc:
-    return {"status": "fail", "default_device": base, "error": _truncate(repr(exc))}
-  forbidden = _forbidden_opened(opened())
-  if forbidden:
-    return {"status": "fail", "default_device": base, "error": f"opened non-DSP accelerators: {forbidden}"}
-  times.sort()
-  return {
-    "status": "pass",
-    "default_device": base,
-    "first_ms": round(first_ms, 3),
-    "steady_median_ms": round(statistics.median(times), 3),
-    "runs": int(runs),
-  }
+    return {"status": "fail", "cmd": cmd, "error": _truncate(repr(exc))}
+  rc = int(getattr(proc, "returncode", 1))
+  stderr = getattr(proc, "stderr", b"") or b""
+  stderr_text = stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr)
+  result = {"returncode": rc, "cmd": cmd}
+  if rc != 0 or not os.path.exists(out_bin):
+    result["status"] = "fail"
+    result["stderr"] = _truncate(stderr_text)
+    result["error"] = _truncate(stderr_text or f"clang++ returned {rc}")
+    return result
+  result["status"] = "pass"
+  result["bin"] = out_bin
+  return result
 
 
 # ---------------------------------------------------------------------------
-# step c: the tlvd ONNX detector on DEV=DSP (+ one CPU reference run)
+# steps c/d: the quantized DM model on the SNPE cpu and dsp runtimes
 # ---------------------------------------------------------------------------
 
-def _fixed_detector_input() -> np.ndarray:
-  rng = np.random.default_rng(7)
-  return rng.integers(0, 256, size=DETECTOR_INPUT_SHAPE, dtype=np.uint8)
+def snpe_env(paths) -> dict:
+  env = dict(os.environ)
+  old = env.get("LD_LIBRARY_PATH", "")
+  env["LD_LIBRARY_PATH"] = "/usr/lib/aarch64-linux-gnu:" + paths["lib"] + (":" + old if old else "")
+  env["ADSP_LIBRARY_PATH"] = paths["dsp"] + "/"
+  return env
 
 
-def _model_path_from_params() -> str:
-  from openpilot.common.params import Params
-  value = Params().get("CarrotTlvModelPath")
-  if isinstance(value, bytes):
-    value = value.decode("utf-8", "replace")
-  return str(value or "").strip() or backends.BUNDLED_DETECTOR
+def _bench_argv(work: dict, p: dict[str, str], runtime: str) -> tuple[list[str], str, str]:
+  out = os.path.join(work.get("dir") or _new_work()["dir"], f"{runtime}.json")
+  dump = dump_path(runtime)
+  cmd = [work.get("bin") or bin_path(), "--dlc", p["dlc"], "--runtime", runtime,
+         "--runs", str(SNPE_RUNS[runtime]), "--out", out, "--dump", dump]
+  return cmd, out, dump
 
 
-class _OnnxAdapter:
-  """OnnxRunner pinned to one explicit device; no implicit default search."""
-
-  def __init__(self, model_path: str, device: str) -> None:
-    os.environ["DEV"] = DSP_DEVICE
-    try:
-      import tinygrad
-    except ImportError:
-      repo = backends._tinygrad_repo_path()
-      if repo not in sys.path:
-        sys.path.append(repo)
-      import tinygrad  # noqa: F401
-    from tinygrad import Device, Tensor
-    from tinygrad.nn.onnx import OnnxRunner
-    self._device = str(device)
-    self._Device = Device
-    self._Tensor = Tensor
-    self._runner = OnnxRunner(model_path)
-    self._runner.to(self._device)
-    self._input_name = next(iter(self._runner.graph_inputs))
-    self._input_spec = self._runner.graph_inputs[self._input_name]
-    self._output_names = tuple(self._runner.graph_outputs)
-
-  def run(self, model_input) -> list[np.ndarray]:
-    dtype = None
-    spec_dtype = getattr(self._input_spec, "dtype", None)
-    if spec_dtype is not None:
-      dtype = backends.TINYGRAD_NP_DTYPES.get(str(spec_dtype).rsplit(".", 1)[-1])
-    data = np.asarray(model_input)
-    if dtype is not None:
-      data = data.astype(dtype, copy=False)
-    x = self._Tensor(data, device=self._device)
-    outs = self._runner({self._input_name: x})
-    return [np.asarray(outs[name].numpy()) for name in self._output_names]
-
-  def opened_devices(self) -> list[str]:
-    return [str(d) for d in getattr(self._Device, "_opened_devices", ())]
-
-
-def step_detector(*, model_path=None, adapter_factory=None, path_getter=None,
-                  runs: int = STEADY_RUNS_DETECTOR) -> dict:
-  path_getter = path_getter or _model_path_from_params
-  factory = adapter_factory or _OnnxAdapter
+def _run_bench(runtime: str, *, run=None, paths=None, work=None) -> dict:
+  run = run or subprocess.run
+  p = paths or snpe_paths()
+  work = work if work is not None else (_WORK or _new_work())
+  cmd, out, dump = _bench_argv(work, p, runtime)
   try:
-    path = model_path if model_path is not None else path_getter()
-  except Exception as exc:
-    return {"status": "fail", "error": _truncate(f"cannot read CarrotTlvModelPath: {exc!r}")}
-  if not path:
-    return {"status": "fail", "error": "CarrotTlvModelPath is not set"}
-  if not os.path.isfile(path):
-    return {"status": "fail", "error": f"model not found: {path}"}
-
-  model_input = _fixed_detector_input()
-  try:
-    dsp = factory(path, DSP_DEVICE)
-    started = time.perf_counter()
-    dsp_out = dsp.run(model_input)
-    compile_s = time.perf_counter() - started
-    times = []
-    for _ in range(int(runs)):
-      started = time.perf_counter()
-      dsp.run(model_input)
-      times.append((time.perf_counter() - started) * 1000.0)
-    cpu = factory(path, "CPU")
-    cpu_out = cpu.run(model_input)
-    opened = list(dsp.opened_devices()) + list(cpu.opened_devices())
+    proc = run(cmd, capture_output=True, timeout=RUNNER_TIMEOUT_S[runtime], env=snpe_env(p),
+               preexec_fn=_preexec())
+  except subprocess.TimeoutExpired:
+    return {"status": "timeout", "error": f"runner timed out after {RUNNER_TIMEOUT_S[runtime]:.0f} s"}
   except Exception as exc:
     return {"status": "fail", "error": _truncate(repr(exc))}
+  rc = int(getattr(proc, "returncode", 1))
+  try:
+    with open(out, encoding="utf-8") as f:
+      bench = json.load(f)
+    if not isinstance(bench, dict):
+      bench = None
+  except (OSError, ValueError):
+    bench = None
+  status = str(bench.get("status", "fail")) if bench else "fail"
+  result = {"returncode": rc, "bench": bench}
+  if status != "pass":
+    stderr = getattr(proc, "stderr", b"") or b""
+    result["stderr"] = _truncate(stderr.decode("utf-8", "replace") if isinstance(stderr, bytes) else str(stderr))
+    if bench and bench.get("error"):
+      result["error"] = _truncate(bench.get("error"))
+    else:
+      result["error"] = f"no result json (exit {rc})"
+  result["status"] = status
+  return result
 
-  forbidden = _forbidden_opened(opened)
-  if forbidden:
-    return {"status": "fail", "error": f"opened non-DSP accelerators: {forbidden}"}
-  if len(dsp_out) != len(cpu_out):
-    return {"status": "fail", "error": f"output count mismatch: dsp={len(dsp_out)} cpu={len(cpu_out)}"}
-  diff = 0.0
-  for dsp_value, cpu_value in zip(dsp_out, cpu_out, strict=True):
-    if dsp_value.shape != cpu_value.shape:
-      return {"status": "fail", "error": f"output shape mismatch: {dsp_value.shape} vs {cpu_value.shape}"}
-    if dsp_value.size:
-      diff = max(diff, float(np.max(np.abs(dsp_value.astype(np.float64) - cpu_value.astype(np.float64)))))
-  times.sort()
-  return {
-    "status": "pass",
-    "compile_s": round(compile_s, 3),
-    "steady_median_ms": round(statistics.median(times), 3),
-    "steady_p90_ms": round(times[min(len(times) - 1, int(len(times) * 0.9))], 3),
-    "max_abs_diff": diff,
-    "runs": int(runs),
-  }
+
+def step_snpe_cpu(**kw) -> dict:
+  return _run_bench("cpu", **kw)
+
+
+def step_snpe_dsp(**kw) -> dict:
+  result = _run_bench("dsp", **kw)
+  cpu_dump = dump_path("cpu")
+  dsp_dump = dump_path("dsp")
+  if os.path.exists(cpu_dump) and os.path.exists(dsp_dump):
+    import numpy as np
+    result["dump_bytes"] = [os.path.getsize(cpu_dump), os.path.getsize(dsp_dump)]
+    if result["dump_bytes"][0] == result["dump_bytes"][1]:
+      a = np.fromfile(cpu_dump, dtype=np.float32)
+      b = np.fromfile(dsp_dump, dtype=np.float32)
+      result["max_abs_diff"] = float(np.max(np.abs(a - b))) if a.size else 0.0
+    else:
+      result["max_abs_diff"] = None
+      result["dump_note"] = "size_mismatch"
+  return result
 
 
 # ---------------------------------------------------------------------------
@@ -638,19 +626,60 @@ def step_detector(*, model_path=None, adapter_factory=None, path_getter=None,
 # ---------------------------------------------------------------------------
 
 STEP_SPECS = (
-  ("presence", step_presence, STEP_TIMEOUTS["presence"]),
-  ("smoke", step_smoke, STEP_TIMEOUTS["smoke"]),
-  ("detector", step_detector, STEP_TIMEOUTS["detector"]),
+  ("presence", step_presence, STEP_TIMEOUTS["presence"], ()),
+  ("build", step_build, STEP_TIMEOUTS["build"], ("presence",)),
+  ("snpe_cpu", step_snpe_cpu, STEP_TIMEOUTS["snpe_cpu"], ("build",)),
+  ("snpe_dsp", step_snpe_dsp, STEP_TIMEOUTS["snpe_dsp"], ("build",)),
 )
 
 
-def collect_steps(*, timed=None, specs=STEP_SPECS, progress_file: str | None = None) -> dict:
+def read_steps(path: str) -> dict:
+  """Stored per-step results across stops; missing or corrupt = {}."""
+  try:
+    with open(path, encoding="utf-8") as f:
+      data = json.load(f)
+    if not isinstance(data, dict):
+      return {}
+    return {str(name): step for name, step in data.items() if isinstance(step, dict)}
+  except (OSError, ValueError):
+    return {}
+
+
+def write_steps(path: str, steps: dict) -> None:
+  write_result_atomic(path, steps)
+
+
+def _is_final(step: dict | None) -> bool:
+  return bool(step) and str(step.get("status")) in FINAL_STATUSES
+
+
+def _resume_valid(name: str, step: dict) -> bool:
+  """A stored build only counts while its binary is still on disk."""
+  if name == "build":
+    return os.path.exists(bin_path())
+  return True
+
+
+def collect_steps(*, timed=None, specs=None, progress_file: str | None = None,
+                  steps_file: str | None = None) -> dict:
+  """Run the steps that are not final yet; persist after every step.
+
+  A step stored with a final status (pass/fail/timeout) is never re-run: its
+  stored dict is reused with "resumed": True, so a red light that ends the
+  child early only costs the step that was running."""
   timed = timed or _timed
+  specs = STEP_SPECS if specs is None else specs
+  stored = read_steps(steps_file) if steps_file else {}
   steps: dict = {}
-  ok_so_far = True
-  for name, fn, timeout_s in specs:
-    if not ok_so_far:
+  for name, fn, timeout_s, needs in specs:
+    previous = stored.get(name)
+    if _is_final(previous) and _resume_valid(name, previous):
+      steps[name] = {**previous, "resumed": True}
+      continue
+    if any(steps.get(dep, {}).get("status") != "pass" for dep in needs):
       steps[name] = {"name": name, "status": "skipped"}
+      if steps_file:
+        write_steps(steps_file, steps)
       continue
     if progress_file:
       try:
@@ -660,7 +689,8 @@ def collect_steps(*, timed=None, specs=STEP_SPECS, progress_file: str | None = N
     result = timed(name, fn, timeout_s)
     result.setdefault("name", name)
     steps[name] = result
-    ok_so_far = result.get("status") == "pass"
+    if steps_file:
+      write_steps(steps_file, steps)
   return steps
 
 
@@ -781,7 +811,7 @@ def _notice_payload(state: str, now: float, **fields) -> dict:
   return payload
 
 
-_STEP_INDEX = {name: index for index, (name, _fn, _timeout) in enumerate(STEP_SPECS, start=1)}
+_STEP_INDEX = {name: index for index, (name, _fn, _timeout, _needs) in enumerate(STEP_SPECS, start=1)}
 
 
 def _step_index_from_progress(progress_file: str | None, last: int = 1) -> int:
@@ -806,53 +836,51 @@ def _publish_outcome_notice(result_path: str, now: float, notice) -> None:
 
 
 # ---------------------------------------------------------------------------
-# parked gate loop
+# stop gate loop
 # ---------------------------------------------------------------------------
 
 def _make_submaster():
   from openpilot.cereal import messaging
-  return messaging.SubMaster(list(PARK_SERVICES), conflate=True)
+  return messaging.SubMaster(list(STOP_SERVICES), conflate=True)
 
 
-def _parked(sm, now: float) -> bool:
-  """PARKED per the probe contract: park gear, standstill, slow, disengaged, fresh."""
+def _stopped(sm, now: float) -> bool:
+  """STOPPED per the probe contract: standstill and slow, messages fresh.
+
+  Any gear and engagement count: a red light with openpilot engaged is the
+  normal case."""
   try:
-    for service in PARK_SERVICES:
+    for service in STOP_SERVICES:
       if not sm.seen[service]:
         return False
-      if now - sm.recv_time[service] > PARK_FRESH_S:
+      if now - sm.recv_time[service] > STOP_FRESH_S:
         return False
     car = sm["carState"]
-    sd = sm[SD_SERVICE]
-    return (str(car.gearShifter) == "park"
-            and bool(car.standstill)
-            and float(car.vEgo) < 0.1
-            and not bool(sd.enabled))
+    return bool(car.standstill) and float(car.vEgo) < 0.1
   except Exception:
     return False
 
 
-def wait_for_parked(sm, *, clock=time.monotonic, sleep=time.sleep,
-                    park_hold_s: float = PARK_HOLD_S, notice=None) -> None:
-  """Block at GATE_HZ until PARKED held continuously for park_hold_s.
+def wait_for_stop(sm, *, clock=time.monotonic, sleep=time.sleep,
+                  stop_hold_s: float = STOP_HOLD_S, notice=None) -> None:
+  """Block at GATE_HZ until STOPPED held continuously for stop_hold_s.
 
-  While arming, refreshes the on-screen notice at 2 Hz once PARKED has held
-  ARMING_SHOW_S (a brief P does not flash it). If PARKED drops before the
-  child spawns, the notice is marked aborted only when it had been shown;
-  otherwise the key is removed."""
+  While arming, refreshes the on-screen notice at 2 Hz once STOPPED has held
+  ARMING_SHOW_S. If STOPPED drops before the child spawns, the notice is
+  marked aborted only when it had been shown; otherwise the key is removed."""
   since: float | None = None
   shown = False
   while True:
     sm.update(0)
     now = clock()
-    if _parked(sm, now):
+    if _stopped(sm, now):
       if since is None:
         since = now
       held = now - since
       if notice is not None and held >= ARMING_SHOW_S:
-        notice(_notice_payload("arming", now, deadline=since + park_hold_s))
+        notice(_notice_payload("arming", now, deadline=since + stop_hold_s))
         shown = True
-      if held >= park_hold_s:
+      if held >= stop_hold_s:
         return
     else:
       if since is not None and notice is not None:
@@ -879,8 +907,9 @@ def monitor_child(proc, sm, *, clock=time.monotonic, sleep=time.sleep,
                   notice=None) -> tuple[str, object]:
   """Watch a running child: ("exited"|"unparked"|"timeout"|"rss", detail).
 
-  While the child runs, the notice sink (when given) is refreshed at 2 Hz with
-  the child's current step from its .progress file."""
+  "unparked" is any sample that is no longer STOPPED: the car pulled away
+  from the red light. While the child runs, the notice sink (when given) is
+  refreshed at 2 Hz with the child's current step from its .progress file."""
   rss_reader = rss_reader or _child_rss_bytes
   spawn_t = clock()
   next_rss = spawn_t
@@ -894,7 +923,7 @@ def monitor_child(proc, sm, *, clock=time.monotonic, sleep=time.sleep,
     now = clock()
     if now - spawn_t >= total_timeout_s:
       return ("timeout", None)
-    if not _parked(sm, now):
+    if not _stopped(sm, now):
       return ("unparked", None)
     if notice is not None and now >= next_notice:
       next_notice = now + NOTICE_PERIOD_S
@@ -913,18 +942,22 @@ def run_probe(result_path: str, *, sm, attempt_file: str, pre_state: dict | None
               popen_factory=None, child_cmd=None, clock=time.monotonic,
               sleep=time.sleep, rss_reader=None, meta: dict | None = None,
               notice=None) -> dict:
-  """Gate loop: spawn the child only while PARKED and watch PARKED + RSS.
+  """Gate loop: spawn the child only while STOPPED and watch STOPPED + RSS.
 
-  A non-PARKED sample (or a stale message) kills the child without a result
-  and restores the attempt latch (notice aborted). A cleanly finished child
-  leaves its result file; any other outcome gets a parent-written failure
-  result (notice failed). The notice writes are best-effort.
+  A non-STOPPED sample (the car pulls away) kills the child without a result
+  and restores the attempt latch: the steps it already persisted stay in
+  steps_file, so the next stop continues where it left off and nothing is a
+  probe failure. A child that exits 0 without a result is likewise "incomplete,
+  wait for the next stop". Only a timeout, the RSS limit, a nonzero exit or an
+  unexpected result file ends the probe with a result. Notices are arming ->
+  running step n/4 while stopped, then done/failed once; the aborted notice
+  marks a stop that ended before its child finished.
   """
   global _RUNNING_CHILD
   factory = popen_factory or _default_popen
   cmd = child_cmd or _default_child_cmd(result_path)
   while True:
-    wait_for_parked(sm, clock=clock, sleep=sleep, notice=notice)
+    wait_for_stop(sm, clock=clock, sleep=sleep, notice=notice)
     state = pre_state or {"count": 0, "lost_steps": []}
     write_attempt_state(attempt_file, {"count": int(state.get("count", 0)) + 1,
                                        "lost_steps": list(state.get("lost_steps", []))})
@@ -937,11 +970,12 @@ def run_probe(result_path: str, *, sm, attempt_file: str, pre_state: dict | None
     finally:
       _RUNNING_CHILD = None
 
-    if outcome == "unparked":
-      if notice is not None:
+    if outcome == "unparked" or (outcome == "exited" and detail == 0
+                                 and not os.path.exists(result_path)):
+      if notice is not None and outcome == "unparked":
         notice(_notice_payload("aborted", clock()))
       _kill_proc(proc)
-      # Ignition/park stop: not a probe failure, do not consume the attempt.
+      # Stop ended / steps still pending: not a probe failure, keep the progress.
       restore_attempt_state(attempt_file, pre_state)
       _remove_file(progress_file)
       continue
@@ -970,15 +1004,35 @@ def _default_child_cmd(result_path: str) -> list[str]:
   return [sys.executable, "-m", "openpilot.selfdrive.carrot.tlv.dsp_probe", "--child", "--result", result_path]
 
 
+def all_final(steps: dict) -> bool:
+  """Every declared step has a final status, so the result may be written."""
+  return all(_is_final(steps.get(spec[0])) for spec in STEP_SPECS)
+
+
 def _child_main(result_path: str) -> None:
-  payload = build_result_payload(
-    collect_steps(progress_file=progress_path(result_path)),
-    commit=current_commit_short(),
-    device_type=_device_type(),
-    agnos_version=_agnos_version(),
-    timestamp=_timestamp_iso(),
-  )
-  write_result_atomic(result_path, payload)
+  """One stop's worth of work: run the pending steps, persist each, and write
+  the result only when nothing is left. The progress store survives the exit."""
+  store = steps_path(result_path)
+  _new_work()
+  try:
+    steps = collect_steps(progress_file=progress_path(result_path), steps_file=store)
+    if not all_final(steps):
+      print(f"dsp_probe: steps pending {sorted(k for k, v in steps.items() if not _is_final(v))}",
+            flush=True)
+      return
+    payload = build_result_payload(
+      steps,
+      commit=current_commit_short(),
+      device_type=_device_type(),
+      agnos_version=_agnos_version(),
+      timestamp=_timestamp_iso(),
+    )
+    write_result_atomic(result_path, payload)
+    _remove_file(store)
+    shutil.rmtree(bin_dir(), ignore_errors=True)
+  finally:
+    shutil.rmtree(_WORK.get("dir") or "", ignore_errors=True)
+    _WORK.clear()
 
 
 def _parse_argv(argv: list[str]) -> dict:
@@ -996,7 +1050,7 @@ def main() -> None:
   global _probe_disabled_by_lost_attempts
   result_path = probe_result_path()
   if os.path.exists(result_path):
-    print(f"dsp_probe: result already exists for this commit: {result_path}", flush=True)
+    print(f"dsp_probe: result already exists: {result_path}", flush=True)
     return
 
   attempt_file = attempt_path(result_path)

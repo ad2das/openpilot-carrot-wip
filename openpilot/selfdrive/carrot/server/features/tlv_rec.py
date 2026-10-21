@@ -113,23 +113,27 @@ def latest_dsp_probe(root: str | None = None) -> dict | None:
   return payload
 
 
-def _probe_commit() -> str:
+def _probe_key() -> str:
   from openpilot.selfdrive.carrot.tlv import dsp_probe
-  return dsp_probe.current_commit_short()
+  return dsp_probe.PROBE_KEY
 
 
 def clear_dsp_probe_files(root: str | None = None) -> list[str]:
-  """Delete this commit's .json/.attempt/.progress so the probe can run again."""
+  """Delete the single probe run's files so it can run again (WSNPE2)."""
   root = root if root is not None else DSP_PROBE_ROOT
-  commit = _probe_commit()
+  key = _probe_key()
   removed = []
-  for suffix in (".json", ".attempt", ".progress"):
-    path = os.path.join(root, f"{commit}{suffix}")
+  for suffix in (".json", ".attempt", ".progress", ".steps.json"):
+    path = os.path.join(root, f"{key}{suffix}")
     try:
       os.unlink(path)
       removed.append(os.path.basename(path))
     except OSError:
       pass
+  bin_root = os.path.join(root, "bin", key)
+  if os.path.isdir(bin_root):
+    shutil.rmtree(bin_root, ignore_errors=True)
+    removed.append(f"bin/{key}")
   return removed
 
 
@@ -289,30 +293,37 @@ document.querySelectorAll('button.del').forEach(function(btn){
 
 
 _PROBE_STEP_LABELS = {
-  "presence": "DSP \uc5f0\uacb0/\ud234\uccb4\uc778",
-  "smoke": "tinygrad DSP \uc2a4\ubaa8\ud06c",
-  "detector": "\uac80\ucd9c\uae30 ONNX",
+  "presence": "SNPE \ud30c\uc77c/\ud234\uccb4\uc778",
+  "build": "\ub7ec\ub108 \ube4c\ub4dc",
+  "snpe_cpu": "SNPE CPU",
+  "snpe_dsp": "SNPE DSP",
 }
 _PROBE_STATUS_LABELS = {"pass": "\ud1b5\uacfc", "fail": "\uc2e4\ud328", "timeout": "\uc2dc\uac04 \ucd08\uacfc", "skipped": "\uac74\ub108\ub700"}
+_PROBE_STEP_ORDER = ("presence", "build", "snpe_cpu", "snpe_dsp")
 
 
 def _probe_detail(step: dict) -> str:
   name = step.get("name")
   if step.get("status") != "pass":
     return html.escape(str(step.get("error") or ""))[:160]
-  if name == "smoke":
-    return f"\uccab \uc2e4\ud589 {step.get('first_ms', '?')} ms / \uc911\uc559\uac12 {step.get('steady_median_ms', '?')} ms"
-  if name == "detector":
-    return (f"\ucef4\ud30c\uc77c {step.get('compile_s', '?')} s / \uc911\uc559\uac12 {step.get('steady_median_ms', '?')} ms / "
-            f"p90 {step.get('steady_p90_ms', '?')} ms / CPU \ub300\ube44 \ucd5c\ub300\ucc28\uc774 {step.get('max_abs_diff', '?')}")
   if name == "presence":
-    clang = step.get("clang") or {}
-    return f"clang {clang.get('status', '?')}"
+    clang = "ok" if step.get("clangxx") not in (None, "missing") else "missing"
+    return f"clang++ {clang} / cdsprpc {len(step.get('cdsprpc') or [])}"
+  if name == "build":
+    return f"{step.get('duration_s', '?')} s"
+  if name in ("snpe_cpu", "snpe_dsp"):
+    bench = step.get("bench") or {}
+    detail = (f"v{bench.get('snpe_version', '?')} / \uccab {bench.get('first_ms', '?')} ms / "
+              f"\uc911\uc559\uac12 {bench.get('median_ms', '?')} ms / p90 {bench.get('p90_ms', '?')} ms")
+    if name == "snpe_dsp":
+      detail += f" / CPU \ub300\ube44 \ucd5c\ub300\ucc28\uc774 {step.get('max_abs_diff', '?')}"
+    return detail
   return ""
 
 
-_PROBE_HINT = ("\uc8fc\ucc28(P) \uc0c1\ud0dc\ub85c \uc2dc\ub3d9\uc744 \ucf20 \ucc44 \uc57d 3\ubd84 \uae30\ub2e4\ub9ac\uba74 "
-               "\uc790\ub3d9\uc73c\ub85c \uc2dc\ud5d8\ud569\ub2c8\ub2e4. \uae30\uc5b4\ub97c \ubc14\uafb8\uba74 \uc989\uc2dc \uc911\ub2e8\ub429\ub2c8\ub2e4.")
+_PROBE_HINT = ("\uc8fc\ud589 \uc911 \uc815\ucc28(\uc2e0\ud638 \ub300\uae30)\ud560 \ub54c\ub9c8\ub2e4 "
+               "\uc790\ub3d9\uc73c\ub85c \uc870\uae08\uc529 \uc2dc\ud5d8\ud569\ub2c8\ub2e4. "
+               "\ub530\ub85c \ud560 \uc77c\uc740 \uc5c6\uc2b5\ub2c8\ub2e4.")
 _PROBE_RETRY_BUTTON = ('<button class="btn" onclick="retryDspProbe()">'
                        'DSP \uc2dc\ud5d8 \ub2e4\uc2dc \ud558\uae30</button>')
 
@@ -325,7 +336,7 @@ def _probe_section(probe: dict | None) -> str:
             + f"<p>{_PROBE_RETRY_BUTTON}</p>")
   steps = probe.get("steps") or {}
   rows = []
-  for name in ("presence", "smoke", "detector"):
+  for name in _PROBE_STEP_ORDER:
     step = steps.get(name) or {"status": "skipped"}
     status = _PROBE_STATUS_LABELS.get(str(step.get("status")), str(step.get("status", "?")))
     css = "ok" if step.get("status") == "pass" else "bad"

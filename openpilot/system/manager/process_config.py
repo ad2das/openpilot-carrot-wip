@@ -137,8 +137,14 @@ def enable_tlvd(started, params, CP: car.CarParams) -> bool:
     return False
 
 def enable_tlv_dsp_probe(started, params, CP: car.CarParams) -> bool:
-  # DSP path parked 2026-10-14 (AGNOS has no lld; tinygrad DSPCompiler unusable): the probe never runs. Kept for a future DSP revisit.
-  return False
+  # Onroad one-time SNPE DSP probe (WSNPE2): idles until any stop and works a step
+  # per stop; the one-shot result file latches it off; see
+  # .../tlv/dsp_probe.py should_run()/run_probe().
+  try:
+    from openpilot.selfdrive.carrot.tlv import dsp_probe
+    return dsp_probe.should_run(started, params)
+  except Exception:
+    return False
 
 procs = [
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),

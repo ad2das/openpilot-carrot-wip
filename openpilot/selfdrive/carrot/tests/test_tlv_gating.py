@@ -259,14 +259,29 @@ def test_tlv_dsp_probe_process_registered():
   assert proc.should_run is process_config.enable_tlv_dsp_probe
 
 
-def test_tlv_dsp_probe_never_runs():
-  # DSP path parked 2026-10-14 (no lld on AGNOS); the probe gating is off for
-  # every started x TrafficLightDetectMode combination.
-  for started in (False, True):
-    for tld in (0, 1, 2):
-      params = FakeParams({"TrafficLightDetectMode": tld})
-      assert process_config.enable_tlv_dsp_probe(started, params, None) is False, (started, tld)
-  assert process_config.enable_tlv_dsp_probe(True, FakeParams(), None) is False
+def test_tlv_dsp_probe_delegates_to_should_run(monkeypatch):
+  from openpilot.selfdrive.carrot.tlv import dsp_probe
+  seen = []
+
+  def fake_should_run(started, params):
+    seen.append((started, params))
+    return started
+
+  monkeypatch.setattr(dsp_probe, "should_run", fake_should_run)
+  params = FakeParams({"TrafficLightDetectMode": 1})
+  assert process_config.enable_tlv_dsp_probe(True, params, None) is True
+  assert process_config.enable_tlv_dsp_probe(False, params, None) is False
+  assert seen == [(True, params), (False, params)]
+
+
+def test_tlv_dsp_probe_false_when_should_run_raises(monkeypatch):
+  from openpilot.selfdrive.carrot.tlv import dsp_probe
+
+  def boom(started, params):
+    raise RuntimeError("boom")
+
+  monkeypatch.setattr(dsp_probe, "should_run", boom)
+  assert process_config.enable_tlv_dsp_probe(True, FakeParams({"TrafficLightDetectMode": 1}), None) is False
 
 
 # -- crash_loop_guard --------------------------------------------------------

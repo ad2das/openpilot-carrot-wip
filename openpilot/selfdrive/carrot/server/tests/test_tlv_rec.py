@@ -185,7 +185,7 @@ def test_dsp_probe_api_and_page_without_result(tmp_path, monkeypatch):
       assert "DSP 시험 결과" in page
       assert "아직 결과가 없습니다" in page
       assert "DSP 시험 다시 하기" in page
-      assert "주차(P) 상태로 시동을 켠 채 약 3분 기다리면 자동으로 시험합니다. 기어를 바꾸면 즉시 중단됩니다." in page
+      assert "주행 중 정차(신호 대기)할 때마다 자동으로 조금씩 시험합니다. 따로 할 일은 없습니다." in page
     finally:
       await client.close()
 
@@ -204,12 +204,15 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
     "ok": False,
     "error": None,
     "steps": {
-      "presence": {"name": "presence", "status": "pass", "clang": {"status": "pass"}},
-      "smoke": {"name": "smoke", "status": "pass", "first_ms": 12.0, "steady_median_ms": 3.0},
-      "detector": {"name": "detector", "status": "fail", "error": "DSP op unsupported"},
+      "presence": {"name": "presence", "status": "pass", "clangxx": "/usr/bin/clang++",
+                   "cdsprpc": ["/usr/lib/libcdsprpc.so"]},
+      "build": {"name": "build", "status": "pass", "duration_s": 41.5},
+      "snpe_cpu": {"name": "snpe_cpu", "status": "pass",
+                   "bench": {"snpe_version": "1.41", "first_ms": 12.0, "median_ms": 3.0, "p90_ms": 4.0}},
+      "snpe_dsp": {"name": "snpe_dsp", "status": "fail", "error": "SNPE op unsupported"},
     },
   }
-  (probe_root / "abc1234.json").write_text(json.dumps(payload), encoding="utf-8")
+  (probe_root / "snpe1.json").write_text(json.dumps(payload), encoding="utf-8")
   monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
 
   async def scenario():
@@ -219,31 +222,38 @@ def test_dsp_probe_api_and_page_with_result(tmp_path, monkeypatch):
       data = await resp.json()
       assert data["ok"] is True
       assert data["probe"]["commit"] == "abc1234"
-      assert data["probe"]["file"] == "abc1234.json"
-      assert data["probe"]["steps"]["detector"]["status"] == "fail"
+      assert data["probe"]["file"] == "snpe1.json"
+      assert data["probe"]["steps"]["snpe_dsp"]["status"] == "fail"
       page = await (await client.get("/tlv_rec")).text()
       assert "DSP 시험 결과" in page
       assert "통과" in page
       assert "실패" in page
-      assert "DSP op unsupported" in page
+      assert "SNPE op unsupported" in page
+      assert "SNPE 파일/툴체인" in page
+      assert "러너 빌드" in page
+      assert "SNPE CPU" in page
+      assert "SNPE DSP" in page
+      assert "41.5 s" in page
       assert "3.0" in page
       assert "DSP 시험 다시 하기" in page
-      assert "주차(P) 상태로 시동을 켠 채 약 3분 기다리면 자동으로 시험합니다. 기어를 바꾸면 즉시 중단됩니다." in page
+      assert "주행 중 정차(신호 대기)할 때마다 자동으로 조금씩 시험합니다. 따로 할 일은 없습니다." in page
     finally:
       await client.close()
 
   asyncio.run(scenario())
 
 
-def test_dsp_probe_retry_clears_this_commit_only(tmp_path, monkeypatch):
+def test_dsp_probe_retry_clears_the_single_run(tmp_path, monkeypatch):
   module = _load_module(tmp_path)
   probe_root = tmp_path / "dsp_probe"
   probe_root.mkdir()
-  for suffix in (".json", ".attempt", ".progress"):
-    (probe_root / f"abc1234{suffix}").write_text("{}", encoding="utf-8")
+  for suffix in (".json", ".attempt", ".progress", ".steps.json"):
+    (probe_root / f"snpe1{suffix}").write_text("{}", encoding="utf-8")
   (probe_root / "other.json").write_text("{}", encoding="utf-8")
+  (probe_root / "bin" / "snpe1").mkdir(parents=True)
+  (probe_root / "bin" / "snpe1" / "tlv_snpe_bench").write_bytes(b"bin")
   monkeypatch.setattr(module, "DSP_PROBE_ROOT", str(probe_root))
-  monkeypatch.setattr(module, "_probe_commit", lambda: "abc1234")
+  monkeypatch.setattr(module, "_probe_key", lambda: "snpe1")
 
   async def scenario():
     client = await _start_client(module)
@@ -252,10 +262,13 @@ def test_dsp_probe_retry_clears_this_commit_only(tmp_path, monkeypatch):
       assert resp.status == 200
       data = await resp.json()
       assert data["ok"] is True
-      assert sorted(data["removed"]) == ["abc1234.attempt", "abc1234.json", "abc1234.progress"]
-      assert not (probe_root / "abc1234.json").exists()
-      assert not (probe_root / "abc1234.attempt").exists()
-      assert not (probe_root / "abc1234.progress").exists()
+      assert sorted(data["removed"]) == ["bin/snpe1", "snpe1.attempt", "snpe1.json",
+                                         "snpe1.progress", "snpe1.steps.json"]
+      assert not (probe_root / "snpe1.json").exists()
+      assert not (probe_root / "snpe1.attempt").exists()
+      assert not (probe_root / "snpe1.progress").exists()
+      assert not (probe_root / "snpe1.steps.json").exists()
+      assert not (probe_root / "bin" / "snpe1").exists()
       assert (probe_root / "other.json").exists()
       # idempotent: a second retry finds nothing left to remove
       resp = await client.post("/api/tlv_rec/dsp_probe/retry")

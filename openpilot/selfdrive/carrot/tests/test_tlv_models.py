@@ -9,7 +9,7 @@ import types
 import numpy as np
 import pytest
 
-from openpilot.selfdrive.carrot.tlv import backends, dsp_probe, resources, tlvd
+from openpilot.selfdrive.carrot.tlv import backends, resources, tlvd
 
 DETECTOR_OUTPUT_SHAPES = ((1, 64, 40, 80), (1, 1, 40, 80), (1, 64, 20, 40), (1, 1, 20, 40), (1, 64, 10, 20), (1, 1, 10, 20))
 
@@ -158,15 +158,6 @@ def _install_fake_params_module(monkeypatch, value) -> None:
   module = types.ModuleType("openpilot.common.params")
   module.Params = FakeParamsModule
   monkeypatch.setitem(sys.modules, "openpilot.common.params", module)
-
-
-def test_dsp_probe_model_path_falls_back_to_bundled(monkeypatch):
-  _install_fake_params_module(monkeypatch, None)
-  assert dsp_probe._model_path_from_params() == backends.BUNDLED_DETECTOR
-  _install_fake_params_module(monkeypatch, b"")
-  assert dsp_probe._model_path_from_params() == backends.BUNDLED_DETECTOR
-  _install_fake_params_module(monkeypatch, b"  /data/models/explicit.onnx  ")
-  assert dsp_probe._model_path_from_params() == "/data/models/explicit.onnx"
 
 
 def _ensure_cc(tmp_path, monkeypatch) -> bool:
