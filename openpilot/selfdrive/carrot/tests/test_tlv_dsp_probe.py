@@ -1760,10 +1760,12 @@ def test_collect_pool_tick_caps_each_view(probe_root, tmp_path):
   root.mkdir()
   session = os.path.join(str(root), "20261020-200100")
   os.makedirs(session)
-  shutil.copyfile(os.path.join(FIXTURE_FRAMES, "0000023.jpg"), os.path.join(session, "0000023.jpg"))
+  # the recorder writes one file per row, so every row has its own key
   with open(os.path.join(session, "index.jsonl"), "w", encoding="utf-8", newline="\n") as f:
-    for _ in range(100):
-      f.write(json.dumps({"file": "0000023.jpg", "view": "far"}) + "\n")
+    for k in range(100):
+      name = f"{k:07d}.jpg"
+      shutil.copyfile(os.path.join(FIXTURE_FRAMES, "0000023.jpg"), os.path.join(session, name))
+      f.write(json.dumps({"file": name, "view": "far"}) + "\n")
 
   added = dsp_probe.collect_pool_tick(str(root), stride=1)
   assert added == dsp_probe.POOL_PER_VIEW == 26
@@ -1790,9 +1792,10 @@ def test_collect_pool_tick_survives_a_session_deleted_mid_scan(probe_root, tmp_p
       raise FileNotFoundError(2, "No such file or directory", str(path))
     return real_open(path, *args, **kwargs)
 
-  monkeypatch.setattr("builtins.open", flaky_open)
-  added = dsp_probe.collect_pool_tick(str(root))
-  monkeypatch.undo()
+  # a scoped patch: monkeypatch.undo() would also revert probe_root's PROBE_ROOT
+  with monkeypatch.context() as m:
+    m.setattr("builtins.open", flaky_open)
+    added = dsp_probe.collect_pool_tick(str(root))
   assert added == 2  # the vanished session is skipped, the others still copy
   assert {row["session"] for row in _pool_rows(probe_root)} == {"20261020-200100",
                                                                "20261020-200300"}
