@@ -54,13 +54,17 @@ RECORDER_RETRY_S = 60.0
 MAX_PUBLISHED_DETS = 16
 CAPNP_VIEW = {"far": "farView", "near": "nearView"}
 # W99 cost-aware scheduling (credit). Classify-only frames keep a 5 Hz cadence
-# target; the detector runs at 5 Hz without tracks and 2.5 Hz with them, but the
-# budget decides what actually runs - there is no frame-rate floor.
+# target; on the DSP build the detector runs every tick while the budget has
+# credit (with or without tracks); the budget decides. There is no frame-rate
+# floor.
 CLASSIFY_INTERVAL_S = 0.2
 # W121 L2: faster lamp votes while all tracks are in the far tier (>120 m)
 CLASSIFY_INTERVAL_FAR_S = 0.1
-DETECT_INTERVAL_S = 0.2
-DETECT_INTERVAL_TRACKS_S = 0.4
+DETECT_INTERVAL_S = 0.1
+DETECT_INTERVAL_TRACKS_S = 0.1
+# WSNPE15: the 10 Hz loop's ticks jitter by a few ms; an interval check that
+# lands 1 ms short would cost a whole tick, so intervals are compared with slack.
+SCHED_SLACK_S = 0.02
 DETECT_MAX_GAP_S = 3.0
 # Flat-road tail-light gate needs a calibrated camera (crops.horizon_row uses
 # rpyCalib); str(calStatus) because pycapnp enums stringify as the enum name.
@@ -85,10 +89,10 @@ def choose_frame_kind(*, now: float, last_detect: float, last_classify: float, h
   of its estimate is refused. Pure apart from budget.can_run()/estimate().
   """
   detect_interval = DETECT_INTERVAL_TRACKS_S if has_tracks else DETECT_INTERVAL_S
-  if now - last_detect >= detect_interval and budget.can_run("detect", now):
+  if now - last_detect >= detect_interval - SCHED_SLACK_S and budget.can_run("detect", now):
     return "detect"
   classify_interval = CLASSIFY_INTERVAL_FAR_S if far_tracks_only else CLASSIFY_INTERVAL_S
-  if not (classifier_enabled and has_tracks and now - last_classify >= classify_interval):
+  if not (classifier_enabled and has_tracks and now - last_classify >= classify_interval - SCHED_SLACK_S):
     return None
   if not budget.can_run("classify", now):
     return None

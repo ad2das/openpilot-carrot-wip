@@ -220,19 +220,45 @@ def test_choose_frame_kind_detector_first_and_intervals():
   budget.tick(0.0)  # seed; credit needs 0.25 s to reach the initial 0.5 s estimate
   assert tlvd.choose_frame_kind(now=1.0, last_detect=-1e9, last_classify=-1e9, has_tracks=False,
                                 classifier_enabled=True, budget=budget) == "detect"
-  # 0.05 s after a detect neither interval is due without tracks -> skip.
+  # WSNPE15: the detector interval is 0.1 s with OR without tracks and is
+  # compared with SCHED_SLACK_S, so 0.05 s is still inside the same tick.
   assert tlvd.choose_frame_kind(now=1.05, last_detect=1.0, last_classify=-1e9, has_tracks=False,
                                 classifier_enabled=True, budget=budget) is None
-  # With tracks the classify interval (0.2 s) can fill in between detections.
+  # At 0.25 s the detector is due again and takes priority over the classifier.
   assert tlvd.choose_frame_kind(now=1.25, last_detect=1.0, last_classify=-1e9, has_tracks=True,
-                                classifier_enabled=True, budget=budget) == "classify"
-  # Detector interval doubles with tracks: at 0.3 s it is not due yet.
+                                classifier_enabled=True, budget=budget) == "detect"
+  # 0.3 s after the last detect: still due (0.3 >= 0.1 - 0.02) and the credit
+  # is still full, so the detector wins again.
   assert tlvd.choose_frame_kind(now=1.3, last_detect=1.0, last_classify=1.25, has_tracks=True,
-                                classifier_enabled=True, budget=budget) is None
-  # At 0.5 s the detector takes priority over the classifier (1.4 - 1.0 is
-  # 0.3999... in float, so stay off the exact interval boundary).
+                                classifier_enabled=True, budget=budget) == "detect"
+  # 0.5 s after the last detect the detector still takes priority.
   assert tlvd.choose_frame_kind(now=1.5, last_detect=1.0, last_classify=1.25, has_tracks=True,
                                 classifier_enabled=True, budget=budget) == "detect"
+
+
+def test_wsnpe15_detect_every_tick_with_tracks():
+  budget, _clocks = make_budget()
+  assert tlvd.choose_frame_kind(now=1.09, last_detect=1.0, last_classify=1.0, has_tracks=True,
+                                classifier_enabled=True, budget=budget) == "detect"
+
+
+def test_wsnpe15_budget_frame_gap_slack():
+  budget, clocks = make_budget()
+  budget.begin("classify", 1.0)
+  clocks.cpu += 0.036
+  budget.end(1.0)
+  assert budget.can_run("classify", 1.09)
+  budget.begin("classify", 1.09)
+  clocks.cpu += 0.036
+  budget.end(1.09)
+  assert not budget.can_run("classify", 1.07)
+
+
+def test_wsnpe15_duty_stays_within_budget():
+  clocks, detects, _classifies, _trace = run_credit_sim(0.064, cls_cost=0.036, tracks=True,
+                                                        camera_hz=10.0)
+  assert clocks.cpu / clocks.t <= resources.CpuCreditBudget.CPU_BUDGET + 0.02
+  assert detects / DURATION >= 4.5
 
 
 def test_choose_frame_kind_needs_classifier_and_tracks():
@@ -273,12 +299,14 @@ def test_choose_frame_kind_skips_without_credit():
 def test_choose_frame_kind_far_tracks_only_uses_0_1s_classify():
   budget, _clocks = make_budget()
   budget.tick(0.0)  # seed the baselines
+  # WSNPE15: the detector is 0.1 s with slack, so these frames sit 0.05 s after
+  # a detect - inside the detector window - and only the classifier can win.
   # With far_tracks_only the classify interval drops to 0.1 s (W121 L2)...
-  assert tlvd.choose_frame_kind(now=1.1, last_detect=1.0, last_classify=1.0, has_tracks=True,
+  assert tlvd.choose_frame_kind(now=1.05, last_detect=1.0, last_classify=0.9, has_tracks=True,
                                 classifier_enabled=True, budget=budget,
                                 far_tracks_only=True) == "classify"
   # ...while the same state without the flag is still inside 0.2 s -> skip.
-  assert tlvd.choose_frame_kind(now=1.1, last_detect=1.0, last_classify=1.0, has_tracks=True,
+  assert tlvd.choose_frame_kind(now=1.05, last_detect=1.0, last_classify=0.9, has_tracks=True,
                                 classifier_enabled=True, budget=budget,
                                 far_tracks_only=False) is None
   # Detector priority is unchanged: a due detector beats the faster classifier.

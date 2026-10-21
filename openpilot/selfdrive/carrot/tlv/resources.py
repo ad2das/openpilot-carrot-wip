@@ -178,6 +178,9 @@ class CpuCreditBudget:
   CREDIT_CAP_S = 2.0
   CREDIT_START_S = 0.4
   MAX_FRAME_HZ = 10.0
+  # WSNPE15: the 10 Hz loop jitters by a few ms; without slack the frame-gap
+  # gate would refuse a legitimately scheduled frame and cost a whole tick.
+  FRAME_SLACK_S = 0.02
   COST_EMA_ALPHA = 0.3
   COST_INIT = {"detect": 0.5, "classify": 0.05}
   DUTY_WINDOW_S = 10.0
@@ -234,7 +237,7 @@ class CpuCreditBudget:
       now = self._clock()
     now = float(now)
     self.tick(now)
-    if self._last_frame_start is not None and now - self._last_frame_start < 1.0 / self.MAX_FRAME_HZ:
+    if self._last_frame_start is not None and now - self._last_frame_start < 1.0 / self.MAX_FRAME_HZ - self.FRAME_SLACK_S:
       return False
     if self._credit >= self.estimate(kind):
       return True
