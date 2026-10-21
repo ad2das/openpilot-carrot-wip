@@ -342,11 +342,45 @@ def test_d12_resolve_backend_name_defaults_dsp_on_tici():
   from openpilot.selfdrive.carrot.tlv import tlvd
   assert tlvd.resolve_backend_name("", True) == "dsp"
   assert tlvd.resolve_backend_name("", False) == "onnx"
-  assert tlvd.resolve_backend_name("onnx", True) == "onnx"
+  assert tlvd.resolve_backend_name("auto", True) == "dsp"
+  assert tlvd.resolve_backend_name(" auto ", False) == "onnx"
+  assert tlvd.resolve_backend_name("onnx", True) == "dsp"   # legacy persisted default (route 468)
   assert tlvd.resolve_backend_name("onnx", False) == "onnx"
+  assert tlvd.resolve_backend_name("cpu", True) == "onnx"
+  assert tlvd.resolve_backend_name("cpu", False) == "onnx"
   assert tlvd.resolve_backend_name("dsp", False) == "dsp"
   assert tlvd.resolve_backend_name(" null ", True) == "null"
   assert tlvd.resolve_backend_name("tinygrad", True) == "tinygrad"
+
+
+def test_d17_params_default_is_auto():
+  import pathlib
+  root = pathlib.Path(__file__).resolve().parents[3]
+  text = (root / "common" / "params_keys.h").read_text()
+  assert '{"CarrotTlvBackend", {PERSISTENT, STRING, "auto"}},' in text
+
+
+def test_d18_legacy_onnx_param_tries_dsp_first_on_tici(monkeypatch):
+  from openpilot.selfdrive.carrot.tlv import tlvd
+
+  calls = []
+
+  def fake_make_backend(name, model_path="", decoder=None):
+    calls.append(name)
+    return _Nop(name), None
+
+  def fake_make_classifier(name, model_path=""):
+    return _Nop("cls")
+
+  monkeypatch.setattr(backends, "make_backend", fake_make_backend)
+  monkeypatch.setattr(backends, "make_classifier", fake_make_classifier)
+  monkeypatch.setattr(tlvd, "_host_is_tici", lambda: True)
+
+  runner = tlvd.TlvRunner(_Params({"CarrotTlvBackend": "onnx"}))
+
+  assert calls[0] == "dsp"
+  assert runner.runtime_name == "dsp"
+  assert runner.backend_error == ""
 
 
 def test_d13_budget_charges_the_server_cpu_delta(monkeypatch):

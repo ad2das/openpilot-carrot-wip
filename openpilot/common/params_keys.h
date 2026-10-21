@@ -389,7 +389,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"DriverMonitoringMode", {PERSISTENT, INT, "0"}},
     {"CarrotVisionEnabled", {PERSISTENT, BOOL, "0"}},
     {"CarrotTlvMode", {PERSISTENT, INT, "0"}},  // legacy, ignored since W129 (vision follows TrafficLightDetectMode)
-    {"CarrotTlvBackend", {PERSISTENT, STRING, "onnx"}},
+    {"CarrotTlvBackend", {PERSISTENT, STRING, "auto"}},
     {"CarrotTlvModelPath", {PERSISTENT, STRING}},
     {"CarrotTlvLampModelPath", {PERSISTENT, STRING}},  // lamp classifier (detect-then-track)
     {"CarrotTlvDisabled", {CLEAR_ON_MANAGER_START, BOOL}},  // tlvd crash-loop / rss_hard latch; cleared every manager start

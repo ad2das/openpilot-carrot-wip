@@ -251,11 +251,12 @@ def test_tinygrad_backend_overrides_inherited_gpu_dev(tmp_path, monkeypatch):
 def test_resolve_backend_name_defaults():
   from openpilot.selfdrive.carrot.tlv import tlvd
   # WSNPE13: "" resolves to the Hexagon DSP detector on TICI and to onnxruntime
-  # on PC; an explicit "onnx" always means onnxruntime.
+  # on PC. WSNPE14: "onnx" is the legacy persisted default (route 468) and now
+  # also means the DSP detector on TICI; "cpu" is the explicit CPU override.
   assert tlvd.resolve_backend_name("", False) == "onnx"
   assert tlvd.resolve_backend_name("onnx", False) == "onnx"
   assert tlvd.resolve_backend_name("", True) == "dsp"
-  assert tlvd.resolve_backend_name("onnx", True) == "onnx"
+  assert tlvd.resolve_backend_name("onnx", True) == "dsp"
   assert tlvd.resolve_backend_name("tinygrad", True) == "tinygrad"
   assert tlvd.resolve_backend_name("null", True) == "null"
   assert tlvd.resolve_backend_name("dsp", False) == "dsp"
@@ -548,7 +549,7 @@ def _runner_with_fake_backends(monkeypatch, tici, onnx_ok, tinygrad_ok, onnx_cla
 
   monkeypatch.setattr(backends, "make_backend", fake_make_backend)
   monkeypatch.setattr(backends, "make_classifier", fake_make_classifier)
-  params = _RunnerFakeParams({"CarrotTlvBackend": "onnx", "CarrotTlvModelPath": "x", "CarrotTlvLampModelPath": "y"})
+  params = _RunnerFakeParams({"CarrotTlvBackend": "cpu", "CarrotTlvModelPath": "x", "CarrotTlvLampModelPath": "y"})
   try:
     runner = tlvd.TlvRunner(params, recorder_root=None)
     return runner, calls

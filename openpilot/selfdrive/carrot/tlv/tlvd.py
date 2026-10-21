@@ -162,14 +162,21 @@ def _enum_ordinal(value) -> int:
 
 
 def resolve_backend_name(value: str, is_tici: bool) -> str:
-  """Resolve CarrotTlvBackend. "" means the Hexagon DSP detector on TICI (the
-  WSNPE13 default: the DLC runs at 16 ms per frame there) and onnxruntime CPU
-  everywhere else; "onnx" always means the onnxruntime CPU backend, TICI
-  included. 'dsp', 'null' and any explicit other name are untouched."""
+  """Resolve CarrotTlvBackend. "" / "auto" mean the Hexagon DSP detector on TICI
+  (the WSNPE13 default: the DLC runs at 16 ms per frame there) and onnxruntime
+  CPU everywhere else. "cpu" forces the onnxruntime CPU backend, TICI included.
+  "onnx" on TICI is the pre-DSP default that manager set_default_params() wrote
+  to every device, so it also means the DSP detector there (WSNPE14; route 468
+  ran dafc2e9c8 on the CPU because of it). 'dsp', 'null', 'tinygrad' and any
+  other explicit name are untouched."""
   name = (value or "").strip()
-  if name:
-    return name
-  return "dsp" if is_tici else "onnx"
+  if name in ("", "auto"):
+    return "dsp" if is_tici else "onnx"
+  if name == "cpu":
+    return "onnx"
+  if name == "onnx" and is_tici:
+    return "dsp"
+  return name
 
 
 def apply_cpu_policy() -> list[str]:
