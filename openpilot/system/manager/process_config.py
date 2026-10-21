@@ -136,16 +136,6 @@ def enable_tlvd(started, params, CP: car.CarParams) -> bool:
   except Exception:
     return False
 
-def enable_tlv_dsp_probe(started, params, CP: car.CarParams) -> bool:
-  # Onroad one-time SNPE DSP probe (WSNPE2): idles until any stop and works a step
-  # per stop; the one-shot result file latches it off; see
-  # .../tlv/dsp_probe.py should_run()/run_probe().
-  try:
-    from openpilot.selfdrive.carrot.tlv import dsp_probe
-    return dsp_probe.should_run(started, params)
-  except Exception:
-    return False
-
 procs = [
   DaemonProcess("manage_athenad", "openpilot.system.athena.manage_athenad", "AthenadPid"),
 
@@ -229,8 +219,6 @@ procs = [
   # Spawn via the stdlib-only launcher: a mid-drive start must not fork the running manager
   # (field hang, route 0000043e), and tlvd_launch sets the env before tlvd imports numpy/tinygrad.
   PythonProcess("tlvd", "openpilot.selfdrive.carrot.tlv.tlvd_launch", enable_tlvd, restart_if_crash=True, spawn=True),
-  # Same spawn protection: the probe is also first enabled mid-drive.
-  PythonProcess("tlv_dsp_probe", "openpilot.selfdrive.carrot.tlv.dsp_probe", enable_tlv_dsp_probe, spawn=True),
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
   PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),

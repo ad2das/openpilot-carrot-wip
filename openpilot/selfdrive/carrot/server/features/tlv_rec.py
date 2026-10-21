@@ -16,8 +16,6 @@ traversal cannot reach the filesystem.
 from __future__ import annotations
 
 import asyncio
-import html
-import json
 import os
 import re
 import shutil
@@ -28,7 +26,6 @@ from datetime import datetime
 from aiohttp import web
 
 REC_ROOT = "/data/media/0/carrot_tlv_rec"
-DSP_PROBE_ROOT = "/data/media/0/carrot_tlv_rec/dsp_probe"
 SESSION_NAME_RE = re.compile(r"^\d{8}-\d{6}$")
 ZIP_CHUNK_BYTES = 256 * 1024
 STREAM_QUEUE_MAX = 8
@@ -83,60 +80,6 @@ def list_sessions(root: str | None = None) -> list[dict]:
   return sessions
 
 
-def latest_dsp_probe(root: str | None = None) -> dict | None:
-  """Newest dsp_probe result (openpilot/selfdrive/carrot/tlv/dsp_probe.py), best-effort."""
-  root = root if root is not None else DSP_PROBE_ROOT
-  try:
-    names = [name for name in os.listdir(root) if name.endswith(".json")]
-  except OSError:
-    return None
-  newest_path = None
-  newest_mtime = -1.0
-  for name in names:
-    path = os.path.join(root, name)
-    try:
-      mtime = os.path.getmtime(path)
-    except OSError:
-      continue
-    if mtime > newest_mtime:
-      newest_path, newest_mtime = path, mtime
-  if newest_path is None:
-    return None
-  try:
-    with open(newest_path, encoding="utf-8") as f:
-      payload = json.load(f)
-  except (OSError, ValueError):
-    return None
-  if not isinstance(payload, dict):
-    return None
-  payload["file"] = os.path.basename(newest_path)
-  return payload
-
-
-def _probe_key() -> str:
-  from openpilot.selfdrive.carrot.tlv import dsp_probe
-  return dsp_probe.PROBE_KEY
-
-
-def clear_dsp_probe_files(root: str | None = None) -> list[str]:
-  """Delete the single probe run's files so it can run again (WSNPE2)."""
-  root = root if root is not None else DSP_PROBE_ROOT
-  key = _probe_key()
-  removed = []
-  for suffix in (".json", ".attempt", ".progress", ".steps.json"):
-    path = os.path.join(root, f"{key}{suffix}")
-    try:
-      os.unlink(path)
-      removed.append(os.path.basename(path))
-    except OSError:
-      pass
-  bin_root = os.path.join(root, "bin", key)
-  if os.path.isdir(bin_root):
-    shutil.rmtree(bin_root, ignore_errors=True)
-    removed.append(f"bin/{key}")
-  return removed
-
-
 class _ChunkSink:
   """Unseekable zipfile sink; drain() hands the buffered bytes out as chunks."""
 
@@ -182,17 +125,6 @@ def iter_zip_chunks(session_dir: str, chunk_size: int = ZIP_CHUNK_BYTES):
 async def api_tlv_rec_sessions(_request: web.Request) -> web.Response:
   sessions = await asyncio.to_thread(list_sessions)
   return web.json_response(sessions)
-
-
-async def api_tlv_rec_dsp_probe(_request: web.Request) -> web.Response:
-  probe = await asyncio.to_thread(latest_dsp_probe)
-  return web.json_response({"ok": True, "probe": probe})
-
-
-async def api_tlv_rec_dsp_probe_retry(_request: web.Request) -> web.Response:
-  """User-triggered re-run: drop this commit's result/attempt/progress files."""
-  removed = await asyncio.to_thread(clear_dsp_probe_files)
-  return web.json_response({"ok": True, "removed": removed})
 
 
 async def api_tlv_rec_download(request: web.Request) -> web.StreamResponse:
@@ -271,17 +203,10 @@ th{color:#aaa;font-weight:normal}
 a.btn,button.btn{display:inline-block;background:#2a6df4;color:#fff;border:0;border-radius:4px;
 padding:5px 10px;font-size:13px;text-decoration:none;cursor:pointer;margin-right:6px}
 button.del{background:#a33}
-td.ok{color:#6f6}
-td.bad{color:#f77}
 tr.empty td{color:#888;text-align:center;padding:24px}
 """
 
 _PAGE_JS = """
-function retryDspProbe(){
-  if(!confirm('DSP \uc2dc\ud5d8\uc744 \ub2e4\uc2dc \uc2dc\uc791\ud560\uae4c\uc694? \uae30\ub85d\uc744 \uc9c0\uc6c1\ub2c8\ub2e4.')) return;
-  fetch('/api/tlv_rec/dsp_probe/retry', {method:'POST'})
-    .then(function(){location.reload();});
-}
 document.querySelectorAll('button.del').forEach(function(btn){
   btn.addEventListener('click', function(){
     if(!confirm('\uc774 \uc138\uc158\uc744 \uc0ad\uc81c\ud560\uae4c\uc694?')) return;
@@ -292,79 +217,7 @@ document.querySelectorAll('button.del').forEach(function(btn){
 """
 
 
-_PROBE_STEP_LABELS = {
-  "presence": "SNPE \ud30c\uc77c/\ud234\uccb4\uc778",
-  "build": "\ub7ec\ub108 \ube4c\ub4dc",
-  "frames": "\ud504\ub808\uc784 \uc218\uc9d1",
-  "cpu_f32": "SNPE CPU(\ud50c\ub85c\ud2b8)",
-  "dsp_q": "DSP(int8)",
-  "dsp_f32": "DSP(\ud50c\ub85c\ud2b8)",
-}
-_PROBE_STATUS_LABELS = {"pass": "\ud1b5\uacfc", "fail": "\uc2e4\ud328", "timeout": "\uc2dc\uac04 \ucd08\uacfc", "skipped": "\uac74\ub108\ub700"}
-_PROBE_STEP_ORDER = ("presence", "build", "frames", "cpu_f32", "dsp_q", "dsp_f32")
-
-
-_PROBE_BENCH_STEPS = ("cpu_f32", "dsp_q", "dsp_f32")
-
-
-def _probe_detail(step: dict, probe_compare: dict | None = None) -> str:
-  probe_compare = probe_compare or {}
-  name = step.get("name")
-  if step.get("status") != "pass":
-    return html.escape(str(step.get("error") or ""))[:160]
-  if name == "presence":
-    clang = "ok" if step.get("clangxx") not in (None, "missing") else "missing"
-    return f"clang++ {clang} / cdsprpc {len(step.get('cdsprpc') or [])}"
-  if name == "build":
-    return f"{step.get('duration_s', '?')} s"
-  if name == "frames":
-    return (f"bundle {step.get('n_bundle', '?')} / pool {step.get('n_pool', '?')} / "
-            f"far {step.get('n_far', '?')} / near {step.get('n_near', '?')} / "
-            f"\uc81c\uc678 {step.get('bad_shape', '?')}")
-  if name in _PROBE_BENCH_STEPS:
-    detail = (f"{step.get('frames', '?')}\ud504\ub808\uc784 / \uccab {step.get('first_ms', '?')} ms / "
-              f"\uc911\uc559\uac12 {step.get('median_ms', '?')} ms / p90 {step.get('p90_ms', '?')} ms / "
-              f"\uac80\ucd9c {step.get('n_dets', '?')}")
-    if name != "cpu_f32":
-      delta = (probe_compare.get("steps") or {}).get(name) or {}
-      total = delta.get("total") or {}
-      if total:
-        detail += (f" / \ubbf8\uac80\ucd9c {total.get('miss_pct', '?')} % / "
-                   f"\uc5ec\ubd84 {total.get('extra_pct', '?')} %")
-    return detail
-  return ""
-
-
-_PROBE_HINT = ("\uc8fc\ud589 \uc911 \uc815\ucc28(\uc2e0\ud638 \ub300\uae30)\ud560 \ub54c\ub9c8\ub2e4 "
-               "\uc790\ub3d9\uc73c\ub85c \uc870\uae08\uc529 \uc2dc\ud5d8\ud569\ub2c8\ub2e4. "
-               "\ub530\ub85c \ud560 \uc77c\uc740 \uc5c6\uc2b5\ub2c8\ub2e4.")
-_PROBE_RETRY_BUTTON = ('<button class="btn" onclick="retryDspProbe()">'
-                       'DSP \uc2dc\ud5d8 \ub2e4\uc2dc \ud558\uae30</button>')
-
-
-def _probe_section(probe: dict | None) -> str:
-  section = ("<h2>DSP \uc2dc\ud5d8 \uacb0\uacfc</h2>"
-             f'<p class="hint">{_PROBE_HINT}</p>')
-  if not probe:
-    return (section + '<p class="hint">\uc544\uc9c1 \uacb0\uacfc\uac00 \uc5c6\uc2b5\ub2c8\ub2e4.</p>'
-            + f"<p>{_PROBE_RETRY_BUTTON}</p>")
-  steps = probe.get("steps") or {}
-  rows = []
-  for name in _PROBE_STEP_ORDER:
-    step = steps.get(name) or {"status": "skipped"}
-    status = _PROBE_STATUS_LABELS.get(str(step.get("status")), str(step.get("status", "?")))
-    css = "ok" if step.get("status") == "pass" else "bad"
-    detail = _probe_detail(step, probe.get("compare") or {})
-    rows.append(f'<tr><td>{_PROBE_STEP_LABELS[name]}</td><td class="{css}">{status}</td><td>{detail}</td></tr>')
-  overall = "\ud1b5\uacfc" if probe.get("ok") else "\uc2e4\ud328"
-  meta = f"commit {html.escape(str(probe.get('commit', '?')))} / {html.escape(str(probe.get('timestamp', '?')))} / \uc885\ud569 {overall}"
-  return (section + f'<p class="hint">{meta}</p>'
-          + "<table><thead><tr><th>\ub2e8\uacc4</th><th>\uacb0\uacfc</th><th>\uc2dc\uac04/\uc624\ub958</th></tr></thead><tbody>"
-          + "".join(rows) + "</tbody></table>"
-          + f"<p>{_PROBE_RETRY_BUTTON}</p>")
-
-
-def _page_html(sessions: list[dict], probe: dict | None = None) -> str:
+def _page_html(sessions: list[dict]) -> str:
   rows = []
   for session in sessions:
     size_mb = session["bytes"] / (1024 * 1024)
@@ -393,20 +246,17 @@ def _page_html(sessions: list[dict], probe: dict | None = None) -> str:
     "<table><thead><tr><th>\uc138\uc158</th><th>\ud06c\uae30</th><th>\ud30c\uc77c</th>"
     "<th>\ucc98\uc74c</th><th>\ub9c8\uc9c0\ub9c9</th><th></th></tr></thead><tbody>"
     + "".join(rows) +
-    f"</tbody></table>{_probe_section(probe)}<script>{_PAGE_JS}</script></body></html>"
+    f"</tbody></table><script>{_PAGE_JS}</script></body></html>"
   )
 
 
 async def tlv_rec_page(_request: web.Request) -> web.Response:
   sessions = await asyncio.to_thread(list_sessions)
-  probe = await asyncio.to_thread(latest_dsp_probe)
-  return web.Response(text=_page_html(sessions, probe), content_type="text/html", charset="utf-8")
+  return web.Response(text=_page_html(sessions), content_type="text/html", charset="utf-8")
 
 
 def register(app: web.Application) -> None:
   app.router.add_get("/api/tlv_rec/sessions", api_tlv_rec_sessions)
   app.router.add_get("/api/tlv_rec/sessions/{name}.zip", api_tlv_rec_download)
   app.router.add_delete("/api/tlv_rec/sessions/{name}", api_tlv_rec_delete)
-  app.router.add_get("/api/tlv_rec/dsp_probe", api_tlv_rec_dsp_probe)
-  app.router.add_post("/api/tlv_rec/dsp_probe/retry", api_tlv_rec_dsp_probe_retry)
   app.router.add_get("/tlv_rec", tlv_rec_page)

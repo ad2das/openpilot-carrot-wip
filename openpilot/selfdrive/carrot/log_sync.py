@@ -3,7 +3,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import time
 from typing import Any
 
@@ -40,11 +39,6 @@ TLVREC_FILE_RE = re.compile(r"^(?:\d{7}\.jpg|index\.jsonl)$")
 TLVREC_ACTIVE_NAME = ".active"
 TLVREC_ACTIVE_FRESH_S = 20.0
 TLVREC_QUIET_S = 15.0
-
-DSPPROBE_ROOT = "/data/media/0/carrot_tlv_rec/dsp_probe"
-DSPPROBE_SEGMENT_PREFIX = "dspprobe--"
-DSPPROBE_FILE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}\.json$")
-DSPPROBE_MARKER_SUFFIX = ".uploaded"
 
 
 def target_url(settings: dict[str, Any]) -> str | None:
@@ -162,36 +156,6 @@ def next_tlvrec_session(now: float) -> tuple[str, dict[str, int]] | None:
   return None
 
 
-def next_dspprobe_result(base_url: str, now: float) -> tuple[str, dict[str, Any]] | None:
-  """Oldest quiet, not-yet-uploaded DSP probe result; the .json is never modified."""
-  try:
-    names = os.listdir(DSPPROBE_ROOT)
-  except OSError:
-    return None
-  for name in sorted(names):
-    if not DSPPROBE_FILE_RE.fullmatch(name):
-      continue
-    path = os.path.join(DSPPROBE_ROOT, name)
-    try:
-      st = os.lstat(path)
-      if not stat.S_ISREG(st.st_mode):
-        continue
-      if now - st.st_mtime < TLVREC_QUIET_S:
-        continue
-    except OSError:
-      continue
-    stamp = {"base_url": base_url, "size": int(st.st_size), "mtime_ns": int(st.st_mtime_ns)}
-    try:
-      with open(path + DSPPROBE_MARKER_SUFFIX, encoding="utf-8") as f:
-        marker = json.load(f)
-    except Exception:
-      marker = None
-    if marker == stamp:
-      continue
-    return name, stamp
-  return None
-
-
 def next_segment(base_url: str, now: float) -> tuple[str, dict[str, int]] | None:
   best: tuple[str, dict[str, int]] | None = None
   best_key: tuple[int, int, str, str, int, str] | None = None
@@ -266,7 +230,7 @@ class LogSync:
     """Drive segments always go first; tlv sessions are considered only here."""
     picked = next_tlvrec_session(time.time())  # noqa: TID251
     if picked is None:
-      return await self._sync_dspprobe(base_url)
+      return POLL_S
     name, files = picked
     session_dir = os.path.join(TLVREC_ROOT, name)
     remote = TLVREC_SEGMENT_PREFIX + name
@@ -287,36 +251,6 @@ class LogSync:
         cloudlog.event("carrot_log_sync_tlvrec_ok", session=name, files=len(files), bytes=sum(files.values()))
       else:
         cloudlog.event("carrot_log_sync_tlvrec_changed", session=name)
-      self._backoff = BACKOFF_MIN_S
-      return 0.5
-    self._session = None
-    cloudlog.event("carrot_log_sync_fail", segment=remote, error=error or "upload failed")
-    backoff = self._backoff
-    self._backoff = min(BACKOFF_MAX_S, self._backoff * 2)
-    return backoff
-
-  async def _sync_dspprobe(self, base_url: str) -> float:
-    """DSP probe results are last; the .json is uploaded once and never touched."""
-    picked = next_dspprobe_result(base_url, time.time())  # noqa: TID251
-    if picked is None:
-      return POLL_S
-    name, stamp = picked
-    remote = DSPPROBE_SEGMENT_PREFIX + name[:-len(".json")]
-    ok = False
-    error: str | None = None
-    try:
-      token, meta = await self._token_for(base_url)
-      ok = await upload_folder_to_web(DSPPROBE_ROOT, upload_device_id(meta), remote, base_url, token, None,
-                                      filenames=[name])
-    except Exception as e:
-      error = str(e)
-    if ok:
-      marker_path = os.path.join(DSPPROBE_ROOT, name + DSPPROBE_MARKER_SUFFIX)
-      tmp_path = marker_path + ".tmp"
-      with open(tmp_path, "w", encoding="utf-8") as f:
-        json.dump(stamp, f)
-      os.replace(tmp_path, marker_path)
-      cloudlog.event("carrot_log_sync_dspprobe_ok", file=name)
       self._backoff = BACKOFF_MIN_S
       return 0.5
     self._session = None
