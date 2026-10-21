@@ -440,7 +440,13 @@ def _dump_for(frames, score=0.9):
   One anchor cell in p3 gets a peak class score so the decoder emits exactly one
   box; everything else stays at a score well below the 0.25 threshold."""
   total, heads = dsp_probe.load_heads()
-  flat = np.zeros(total, dtype="<f4")
+  # A zero class logit is sigmoid(0)=0.5, above the 0.25 threshold, so every
+  # anchor would decode as a detection. Baseline the class heads low instead.
+  flat = np.full(total, -10.0, dtype="<f4")
+  for key, head in heads.items():
+    if key.endswith("_cls"):
+      continue
+    flat[head["offset"]:head["offset"] + head["count"]] = 0.0
   p3_cls = heads["p3_cls"]
   for _row in frames:
     flat[p3_cls["offset"] + 5] = 10.0
@@ -569,9 +575,11 @@ def test_bench_dsp_steps_record_head_deltas_and_drop_their_dumps(probe_root, tmp
   for i in range(2):
     cpu.tofile(os.path.join(dsp_probe.dump_dir("cpu_f32"), f"{i:04d}.f32"))
 
+  _, heads = dsp_probe.load_heads()
+  p3_cls = heads["p3_cls"]
   dsp = cpu.copy()
-  dsp[0] += 2.0
-  dsp[1] -= 1.0
+  dsp[p3_cls["offset"]] += 2.0  # inside p3_cls, so its max delta is 2.0
+  dsp[p3_cls["offset"] + 1] -= 1.0
 
   def fake_run(cmd, capture_output=True, timeout=None, env=None, preexec_fn=None):
     out = cmd[cmd.index("--out") + 1]
@@ -624,7 +632,10 @@ def test_snpe_env_prepends_the_snpe_dirs(probe_root, tmp_path):
 # ---------------------------------------------------------------------------
 
 def test_step_timeouts_fit_the_total_budget():
-  assert sum(dsp_probe.STEP_TIMEOUTS.values()) <= dsp_probe.TOTAL_TIMEOUT_S
+  # Six steps are resumable across stops, so they do not sum into one child's
+  # budget; what must hold is that every step fits it on its own, with the
+  # bench subprocess timed out below the step that wraps it.
+  assert max(dsp_probe.STEP_TIMEOUTS.values()) < dsp_probe.TOTAL_TIMEOUT_S
   assert dsp_probe.BUILD_TIMEOUT_S < dsp_probe.STEP_TIMEOUTS["build"]
   for step in dsp_probe.DET_MODELS:
     assert dsp_probe.bench_timeout_s(step) < dsp_probe.STEP_TIMEOUTS[step]
@@ -682,7 +693,7 @@ def test_collect_steps_skips_dependents_after_failure():
     return {"name": name, "status": "fail" if name == "presence" else "pass"}
 
   steps = dsp_probe.collect_steps(timed=timed)
-  assert [step["status"] for step in steps.values()] == ["fail", "skipped", "skipped", "skipped"]
+  assert [step["status"] for step in steps.values()] == ["fail"] + ["skipped"] * 5
   assert calls == ["presence"]
 
 
@@ -695,7 +706,7 @@ def test_collect_steps_cpu_failure_still_runs_dsp():
 
   steps = dsp_probe.collect_steps(timed=timed)
   assert calls == ["presence", "build", "frames", "cpu_f32", "dsp_q", "dsp_f32"]
-  assert [step["status"] for step in steps.values()] == ["pass", "pass", "fail", "pass"]
+  assert [step["status"] for step in steps.values()] == ["pass", "pass", "pass", "fail", "pass", "pass"]
 
 
 def test_collect_steps_runs_all_when_passing():
@@ -752,7 +763,9 @@ def test_child_main_writes_result_and_cleans_stores(probe_root, monkeypatch):
   monkeypatch.setattr(dsp_probe, "collect_steps", lambda **kwargs: {
     "presence": {"name": "presence", "status": "pass"},
     "build": {"name": "build", "status": "pass"},
+    "frames": {"name": "frames", "status": "pass"},
     "cpu_f32": {"name": "cpu_f32", "status": "pass"},
+    "dsp_q": {"name": "dsp_q", "status": "fail", "error": "runtime_unavailable"},
     "dsp_f32": {"name": "dsp_f32", "status": "fail", "error": "boom"},
   })
   steps = os.path.join(str(probe_root), "snpe2.steps.json")
@@ -817,7 +830,7 @@ def test_collect_steps_rebuilds_when_binary_is_gone(probe_root, tmp_path):
     return {"name": name, "status": "pass"}
 
   steps = dsp_probe.collect_steps(timed=timed, steps_file=store)
-  assert calls == ["build", "cpu_f32", "dsp_f32"]
+  assert calls == ["build", "frames", "cpu_f32", "dsp_q", "dsp_f32"]
   assert "resumed" not in steps["build"]
 
 
@@ -1029,7 +1042,7 @@ def test_monitor_child_running_notice_tracks_progress(tmp_path):
   running = logs.of_state("running")
   assert running, "running notice must be refreshed while the child runs"
   assert all(item["steps"] == 6 for item in running)
-  assert [item["step"] for item in running] == [1, 1, 2, 3]
+  assert [item["step"] for item in running] == [1, 1, 2, 4]
 
 
 
@@ -1295,7 +1308,8 @@ def test_latched_step_requires_same_step_three_times():
   assert dsp_probe._latched_step(["build", "build", "build"]) == "build"
   assert dsp_probe._latched_step(["build", "cpu_f32", "build"]) is None
   assert dsp_probe._latched_step(["presence", "build", "frames"]) is None
-  assert dsp_probe._latched_step(["dsp_q", "dsp_f32", "dsp_q", "dsp_f32", "dsp_q"]) == "cpu_f32"
+  assert dsp_probe._latched_step(["dsp_q", "dsp_f32", "dsp_q", "dsp_f32", "dsp_q"]) == "dsp_q"
+  assert dsp_probe._latched_step(["dsp_q", "dsp_f32", "dsp_q", "dsp_f32"]) is None
 
 
 def test_main_latches_after_three_same_step_losses(probe_root, monkeypatch):
@@ -1572,6 +1586,8 @@ def test_step_index_from_progress(tmp_path):
   assert dsp_probe._step_index_from_progress(None, 2) == 2
   assert dsp_probe._step_index_from_progress(progress, 1) == 1  # missing -> last known
   dsp_probe.write_progress(progress, "dsp_f32")
+  assert dsp_probe._step_index_from_progress(progress, 1) == 6
+  dsp_probe.write_progress(progress, "cpu_f32")
   assert dsp_probe._step_index_from_progress(progress, 1) == 4
   dsp_probe.write_progress(progress, "build")
   assert dsp_probe._step_index_from_progress(progress, 1) == 2

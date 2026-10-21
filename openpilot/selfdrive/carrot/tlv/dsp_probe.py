@@ -946,6 +946,13 @@ def match(ref: list, cand: list) -> tuple[list, list, list]:
   return pairs, missed, used
 
 
+def _median(sorted_values: list[float]) -> float:
+  """True median (mean of the middle pair for an even count), as det_eval's np.median."""
+  n = len(sorted_values)
+  mid = n // 2
+  return sorted_values[mid] if n % 2 else 0.5 * (sorted_values[mid - 1] + sorted_values[mid])
+
+
 def _agreement(ref_frames: list, cand_frames: list) -> dict:
   n_ref = n_cand = matched = conf_ref = conf_missed = 0
   score_deltas: list[float] = []
@@ -974,7 +981,7 @@ def _agreement(ref_frames: list, cand_frames: list) -> dict:
     "extra_pct": round(100.0 * (n_cand - matched) / n_cand, 2) if n_cand else 0.0,
     "conf_ref": conf_ref,
     "conf_missed": conf_missed,
-    "median_score_delta": round(score_deltas[len(score_deltas) // 2], 4) if score_deltas else None,
+    "median_score_delta": round(_median(score_deltas), 4) if score_deltas else None,
     "mean_iou": round(sum(ious) / len(ious), 4) if ious else None,
   }
   return out
