@@ -125,6 +125,13 @@ TLV_GREEN_FAMILY_STATES = (3, 4, 6)     # green, left, greenLeft
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
 # Hold a src-1 TLV state for this long since the last accepted message.
 TLV_HOLD_S = 0.8
+# 10-22 flashing amber: a TLV yellow feeds traffic_light() (yellow = stop) only as a phase
+# change, i.e. when the same light (same +-0.2 spot) was a confirmed green within
+# TLV_YELLOW_AFTER_GREEN_S, and then only while that yellow run continues (gaps <
+# TLV_YELLOW_RUN_GAP_S). A yellow that never followed a green (flashing amber) is ignored.
+TLV_YELLOW_AFTER_GREEN_S = 3.0
+TLV_YELLOW_RUN_GAP_S = 1.0
+TLV_YELLOW_SPOT = 0.2
 # W148: no TLV on expressways (NAVER roadCategory 0 = Expressway, 1 = CityExpressway).
 TLV_HIGHWAY_CATEGORIES = (0, 1)
 TLV_HIGHWAY_FRESH_S = 2.0   # carrotNavi is 2 Hz
@@ -565,6 +572,12 @@ class CarrotServ:
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
       return
+    x = 0.5 * (float(rb.x1) + float(rb.x2)) / TLV_FRAME_W
+    y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
+    if state_raw in TLV_GREEN_FAMILY_STATES:
+      self.tlv_last_green = (now, x, y)
+    if color == TLV_COLOR_YELLOW and not self._tlv_yellow_after_green(now, x, y):
+      return
     # Same-track green (W74D): a TLV green/left may only feed the confirmed
     # color path when it comes from the light that was red-confirmed within
     # 120 s (goAfterRed). Otherwise keep the PREVIOUS traffic_state: storing 0
@@ -572,12 +585,22 @@ class CarrotServ:
     # while holding the previous value can never create a start edge.
     if color in (TLV_COLOR_GREEN, TLV_COLOR_LEFT) and not bool(msg.goAfterRed):
       return
-    x = 0.5 * (float(rb.x1) + float(rb.x2)) / TLV_FRAME_W
-    y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.tlv_det_support = int(msg.relevantDetSupport)
     self.tlv_hold_until = now + TLV_HOLD_S
     self.traffic_light_count = int(0.5 / 0.1)
+
+  def _tlv_yellow_after_green(self, now: float, x: float, y: float) -> bool:
+    """True when this TLV yellow is a green->yellow phase change of the same light, or the
+    continuation of such a yellow run. Flashing amber never follows a green, so it is False."""
+    def near(p):
+      return abs(p[1] - x) < TLV_YELLOW_SPOT and abs(p[2] - y) < TLV_YELLOW_SPOT
+    green = getattr(self, "tlv_last_green", None)
+    run = getattr(self, "tlv_last_yellow", None)
+    ok = ((green is not None and now - green[0] <= TLV_YELLOW_AFTER_GREEN_S and near(green)) or
+          (run is not None and now - run[0] <= TLV_YELLOW_RUN_GAP_S and near(run)))
+    self.tlv_last_yellow = (now, x, y) if ok else None
+    return ok
 
   def _tlv_left_intent(self, sm) -> bool:
     """Left-turn intent, same definition tlvd uses (LEFT_INTENT_ATCTYPES):

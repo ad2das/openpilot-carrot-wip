@@ -1587,3 +1587,61 @@ def test_fast_gate_resets_after_long_red_absence(monkeypatch):
   # New episode with no support is gated again.
   sm0 = FakeSM(carrotMan=carrot_man_message(state=1, src=1, det_support=0))
   assert planner._apply_fast_gate(True, sm0, 25.0) is False
+
+def _yellow_clock(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  return clock
+
+
+def test_flashing_amber_without_green_never_feeds_a_stop(monkeypatch):
+  # Route 471 (10-22): a flashing amber read as a steady TLV yellow became trafficState 1
+  # (yellow = stop) and the car braked at -1.73 m/s^2. A yellow that never followed a green
+  # of the same light must not feed traffic_light().
+  clock = _yellow_clock(monkeypatch)
+  serv = make_serv(2)
+  for _ in range(60):  # 6 s of yellow at 10 Hz
+    serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("yellow")))
+    clock[0] += 0.1
+  assert snapshot(serv) == (0, 0, -1, [])
+
+
+def test_green_then_yellow_of_same_light_still_stops(monkeypatch):
+  clock = _yellow_clock(monkeypatch)
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green")))
+  clock[0] += 1.5  # green -> yellow transition gap
+  for _ in range(30):  # a 3 s yellow phase keeps the stop while the run continues
+    serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("yellow")))
+    clock[0] += 0.1
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_yellow_after_stale_or_other_green_is_ignored(monkeypatch):
+  clock = _yellow_clock(monkeypatch)
+  stale = make_serv(2)
+  stale._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green")))
+  clock[0] += 3.5
+  for _ in range(10):
+    stale._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("yellow")))
+    clock[0] += 0.1
+  assert stale.traffic_state == 0
+  other = make_serv(2)
+  other._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", rel_box=(100.0, 100.0, 140.0, 140.0))))
+  clock[0] += 0.5
+  for _ in range(10):
+    other._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("yellow")))
+    clock[0] += 0.1
+  assert other.traffic_state == 0
+
+
+def test_yellow_run_ends_after_a_gap(monkeypatch):
+  clock = _yellow_clock(monkeypatch)
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green")))
+  clock[0] += 0.5
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("yellow")))
+  assert serv._tlv_yellow_after_green(clock[0] + 0.5, 920 / 1928.0, 420 / 1208.0)
+  # 4 s later: green is stale and the run has a > 1 s gap -> a new yellow is rejected.
+  assert not serv._tlv_yellow_after_green(clock[0] + 4.5, 920 / 1928.0, 420 / 1208.0)
