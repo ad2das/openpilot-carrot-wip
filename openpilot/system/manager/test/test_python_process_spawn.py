@@ -36,9 +36,9 @@ def test_start_uses_selected_context_and_does_not_duplicate_child(factories, spa
     ns['get_context'].assert_not_called()
 
 
-def test_only_deferred_xiaoge_selects_spawn():
+def test_spawned_processes_are_the_reviewed_set():
   path = Path(__file__).parents[1] / 'process_config.py'
   calls = [n for n in ast.walk(ast.parse(path.read_text(encoding='utf-8')))
            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == 'PythonProcess']
   selected = [n.args[0].value for n in calls if any(k.arg == 'spawn' and ast.literal_eval(k.value) for k in n.keywords)]
-  assert selected == ['xiaoge_data']
+  assert selected == ['signalcolord', 'qcomgpsd', 'xiaoge_data', 'tlvd']
