@@ -25,6 +25,7 @@ from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
 from openpilot.system.manager.update_status import UpdateStatus
 from openpilot.system.manager.xiaoge_startup import XiaogeStartupGate
+from openpilot.system.manager.stall_watchdog import StallWatchdog
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.system.version import get_build_metadata
@@ -254,6 +255,9 @@ def manager_thread(update_status: UpdateStatus) -> None:
   sm = messaging.SubMaster(['deviceState', 'carParams', 'pandaStates', 'selfdriveState', 'modelV2', 'carState'], poll='deviceState')
   pm = messaging.PubMaster(['managerState'])
   xiaoge_startup = XiaogeStartupGate()
+  # Instrumentation only: log every thread's stack if the loop below hangs (route 46d).
+  stall_watchdog = StallWatchdog(main_ident=threading.get_ident())
+  stall_watchdog.start()
 
   write_onroad_params(False, params)
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
@@ -267,6 +271,7 @@ def manager_thread(update_status: UpdateStatus) -> None:
   ignition_prev = False
 
   while True:
+    stall_watchdog.kick()
     sm.update(1000)
     now = time.monotonic()
 
