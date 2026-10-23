@@ -71,12 +71,14 @@ RED_LIKELY_MIN_PROB = 0.6
 ONSET_RED_CLASSES = (LampClass.RED, LampClass.RED_LEFT)
 ONSET_RED_MIN_PROB = 0.6
 ONSET_GATE_S = 2.0
-# W150: release a held red when the newest 3 votes are all green-family/left at
-# prob >= 0.80 with no newer red vote. CP1 chose N=3/P=0.80: its modelled risk is
-# 0.68x the existing 4-vote confirm, and 1-2 vote releases were 4-27x riskier.
+# W150: release a held red when the newest votes are all green-family/left at
+# GREEN_RELEASE_PROB with no newer red vote. WREL4 (2026-10-23): N=4/P=0.75
+# replaces CP1's N=3/P=0.80. Route 477 dusk green voted 0.756-0.776 and never
+# released. N4@0.75 is modelled at 0.171x the 4-vote confirm (N3@0.80 0.682x,
+# +1 wrong vote 0.212x), with 0 real-log false releases (W178 section 4).
 # This lifts the red only (state -> none); green still needs the W143 confirm.
-GREEN_RELEASE_VOTES = 3
-GREEN_RELEASE_PROB = 0.80
+GREEN_RELEASE_VOTES = 4
+GREEN_RELEASE_PROB = 0.75
 GREEN_RELEASE_CLASSES = (LampClass.GREEN, LampClass.GREEN_LEFT, LampClass.LEFT)
 # W143: green/go confirmation is vote-based in a longer window. Field classify
 # cadence on route 450 is clsHz 2.6-3.2 (budget-limited), so the old 6-in-1.2 s

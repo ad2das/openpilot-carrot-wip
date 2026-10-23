@@ -190,11 +190,12 @@ def test_sticky_release_survives_a_stale_box_non_green_result():
   pipe.machine.last_lamp_time = 0.6
   pipe._last_red_confirm_s = 0.0
   tr.red_confirmed_s = 0.0
-  # Three confident green votes: the release run that already exists today.
-  tr.votes = [(0.0, GREEN, 0.95), (0.2, GREEN, 0.95), (0.4, GREEN, 0.95)]
+  # Four confident green votes: the release run GREEN_RELEASE_VOTES needs.
+  tr.votes = [(0.0, GREEN, 0.95), (0.15, GREEN, 0.95), (0.3, GREEN, 0.95),
+              (0.45, GREEN, 0.95)]
   out = _run(pipe, (0.0, 0.6), v_ego_kph=0.0)
   # The stale box reads RED at 0.95, and that vote must NOT be recorded.
-  assert [v[1] for v in _votes(tr)] == [GREEN, GREEN, GREEN]
+  assert [v[1] for v in _votes(tr)] == [GREEN, GREEN, GREEN, GREEN]
   assert out.released
   assert pipe.machine.state == tracker.SignalState.red
 
@@ -206,7 +207,9 @@ def test_stale_box_green_extends_the_release_run():
   pipe.machine.last_lamp_time = 0.6
   pipe._last_red_confirm_s = 0.0
   tr.red_confirmed_s = 0.0
-  tr.votes = [(0.0, GREEN, 0.95), (0.2, GREEN, 0.95)]
+  # One STALE_BOX vote short of GREEN_RELEASE_VOTES: the recorded vote at 0.6 s
+  # is what completes the run.
+  tr.votes = [(0.15, GREEN, 0.95), (0.3, GREEN, 0.95), (0.45, GREEN, 0.95)]
   out = _run(pipe, (0.0, 0.6), v_ego_kph=0.0)
-  assert [v[1] for v in _votes(tr)] == [GREEN, GREEN, GREEN]
+  assert [v[1] for v in _votes(tr)] == [GREEN, GREEN, GREEN, GREEN]
   assert out.released

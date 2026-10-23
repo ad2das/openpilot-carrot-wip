@@ -514,19 +514,19 @@ class FramePipeline:
       machine_conf = self.last_conf  # refresh only
       self.red_sustain_total += 1
     self.last_relevant_det_support = relevant[0].det_support(now) if relevant is not None else 0
-    # W150: report a release of a held red when the newest 3 relevant-track votes
-    # are green at prob >= 0.80 (tracker.GREEN_RELEASE_*). This does NOT touch
-    # the state machine: the published state stays red, so without a model cue
-    # the car keeps today's off_timeout + 0.8 s hold exactly. carrotServ decides,
-    # per publish and only while the model start cue is active, whether that red
-    # is lifted at once.
+    # W150: report a release of a held red when the newest GREEN_RELEASE_VOTES
+    # relevant-track votes are green at prob >= GREEN_RELEASE_PROB
+    # (tracker.GREEN_RELEASE_*). This does NOT touch the state machine: the
+    # published state stays red, so without a model cue the car keeps today's
+    # off_timeout + 0.8 s hold exactly. carrotServ decides, per publish and only
+    # while the model start cue is active, whether that red is lifted at once.
     #
     # W150b: the release is STICKY. A sub-threshold green vote or votes ageing
-    # out of the deque breaks the 3-vote run, which used to drop the flag while
-    # the machine was still red -- carrotServ then unlatched and the red came
-    # back (a start-then-brake jerk). Once a run has been released it holds
-    # until a red-family vote arrives on the same track, the track changes, the
-    # machine leaves red, or a green is confirmed.
+    # out of the deque breaks the GREEN_RELEASE_VOTES-vote run, which used to
+    # drop the flag while the machine was still red -- carrotServ then unlatched
+    # and the red came back (a start-then-brake jerk). Once a run has been
+    # released it holds until a red-family vote arrives on the same track, the
+    # track changes, the machine leaves red, or a green is confirmed.
     green_confirmed = lamp_state in (tracker.SignalState.green, tracker.SignalState.greenLeft,
                                      tracker.SignalState.left)
     machine_red = self.machine.state in (tracker.SignalState.red, tracker.SignalState.redLeft)

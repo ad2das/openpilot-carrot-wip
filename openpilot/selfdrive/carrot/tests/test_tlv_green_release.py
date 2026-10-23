@@ -1,10 +1,14 @@
-"""W150: release a held TLV red on 3 confident green votes, gated by the model cue.
+"""W150/WREL4: release a held TLV red on confident green votes, gated by the cue.
 
 Two layers are tested separately:
 
-  tracker/pipeline - the release itself: the newest 3 relevant-track votes must
-    be green-family/left at prob >= 0.80 with no newer red vote, and it turns
-    the state machine to none (never to green).
+  tracker/pipeline - the release itself: the newest GREEN_RELEASE_VOTES
+    relevant-track votes must be green-family/left at prob >= GREEN_RELEASE_PROB
+    with no newer red vote, and it turns the state machine to none (never to
+    green). WREL4 moved the constants from 3 votes at 0.80 to 4 votes at 0.75;
+    release-only tests space their votes 0.15 s apart (span 0.45 s), because at
+    0.2 s apart a 4-vote run would also pass the W143 green confirm and move the
+    machine off red.
   carrotServ - the released red is cleared immediately ONLY while the model
     start cue is active (plan trafficState 2, an xState edge out of e2eStopped,
     or trafficSignGreen). Without the cue today's hold must be unchanged.
@@ -27,6 +31,7 @@ GREEN = int(LampClass.GREEN)
 GREEN_LEFT = int(LampClass.GREEN_LEFT)
 LEFT = int(LampClass.LEFT)
 RED = int(LampClass.RED)
+RED_LEFT = int(LampClass.RED_LEFT)
 
 
 def track_with_votes(votes):
@@ -36,9 +41,18 @@ def track_with_votes(votes):
   return tr
 
 
-def test_release_requires_three_votes():
+def green_run(now, prob=0.9):
+  """GREEN_RELEASE_VOTES green votes ending at `now`, 0.15 s apart.
+
+  The 0.45 s span stays below GREEN_CONFIRM_MIN_SPAN_S, so a plain release run
+  never doubles as a W143 green confirm.
+  """
+  return [(now - 0.15 * k, GREEN, prob) for k in reversed(range(GREEN_RELEASE_VOTES))]
+
+
+def test_release_requires_four_votes():
   now = 100.0
-  tr = track_with_votes([(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9)])
+  tr = track_with_votes(green_run(now)[:-1])
   assert not tr.released()
   tr.votes.append((now, GREEN, 0.9))
   assert tr.released()
@@ -46,41 +60,93 @@ def test_release_requires_three_votes():
 
 def test_release_accepts_green_family_and_left():
   now = 100.0
-  tr = track_with_votes([(now - 0.4, GREEN, 0.85), (now - 0.2, LEFT, 0.9), (now, GREEN_LEFT, 0.95)])
+  tr = track_with_votes([(now - 0.45, GREEN, 0.85), (now - 0.30, LEFT, 0.9),
+                         (now - 0.15, GREEN_LEFT, 0.95), (now, GREEN, 0.9)])
   assert tr.released()
 
 
 def test_release_rejects_a_low_probability_vote():
   now = 100.0
-  tr = track_with_votes([(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, GREEN_RELEASE_PROB - 0.01),
-                         (now, GREEN, 0.9)])
+  tr = track_with_votes([(now - 0.45, GREEN, 0.9), (now - 0.30, GREEN, GREEN_RELEASE_PROB - 0.01),
+                         (now - 0.15, GREEN, 0.9), (now, GREEN, 0.9)])
   assert not tr.released()
+
+
+def test_release_accepts_075():
+  now = 100.0
+  tr = track_with_votes(green_run(now, prob=0.75))
+  assert tr.released()
+  # 0.749 in any single slot is below GREEN_RELEASE_PROB -> no release.
+  for k in range(4):
+    votes = green_run(now, prob=0.75)
+    votes[k] = (votes[k][0], votes[k][1], 0.749)
+    assert not track_with_votes(votes).released()
 
 
 def test_release_rejects_yellow_in_the_run():
   now = 100.0
-  tr = track_with_votes([(now - 0.4, GREEN, 0.9), (now - 0.2, int(LampClass.YELLOW), 0.9),
-                         (now, GREEN, 0.9)])
+  tr = track_with_votes([(now - 0.45, GREEN, 0.9), (now - 0.30, int(LampClass.YELLOW), 0.9),
+                         (now - 0.15, GREEN, 0.9), (now, GREEN, 0.9)])
   assert not tr.released()
 
 
 def test_a_newer_red_vote_blocks_the_release():
   now = 100.0
-  tr = track_with_votes([(now - 0.6, GREEN, 0.9), (now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                         (now, RED, 0.9)])
-  # Newest 3 are green,green,red -> no release.
+  tr = track_with_votes(green_run(now))
+  assert tr.released()
+  tr.votes.append((now + 0.15, RED, 0.9))
   assert not tr.released()
-  # Two greens after the red: the newest 3 are green,green,red -> still blocked.
-  tr.votes.append((now + 0.2, GREEN, 0.9))
+  # One to three greens after the red keep the red inside the newest 4 -> blocked.
+  for k in (2, 3, 4):
+    tr.votes.append((now + 0.15 * k, GREEN, 0.9))
   assert not tr.released()
-  # Third green after the red: the red is older than the run -> release.
-  tr.votes.append((now + 0.4, GREEN, 0.9))
-  tr.votes.append((now + 0.6, GREEN, 0.9))
+  # The fourth green after the red leaves the red older than the run -> release.
+  tr.votes.append((now + 0.75, GREEN, 0.9))
   assert tr.released()
 
 
-def test_release_count_constant_is_three():
-  assert GREEN_RELEASE_VOTES == 3
+def test_release_count_constant_is_four():
+  assert GREEN_RELEASE_VOTES == 4
+  assert GREEN_RELEASE_PROB == 0.75
+
+
+def test_route477_dusk_votes_release_at_03643(monkeypatch):
+  """The field miss: route 477 dusk greens voted 0.756-0.776 and never released.
+
+  Votes are the relevant-track (tid 17) sequence logged 2026-10-23 17:12, with
+  t in seconds after 17:12:00. N=4/P=0.75 releases on the 17:12:03.643 vote; the
+  landed N=3/P=0.80 never released at all.
+  """
+  import openpilot.selfdrive.carrot.tlv.tracker as tracker
+
+  votes = [
+    (2.862, RED, 0.972),
+    (2.949, RED_LEFT, 0.901),
+    (3.160, GREEN, 0.776),
+    (3.343, GREEN, 0.768),
+    (3.446, GREEN, 0.766),
+    (3.643, GREEN, 0.765),
+    (3.842, GREEN, 0.756),
+    (4.044, GREEN, 0.795),
+    (4.254, GREEN, 0.710),
+  ]
+  released_at = []
+  tr = track_with_votes([])
+  for vote in votes:
+    tr.votes.append(vote)
+    if tr.released():
+      released_at.append(vote[0])
+  assert released_at == [3.643, 3.842, 4.044]
+  # Not yet after the 03.446 vote: the fourth green had not landed.
+  tr.votes = [v for v in votes if v[0] <= 3.446]
+  assert not tr.released()
+  # The landed constants reproduce the field miss exactly.
+  monkeypatch.setattr(tracker, "GREEN_RELEASE_VOTES", 3)
+  monkeypatch.setattr(tracker, "GREEN_RELEASE_PROB", 0.80)
+  tr.votes = []
+  for vote in votes:
+    tr.votes.append(vote)
+    assert not tr.released()
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +173,7 @@ def _release_pipe(now, votes, machine_state=SignalState.red):
 
   from openpilot.selfdrive.carrot.tlv import backends
   # A classifier selects the candidate-only branch, so the track is relevant
-  # without detections; 3 green votes do not yet confirm a green either.
+  # without detections; green_run()'s 0.45 s span does not confirm a green either.
   pipe = pl.FramePipeline(_Backend(), decode.PlaceholderDecoder(),
                           classifier=backends.StubClassifier(cls=RED, prob=0.9))
   pipe.machine.state = machine_state
@@ -128,8 +194,7 @@ def _release_pipe(now, votes, machine_state=SignalState.red):
 
 def test_release_flag_set_but_machine_stays_red():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   # Published state must stay red: without a cue today's off_timeout still holds.
   assert out.state in (SignalState.red, SignalState.redLeft)
@@ -144,14 +209,13 @@ def _step(pipe, now, detect=False):
 
 
 def test_sticky_survives_a_sub_threshold_green_vote():
-  """W150b: p<0.80 breaks the 3-vote run; the release must stay sticky.
+  """W150b: p < GREEN_RELEASE_PROB breaks the release run; it must stay sticky.
 
   The low-probability vote lands after the W143 green window, so it breaks the
   release run without also confirming a green (4 greens in 1.6 s would).
   """
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   tr = pipe.tracker.tracks[0]
   later = now + 2.0                      # outside GREEN_CONFIRM_WINDOW_S
@@ -166,11 +230,10 @@ def test_sticky_survives_a_sub_threshold_green_vote():
 
 def test_sticky_survives_votes_ageing_out():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   tr = pipe.tracker.tracks[0]
-  tr.votes.clear()                       # fewer than 3 votes left
+  tr.votes.clear()                       # fewer than GREEN_RELEASE_VOTES left
   pipe.machine.last_lamp_time = now
   out2 = _step(pipe, now + 0.1)
   assert out2.released
@@ -179,8 +242,7 @@ def test_sticky_survives_votes_ageing_out():
 
 def test_one_red_vote_drops_the_sticky_release():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   pipe.tracker.tracks[0].votes.append((now + 0.2, RED, 0.9))
   pipe.machine.last_lamp_time = now
@@ -190,8 +252,7 @@ def test_one_red_vote_drops_the_sticky_release():
 
 def test_a_track_change_drops_the_sticky_release():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   other = Track(track_id=2, first_frame=0, last_frame=0, cls=GREEN, score=0.9,
                 box=(940.0, 50.0, 990.0, 90.0), view="far", focal_px=2648.0)
@@ -204,8 +265,7 @@ def test_a_track_change_drops_the_sticky_release():
 
 def test_the_machine_leaving_red_drops_the_sticky_release():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now))
   assert out.released
   pipe.machine.state = SignalState.none
   out2 = _step(pipe, now + 0.1)
@@ -220,12 +280,12 @@ def _geom():
 def test_no_cue_keeps_the_red_until_the_usual_off_timeout():
   """Spec: without a cue the red must end exactly when it does today.
 
-  The release flag goes True as soon as the 3 green votes land, but nothing is
-  cleared: the machine keeps red and expires off_timeout_s after the last lamp,
-  which is the pre-W150 behaviour.
+  The release flag goes True as soon as the GREEN_RELEASE_VOTES green votes
+  land, but nothing is cleared: the machine keeps red and expires off_timeout_s
+  after the last lamp, which is the pre-W150 behaviour.
   """
   now = 100.0
-  votes = [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)]
+  votes = green_run(now)
   pipe, out = _release_pipe(now, votes)
   assert out.released
   assert out.state in (SignalState.red, SignalState.redLeft)
@@ -242,17 +302,16 @@ def test_no_cue_keeps_the_red_until_the_usual_off_timeout():
   assert out_after.state == SignalState.none
 
 
-def test_no_release_flag_without_three_votes():
+def test_no_release_flag_without_four_votes():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.2, GREEN, 0.9), (now, GREEN, 0.9)])
+  pipe, out = _release_pipe(now, green_run(now)[:-1])
   assert not out.released
   assert out.state in (SignalState.red, SignalState.redLeft)
 
 
 def test_no_release_flag_when_machine_is_not_red():
   now = 100.0
-  pipe, out = _release_pipe(now, [(now - 0.4, GREEN, 0.9), (now - 0.2, GREEN, 0.9),
-                                  (now, GREEN, 0.9)], machine_state=SignalState.none)
+  pipe, out = _release_pipe(now, green_run(now), machine_state=SignalState.none)
   # The run is there, but the machine was not red, so this is not a release.
   assert not out.released
 
