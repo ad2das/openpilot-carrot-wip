@@ -227,6 +227,7 @@ class CarrotPlanner:
     self.trafficState_carrot = 0
     self.trafficState_carrot_src = 0
     self.carrot_stay_stop = False
+    self.tlv_red_veto = False
     self.tlv_standstill_hold_frames = 0
     self.tlv_hold_run = False  # W74D B1: at most one 120 s hold per unknown run
     self.tlv_gas_cooldown_frames = 0
@@ -708,6 +709,10 @@ class CarrotPlanner:
       v_stopped = v_ego_kph < TLV_STANDSTILL_MPS * CV.MS_TO_KPH
       v_moving_end = v_ego_kph > TLV_MOVE_END_MPS * CV.MS_TO_KPH
       cooldown = self.tlv_gas_cooldown_frames > 0
+      # WTOP1: a published TLV red (src 1, state 1) vetoes the model's own green
+      # start. W150 release (0/0) and W143 green (2) both end it, so TLV starts
+      # are unaffected; gas and the gas cooldown end it too.
+      self.tlv_red_veto = tlv_src and state_in == 1 and not cooldown and not gas
       # A start trigger produced by the on-device carrotTlv detector may start
       # the car only while the supercombo model is not signalling a stop, i.e.
       # both cues agree (ONE extra gate for tlv-originated red->green AND
@@ -836,6 +841,7 @@ class CarrotPlanner:
       self.tlv_standstill_hold_frames = 0
       self.tlv_hold_run = False
       self.carrot_stay_stop = False
+      self.tlv_red_veto = False
       self.tlv_red_confirmed_at = None
       self.tlv_veto_active = False
       self.tlv_green_chime_done = False
@@ -1043,6 +1049,10 @@ class CarrotPlanner:
     if self.myDrivingModeAuto > 0 and not self.myDrivingMode_disable_auto:
       self.myDrivingMode = self.drivingModeDetector.get_mode(self.myDrivingModeAuto)
 
+  def _model_green_start_allowed(self) -> bool:
+    """Model green may start the car unless a published TLV red vetoes it (WTOP1)."""
+    return self.trafficState == TrafficState.green and not getattr(self, 'tlv_red_veto', False)
+
   def update(self, sm, v_cruise_kph, mode, *, signal_observation=None, signal_context=None,
              start_observation=None, start_context=None, prepare_observation=None, prepare_context=None):
     self._params_update()
@@ -1196,7 +1206,7 @@ class CarrotPlanner:
       elif lead_detected and (radarstate.leadOne.dRel - stop_model_x_raw) < 2.0:
         self.xState = XState.lead
       elif self.stopping_count == 0:
-        if self.trafficState == TrafficState.green and not self.carrot_stay_stop and not carstate.leftBlinker and self.trafficLightDetectMode != 1:
+        if self._model_green_start_allowed() and not self.carrot_stay_stop and not carstate.leftBlinker and self.trafficLightDetectMode != 1:
           #self.xState = XState.e2ePrepare
           self.xState = XState.e2eCruise  # 실험모드를 거치지 않고 바로 출발.
           self.add_event(EventName.trafficSignGreen)
@@ -1211,7 +1221,7 @@ class CarrotPlanner:
       elif lead_detected and (radarstate.leadOne.dRel - stop_model_x_raw) < 2.0:
         self.xState = XState.lead
       else:
-        if self.trafficState == TrafficState.green:
+        if self._model_green_start_allowed():
           self.add_event(EventName.trafficSignGreen)
           self.xState = XState.e2eCruise
         else:

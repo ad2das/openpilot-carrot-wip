@@ -125,6 +125,13 @@ TLV_GREEN_FAMILY_STATES = (3, 4, 6)     # green, left, greenLeft
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
 # Hold a src-1 TLV state for this long since the last accepted message.
 TLV_HOLD_S = 0.8
+# WTOP1: a red whose relevant box touched the frame top (the head passed out of
+# view at a stop line right under it) stays held after the track is lost while
+# the car is slow, so the model cannot start into it (route 479 18:57:07).
+TLV_TOP_EXIT_Y1_PX = 4.0
+TLV_TOP_EXIT_MAX_MPS = 3.0
+TLV_TOP_EXIT_MAX_M = 15.0
+TLV_TOP_EXIT_MAX_S = 120.0
 # 10-22 flashing amber: a TLV yellow feeds traffic_light() (yellow = stop) only as a phase
 # change, i.e. when the same light (same +-0.2 spot) was a confirmed green within
 # TLV_YELLOW_AFTER_GREEN_S, and then only while that yellow run continues (gaps <
@@ -161,6 +168,8 @@ class CarrotServ:
   tlv_release_latched = False
   tlv_release_track_id = -1
   tlv_release_clears = 0
+  tlv_last_red_top = None
+  tlv_top_exit = None
   tlv_last_stopped = None
   tlv_xstate_left_at = -1e9
   tlv_green_event_at = -1e9
@@ -265,6 +274,8 @@ class CarrotServ:
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
     self.tlv_det_support = 0    # W139c: carrotTlv.relevantDetSupport passed through
     self.tlv_hold_until = 0.0   # W143: src-1 TLV state held until this monotonic time
+    self.tlv_last_red_top = None  # (monotonic, relevantBox.y1) of the last accepted red
+    self.tlv_top_exit = None      # WTOP1 hold state
     # W150: model start cue state for the released-red clear. The xState cue is
     # an edge, so the previous sample's stopped flag is kept here.
     self.tlv_last_stopped: bool | None = None
@@ -514,6 +525,7 @@ class CarrotServ:
     # the coast cap, red stop/hold, starts and the green chime all turn off
     # together; navi-sourced (src 0) states are not touched.
     if self._update_tlv_highway_gate(now):
+      self.tlv_top_exit = None
       if self.traffic_state_src == 1:
         self.traffic_state = 0
         self.traffic_state_src = 0
@@ -530,10 +542,13 @@ class CarrotServ:
     # W138: require the relevant track and a non-degenerate relevantBox; dets[0]
     # is no longer a fallback (it may be an unrelated light).
     if int(msg.relevantTrackId) < 0:
+      self._tlv_top_exit_hold(sm, now)
       return
     rb = msg.relevantBox
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
+      self._tlv_top_exit_hold(sm, now)
       return
+    self.tlv_top_exit = None  # WTOP1: a visible relevant track ends the hold
     state_raw = int(msg.state.raw)
     released_flag = bool(getattr(msg, "relevantReleased", False))
     track_id = int(msg.relevantTrackId)
@@ -585,10 +600,38 @@ class CarrotServ:
     # while holding the previous value can never create a start edge.
     if color in (TLV_COLOR_GREEN, TLV_COLOR_LEFT) and not bool(msg.goAfterRed):
       return
+    if color == TLV_COLOR_RED:
+      self.tlv_last_red_top = (now, float(rb.y1))
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.tlv_det_support = int(msg.relevantDetSupport)
     self.tlv_hold_until = now + TLV_HOLD_S
     self.traffic_light_count = int(0.5 / 0.1)
+
+  def _tlv_top_exit_hold(self, sm, now: float) -> None:
+    """WTOP1: keep a src-1 red whose box left through the frame top while slow."""
+    try:
+      cs = sm['carState']
+      v = float(cs.vEgo)
+      gas = bool(cs.gasPressed)
+    except Exception:
+      self.tlv_top_exit = None
+      return
+    red_held = self.traffic_state == 1 and self.traffic_state_src == 1
+    st = self.tlv_top_exit
+    if st is None:
+      last = self.tlv_last_red_top
+      if not (red_held and now < self.tlv_hold_until and last is not None
+              and last[1] <= TLV_TOP_EXIT_Y1_PX and now - last[0] <= TLV_HOLD_S
+              and v <= TLV_TOP_EXIT_MAX_MPS and not gas):
+        return
+      st = self.tlv_top_exit = {"since": now, "dist": 0.0, "t": now}
+    st["dist"] += v * max(0.0, now - st["t"])
+    st["t"] = now
+    if (gas or not red_held or st["dist"] > TLV_TOP_EXIT_MAX_M
+        or now - st["since"] > TLV_TOP_EXIT_MAX_S):
+      self.tlv_top_exit = None
+      return
+    self.tlv_hold_until = now + TLV_HOLD_S
 
   def _tlv_yellow_after_green(self, now: float, x: float, y: float) -> bool:
     """True when this TLV yellow is a green->yellow phase change of the same light, or the

@@ -1,0 +1,273 @@
+"""WTOP1: a red that left the frame top at the stop line, and the model green veto.
+
+Route 479, 2026-XX-XX 18:57:07 (KST): the car stopped at a red whose relevant box
+had already walked up to the frame top (y1 = 0..1 px). The track was lost at
+07.178, the src-1 state expired at the normal W143 hold (carrotMan 1/1 -> 0/0 at
+07.866 while v = 2.5 km/h), and at 08.33 the model's own green started the car
+into a red it could no longer see.
+
+Two independent defences, tested separately:
+
+  carrotServ - `_tlv_top_exit_hold`: after a src-1 red whose box touched the
+    frame top was lost, the src-1 state keeps being held while the car is slow,
+    until it drives TLV_TOP_EXIT_MAX_M past the stop line (or 120 s, or the gas
+    pedal, or a visible relevant track returns).
+  carrot_functions - `_model_green_start_allowed`: the model's trafficState
+    green no longer starts the car while a published TLV red is in the state
+    (state_in == 1, src == 1). W150 release (0/0) and W143 green (2) both clear
+    it, so TLV-originated starts are unaffected.
+"""
+from types import SimpleNamespace
+
+import numpy as np
+
+from test_tlv_fusion import (FakeSM, carrot_man_message, gate_sm, make_serv as base_make_serv,
+                             planner_for_gate, tlv_message)
+
+import openpilot.selfdrive.carrot.carrot_man_input as carrot_man_input
+import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+from openpilot.selfdrive.carrot.carrot_functions import TrafficState
+from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
+
+# ---------------------------------------------------------------------------
+# The 479 replay: the logged relevant-track rows, then the track vanishing.
+# ---------------------------------------------------------------------------
+
+RED_ROWS = [
+  (5.983, (967.0, -5.0, 1070.0, 28.0)),
+  (6.091, (969.0, 0.0, 1069.0, 23.0)),
+  (6.292, (967.0, 0.0, 1073.0, 16.0)),
+  (6.495, (966.0, 0.0, 1061.0, 8.0)),
+  (6.684, (970.0, 1.0, 1065.0, 10.0)),
+  (6.883, (970.0, 0.0, 1066.0, 9.0)),
+  (7.022, (970.0, 0.0, 1066.0, 8.0)),
+]
+LOST_AT = 7.178
+REPLAY_END = 12.0
+# car vEgo in km/h, read off the 479 log around the stop.
+SPEED_KPH = [(6.0, 7.9), (6.5, 5.9), (7.0, 4.2), (7.5, 3.0), (8.0, 2.0), (8.5, 1.3),
+             (9.0, 2.4), (12.0, 0.2)]
+SPEED_TS = [p[0] for p in SPEED_KPH]
+SPEED_VS = [p[1] for p in SPEED_KPH]
+
+
+def speed_mps(t: float) -> float:
+  return float(np.interp(t, SPEED_TS, SPEED_VS)) / 3.6
+
+
+def car_state(t: float, gas: bool = False) -> SimpleNamespace:
+  return SimpleNamespace(vEgo=speed_mps(t), gasPressed=gas)
+
+
+def make_serv() -> CarrotServ:
+  serv = base_make_serv(2)
+  serv.tlv_navi_road_category = None
+  serv.tlv_navi_road_category_t = -1e9
+  serv.tlv_highway_gate = False
+  serv.tlv_highway_clear_since = None
+  serv.tlv_last_stopped = None
+  serv.tlv_xstate_left_at = -1e9
+  serv.tlv_green_event_at = -1e9
+  serv.tlv_release_clears = 0
+  serv.tlv_release_latched = False
+  serv.tlv_release_track_id = -1
+  serv.tlv_last_red_top = None
+  serv.tlv_top_exit = None
+  return serv
+
+
+def red_msg(box):
+  return tlv_message("red", conf=0.9, rel_box=box, box=box)
+
+
+def lost_msg():
+  return tlv_message("red", conf=0.9, rel_id=-1, rel_box=(0.0, 0.0, 0.0, 0.0))
+
+
+def drive_red_phase(serv: CarrotServ, clock: list, rows=RED_ROWS) -> None:
+  """Publish the logged relevant-track red rows at their own timestamps."""
+  t0, box0 = rows[0]
+  clock[0] = t0
+  serv._update_cmd()
+  serv._update_tlv_fusion(FakeSM(carrotTlv=red_msg(box0), carState=car_state(t0)))
+  for t, box in rows[1:]:
+    while clock[0] < t - 0.049:
+      clock[0] = round(min(clock[0] + 0.05, t), 3)
+      serv._update_cmd()
+    clock[0] = t
+    serv._update_cmd()
+    serv._update_tlv_fusion(FakeSM(carrotTlv=red_msg(box), carState=car_state(t)))
+
+
+def drive_loss(serv: CarrotServ, clock: list, start: float = LOST_AT, end: float = REPLAY_END,
+               cs_for_t=None, step: float = 0.05):
+  """Publish relevantTrackId = -1 at 20 Hz; return [(t, state, src, holding)]."""
+  cs_for_t = cs_for_t or (lambda t: car_state(t))
+  out = []
+  t = start
+  while t <= end + 1e-9:
+    clock[0] = t
+    serv._update_cmd()
+    serv._update_tlv_fusion(FakeSM(carrotTlv=lost_msg(), carState=cs_for_t(t)))
+    out.append((t, serv.traffic_state, serv.traffic_state_src, serv.tlv_top_exit is not None))
+    t = round(t + step, 3)
+  return out
+
+
+def at(states, t: float):
+  return min(states, key=lambda s: abs(s[0] - t))
+
+
+def freeze(monkeypatch):
+  clock = [0.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  return clock
+
+
+# ---------------------------------------------------------------------------
+# T1: the 479 replay. Validate-first: with the hold disabled the logged drop must
+# reproduce (0/0 by 07.9 s) before the enabled case is allowed to count.
+# ---------------------------------------------------------------------------
+
+def test_t1_replay_reproduces_the_logged_drop_with_the_hold_disabled(monkeypatch):
+  monkeypatch.setattr(carrot_serv, "TLV_TOP_EXIT_Y1_PX", -1.0)
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  states = drive_loss(serv, clock)
+  assert at(states, 7.2)[1:3] == (1, 1)  # still inside the normal W143 hold
+  assert at(states, 7.9)[1:3] == (0, 0)  # the 479 drop, logged at 07.866
+
+
+def test_t1_replay_keeps_the_red_through_the_loss_and_the_model_green(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  states = drive_loss(serv, clock)
+  assert at(states, 8.33)[1:3] == (1, 1)  # 479: model green started the car here
+  assert at(states, 9.2)[1:3] == (1, 1)
+  assert at(states, REPLAY_END)[1:3] == (1, 1)
+
+
+# ---------------------------------------------------------------------------
+# T2-T7: the hold's entry gate, its three ways to end, and its hand-off.
+# ---------------------------------------------------------------------------
+
+def test_t2_a_mid_frame_loss_does_not_hold(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  rows = RED_ROWS[:-1] + [(7.022, (970.0, 40.0, 1066.0, 68.0))]
+  drive_red_phase(serv, clock, rows)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  states = drive_loss(serv, clock)
+  assert at(states, 7.9)[1:3] == (0, 0)
+  assert not any(s[3] for s in states)
+
+
+def test_t3_a_fast_car_does_not_hold(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  states = drive_loss(serv, clock, cs_for_t=lambda t: SimpleNamespace(vEgo=4.0, gasPressed=False))
+  assert at(states, 7.9)[1:3] == (0, 0)
+  assert not any(s[3] for s in states)
+
+
+def test_t4_gas_pedal_ends_the_hold(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  drive_loss(serv, clock, start=LOST_AT, end=7.5)
+  assert serv.tlv_top_exit is not None
+  states = drive_loss(serv, clock, start=7.55, end=8.6,
+                      cs_for_t=lambda t: SimpleNamespace(vEgo=1.0, gasPressed=True))
+  assert at(states, 8.6)[1:3] == (0, 0)
+  assert not any(s[3] for s in states)
+
+
+def test_t5_driving_15_m_past_the_line_ends_the_hold(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  states = drive_loss(serv, clock, end=18.0,
+                      cs_for_t=lambda t: SimpleNamespace(vEgo=2.0, gasPressed=False))
+  assert at(states, 9.0)[1:3] == (1, 1)    # 3.6 m in, still held
+  assert at(states, 13.0)[1:3] == (1, 1)   # 11.6 m
+  assert at(states, 17.5)[1:3] == (0, 0)   # 20.6 m > 15 m
+
+
+def test_t6_the_hold_caps_at_120_s(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  # The cap is measured from the hold's first held tick (7.178), so it fires at 127.2.
+  states = drive_loss(serv, clock, end=131.0,
+                      cs_for_t=lambda t: SimpleNamespace(vEgo=0.0, gasPressed=False))
+  assert at(states, 126.0)[1:3] == (1, 1)
+  assert at(states, 130.5)[1:3] == (0, 0)
+
+
+def test_t7_a_new_relevant_track_ends_the_hold_and_green_still_fires(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv = make_serv()
+  drive_red_phase(serv, clock)
+  drive_loss(serv, clock, start=LOST_AT, end=7.45)
+  assert serv.tlv_top_exit is not None
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  clock[0] = 7.5
+  box = RED_ROWS[-1][1]
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", conf=0.9, go_after_red=True,
+                                                       rel_id=2, rel_box=box, box=box)))
+  assert serv.tlv_top_exit is None
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+
+
+# ---------------------------------------------------------------------------
+# T8: the planner veto. Published TLV red stops the model green start; the W150
+# release state, the W143 green, gas and the gas cooldown all let it through.
+# ---------------------------------------------------------------------------
+
+def freeze_man(monkeypatch):
+  # FakeSM stamps every service at 100.0; get_carrot_man drops stale messages.
+  monkeypatch.setattr(carrot_man_input.time, "monotonic", lambda: 100.0)
+
+
+def planner_with(monkeypatch, published: tuple[int, int], speed: int = 60, **gate_kw):
+  freeze_man(monkeypatch)
+  planner = planner_for_gate(False)
+  planner.trafficState = TrafficState.green
+  planner._update_carrot_man(
+    gate_sm(carrot_man_message(state=published[0], src=published[1], speed=speed), **gate_kw), 20.0, 60.0)
+  return planner
+
+
+def test_t8_published_tlv_red_vetoes_the_model_green_start(monkeypatch):
+  assert planner_with(monkeypatch, (1, 1))._model_green_start_allowed() is False
+
+
+def test_t8_w150_release_and_w143_green_are_not_vetoed(monkeypatch):
+  assert planner_with(monkeypatch, (0, 0))._model_green_start_allowed() is True
+  assert planner_with(monkeypatch, (2, 1))._model_green_start_allowed() is True
+
+
+def test_t8_navi_state_and_gas_are_not_vetoed(monkeypatch):
+  assert planner_with(monkeypatch, (1, 0))._model_green_start_allowed() is True
+  assert planner_with(monkeypatch, (1, 1), gas=True)._model_green_start_allowed() is True
+
+
+def test_t8_gas_cooldown_is_not_vetoed(monkeypatch):
+  freeze_man(monkeypatch)
+  planner = planner_for_gate(False)
+  planner.trafficState = TrafficState.green
+  planner.tlv_gas_cooldown_frames = 200
+  planner._update_carrot_man(gate_sm(carrot_man_message(state=1, src=1)), 20.0, 60.0)
+  assert planner._model_green_start_allowed() is True
+
+
+def test_t8_a_missing_carrot_man_leaves_the_model_start_alone(monkeypatch):
+  # desiredSpeed 0 makes get_carrot_man drop the message: the else branch runs.
+  planner = planner_with(monkeypatch, (1, 1), speed=0)
+  assert planner.tlv_red_veto is False
+  assert planner._model_green_start_allowed() is True
