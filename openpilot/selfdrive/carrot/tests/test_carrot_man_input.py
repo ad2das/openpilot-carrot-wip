@@ -40,6 +40,11 @@ def planner():
   value.left_blinker_pre_stop = False
   value.left_blinker_off_frames = 0
   value.a4_lane_ok = False
+  # WLF2: the lead-follow latch state (this skeleton skips CarrotPlanner.__init__).
+  value.lead_follow_active = False
+  value.lead_follow_arm_frames = 0
+  value.lead_follow_d_stop = None
+  value.lead_follow_d_prev = 0.0
   return value
 
 

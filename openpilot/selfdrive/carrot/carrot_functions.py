@@ -79,6 +79,16 @@ TLV_GAS_COOLDOWN_FRAMES = int(10.0 / DT_MDL)
 # measurement events (at most one per kind).
 TLV_COAST_MAX_MOVING_S = 12.0
 TLV_COAST_MAX_MOVING_FRAMES = int(TLV_COAST_MAX_MOVING_S / DT_MDL)
+# WLF2 (user 2026-10-24): behind a stopped lead, the lead's departure releases the TLV
+# stop holds (coast cap, model-green veto, left-intent stay). Lead lost/far/jump or the
+# TLV red ending gives control back to the TLV.
+LEAD_FOLLOW_ARM_DIST_M = 15.0
+LEAD_FOLLOW_ARM_VLEAD = 0.5
+LEAD_FOLLOW_ARM_FRAMES = int(1.0 / DT_MDL)
+LEAD_FOLLOW_GO_VLEAD = 1.0
+LEAD_FOLLOW_GO_GAIN_M = 0.5
+LEAD_FOLLOW_MAX_DIST_M = 40.0
+LEAD_FOLLOW_JUMP_M = 5.0
 TLV_LOG_MIN_INTERVAL_S = 2.0
 TLV_ROUTE_LEFT_NEAR_M = 150.0
 TLV_BLINKER_STOP_GAP_S = 0.5
@@ -262,6 +272,10 @@ class CarrotPlanner:
     self.last_model_start_sign = False
     self.tlv_red_active = False
     self.coast_cap_active = False
+    self.lead_follow_active = False
+    self.lead_follow_arm_frames = 0
+    self.lead_follow_d_stop = None
+    self.lead_follow_d_prev = 0.0
     # W74D follow-up: moving-timeout and veto instrumentation state.
     self.tlv_coast_moving_frames = 0
     self.tlv_coast_stop_sign_seen = False
@@ -712,7 +726,7 @@ class CarrotPlanner:
       # WTOP1: a published TLV red (src 1, state 1) vetoes the model's own green
       # start. W150 release (0/0) and W143 green (2) both end it, so TLV starts
       # are unaffected; gas and the gas cooldown end it too.
-      self.tlv_red_veto = tlv_src and state_in == 1 and not cooldown and not gas
+      self.tlv_red_veto = tlv_src and state_in == 1 and not cooldown and not gas and not self.lead_follow_active
       # A start trigger produced by the on-device carrotTlv detector may start
       # the car only while the supercombo model is not signalling a stop, i.e.
       # both cues agree (ONE extra gate for tlv-originated red->green AND
@@ -745,7 +759,7 @@ class CarrotPlanner:
         elif state_in in [1, 2]:
           # TLV red/left keeps the stop only outside the gas cooldown;
           # non-TLV sources stay byte-identical to the pre-W74D behavior.
-          self.carrot_stay_stop = not (tlv_src and cooldown)
+          self.carrot_stay_stop = not (tlv_src and cooldown) and not self.lead_follow_active
       elif self.trafficState_carrot == 1 and state_in == 2:  # red -> green triggered
         if tlv_src:
           trigger_start = (not tlv_start_disagrees) and not cooldown
@@ -970,7 +984,34 @@ class CarrotPlanner:
     else:
       self.tlv_coast_moving_frames = 0
       self.tlv_coast_stop_sign_seen = False
-    self.coast_cap_active = cap and not self.tlv_coast_released
+    self.coast_cap_active = cap and not self.tlv_coast_released and not self.lead_follow_active
+
+  def _update_lead_follow(self, lead, v_ego: float) -> None:
+    """WLF2: latch a stopped lead's departure; see the LEAD_FOLLOW_* constants."""
+    status = bool(getattr(lead, 'status', False))
+    d = float(getattr(lead, 'dRel', 0.0))
+    vl = float(getattr(lead, 'vLead', 0.0))
+    if self.lead_follow_active:
+      if (not status or d > LEAD_FOLLOW_MAX_DIST_M or abs(d - self.lead_follow_d_prev) > LEAD_FOLLOW_JUMP_M
+          or not self.tlv_red_active):
+        self.lead_follow_active = False
+        self.lead_follow_arm_frames = 0
+        self.lead_follow_d_stop = None
+      else:
+        self.lead_follow_d_prev = d
+      return
+    if not status or v_ego >= TLV_STANDSTILL_MPS:
+      self.lead_follow_arm_frames = 0
+      self.lead_follow_d_stop = None
+      return
+    if d <= LEAD_FOLLOW_ARM_DIST_M and abs(vl) < LEAD_FOLLOW_ARM_VLEAD:
+      self.lead_follow_arm_frames += 1
+      self.lead_follow_d_stop = d if self.lead_follow_d_stop is None else min(self.lead_follow_d_stop, d)
+      return
+    if (self.lead_follow_arm_frames >= LEAD_FOLLOW_ARM_FRAMES and self.lead_follow_d_stop is not None
+        and vl >= LEAD_FOLLOW_GO_VLEAD and d >= self.lead_follow_d_stop + LEAD_FOLLOW_GO_GAIN_M):
+      self.lead_follow_active = True
+      self.lead_follow_d_prev = d
 
   def _tlv_red_age_s(self, now: float):
     if self.tlv_red_confirmed_at is None:
@@ -1088,6 +1129,7 @@ class CarrotPlanner:
 
     v_cruise_kph = self.cruise_eco_control(v_ego_cluster_kph, v_cruise_kph)
     self._update_tlv_gas_cooldown(carstate)
+    self._update_lead_follow(radarstate.leadOne, v_ego)
     try:
       model_v2 = sm['modelV2']
     except Exception:

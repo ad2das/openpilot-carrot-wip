@@ -546,6 +546,11 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   planner.tlv_coast_moving_frames = 0
   planner.tlv_coast_stop_sign_seen = False
   planner.tlv_coast_released = False
+  # WLF2: the lead-follow latch state (this skeleton skips CarrotPlanner.__init__).
+  planner.lead_follow_active = False
+  planner.lead_follow_arm_frames = 0
+  planner.lead_follow_d_stop = None
+  planner.lead_follow_d_prev = 0.0
   planner.tlv_veto_active = False
   planner.tlv_veto_started = 0.0
   planner.tlv_red_confirmed_at = None
@@ -711,6 +716,10 @@ def accel_planner(detect_mode: int = 2) -> CarrotPlanner:
   planner.tlv_coast_moving_frames = 0
   planner.tlv_coast_stop_sign_seen = False
   planner.tlv_coast_released = False
+  planner.lead_follow_active = False
+  planner.lead_follow_arm_frames = 0
+  planner.lead_follow_d_stop = None
+  planner.lead_follow_d_prev = 0.0
   planner.tlv_veto_active = False
   planner.tlv_veto_started = 0.0
   planner.tlv_red_confirmed_at = None
