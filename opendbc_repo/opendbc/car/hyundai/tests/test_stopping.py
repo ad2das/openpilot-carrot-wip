@@ -6,7 +6,7 @@ from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
-from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, PASS_ACCEL_MIN, STOP_LOWER_BAND
+from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, STOP_LOWER_BAND
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -460,18 +460,23 @@ def test_pass_accel_default_off():
   butter_cmd(cmd, (1, 0.0, 0.0, STOP_LOWER_BAND))
 
 
-def test_pass_accel_request_sends_jerk_limited_accel():
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
+def test_pass_accel_request_keeps_stock_zero_entry():
+  # The request phase is always the stock zero entry, whatever the approach
+  # passed through: the ESC only stops and holds from that entry.
+  for accel in (-0.2, -0.6):
+    controller = CanfdStopping()
+    controller.pass_accel = True
+    butter_cmd(step(controller, speed=0.3, accel=accel, previous_value=accel), (1, 0.0, 0.0, STOP_LOWER_BAND))
 
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=0.0), (1, -0.2, -0.02, 0.0))
 
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  butter_cmd(step(controller, speed=0.3, accel=0.1, previous_value=-0.2), (1, 0.0, -0.16, 0.0))
+def test_request_entry_never_carries_accel():
+  for pass_accel in (False, True):
+    for accel in (-0.05, -0.2, -0.44, -0.46, -1.5):
+      controller = CanfdStopping()
+      controller.pass_accel = pass_accel
+      cmd = step(controller, speed=0.3, accel=accel, previous_value=accel)
+      assert controller.phase == StopPhase.request
+      assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (1, 0.0, 0.0, STOP_LOWER_BAND)
 
 
 def test_pass_accel_approach_uses_accel_not_floor():
@@ -560,54 +565,9 @@ def test_controller_reads_butter_stop_param(monkeypatch):
   assert controller.canfd_stopping.pass_accel is False
 
 
-def test_pass_accel_hands_over_on_hard_request():
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  # Hard request straight away: the ESC owns the stop, both aReq fields go zero.
-  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.45), (1, 0.0, 0.0, STOP_LOWER_BAND))
-  assert controller.handed_over is True
-
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
-  assert controller.handed_over is False
-  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.2), (1, 0.0, 0.0, STOP_LOWER_BAND))
-  assert controller.handed_over is True
-
-
-def test_pass_accel_handover_is_latched_until_reset():
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.45), (1, 0.0, 0.0, STOP_LOWER_BAND))
-  # A soft request after the handover must not re-arm the pass-through.
-  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, 0.0, 0.0, STOP_LOWER_BAND))
-  assert controller.handed_over is True
-  # Only the episode reset clears the latch.
-  assert step(controller, requested=False) is None
-  assert controller.handed_over is False
-  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
-
-
-def test_pass_accel_boundary_is_handover():
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  # Exactly PASS_ACCEL_MIN is not "softer than": hand over.
-  butter_cmd(step(controller, speed=0.3, accel=PASS_ACCEL_MIN, previous_value=-0.2),
-             (1, 0.0, 0.0, STOP_LOWER_BAND))
-  assert controller.handed_over is True
-
-  controller = CanfdStopping()
-  controller.pass_accel = True
-  # One hundredth above the boundary is still passed through.
-  accel = PASS_ACCEL_MIN + 0.01
-  butter_cmd(step(controller, speed=0.3, accel=accel, previous_value=accel), (1, accel, accel, 0.0))
-  assert controller.handed_over is False
-
-
-def test_pass_accel_approach_hard_keeps_floor_and_no_latch():
+def test_pass_accel_approach_hard_keeps_floor():
   controller = CanfdStopping()
   controller.pass_accel = True
   cmd = step(controller, speed=1.0, accel=-0.6, previous_value=-0.6)
   assert controller.phase == StopPhase.approach
   butter_cmd(cmd, (0, -0.6, -0.6, 0.0))
-  assert controller.handed_over is False

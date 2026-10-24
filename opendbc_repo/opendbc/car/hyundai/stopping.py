@@ -14,7 +14,7 @@ MOVING_SPEED = 0.10
 STOP_CONFIRM_TIME = 0.2
 APPROACH_ACCEL = -0.5
 STOP_LOWER_BAND = 0.20  # fixed experimental value; never copied from the stock SCC
-PASS_ACCEL_MIN = -0.45  # ButterStop pass-through only while the request is softer than this; harder -> ESC stop as before
+PASS_ACCEL_MIN = -0.45  # approach (StopReq 0): ButterStop accel passes only while softer than this; harder keeps the -0.5 floor
 
 
 class StopPhase(StrEnum):
@@ -55,8 +55,6 @@ class CanfdStopping:
     self.phase = StopPhase.idle
     self.reason = "inactive"
     self.stopped_time = 0.0
-    # Handover lasts for the rest of the stop episode; only reset() clears it.
-    self.handed_over = False
 
   def enter(self, phase: StopPhase, reason: str):
     self.phase = phase
@@ -88,15 +86,9 @@ class CanfdStopping:
       return StopCommand(1, 0.0, 0.0, STOP_LOWER_BAND)
 
     if self.phase == StopPhase.request:
-      if self.pass_accel and not self.handed_over and accel > PASS_ACCEL_MIN:
-        # Soft request: the taper is ours, let it reach the ESC.
-        raw = min(accel, 0.0)
-        value = min(0.0, max(previous_value - jerk_l * DT, min(raw, previous_value + jerk_u * DT)))
-        return StopCommand(1, raw, value, 0.0)
-      if self.pass_accel:
-        self.handed_over = True
       # Match the observed Ioniq stock entry: both aReq fields become zero in
-      # the FIRST StopReq frame, bypassing the ordinary aReqValue jerk ramp.
+      # the FIRST StopReq frame, bypassing the ordinary aReqValue jerk ramp. The ESC only stops and holds on
+      # its own from that entry: a negative aReq handed over later let a K5 creep on (route 6ce, 10-24).
       return StopCommand(1, 0.0, 0.0, STOP_LOWER_BAND)
 
     # Preserve the existing approach deceleration until initial low-speed entry.
