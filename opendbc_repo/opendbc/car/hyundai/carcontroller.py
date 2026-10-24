@@ -51,6 +51,19 @@ CANFD_JERK_RELEASE_THRESHOLD = 0.1
 CANFD_JERK_LOWER_ACCEL_BP = [0.0, 0.8, 1.2, 1.5, 2.0, 2.5, 3.2]
 CANFD_JERK_LOWER_LIMIT_V = [1.2, 1.2, 1.2, 1.7, 3.0, 3.3, 3.7]
 
+CLASSIC_CB_FADE_V = (1.0, 3.0)  # m/s: classic-CAN comfort band off below 1.0 m/s and full above 3.0 m/s while braking
+
+
+def classic_cb_scale(long_control_state, v_ego, accel):
+  # A ~0.8 m/s^2 comfort band lets the ESC ignore a soft stop request at walking speed (creep and a late brake bite
+  # then set the decel at rest). No band while stopping; fade it in with speed while braking.
+  if long_control_state == LongCtrlState.stopping:
+    return 0.0
+  if accel >= 0.0:
+    return 1.0
+  return float(np.interp(v_ego, CLASSIC_CB_FADE_V, (0.0, 1.0)))
+
+
 vibrate_intervals = [
   (0.0, 0.5),
   (1.0, 1.5),
@@ -925,6 +938,7 @@ class HyundaiJerk:
       else:
         self.jerk_u = min(max(self.jerk_u_min, self.jerk * 2.0), jerk_max_u)
         self.jerk_l = min(max(1.0, -self.jerk * 4.0), jerk_max_l)
-        self.cb_upper = np.clip(0.9 + accel * 0.2, 0, 1.2)
-        self.cb_lower = np.clip(0.8 + accel * 0.2, 0, 1.2)
+        cb_scale = classic_cb_scale(actuators.longControlState, CS.out.vEgo, accel)
+        self.cb_upper = np.clip(0.9 + accel * 0.2, 0, 1.2) * cb_scale
+        self.cb_lower = np.clip(0.8 + accel * 0.2, 0, 1.2) * cb_scale
 

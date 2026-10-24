@@ -5,7 +5,7 @@ import pytest
 
 from opendbc.car import DT_CTRL
 from opendbc.car.hyundai.carcontroller import CANFD_JERK_ERROR_DELAY, CANFD_JERK_ERROR_FILTER_TIME, CarController, HyundaiJerk, LongCtrlState, \
-                                                   calculate_canfd_jerk_limits
+                                                   calculate_canfd_jerk_limits, classic_cb_scale
 from opendbc.car.hyundai.carstate import is_canfd_avh_active, is_canfd_parking_brake_active
 from opendbc.car.hyundai.hyundaicanfd import apply_accel_jerk_limit, create_acc_control, create_acc_control_scc2, create_tcs_messages, \
                                                  longitudinal_interlock_active
@@ -357,10 +357,87 @@ def test_canfd_tracking_assist_releases_when_plan_unwinds():
 def test_classic_can_jerk_limits_are_unchanged():
   controller = build_jerk_controller()
   CP = SimpleNamespace(flags=0)
-  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-1.4, brakePressed=False, gasPressed=False))
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-1.4, vEgo=10.0, brakePressed=False, gasPressed=False))
   actuators = SimpleNamespace(longControlState=LongCtrlState.pid, jerk=0.0)
 
   controller.make_jerk(CP, CS, accel=-2.0, actuators=actuators, hud_control=None)
 
   assert controller.jerk_u == pytest.approx(0.5)
   assert controller.jerk_l == pytest.approx(1.0)
+
+
+def test_classic_cb_scale():
+  for v, accel in ((0.0, -0.5), (2.0, -0.5), (10.0, -0.5), (0.0, 0.3)):
+    assert classic_cb_scale(LongCtrlState.stopping, v, accel) == 0.0
+
+  for v in (0.0, 0.5, 10.0):
+    assert classic_cb_scale(LongCtrlState.pid, v, 0.3) == pytest.approx(1.0)
+
+  assert classic_cb_scale(LongCtrlState.pid, 0.5, 0.0) == pytest.approx(1.0)
+
+  for v, expected in ((0.5, 0.0), (1.0, 0.0), (2.0, 0.5), (3.0, 1.0), (10.0, 1.0)):
+    assert classic_cb_scale(LongCtrlState.pid, v, -0.3) == pytest.approx(expected)
+
+  assert classic_cb_scale(LongCtrlState.starting, 0.0, 0.5) == pytest.approx(1.0)
+
+
+def test_classic_can_comfort_band_off_while_stopping():
+  controller = build_jerk_controller()
+  CP = SimpleNamespace(flags=0)
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-0.2, vEgo=0.3, brakePressed=False, gasPressed=False))
+  actuators = SimpleNamespace(longControlState=LongCtrlState.stopping, jerk=0.0)
+
+  controller.make_jerk(CP, CS, accel=-0.2, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == 0.0
+  assert controller.cb_lower == 0.0
+  assert controller.jerk_u == pytest.approx(0.9)
+  assert controller.jerk_l == pytest.approx(1.0)
+
+
+def test_classic_can_comfort_band_unchanged_at_speed():
+  controller = build_jerk_controller()
+  CP = SimpleNamespace(flags=0)
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-0.5, vEgo=10.0, brakePressed=False, gasPressed=False))
+  actuators = SimpleNamespace(longControlState=LongCtrlState.pid, jerk=0.0)
+
+  controller.make_jerk(CP, CS, accel=-0.5, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == pytest.approx(0.8)
+  assert controller.cb_lower == pytest.approx(0.7)
+
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=0.5, vEgo=0.5, brakePressed=False, gasPressed=False))
+  controller.make_jerk(CP, CS, accel=0.5, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == pytest.approx(1.0)
+  assert controller.cb_lower == pytest.approx(0.9)
+
+
+def test_classic_can_comfort_band_fades_while_braking():
+  controller = build_jerk_controller()
+  CP = SimpleNamespace(flags=0)
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-0.5, vEgo=2.0, brakePressed=False, gasPressed=False))
+  actuators = SimpleNamespace(longControlState=LongCtrlState.pid, jerk=0.0)
+
+  controller.make_jerk(CP, CS, accel=-0.5, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == pytest.approx(0.4)
+  assert controller.cb_lower == pytest.approx(0.35)
+
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-0.5, vEgo=0.8, brakePressed=False, gasPressed=False))
+  controller.make_jerk(CP, CS, accel=-0.5, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == 0.0
+  assert controller.cb_lower == 0.0
+
+
+def test_canfd_comfort_band_still_zero():
+  controller = build_jerk_controller()
+  CP = SimpleNamespace(flags=HyundaiFlags.CANFD)
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=-0.5, vEgo=10.0, brakePressed=False, gasPressed=False))
+  actuators = SimpleNamespace(longControlState=LongCtrlState.pid, jerk=0.0)
+
+  controller.make_jerk(CP, CS, accel=-0.5, actuators=actuators, hud_control=None)
+
+  assert controller.cb_upper == 0.0
+  assert controller.cb_lower == 0.0
