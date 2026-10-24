@@ -774,3 +774,22 @@ def test_a_stock_radar_lead_matches_its_track_by_position():
 
   assert model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=12, dRel=50.5, yRel=-0.6), lead_one)
   assert not model_renderer.ModelRenderer._is_lead_one_track(SimpleNamespace(radarTrackId=0, dRel=20.0, yRel=0.0), lead_one)
+
+
+def rgba(color):
+  return color.r, color.g, color.b, color.a
+
+
+def test_ar_turn_sign_is_green_only_while_atc_steers():
+  """atcType is always set ("straight" through a toll plaza), so only a steering ATC turns the sign green."""
+  renderer = object.__new__(model_renderer.ModelRenderer)
+  sm = ar_submaster(turn=2, dist=15.0)
+
+  sm["carrotMan"].atcType = "straight"
+  assert rgba(renderer._ar_turn_state(sm)[3]) == rgba(model_renderer.hs.TEXT)
+
+  sm["carrotMan"].atcType = "turn right prepare"
+  assert rgba(renderer._ar_turn_state(sm)[3]) == rgba(model_renderer.hs.TEXT)
+
+  sm["carrotMan"].atcType = "atc right"
+  assert rgba(renderer._ar_turn_state(sm)[3]) == rgba(model_renderer.hs.LIVE_GREEN)

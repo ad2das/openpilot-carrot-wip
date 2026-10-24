@@ -1215,3 +1215,81 @@ def test_hot_values_blink_red_and_links_keep_their_colour(hud_module, monkeypatc
 
   assert "APM" not in drawn, "the blue APM badge stayed up once APN took over"
   assert drawn["APN"].color == module.hs.LIVE_GREEN
+
+
+# ---- toll card: NAVER's TG icon, a named plaza, green only while auto turn control steers -------------
+
+
+@pytest.mark.parametrize("atc_type, engaged", [
+  ("none", False),
+  ("straight", False),           # the car always sends a type; the old "not empty" test made every turn green
+  ("straight prepare", False),
+  ("turn right prepare", False),
+  ("turn left canceled", False),
+  ("atc right", True),
+  ("fork left", True),
+  ("", False),
+  (None, False),
+])
+def test_atc_engaged_only_for_live_turn_control(hud_module, atc_type, engaged):
+  """Green means auto turn control is steering this manoeuvre, not merely that atcType is set."""
+  module, _ = hud_module
+
+  assert module.hs.atc_engaged(atc_type) is engaged, atc_type
+
+
+@pytest.mark.parametrize("main_text, label", [
+  ("서울요금소", "서울요금소"),      # the plaza names itself
+  (" 판교톨게이트 ", "판교톨게이트"),  # ...or says "toll gate": kept, trimmed
+  ("강남대로 방면", "톨게이트"),      # a road name is not a plaza name
+  ("", "톨게이트"),
+])
+def test_toll_label_prefers_the_plaza_name(hud_module, main_text, label):
+  module, _ = hud_module
+
+  assert module.HudRenderer._toll_label(main_text) == label
+
+
+def toll_arrow_blits(module, monkeypatch, turn, color):
+  """Draw one manoeuvre arrow and return (drawn, [(texture name, rgba)])."""
+  blits = []
+  monkeypatch.setattr(module.hs, "_texture", lambda name: SimpleNamespace(width=256, height=256, name=name))
+  monkeypatch.setattr(module.hs, "_blit", lambda tex, x, y, w, h, tint: blits.append((tex.name, tint)))
+
+  drawn = module.hs.maneuver_arrow(turn, 500.0, 400.0, 1.0, color)
+
+  return drawn, [(name, (tint.r, tint.g, tint.b, tint.a)) for name, tint in blits]
+
+
+def test_toll_icon_is_drawn_untinted(hud_module, monkeypatch):
+  """The TG icon carries NAVER's own colours, so only its alpha may be changed; other arrows stay tinted."""
+  module, _ = hud_module
+  dimmed = module.hs.rgba(200, 200, 200, 120)
+
+  drawn, blits = toll_arrow_blits(module, monkeypatch, module.hs.TURN_TOLL, dimmed)
+  assert drawn is True
+  assert blits == [("nav_toll", (255, 255, 255, 120))], "the toll icon was tinted"
+
+  drawn, blits = toll_arrow_blits(module, monkeypatch, 1, dimmed)
+  assert drawn is True
+  assert blits == [("nav_turn_left", (200, 200, 200, 120))], "a turn arrow lost its tint"
+
+  drawn, blits = toll_arrow_blits(module, monkeypatch, 99, dimmed)
+  assert drawn is False and blits == [], "an unknown manoeuvre drew something"
+
+
+def test_nav_toll_is_naver_tg_icon():
+  """The asset is NAVER's TG pictogram: square RGBA with the logo's blue band across the top."""
+  from PIL import Image
+  import numpy as np
+
+  asset = Path(__file__).parents[2] / "assets" / "images" / "nav" / "nav_toll.png"
+  with Image.open(asset) as image:
+    image.load()
+    assert image.size == (256, 256)
+    assert image.mode == "RGBA"
+    band = np.asarray(image)[30:60, 100:157].reshape(-1, 4).mean(axis=0)
+
+  r, g, b, a = (float(v) for v in band)
+  assert a > 200, f"the top band is transparent (alpha {a:.1f})"
+  assert b > r + 60, f"the top band is not blue (r {r:.1f}, b {b:.1f})"

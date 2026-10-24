@@ -1268,10 +1268,12 @@ class HudRenderer(Widget):
       key: tuple = ("camera", x_sign_type)
       dist_text = self._format_camera_distance_text(self._camera_display_dist(key, dist, now))
     else:
-      # Turn guidance is the arrow and the distance alone; the road name only cost a glance.
+      # Turn guidance is the arrow and the distance alone; the road name only cost a glance. A toll plaza is
+      # named, though: its pictogram is new to the eye, and the word tells the driver which lane to pick.
       dist = turn_dist
-      text, extra = "", ""
-      body, bar = hs.CARD_BODY, hs.LIVE_GREEN if info["atc_type"] else NAV_BLUE
+      text, extra = (self._toll_label(info["tbt_main_text"]) if turn_info == hs.TURN_TOLL else ""), ""
+      atc = hs.atc_engaged(info["atc_type"])
+      body, bar = hs.CARD_BODY, hs.LIVE_GREEN if atc else NAV_BLUE
       key = ("turn", turn_info)
       dist_text = self._format_turn_distance_text(dist)
 
@@ -1291,7 +1293,7 @@ class HudRenderer(Widget):
     gx, gy = x + 120, y + (128 if text else 102)
     if camera:
       hs.regulatory_sign(gx, gy, extra, t, 0.92)
-    elif not hs.maneuver_arrow(turn_info, gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if info["atc_type"] else hs.TEXT):
+    elif not hs.maneuver_arrow(turn_info, gx, gy, 1.12 if text else 0.96, hs.LIVE_GREEN if atc else hs.TEXT):
       t.draw_mid(f"감속:{turn_info}", gx, gy, 40, hs.TEXT, hs.BOLD, align=0.5)
 
     if number:
@@ -1310,6 +1312,12 @@ class HudRenderer(Widget):
       hs.card(x + 30, bar_y, max(10.0, (w - 60) * progress), 10, bar, 5, None)
     if not camera and next_info > 0:
       self._draw_next_turn(x, y + h + NEXT_GAP, next_info, next_gap)
+
+  @staticmethod
+  def _toll_label(main_text: str) -> str:
+    """The plaza's own name when the navigator gives one ("서울요금소"), else the plain word."""
+    main = main_text.strip()
+    return main if ("요금소" in main or "톨게이트" in main) else "톨게이트"
 
   def _draw_next_turn(self, x: float, y: float, turn_info: int, gap: int) -> None:
     """The turn after next, a step smaller under the turn card: its arrow and the distance between the two turns."""

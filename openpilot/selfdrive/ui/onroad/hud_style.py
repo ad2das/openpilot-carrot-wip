@@ -766,6 +766,15 @@ MANEUVER_ICONS = {1: "turn_left", 2: "turn_right", 3: "keep_left", 4: "keep_righ
 AR_FEET = {"turn_right": (0.1985, 0.9229), "turn_left": (0.7985, 0.9229), "keep_right": (0.1982, 0.9339),
            "keep_left": (0.7982, 0.9339), "uturn": (0.8127, 0.9254), "destination": (0.4969, 0.9031)}
 AR_ICONS = {1: "turn_left", 2: "turn_right", 3: "keep_left", 4: "keep_right", 7: "uturn", 8: "destination"}
+TURN_TOLL = 6
+COLOUR_ICONS = frozenset(("toll",))  # baked in colour (red-white boom, gold coin): drawn untinted, alpha only
+# carrotMan.atcType is never empty ("none", "... prepare", "... canceled", "straight" for tolls and rotaries), so
+# green means auto turn control is actually steering this manoeuvre, not merely that the field is set.
+ATC_ENGAGED_TYPES = frozenset(("turn left", "turn right", "atc left", "atc right", "fork left", "fork right"))
+
+
+def atc_engaged(atc_type) -> bool:
+  return str(atc_type or "").strip() in ATC_ENGAGED_TYPES
 
 _TEXTURES: dict[str, rl.Texture] = {}
 
@@ -789,6 +798,8 @@ def maneuver_arrow(turn_info: int, cx: float, cy: float, k: float, color: rl.Col
   if name is None:
     return False
   size = 140.0 * k
+  if name in COLOUR_ICONS:
+    color = rgba(255, 255, 255, color.a)
   _blit(_texture(f"nav_{name}"), cx - size / 2, cy - size / 2, size, size, color)
   return True
 

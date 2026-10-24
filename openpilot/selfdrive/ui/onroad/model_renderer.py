@@ -1354,7 +1354,7 @@ class ModelRenderer(Widget):
       cm = sm['carrotMan']
       turn, dist = int(cm.xTurnInfo), float(cm.xDistToTurn)
       route = int(cm.nGoPosDist) > 0 and int(cm.nGoPosTime) > 0
-      atc = bool(str(cm.atcType or ""))
+      atc = hs.atc_engaged(cm.atcType)
     except Exception:
       return None
     if not route or not (self.AR_NEAR < dist <= self.AR_FAR):
