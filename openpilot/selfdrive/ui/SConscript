@@ -4,11 +4,12 @@ Import('env', 'arch', 'common')
 # build the fonts
 generator = File("#openpilot/selfdrive/assets/fonts/process.py")
 source_files = Glob("#openpilot/selfdrive/assets/fonts/*.ttf") + Glob("#openpilot/selfdrive/assets/fonts/*.otf")
+# Keep in sync with process.py: SKIP_FONTS are not processed, KR_ATLASES add extra atlases.
 output_files = [
   (f"#{Path(f.path).with_suffix('.fnt')}", f"#{Path(f.path).with_suffix('.png')}")
   for f in source_files
-  if "NotoColor" not in f.name
-]
+  if "NotoColor" not in f.name and Path(f.path).stem != "KaiGenGothicKR-Bold"
+] + [("#openpilot/selfdrive/assets/fonts/PretendardKR-Bold.fnt", "#openpilot/selfdrive/assets/fonts/PretendardKR-Bold.png")]
 env.Command(
   target=output_files,
   source=[generator, source_files],

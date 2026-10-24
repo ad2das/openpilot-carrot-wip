@@ -14,7 +14,7 @@ import numpy as np
 import pyray as rl
 
 from openpilot.system.ui.lib import native_text
-from openpilot.system.ui.lib.application import FONT_DIR, FontWeight, gui_app
+from openpilot.system.ui.lib.application import FONT_DIR, KR_ATLAS_RAISE, KR_ATLAS_SCALE, FontWeight, gui_app
 from openpilot.system.ui.lib.shader_polygon import Gradient, draw_polygon, draw_polygon_solid, draw_polygons
 
 
@@ -57,13 +57,15 @@ BOLD = FontWeight.BOLD
 SEMI = FontWeight.SEMI_BOLD
 MEDIUM = FontWeight.MEDIUM
 
-# Baseline as a fraction of the draw size, measured from the generated atlases:
-# Inter caps span 0.195..0.800, KaiGenGothicKR Latin/digits sit on 0.896.
-_INTER_BASELINE = 0.80
-_HANGUL_BASELINE = 0.896
-INTER_CAP = 0.605
-# Hangul glyphs fill 0.02..0.98 of the draw size, so their centre is 0.396 above the baseline.
-_HANGUL_MIDDLE = _HANGUL_BASELINE - 0.5
+# Baseline as a fraction of the draw size, from Pretendard's metrics (ascent 1950 / em 2444;
+# caps span 0.206..0.798, matching the generated atlases). The Hangul atlases are scaled by
+# KR_ATLAS_SCALE and raised by KR_ATLAS_RAISE, so their baseline sits at 0.798 * 1.25 - 0.125.
+_PRETENDARD_BASELINE = 1950 / 2444
+_INTER_BASELINE = _PRETENDARD_BASELINE
+_HANGUL_BASELINE = _PRETENDARD_BASELINE * KR_ATLAS_SCALE - KR_ATLAS_RAISE
+INTER_CAP = 0.592
+# Hangul glyphs span 0.136..0.873 of the em (centre 0.505) before scaling and raising.
+_HANGUL_MIDDLE = _HANGUL_BASELINE - (0.505 * KR_ATLAS_SCALE - KR_ATLAS_RAISE)
 _INTER_EXTRA = frozenset("°–•×")
 _WIDTH_CACHE_LIMIT = 512
 
@@ -77,11 +79,11 @@ HIRES_MIN_SIZE = 52.0
 _HIRES_SIZE = 128
 _HIRES_GLYPH_LIMIT = 160
 _HIRES_PADDING = 8
-_HIRES_TTF = "KaiGenGothicKR-Bold.ttf"
+_HIRES_TTF = "Pretendard-Bold.ttf"
 
 
 class _HiResHangul:
-  """KaiGenGothicKR at 128 px holding only the characters drawn recently (bounded, rebuilt on a miss).
+  """Pretendard Bold Hangul at 128 px holding only the characters drawn recently (bounded, rebuilt on a miss).
 
   The 48 px atlas covers all 11,172 syllables; at 128 px that would be a 100+ MB texture, so this
   keeps just the characters of the large text shown so far. Rasterising and packing a rebuild
@@ -142,10 +144,15 @@ class _HiResHangul:
       ordered = sorted(codepoints)
       cps = rl.ffi.new("int[]", ordered)
       count = rl.ffi.new("int *", len(ordered))
-      glyphs = rl.load_font_data(rl.ffi.cast("unsigned char *", self._buffer), self._size, _HIRES_SIZE,
-                                 rl.ffi.cast("int *", cps), len(ordered), rl.FontType.FONT_DEFAULT, count)
+      glyphs = rl.load_font_data(rl.ffi.cast("unsigned char *", self._buffer), self._size,
+                                 round(_HIRES_SIZE * KR_ATLAS_SCALE), rl.ffi.cast("int *", cps), len(ordered),
+                                 rl.FontType.FONT_DEFAULT, count)
       if glyphs == rl.ffi.NULL or count[0] <= 0:
         raise RuntimeError("high-resolution Hangul glyphs failed")
+      # Same optical size and raise as the 48 px atlas (fonts/process.py).
+      raise_px = round(_HIRES_SIZE * KR_ATLAS_RAISE)
+      for i in range(count[0]):
+        glyphs[i].offsetY -= raise_px
       recs, image = self._pack(glyphs, count[0])
       self._result = (codepoints, glyphs, count[0], recs, image)
     except Exception:

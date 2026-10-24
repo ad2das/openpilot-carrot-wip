@@ -110,18 +110,28 @@ FONT_SOURCE_EXTS = (".ttf", ".otf")
 
 
 class FontWeight(StrEnum):
-  NORMAL = "Inter-Regular.fnt" if BIG_UI else "Inter-Medium.fnt"
-  MEDIUM = "Inter-Medium.fnt"
-  BOLD = "Inter-Bold.fnt"
-  SEMI_BOLD = "Inter-SemiBold.fnt"
+  NORMAL = "Pretendard-Regular.fnt" if BIG_UI else "Pretendard-Medium.fnt"
+  MEDIUM = "Pretendard-Medium.fnt"
+  BOLD = "Pretendard-Bold.fnt"
+  SEMI_BOLD = "Pretendard-SemiBold.fnt"
   PRETENDARD = "Pretendard-SemiBold.fnt"
   UNIFONT = "unifont.fnt"
 
   # Small UI fonts
-  DISPLAY_REGULAR = "Inter-Regular.fnt"
-  ROMAN = "Inter-Regular.fnt"
-  #DISPLAY = "Inter-Bold.fnt"
-  DISPLAY = "KaiGenGothicKR-Bold.fnt"
+  DISPLAY_REGULAR = "Pretendard-Regular.fnt"
+  ROMAN = "Pretendard-Regular.fnt"
+  # Hangul: a 48 px atlas of every syllable, generated from Pretendard-Bold.ttf (fonts/process.py).
+  DISPLAY = "PretendardKR-Bold.fnt"
+
+
+# Atlas stems generated from another font's source file (fonts/process.py KR_ATLASES).
+FONT_SOURCE_ALIASES = {"PretendardKR-Bold": "Pretendard-Bold"}
+# Pretendard Hangul is 0.74 of the em; the KaiGen face the layouts were tuned on is 0.92. The
+# Hangul atlas is rasterised KR_ATLAS_SCALE larger than its nominal size and raised by
+# KR_ATLAS_RAISE of the draw size, so Korean text keeps its size and position. Keep in sync
+# with fonts/process.py.
+KR_ATLAS_SCALE = 1.25
+KR_ATLAS_RAISE = 0.125  # 6 px of the 48 px atlas, 16 px of the 128 px HUD atlas
 
 
 class TextAlignment(IntEnum):
@@ -144,6 +154,9 @@ def font_fallback(font: rl.Font, text: str | bytes | None = None) -> rl.Font:
   if not gui_app.has_font(FontWeight.DISPLAY):
     return font
   if multilang.requires_unifont():
+    # Pretendard has no Han or Thai glyphs; those locales keep the unifont atlas.
+    if multilang.language != "ko" and gui_app.has_font(FontWeight.UNIFONT):
+      return gui_app.font(FontWeight.UNIFONT)
     return gui_app.font(FontWeight.DISPLAY)
   if isinstance(text, bytes):
     text = text.decode("utf-8", errors="replace")
@@ -986,6 +999,7 @@ class GuiApplication:
       return fnt_path
 
     stem = fnt_path.with_suffix("")
+    stem = stem.with_name(FONT_SOURCE_ALIASES.get(stem.name, stem.name))
     for ext in FONT_SOURCE_EXTS:
       source_path = stem.with_suffix(ext)
       if source_path.exists():
@@ -1001,7 +1015,14 @@ class GuiApplication:
       codepoints = self._font_codepoints(font_weight)
       cp_buffer = rl.ffi.new("int[]", codepoints)
       cp_ptr = rl.ffi.cast("int *", cp_buffer)
-      return rl.load_font_ex(font_path.as_posix(), font_size, cp_ptr, len(codepoints))
+      if font_weight != FontWeight.DISPLAY:
+        return rl.load_font_ex(font_path.as_posix(), font_size, cp_ptr, len(codepoints))
+      font = rl.load_font_ex(font_path.as_posix(), round(font_size * KR_ATLAS_SCALE), cp_ptr, len(codepoints))
+      raise_px = round(font_size * KR_ATLAS_RAISE)
+      for i in range(font.glyphCount):
+        font.glyphs[i].offsetY -= raise_px
+      font.baseSize = font_size
+      return font
     except Exception:
       cloudlog.exception(f"Failed to load source font with codepoints: {font_path}")
       return rl.load_font(font_path.as_posix())
@@ -1014,6 +1035,7 @@ class GuiApplication:
       codepoints.update(range(0xAC00, 0xD7A4))
       codepoints.update(range(0x1100, 0x1200))
       codepoints.update(range(0x3130, 0x3190))
+    if font_weight == FontWeight.UNIFONT:
       codepoints.update(range(0x4E00, 0xA000))
       codepoints.update(range(0x3400, 0x4DC0))
     return sorted(codepoints)
