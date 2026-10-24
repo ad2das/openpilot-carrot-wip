@@ -6,7 +6,7 @@ from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
-from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, STOP_LOWER_BAND
+from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, STOP_LOWER_BAND, ZERO_CONFIRM_FRAMES
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -509,23 +509,59 @@ def test_pass_accel_default_off():
   butter_cmd(cmd, (1, 0.0, 0.0, STOP_LOWER_BAND))
 
 
-def test_pass_accel_request_keeps_stock_zero_entry():
-  # The request phase is always the stock zero entry, whatever the approach
-  # passed through: the ESC only stops and holds from that entry.
+def test_pass_accel_request_sends_decel_until_hold():
+  # A zero entry while the car still rolls never reaches a hold; the request
+  # phase keeps sending the openpilot decel until the ESC confirms it.
   for accel in (-0.2, -0.6):
     controller = CanfdStopping()
     controller.pass_accel = True
-    butter_cmd(step(controller, speed=0.3, accel=accel, previous_value=accel), (1, 0.0, 0.0, STOP_LOWER_BAND))
+    butter_cmd(step(controller, speed=0.3, accel=accel, previous_value=accel), (1, accel, accel, 0.0))
+
+
+def test_creep_guard_reaches_esc():
+  # The relaxed -1.5 creep guard is jerk limited, not clipped to the -0.5 floor.
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=-1.5, previous_value=-0.5), (1, -1.5, -0.52, 0.0))
+
+
+def test_avh_hold_switches_to_stock_zero():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.0, held=True, accel=-0.5, previous_value=-0.5), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.phase == StopPhase.held
+
+
+def test_slow_roll_without_avh_keeps_decel():
+  # 6d1 3.5 case: 0.03 m/s is inside the stop region (held) but not truly stopped,
+  # so the ESC never sees the zero entry and keeps getting the decel.
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  for _ in range(15):  # stopped_time reaches STOP_CONFIRM_TIME
+    butter_cmd(step(controller, speed=0.03, held=False, accel=-0.5, previous_value=-0.5), (1, -0.5, -0.5, 0.0))
+  assert controller.phase == StopPhase.held
+  assert controller.zero_frames == 0
+
+
+def test_true_zero_without_avh_falls_back_to_zero_after_1s():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  for _ in range(ZERO_CONFIRM_FRAMES - 1):
+    butter_cmd(step(controller, speed=0.0, held=False, accel=-0.5, previous_value=-0.5), (1, -0.5, -0.5, 0.0))
+  butter_cmd(step(controller, speed=0.0, held=False, accel=-0.5, previous_value=-0.5), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.zero_frames == ZERO_CONFIRM_FRAMES
+  # Any motion restarts the climb-down wait.
+  butter_cmd(step(controller, speed=0.05, held=False, accel=-0.5, previous_value=-0.5), (1, -0.5, -0.5, 0.0))
+  assert controller.zero_frames == 0
 
 
 def test_request_entry_never_carries_accel():
-  for pass_accel in (False, True):
-    for accel in (-0.05, -0.2, -0.44, -0.46, -1.5):
-      controller = CanfdStopping()
-      controller.pass_accel = pass_accel
-      cmd = step(controller, speed=0.3, accel=accel, previous_value=accel)
-      assert controller.phase == StopPhase.request
-      assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (1, 0.0, 0.0, STOP_LOWER_BAND)
+  for accel in (-0.05, -0.2, -0.44, -0.46, -1.5):
+    controller = CanfdStopping()
+    controller.pass_accel = False
+    cmd = step(controller, speed=0.3, accel=accel, previous_value=accel)
+    assert controller.phase == StopPhase.request
+    assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (1, 0.0, 0.0, STOP_LOWER_BAND)
 
 
 def test_pass_accel_approach_uses_accel_not_floor():
@@ -541,7 +577,7 @@ def test_pass_accel_held_keeps_zero_hold():
   controller.pass_accel = True
   held = []
   for _ in range(15):
-    cmd = step(controller, speed=0.0, accel=-0.5, previous_value=0.0)
+    cmd = step(controller, speed=0.0, held=True, accel=-0.5, previous_value=0.0)
     if controller.phase == StopPhase.held:
       held.append(cmd)
   assert controller.phase == StopPhase.held
