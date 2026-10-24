@@ -12,8 +12,9 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 )
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, HOLD_RAMP, LeadPosFilter, STANDSTILL_T, STANDSTILL_V,
-  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor,
+  CREEP_ACCEL, CREEP_V, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, HOLD_RAMP,
+  LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, final_roll_limit,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -98,6 +99,7 @@ class LongControl:
     self._butter_floor_prev = None
     self._butter_s_ego = 0.0
     self._butter_lead_filter = LeadPosFilter()
+    self._butter_roll_limit = None
     self._butter_diag = {}
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
@@ -161,6 +163,7 @@ class LongControl:
     # The lead bound uses the smoothed lead position (d_eff); every gate above
     # still uses the raw radar values. s_ego is maintained by update().
     d_eff = None
+    v_lead = float("nan")
     if lead is not None and bool(getattr(lead, "status", False)):
       try:
         d_rel_raw = float(lead.dRel)
@@ -169,10 +172,25 @@ class LongControl:
       d_eff = self._butter_lead_filter.update(True, d_rel_raw, self._butter_s_ego)
       if d_eff is None:
         return None
+      try:
+        v_lead = float(lead.vLead)
+      except (TypeError, ValueError, AttributeError):
+        v_lead = float("nan")
     else:
       self._butter_lead_filter.reset()
+      # A latch taken with a lead in view is invalid without one.
+      self._butter_roll_limit = None
+    # Final-roll latch: taken once per stop, and only behind a stopped lead.
+    lead_stopped = math.isfinite(v_lead) and v_lead < FINAL_ROLL_VLEAD
+    roll_avail = None
+    if self._butter_roll_limit is not None and (v_ego > FINAL_ROLL_RESET_V or not lead_stopped):
+      self._butter_roll_limit = None
+    if self._butter_roll_limit is None and d_eff is not None and lead_stopped and v_ego <= FINAL_ROLL_V:
+      self._butter_roll_limit = final_roll_limit(v_ego, d_eff, self._butter_s_ego)
+    if self._butter_roll_limit is not None:
+      roll_avail = min(self._butter_roll_limit - self._butter_s_ego, d_eff - MIN_FINAL_GAP_ABS)
     return butter_floor(v_ego, CONTROL_N_T_IDX, plan_speeds, lead, self.stop_distance_orig,
-                        d_rel_eff=d_eff, diag=self._butter_diag)
+                        d_rel_eff=d_eff, diag=self._butter_diag, roll_avail=roll_avail)
 
   def _apply_hyundai_longitudinal_tuning(self):
     # Hyundai, Kia, and Genesis all use the opendbc "hyundai" brand. Keep the
@@ -271,6 +289,7 @@ class LongControl:
       else:
         self._butter_s_ego = 0.0
         self._butter_lead_filter.reset()
+        self._butter_roll_limit = None
       # One-way floor slew: tightening (more negative) is instant, relaxing
       # (rising toward 0) is rate-limited at FLOOR_RELAX_JERK so radar noise
       # cannot flap the applied braking; that constant is read at call time so
@@ -289,6 +308,7 @@ class LongControl:
     else:
       self._butter_floor_prev = None
       self._butter_lead_filter.reset()
+      self._butter_roll_limit = None
       self._butter_s_ego = 0.0
     self.butter_floor_raw_last = butter_floor_raw_value
     self.butter_floor_last = butter_floor_value

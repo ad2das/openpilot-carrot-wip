@@ -918,3 +918,146 @@ def test_state_sequence_identical_on_vs_off_but_output_differs(monkeypatch):
     if on_out != off_out:
       outputs_differ = True
   assert outputs_differ, "ButterStop=1 must change the stopping output somewhere"
+
+
+# ---------------------------------------------------------------------------
+# final-roll latch (W-ROLL2)
+# ---------------------------------------------------------------------------
+
+def _roll_plan():
+  """Plan used by the final-roll fixtures: plan_stop_distance == 0.90 m."""
+  t = np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.2, 1.4, 1.6, 1.8, 2.0,
+                2.5, 3.0, 3.5, 4.0, 5.0, 6.0])
+  v = np.maximum(0.0, 0.6 - 0.2 * t)
+  return t, v
+
+
+def test_final_roll_limit_values():
+  from openpilot.selfdrive.controls.lib.butter_stop import final_roll_limit
+  assert final_roll_limit(0.6, 4.85, 10.0) == pytest.approx(10.51, abs=1e-9)
+  assert final_roll_limit(0.3, 4.7, 0.0) == pytest.approx(0.24, abs=1e-9)
+  assert final_roll_limit(0.6, 3.2, 5.0) == pytest.approx(5.2, abs=1e-9)
+
+
+def test_butter_floor_roll_avail_only_raises_lead_budget():
+  t, speeds = _roll_plan()
+  assert plan_stop_distance(t, speeds) == pytest.approx(0.90, abs=1e-9)
+  lead = SimpleNamespace(status=True, dRel=4.85, aLeadK=0.0)
+
+  for d in (4.85, 4.55, 3.24):
+    lead = SimpleNamespace(status=True, dRel=d, aLeadK=0.0)
+    for v in (0.6, 0.3, 0.25):
+      plain = butter_floor(v, t, speeds, lead, 6.0, d_rel_eff=d)
+      garbage = butter_floor(v, t, speeds, lead, 6.0, d_rel_eff=d, roll_avail=-0.1)
+      nan_roll = butter_floor(v, t, speeds, lead, 6.0, d_rel_eff=d, roll_avail=float("nan"))
+      assert garbage == plain
+      assert nan_roll == plain
+      # No lead in view: roll_avail must not change the plan-bound floor.
+      no_lead = SimpleNamespace(status=False, dRel=d, aLeadK=0.0)
+      assert butter_floor(v, t, speeds, no_lead, 6.0, roll_avail=0.51) == \
+             butter_floor(v, t, speeds, no_lead, 6.0)
+
+
+def test_butter_floor_roll_avail_turns_none_into_floor():
+  t, speeds = _roll_plan()
+  lead = SimpleNamespace(status=True, dRel=4.85, aLeadK=0.0)
+  assert butter_floor(0.6, t, speeds, lead, 6.0, d_rel_eff=4.85) is None
+  floor = butter_floor(0.6, t, speeds, lead, 6.0, d_rel_eff=4.85, roll_avail=0.51)
+  assert floor == pytest.approx(-0.469, abs=1e-3)
+  assert floor == pytest.approx(-(solve_taper_a_end(0.6, 0.51, K_TAPER) + K_TAPER * 0.6), abs=1e-12)
+
+  lead = SimpleNamespace(status=True, dRel=4.55, aLeadK=0.0)
+  assert butter_floor(0.25, t, speeds, lead, 6.0, d_rel_eff=4.55) is None
+  assert butter_floor(0.25, t, speeds, lead, 6.0, d_rel_eff=4.55, roll_avail=0.21) == \
+         pytest.approx(-0.225, abs=1e-9)
+
+  lead = SimpleNamespace(status=True, dRel=3.24, aLeadK=0.0)
+  assert butter_floor(0.3, t, speeds, lead, 6.0, d_rel_eff=3.24, roll_avail=0.24) == \
+         pytest.approx(-0.25, abs=1e-9)
+
+
+def _roll_frames(control, v_sequence, radar_state):
+  outs = []
+  for v in v_sequence:
+    cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=_roll_plan()[1],
+                                      lead_status=radar_state["status"],
+                                      d_rel=radar_state["d_rel"], v_lead=radar_state["v_lead"])
+    radar.leadOne = SimpleNamespace(status=radar_state["status"], dRel=radar_state["d_rel"],
+                                    aLeadK=0.0, vLead=radar_state["v_lead"])
+    outs.append(control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)[0])
+  return outs
+
+
+def test_longcontrol_roll_latch(monkeypatch):
+  from openpilot.selfdrive.controls.lib.butter_stop import (
+    FINAL_ROLL_M, FINAL_ROLL_V, final_roll_limit,
+  )
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
+  # Normal lead budget is 4.3 - 4.3 = 0 m, i.e. below AVAIL_MIN: only the
+  # latch can make the floor exist here.
+  lead = {"status": True, "d_rel": 4.3, "v_lead": 0.0}
+  v_seq = [round(0.9 - 0.05 * i, 2) for i in range(17)]  # 0.9 .. 0.10
+
+  latched_at = []
+  prev = None
+  for v in v_seq:
+    _roll_frames(control, [v], lead)
+    cur = control._butter_roll_limit
+    if cur is not None and prev is None:
+      latched_at.append(v)
+      # Exactly the stock rolling distance plus FINAL_ROLL_M from this position.
+      assert cur - control._butter_s_ego == pytest.approx(
+        min(v * v / 1.0 + FINAL_ROLL_M, 4.3 - MIN_FINAL_GAP_ABS), abs=1e-9)
+      assert cur == pytest.approx(final_roll_limit(v, 4.3, control._butter_s_ego), abs=1e-9)
+    prev = cur
+  assert latched_at == [FINAL_ROLL_V]
+  assert control._butter_roll_limit is not None
+  # Unchanged while the car keeps rolling down.
+  held = control._butter_roll_limit
+  _roll_frames(control, [0.3], lead)
+  assert control._butter_roll_limit == pytest.approx(held, abs=1e-12)
+  assert control.butter_floor_raw_last is not None
+
+  # A stale latch above FINAL_ROLL_RESET_V is dropped.
+  _roll_frames(control, [1.1], lead)
+  assert control._butter_roll_limit is None
+  # Relatching while the lead is stopped is allowed again.
+  _roll_frames(control, [0.3], lead)
+  assert control._butter_roll_limit is not None
+  # Losing the lead invalidates the latch.
+  _roll_frames(control, [0.3], {"status": False, "d_rel": 30.0, "v_lead": 0.0})
+  assert control._butter_roll_limit is None
+  # A moving lead invalidates it too.
+  _roll_frames(control, [0.3], lead)
+  assert control._butter_roll_limit is not None
+  _roll_frames(control, [0.3], {"status": True, "d_rel": 4.3, "v_lead": 0.5})
+  assert control._butter_roll_limit is None
+
+
+def test_longcontrol_roll_latch_needs_stopped_lead(monkeypatch):
+  """A lead that keeps rolling must never grant a limit, tick after tick."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  seen = []
+  real = lc.butter_floor
+
+  def spy(v, plan_t, speeds, lead, stop_d, d_rel_eff=None, diag=None, roll_avail=None):
+    got = real(v, plan_t, speeds, lead, stop_d, d_rel_eff=d_rel_eff, diag=diag)
+    seen.append((v, d_rel_eff, roll_avail, got))
+    return got
+
+  monkeypatch.setattr(lc, "butter_floor", spy)
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
+  moving = {"status": True, "d_rel": 4.3, "v_lead": 0.5}
+  v_seq = [round(0.9 - 0.05 * i, 2) for i in range(17)]  # 0.9 .. 0.10
+  for v in v_seq:
+    _roll_frames(control, [v], moving)
+    assert control._butter_roll_limit is None, "a moving lead must never latch"
+
+  assert seen, "the floor was never consulted"
+  t, speeds = _roll_plan()
+  lead = SimpleNamespace(status=True, dRel=4.3, aLeadK=0.0, vLead=0.5)
+  for v, d_eff, roll, got in seen:
+    assert roll is None
+    # The floor is exactly the latch-off floor for the same filtered distance.
+    assert got == real(v, t, speeds, lead, control.stop_distance_orig, d_rel_eff=d_eff)

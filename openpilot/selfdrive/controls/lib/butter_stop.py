@@ -43,6 +43,28 @@ LEAD_ACCEL_MIN = -1.5
 LEAD_CLOSING_TIME_MIN = 2.5
 STOP_DISTANCE_DEFAULT = 5.5
 
+# Latched final-roll limit. Once per stop, behind a lead that is no longer
+# closing, the ego-odometry position where the car must be at rest is latched
+# to at most stock rolling distance + FINAL_ROLL_M from where it is at that
+# moment. The taper may then use that slack, so the last metres keep rolling
+# instead of being given back to the plan at the stop point.
+FINAL_ROLL_M = 0.15      # extra rolling distance granted at the latch (m)
+FINAL_ROLL_V = 0.6       # latch when v_ego <= this (m/s)
+FINAL_ROLL_RESET_V = 1.0 # a latch above this speed is stale, drop it (m/s)
+FINAL_ROLL_VLEAD = 0.3   # lead must be slower than this to latch (m/s)
+STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling distance
+
+
+def final_roll_limit(v_ego, d_eff, s_ego):
+  """Latched ego-odometry position where the taper must have stopped the car.
+
+  stock is the distance stock stopping would still cover at v_ego; the extra
+  FINAL_ROLL_M on top of it is the only slack the latch may add, and the lead
+  budget still caps the result MIN_FINAL_GAP_ABS short of the lead.
+  """
+  stock = v_ego * v_ego / (2.0 * STOCK_ROLL_DECEL)
+  return s_ego + min(stock + FINAL_ROLL_M, d_eff - MIN_FINAL_GAP_ABS)
+
 
 def plan_stop_distance(plan_t, plan_speeds):
   """Trapezoid distance along the plan until it first drops below standstill."""
@@ -159,7 +181,8 @@ def slew_floor(prev, floor_raw, dt=DT_CTRL):
   return min(floor_raw, prev + FLOOR_RELAX_JERK * dt)
 
 
-def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff=None, diag=None):
+def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff=None, diag=None,
+                 roll_avail=None):
   """Most-negative allowed acceleration at v_ego, or None to let the plan win.
 
   The taper distance budget is the plan's own remaining stop distance plus
@@ -168,6 +191,9 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff
   slack outside the minimum final gap. d_rel_eff replaces the raw lead dRel
   when given (the smoothed lead position LongControl maintains); diag, when
   given, records the binding term and the solved a_end for the sim telemetry.
+  roll_avail is the remaining distance to the latched final-roll limit; it only
+  ever raises the lead budget, and the caller has already clipped it to the
+  lead, so it can never push the car past MIN_FINAL_GAP_ABS.
   """
   if diag is not None:
     diag["bound"] = None
@@ -195,6 +221,8 @@ def butter_floor(v_ego, plan_t, plan_speeds, lead, stop_distance_orig, d_rel_eff
     if not math.isfinite(d_rel):
       return None
     lead_avail = d_rel - max(MIN_FINAL_GAP_ABS, stop_distance_orig - LEAD_SLACK)
+    if roll_avail is not None and math.isfinite(roll_avail):
+      lead_avail = max(lead_avail, roll_avail)
     if lead_avail < avail:
       bound = "lead"
     avail = min(avail, lead_avail)
