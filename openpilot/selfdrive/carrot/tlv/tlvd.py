@@ -413,14 +413,23 @@ class TlvRunner:
     self.pipeline.ego = tracker.EgoFrame(
       odo=self.odo, focal_px=focal, foe_x=foe_x, foe_y=horizon, image_w=width, image_h=height,
     )
+    # WCV4: the model path is read once here and reused for every crop, so all
+    # views of one frame aim with the same path sample.
+    path_x, path_y = self._path_x(), self._path_y()
     if detect:
       # Only detect frames advance the speed-aware ViewScheduler.
       view = self.pipeline.next_view(v_ego_kph)
     else:
-      far_geom = pipeline.FramePipeline.geometry("far", horizon, width, height, focal)
+      far_geom = self.pipeline.path_geometry(
+        "far", horizon, width, height, focal, raised=False,
+        path_x=path_x, path_y=path_y, v_ego_kph=v_ego_kph,
+      )
       view = self.pipeline.classify_view(far_geom)
     raised = view == "near" and v_ego_kph < pipeline.STANDSTILL_V_KPH
-    geom = pipeline.FramePipeline.geometry(view, horizon, width, height, focal, raised=raised)
+    geom = self.pipeline.path_geometry(
+      view, horizon, width, height, focal, raised=raised,
+      path_x=path_x, path_y=path_y, v_ego_kph=v_ego_kph,
+    )
 
     data = frame.data
     # VisionIPC: copy the ROI into the preallocated workspace NOW and drop the
@@ -439,7 +448,7 @@ class TlvRunner:
     del frame, data
 
     out = self.pipeline.infer(
-      view, geom, image_width=width, path_x=self._path_x(), path_y=self._path_y(),
+      view, geom, image_width=width, path_x=path_x, path_y=path_y,
       left_intent=self._left_intent(), now=time.monotonic(), detect=detect,
       horizon_y=horizon, gate_enabled=self._gate_enabled, v_ego_kph=v_ego_kph,
     )

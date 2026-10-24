@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -56,6 +56,57 @@ RED_SUSTAIN_MAX_S = 10.0
 # light (>= 4.5 m up); car tail lights always are below it. The 0.25 deg margin
 # keeps boxes that merely touch the horizon.
 TAIL_GATE_MARGIN_DEG = 0.25
+
+# WCV4: the crop follows the model path. On a curve the lamp that decides the
+# signal leaves the centred crop while the detector still has to see it, so aim
+# each view's crop at where modelV2 says the road is at that view's look-ahead
+# distance. Two limits: the relevant track's predicted box stays inside the crop
+# (the keep rule only ever limits the shift, it can never move the crop away from
+# the centred position on its own), and a straight/stale/empty path, standstill or
+# the raised standstill view leaves the crop exactly where it was.
+PATH_SHIFT_LOOK_M = {"far": 80.0, "near": 50.0}
+PATH_SHIFT_MIN_M = 20.0
+PATH_SHIFT_KEEP_MARGIN_PX = 16
+
+
+def path_shift_px(view: str, path_x, path_y, focal_px: float) -> float:
+  """Horizontal crop shift (px) that puts the path at this view's look-ahead.
+
+  Positive is right. 0.0 when the path is missing/has fewer than two points,
+  ends nearer than PATH_SHIFT_MIN_M (nothing out there to aim at) or is not
+  finite.
+  """
+  xs = np.asarray(path_x, dtype=float).reshape(-1)
+  ys = np.asarray(path_y, dtype=float).reshape(-1)
+  if xs.size < 2 or ys.size < 2:
+    return 0.0
+  d = min(PATH_SHIFT_LOOK_M[view], float(xs[-1]))
+  if not math.isfinite(d) or d < PATH_SHIFT_MIN_M:
+    return 0.0
+  lateral = float(tracker.path_lateral_m(d, xs, ys))
+  if not math.isfinite(lateral):
+    return 0.0
+  return float(focal_px) * lateral / d
+
+
+def shift_geometry(geom: crops.ViewGeometry, shift_px: float, width: int,
+                   keep_box: tuple[float, float, float, float] | None = None) -> crops.ViewGeometry:
+  """`geom` moved by shift_px, clamped into the frame and around keep_box.
+
+  keep_box (full-frame x1, y1, x2, y2) can only limit the movement: it never
+  pushes the crop past the requested position.
+  """
+  target = float(geom.x0) + float(shift_px)
+  if keep_box is not None:
+    lo = float(keep_box[2]) + PATH_SHIFT_KEEP_MARGIN_PX - geom.w
+    hi = float(keep_box[0]) - PATH_SHIFT_KEEP_MARGIN_PX
+    if lo <= hi:
+      target = min(max(target, lo), hi)
+  # The keep rule may only shorten the move, never reverse or extend it.
+  target = min(max(target, min(float(geom.x0), float(geom.x0) + float(shift_px))),
+               max(float(geom.x0), float(geom.x0) + float(shift_px)))
+  x0 = crops._clamp_even(int(round(target)), 0, width - geom.w)
+  return geom if x0 == geom.x0 else replace(geom, x0=x0)
 
 
 class ViewScheduler:
@@ -266,6 +317,25 @@ class FramePipeline:
       return crops.far_geometry(horizon_y, width, height, focal_px)
     fraction = crops.STANDSTILL_HORIZON_CROP_FRACTION if raised else crops.HORIZON_CROP_FRACTION
     return crops.near_geometry(horizon_y, width, height, focal_px, horizon_fraction=fraction)
+
+  def path_geometry(self, view: str, horizon_y: float, width: int, height: int, focal_px: float, *,
+                    raised: bool, path_x, path_y, v_ego_kph: float) -> crops.ViewGeometry:
+    """geometry() aimed at the model path at this view's look-ahead (WCV4).
+
+    The relevant track's predicted box stays inside the crop; when there is no
+    usable path, at standstill or on the raised standstill view, this is exactly
+    geometry().
+    """
+    geom = self.geometry(view, horizon_y, width, height, focal_px, raised=raised)
+    if raised or v_ego_kph is None or float(v_ego_kph) < STANDSTILL_V_KPH:
+      return geom
+    shift = path_shift_px(view, path_x, path_y, focal_px)
+    keep = None
+    if self.last_track_id >= 0:
+      track = self.tracker.track_by_id(self.last_track_id)
+      if track is not None:
+        keep = self._predicted_box(track)
+    return shift_geometry(geom, shift, width, keep)
 
   def next_view(self, v_ego_kph: float | None = None) -> str:
     """Speed-aware scheduler when vEgo is given; legacy alternation otherwise."""
