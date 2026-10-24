@@ -2,9 +2,10 @@
 
 On a curve the lamp that decides the signal sits off to the side of the centred
 crop, so each view's crop is aimed at where modelV2 says the road is at that
-view's look-ahead distance (FAR 80 m, NEAR 50 m). The relevant track's predicted
-box always stays inside the crop, and a straight/stale/empty path, standstill or
-the raised standstill view leaves the crop exactly where it was.
+view's look-ahead distance (FAR 50 m, NEAR 30 m; WCV3 grid tie-break). The
+relevant track's predicted box always stays inside the crop, and a
+straight/stale/empty path, standstill or the raised standstill view leaves the
+crop exactly where it was.
 """
 from __future__ import annotations
 
@@ -18,8 +19,10 @@ W, H = crops.REFERENCE_WIDTH, crops.REFERENCE_HEIGHT
 FOCAL = crops.focal_px_for_width(W)
 HORIZON_Y = 640.0
 
-# A path that bends 10 m left over 80 m: the far look-ahead sits 331 px left of
-# the image centre at the reference focal (2648 * 10 / 80).
+# A path with a constant lateral grade of -0.125 (10 m left per 80 m of travel):
+# on a straight-grade path y/d is the grade for every look distance, so the far
+# look-ahead sits 331 px left of the image centre at the reference focal
+# (2648 * 0.125) whether the look-ahead is 50 m or 80 m.
 LEFT_X = (0.0, 50.0, 100.0)
 LEFT_Y = (0.0, -6.25, -12.5)
 RIGHT_Y = (0.0, 6.25, 12.5)

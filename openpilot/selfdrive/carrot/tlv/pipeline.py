@@ -64,7 +64,8 @@ TAIL_GATE_MARGIN_DEG = 0.25
 # (the keep rule only ever limits the shift, it can never move the crop away from
 # the centred position on its own), and a straight/stale/empty path, standstill or
 # the raised standstill view leaves the crop exactly where it was.
-PATH_SHIFT_LOOK_M = {"far": 80.0, "near": 50.0}
+# Look-ahead FAR 50 / NEAR 30 m: WCV3 grid (25 cells) gave identical gains; tie-break = shorter look.
+PATH_SHIFT_LOOK_M = {"far": 50.0, "near": 30.0}
 PATH_SHIFT_MIN_M = 20.0
 PATH_SHIFT_KEEP_MARGIN_PX = 16
 
