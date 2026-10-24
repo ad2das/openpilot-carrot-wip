@@ -138,6 +138,8 @@ def model_renderer_module(monkeypatch):
                               has_font=lambda _weight: False),
       FontWeight=SimpleNamespace(NORMAL=0, MEDIUM=1, BOLD=2, SEMI_BOLD=3, DISPLAY=4),
       FONT_DIR=Path("openpilot/system/assets/fonts"),
+      KR_ATLAS_SCALE=1.25,
+      KR_ATLAS_RAISE=0.125,
     ),
     "openpilot.system.ui.lib.text_draw": SimpleNamespace(draw_text_ui_style=lambda *args, **kwargs: None),
     "openpilot.system.ui.lib.shader_polygon": SimpleNamespace(
