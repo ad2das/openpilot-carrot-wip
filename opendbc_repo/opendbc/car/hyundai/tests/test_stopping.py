@@ -6,7 +6,7 @@ from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
-from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, STOP_LOWER_BAND
+from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, STOP_LOWER_BAND
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -329,6 +329,55 @@ def test_confirmed_existing_hold_is_not_released():
   command = step(controller, speed=0., held=True)
   assert command.stop_req == 1
   assert controller.phase == StopPhase.held
+
+
+def _held_controller():
+  controller = CanfdStopping()
+  for _ in range(30):
+    step(controller, speed=0., held=True)
+  assert controller.phase == StopPhase.held
+  return controller
+
+
+def test_release_waits_for_confirm_time():
+  controller = _held_controller()
+  for _ in range(RELEASE_CONFIRM_FRAMES - 1):
+    cmd = step(controller, speed=0., held=True, requested=False)
+    assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (1, 0., 0., STOP_LOWER_BAND)
+    assert controller.phase == StopPhase.held
+  assert controller.release_frames == RELEASE_CONFIRM_FRAMES - 1
+  assert step(controller, speed=0., held=True, requested=False) is None
+  assert controller.phase == StopPhase.idle
+
+
+def test_flicker_never_drops_stop_req():
+  controller = _held_controller()
+  for requested in [False] * 9 + [True] * 2 + [False] * 9 + [True] + [False] * 9:
+    cmd = step(controller, speed=0., held=True, requested=requested)
+    assert cmd.stop_req == 1
+  assert controller.phase == StopPhase.held
+
+
+def test_inactive_releases_immediately():
+  controller = _held_controller()
+  assert step(controller, speed=0., held=True, active=False) is None
+  assert controller.phase == StopPhase.idle
+
+
+def test_moving_release_not_delayed():
+  controller = CanfdStopping()
+  step(controller, speed=0.5)
+  assert controller.phase == StopPhase.request
+  assert step(controller, speed=0.5, requested=False) is None
+  assert controller.phase == StopPhase.idle
+
+
+def test_approach_release_not_delayed():
+  controller = CanfdStopping()
+  step(controller, speed=1.0)
+  assert controller.phase == StopPhase.approach
+  assert step(controller, speed=1.0, requested=False) is None
+  assert controller.phase == StopPhase.idle
 
 
 @pytest.mark.parametrize('camera', [True, False])

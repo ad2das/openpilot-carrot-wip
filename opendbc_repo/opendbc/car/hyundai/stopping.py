@@ -14,6 +14,7 @@ MOVING_SPEED = 0.10
 STOP_CONFIRM_TIME = 0.2
 APPROACH_ACCEL = -0.5
 STOP_LOWER_BAND = 0.20  # fixed experimental value; never copied from the stock SCC
+RELEASE_CONFIRM_FRAMES = 10  # 0.2 s at 50 Hz; a held/requesting stop lets go only after the request stays off this long (departure flicker, route 6d1)
 PASS_ACCEL_MIN = -0.45  # approach (StopReq 0): ButterStop accel passes only while softer than this; harder keeps the -0.5 floor
 
 
@@ -55,6 +56,7 @@ class CanfdStopping:
     self.phase = StopPhase.idle
     self.reason = "inactive"
     self.stopped_time = 0.0
+    self.release_frames = 0
 
   def enter(self, phase: StopPhase, reason: str):
     self.phase = phase
@@ -63,9 +65,19 @@ class CanfdStopping:
   def update(self, *, active: bool, requested: bool, speed: float, held: bool,
              accel: float, previous_value: float, jerk_u: float, jerk_l: float) -> StopCommand | None:
     # Caller validates sensor values and applies pedal/CAN/hold interlocks.
-    if not active or not requested:
+    if not active:
       self.reset()
       return None
+    if not requested:
+      # Debounce the release only at rest in request/held; pedals, gear, CAN faults and ACC off
+      # arrive as active=False above and still release at once.
+      if self.phase in (StopPhase.request, StopPhase.held) and speed <= MOVING_SPEED:
+        self.release_frames += 1
+        if self.release_frames < RELEASE_CONFIRM_FRAMES:
+          return StopCommand(1, 0.0, 0.0, STOP_LOWER_BAND)
+      self.reset()
+      return None
+    self.release_frames = 0
 
     if self.phase == StopPhase.idle:
       self.enter(StopPhase.approach if speed > ENTRY_SPEED else StopPhase.request, "stop_requested")
