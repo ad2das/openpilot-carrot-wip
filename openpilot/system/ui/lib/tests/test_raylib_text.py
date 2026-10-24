@@ -110,10 +110,18 @@ def korean_renderer(renderer):
   normal = SimpleNamespace(texture=SimpleNamespace(id=1), advance=10, baseSize=20, glyphCount=95, glyphPadding=0)
   display = SimpleNamespace(texture=SimpleNamespace(id=2), advance=20, baseSize=20, glyphCount=12000, glyphPadding=0)
   app = scope["gui_app"]
-  app.font = lambda weight: display if weight == weights.DISPLAY else normal
+  unifont = SimpleNamespace(texture=SimpleNamespace(id=3), advance=8, baseSize=16, glyphCount=60000, glyphPadding=0)
+  app.font = lambda weight: display if weight == weights.DISPLAY else unifont if weight == weights.UNIFONT else normal
   app.has_font = lambda weight: True
   language = SimpleNamespace(value="en")
-  scope.update(re=re, multilang=SimpleNamespace(requires_unifont=lambda: language.value == "ko"))
+
+  class _Multilang:
+    language = property(lambda self: language.value)
+
+    def requires_unifont(self):
+      return language.value in ("ko", "ja")
+
+  scope.update(re=re, multilang=_Multilang())
   tree = ast.parse((UI_DIR / "lib/application.py").read_text(encoding="utf-8"))
   pattern = next(n for n in tree.body if isinstance(n, ast.Assign) and
                  any(isinstance(t, ast.Name) and t.id == "_KOREAN_TEXT_RE" for t in n.targets))
@@ -128,7 +136,8 @@ def korean_renderer(renderer):
   measure_scope = {**scope, "OrderedDict": OrderedDict, "_cache": OrderedDict(), "_MAX_ENTRIES": 2048, "_MAX_TEXT_LENGTH": 512}
   load_definitions(UI_DIR / "lib/text_measure.py", measure_scope)
   scope["measure_text_cached"] = measure_scope["measure_text_cached"]
-  return SimpleNamespace(**scope, namespace=scope, normal=normal, display=display, language=language, measurements=measurements)
+  return SimpleNamespace(**scope, namespace=scope, normal=normal, display=display, unifont=unifont,
+                         language=language, measurements=measurements)
 
 
 @pytest.mark.parametrize("text", ["한글", "AB 한글", "ㄱㅏ", "가", "힣", "한글".encode(), b"\xff" + "한글".encode()])
@@ -150,6 +159,15 @@ def test_legacy_locale_and_bootstrap_without_display_font(korean_renderer):
   assert r.font_fallback(r.normal) is r.display
   r.gui_app.has_font = lambda weight: False
   assert r.font_fallback(r.normal, "한글") is r.normal
+
+
+def test_cjk_locales_without_pretendard_glyphs_use_unifont(korean_renderer):
+  r = korean_renderer
+  r.language.value = "ja"
+  assert r.font_fallback(r.normal) is r.unifont
+  assert r.font_fallback(r.normal, "한글") is r.unifont
+  r.language.value = "ko"
+  assert r.font_fallback(r.normal, "abc") is r.display
 
 
 @pytest.mark.parametrize("label_class", ["Label", "UnifiedLabel"])
@@ -223,7 +241,7 @@ def test_generated_and_source_fonts_cover_jamo_and_common_symbols(korean_rendere
   scope = {"_languages": dict}
   exec(compile(ast.Module(body=[extra], type_ignores=[]), "process.py", "exec"), scope)
   load_definitions(font_dir / "process.py", scope, {"_char_sets"})
-  base, generated = map(set, scope["_char_sets"]())
+  base, generated, korean = map(set, scope["_char_sets"]())
 
   tree = ast.parse((UI_DIR / "lib/application.py").read_text(encoding="utf-8"))
   app = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "GuiApplication")
@@ -239,3 +257,8 @@ def test_generated_and_source_fonts_cover_jamo_and_common_symbols(korean_rendere
     assert jamo | common <= set(source(None, weight))
   assert common <= set(source(None, r.FontWeight.NORMAL))
   assert not jamo & set(source(None, r.FontWeight.NORMAL))
+
+  assert jamo | set(range(0xAC00, 0xD7A4)) <= korean
+  assert not set(range(0x4E00, 0xA000)) & korean
+  assert 0x4E00 not in set(source(None, r.FontWeight.DISPLAY))
+  assert 0x4E00 in set(source(None, r.FontWeight.UNIFONT))
