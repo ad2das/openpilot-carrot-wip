@@ -6,7 +6,7 @@ from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
-from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, STOP_LOWER_BAND
+from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, PASS_ACCEL_MIN, STOP_LOWER_BAND
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -429,3 +429,185 @@ def test_upper_sequence_changes_no_other_decoded_packet_fields(camera):
     expected.pop('JerkUpperLimit')
     assert actual == expected
     assert controller.phase == reference.phase
+
+
+# --- ButterStop: pass the openpilot request through approach/request --------
+
+def butter_cmd(cmd, expected):
+  assert cmd.stop_req == expected[0]
+  assert cmd.raw == pytest.approx(expected[1], abs=1e-9)
+  assert cmd.value == pytest.approx(expected[2], abs=1e-9)
+  assert cmd.lower == pytest.approx(expected[3], abs=1e-9)
+
+
+def test_pass_accel_default_off():
+  controller = CanfdStopping()
+  assert controller.pass_accel is False
+
+  cmd = step(controller, speed=0.3, accel=-0.2, previous_value=-0.2)
+  assert controller.phase == StopPhase.request and controller.reason == "stop_requested"
+  butter_cmd(cmd, (1, 0.0, 0.0, STOP_LOWER_BAND))
+
+  controller = CanfdStopping()
+  cmd = step(controller, speed=1.0, accel=-0.2, previous_value=-0.2)
+  assert controller.phase == StopPhase.approach
+  butter_cmd(cmd, (0, -0.5, -0.22, 0.0))
+
+  controller = CanfdStopping()
+  for _ in range(15):  # hold confirmed after 0.2 s at 50 Hz
+    cmd = step(controller, speed=0.0, accel=-0.5, previous_value=-0.5)
+  assert controller.phase == StopPhase.held
+  butter_cmd(cmd, (1, 0.0, 0.0, STOP_LOWER_BAND))
+
+
+def test_pass_accel_request_sends_jerk_limited_accel():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
+
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=0.0), (1, -0.2, -0.02, 0.0))
+
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=0.1, previous_value=-0.2), (1, 0.0, -0.16, 0.0))
+
+
+def test_pass_accel_approach_uses_accel_not_floor():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  cmd = step(controller, speed=1.0, accel=-0.2, previous_value=-0.2)
+  assert controller.phase == StopPhase.approach
+  butter_cmd(cmd, (0, -0.2, -0.2, 0.0))
+
+
+def test_pass_accel_held_keeps_zero_hold():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  held = []
+  for _ in range(15):
+    cmd = step(controller, speed=0.0, accel=-0.5, previous_value=0.0)
+    if controller.phase == StopPhase.held:
+      held.append(cmd)
+  assert controller.phase == StopPhase.held
+  assert len(held) >= 1
+  for cmd in held:
+    assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (1, 0.0, 0.0, STOP_LOWER_BAND)
+
+
+def butter_cs():
+  cs = make_cs()
+  cs.out.steeringTorque = 0.0
+  cs.out.steeringPressed = False
+  cs.out.steeringAngleDeg = 0.0
+  cs.out.steerFaultTemporary = False
+  cs.out.steerFaultPermanent = False
+  cs.out.cruiseState.enabled = True
+  cs.is_metric = False
+  cs.modelV2 = None
+  cs.radarState = None
+  cs.lfahda_cluster = None
+  cs.lfa = None
+  cs.mdps = None
+  cs.adrv_0x161 = None
+  return cs
+
+
+def test_controller_reads_butter_stop_param(monkeypatch):
+  from opendbc.car.hyundai import hyundaican, hyundaicanfd
+  seen = []
+
+  def make_controller(butter_stop):
+    def get_bool(key):
+      assert key != "CanfdStopRetry", "Removed stop retry setting must never be read"
+      return False
+
+    def get_int(key):
+      seen.append(key)
+      return butter_stop if key == "ButterStop" else 0
+
+    params = SimpleNamespace(get_bool=get_bool, get_int=get_int)
+    monkeypatch.setattr(carcontroller, "Params", lambda: params)
+    cp = structs.CarParams(carFingerprint=CAR.KIA_EV6, flags=int(HyundaiFlags.CANFD),
+                           openpilotLongitudinalControl=True, stoppingDecelRate=0.8,
+                           steerRatio=13.5, wheelbase=2.9)
+    return carcontroller.CarController({Bus.pt: "hyundai_canfd_generated"}, cp)
+
+  # The unrelated CAN emitters need a live bus; the parameter plumbing is the
+  # subject here. Same separation the cluster-popup controller test uses.
+  monkeypatch.setattr(hyundaicanfd, "create_acc_control", lambda *a, **kw: (None, 0.0))
+  for name in ("create_steering_messages", "create_lfahda_cluster", "create_lfa_icon_non_camera_scc",
+               "create_ccnc_messages", "create_fca_warning_light"):
+    monkeypatch.setattr(hyundaicanfd, name, lambda *a, **kw: [])
+  monkeypatch.setattr(hyundaican, "create_frt_radar_opt", lambda *a, **kw: [])
+
+  controller = make_controller(1)
+  assert isinstance(controller.canfd_stopping, CanfdStopping)
+  assert controller.canfd_stopping.pass_accel is False  # constructor default
+  monkeypatch.setattr(controller.hyundai_jerk, "make_jerk", lambda *a, **kw: None)
+  monkeypatch.setattr(controller.hyundai_jerk, "check_carrot_cruise", lambda *a, **kw: None)
+  assert controller.frame == 0  # frame % 50 == 0 runs the parameter refresh block
+  controller.update(structs.CarControl().as_reader(), butter_cs(), 0)
+  assert "ButterStop" in seen
+  assert controller.canfd_stopping.pass_accel is True
+
+  controller = make_controller(0)
+  controller.canfd_stopping.pass_accel = True  # prove the block drives it both ways
+  monkeypatch.setattr(controller.hyundai_jerk, "make_jerk", lambda *a, **kw: None)
+  monkeypatch.setattr(controller.hyundai_jerk, "check_carrot_cruise", lambda *a, **kw: None)
+  controller.update(structs.CarControl().as_reader(), butter_cs(), 0)
+  assert controller.canfd_stopping.pass_accel is False
+
+
+def test_pass_accel_hands_over_on_hard_request():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  # Hard request straight away: the ESC owns the stop, both aReq fields go zero.
+  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.45), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.handed_over is True
+
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
+  assert controller.handed_over is False
+  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.2), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.handed_over is True
+
+
+def test_pass_accel_handover_is_latched_until_reset():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  butter_cmd(step(controller, speed=0.3, accel=-0.5, previous_value=-0.45), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  # A soft request after the handover must not re-arm the pass-through.
+  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.handed_over is True
+  # Only the episode reset clears the latch.
+  assert step(controller, requested=False) is None
+  assert controller.handed_over is False
+  butter_cmd(step(controller, speed=0.3, accel=-0.2, previous_value=-0.2), (1, -0.2, -0.2, 0.0))
+
+
+def test_pass_accel_boundary_is_handover():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  # Exactly PASS_ACCEL_MIN is not "softer than": hand over.
+  butter_cmd(step(controller, speed=0.3, accel=PASS_ACCEL_MIN, previous_value=-0.2),
+             (1, 0.0, 0.0, STOP_LOWER_BAND))
+  assert controller.handed_over is True
+
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  # One hundredth above the boundary is still passed through.
+  accel = PASS_ACCEL_MIN + 0.01
+  butter_cmd(step(controller, speed=0.3, accel=accel, previous_value=accel), (1, accel, accel, 0.0))
+  assert controller.handed_over is False
+
+
+def test_pass_accel_approach_hard_keeps_floor_and_no_latch():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  cmd = step(controller, speed=1.0, accel=-0.6, previous_value=-0.6)
+  assert controller.phase == StopPhase.approach
+  butter_cmd(cmd, (0, -0.6, -0.6, 0.0))
+  assert controller.handed_over is False

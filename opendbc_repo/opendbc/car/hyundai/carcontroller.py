@@ -311,6 +311,8 @@ class CarController(CarControllerBase):
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
       self.paddle_mode = params.get_int("PaddleMode")
+      if self.canfd_stopping is not None:
+        self.canfd_stopping.pass_accel = params.get_int("ButterStop") > 0
 
     actuators = CC.actuators
     hud_control = CC.hudControl
