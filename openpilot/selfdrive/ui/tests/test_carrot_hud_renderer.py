@@ -693,6 +693,7 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
   monkeypatch.setattr(renderer, "_draw_trip", lambda rect, info: calls.append("trip"))
   monkeypatch.setattr(renderer, "_draw_drive_card", lambda rect: calls.append("drive"))
   monkeypatch.setattr(renderer, "_draw_clock", lambda rect: calls.append("clock"))
+  monkeypatch.setattr(renderer, "_draw_soft_hold", lambda rect: calls.append("softhold"))
   monkeypatch.setattr(renderer, "_draw_egpu_badge", lambda rect: calls.append("egpu"))
   monkeypatch.setattr(renderer, "_draw_cruise_speed_animation", lambda rect: calls.append("animation"))
   monkeypatch.setattr(module.rl, "draw_rectangle_gradient_v", lambda *args: calls.append("shade"))
@@ -713,9 +714,105 @@ def test_render_draws_each_hud_section_in_order(hud_module, monkeypatch):
     "drive",
     ("plot", 6),
     "clock",
+    "softhold",
     "egpu",
     "animation",
   ]
+
+
+def hud_prompt_renderer(module, monkeypatch, calls, *, banner_alert=False, top_exit=False):
+  """The order test's stubs, for the tests that only care about which centre element wins."""
+  renderer = object.__new__(module.HudRenderer)
+  renderer.is_cruise_available = True
+  renderer._show_plot_mode = 6
+  renderer._font_display = object()
+  renderer._blink_timer = 0
+  renderer._disp_timer = 0
+  renderer._plot_renderer = SimpleNamespace(draw=lambda rect, font, mode: calls.append(("plot", mode)))
+  monkeypatch.setattr(renderer, "_refresh_hud_params", lambda now: calls.append(("params", now)))
+  monkeypatch.setattr(renderer, "_get_turn_info_hud_data", lambda: {})
+  monkeypatch.setattr(renderer, "_draw_guidance_card", lambda rect, info: calls.append("guide"))
+  monkeypatch.setattr(renderer, "_draw_tpms", lambda rect, top: calls.append(("tpms", top)))
+  monkeypatch.setattr(renderer, "_draw_system_card", lambda rect: calls.append("system"))
+  monkeypatch.setattr(renderer, "_draw_trip", lambda rect, info: calls.append("trip"))
+  monkeypatch.setattr(renderer, "_draw_drive_card", lambda rect: calls.append("drive"))
+  monkeypatch.setattr(renderer, "_draw_clock", lambda rect: calls.append("clock"))
+  monkeypatch.setattr(renderer, "_draw_top_exit_prompt", lambda rect: calls.append("topexit"))
+  monkeypatch.setattr(renderer, "_draw_soft_hold", lambda rect: calls.append("softhold"))
+  monkeypatch.setattr(renderer, "_draw_egpu_badge", lambda rect: calls.append("egpu"))
+  monkeypatch.setattr(renderer, "_draw_cruise_speed_animation", lambda rect: calls.append("animation"))
+  monkeypatch.setattr(renderer, "_banner_alert_active", lambda: banner_alert)
+  monkeypatch.setattr(renderer, "_tlv_top_exit", lambda: top_exit)
+  monkeypatch.setattr(module.time, "monotonic", lambda: 12.5)
+  return renderer
+
+
+def test_render_shows_top_exit_prompt_instead_of_clock(hud_module, monkeypatch):
+  module, _ = hud_module
+  calls = []
+  renderer = hud_prompt_renderer(module, monkeypatch, calls, top_exit=True)
+
+  renderer._render(module.rl.Rectangle(0, 0, 2160, 1080))
+
+  assert "topexit" in calls
+  assert "clock" not in calls
+
+
+def test_banner_alert_still_wins_over_top_exit_prompt(hud_module, monkeypatch):
+  module, _ = hud_module
+  calls = []
+  renderer = hud_prompt_renderer(module, monkeypatch, calls, banner_alert=True, top_exit=True)
+
+  renderer._render(module.rl.Rectangle(0, 0, 2160, 1080))
+
+  assert "clock" not in calls
+  assert "topexit" not in calls
+
+
+def test_tlv_top_exit_reads_carrot_man_and_tolerates_old_schema(hud_module):
+  module, fake_ui_state = hud_module
+  renderer = object.__new__(module.HudRenderer)
+
+  fake_ui_state.sm = {"carrotMan": SimpleNamespace(tlvTopExit=True)}
+  assert renderer._tlv_top_exit() is True
+
+  fake_ui_state.sm = {"carrotMan": SimpleNamespace()}
+  assert renderer._tlv_top_exit() is False
+
+  fake_ui_state.sm = None
+  assert renderer._tlv_top_exit() is False
+
+
+def test_soft_hold_pill_draws_only_when_active(hud_module, monkeypatch):
+  module, fake_ui_state = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  draws = []
+  renderer._type = SimpleNamespace(
+    width=lambda text, size, bold: 260.0,
+    draw_mid=lambda *args, **kwargs: draws.append(("text", args)),
+  )
+  monkeypatch.setattr(module.hs, "chip", lambda *args: draws.append(("chip", args)))
+  monkeypatch.setattr(module.hs, "glow", lambda *args: draws.append(("glow", args)))
+  rect = module.rl.Rectangle(0, 0, 2160, 1080)
+
+  fake_ui_state.sm = {"carState": SimpleNamespace(softHoldActive=0)}
+  renderer._draw_soft_hold(rect)
+  assert draws == []
+
+  fake_ui_state.sm = {"carState": SimpleNamespace(softHoldActive=1)}
+  renderer._draw_soft_hold(rect)
+
+  chips = [entry for entry in draws if entry[0] == "chip"]
+  assert len(chips) == 1
+  x, y, w, h, _color = chips[0][1]
+  assert h == module.SOFTHOLD_H
+  # One pill, dead centre of the rect, and the text sits on the same centre.
+  assert x + w / 2 == pytest.approx(1080, abs=0.5)
+  assert y + h / 2 == pytest.approx(540, abs=0.5)
+  text = [entry for entry in draws if entry[0] == "text"]
+  assert len(text) == 1
+  assert text[0][1][0] == "SoftHold"
+  assert text[0][1][1:3] == (1080, 540)
 
 
 def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_module):

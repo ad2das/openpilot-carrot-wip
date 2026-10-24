@@ -310,7 +310,5 @@ class CarSpecificEvents:
           events.add(EventName.buttonEnable)
       elif CS.activateCruise < 0 and CS_prev.activateCruise >= 0:
         events.add(EventName.buttonCancel)
-      if CS.softHoldActive > 0:
-        events.add(EventName.softHold)
 
     return events

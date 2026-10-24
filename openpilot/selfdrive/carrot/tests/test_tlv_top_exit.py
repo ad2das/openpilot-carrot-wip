@@ -23,6 +23,7 @@ import numpy as np
 
 from test_tlv_fusion import (FakeSM, carrot_man_message, gate_sm, make_serv as base_make_serv,
                              planner_for_gate, tlv_message)
+from test_vehicle_speed_camera_control import _car_state
 
 import openpilot.selfdrive.carrot.carrot_man_input as carrot_man_input
 import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
@@ -271,3 +272,110 @@ def test_t8_a_missing_carrot_man_leaves_the_model_start_alone(monkeypatch):
   planner = planner_with(monkeypatch, (1, 1), speed=0)
   assert planner.tlv_red_veto is False
   assert planner._model_green_start_allowed() is True
+
+
+# ---------------------------------------------------------------------------
+# T9: the published field the C3X prompt reads (carrotMan.tlvTopExit @37). The UI
+# can only show what carrot_serv publishes, so the replay is driven through the
+# real update_navi() message-building path, not _update_tlv_fusion() alone.
+# ---------------------------------------------------------------------------
+
+class TopExitParams:
+  """Just enough typed Params for a real CarrotServ(); only the detector mode matters here."""
+
+  def __init__(self, *_args):
+    pass
+
+  def get(self, key):
+    return str({"TrafficLightDetectMode": 2}.get(key, 0))
+
+  def get_int(self, key):
+    return int(self.get(key))
+
+  def get_float(self, key):
+    return float(self.get(key))
+
+  def get_bool(self, key):
+    return bool(self.get_int(key))
+
+
+class PublishSM(FakeSM):
+  """FakeSM plus the one service update_navi() indexes but a publish test does not drive."""
+
+  def __init__(self, **services):
+    super().__init__(**services)
+    for name in ("navInstruction",):
+      self.seen[name] = True
+      self.updated[name] = False
+      self.alive[name] = False
+      self.valid[name] = False
+      self.recv_time[name] = 100.0
+
+
+def publish_serv(monkeypatch):
+  """A real CarrotServ() with the navigation/display inputs stubbed out as test_carrot_navi_serv does."""
+  monkeypatch.setattr(carrot_serv, "Params", TopExitParams)
+  serv = CarrotServ()
+  monkeypatch.setattr(serv, "_update_carrot_navi", lambda _sm: False)
+  monkeypatch.setattr(serv, "_update_gps", lambda *_args: 0.)
+  monkeypatch.setattr(serv, "update_nav_instruction", lambda _sm: None)
+  monkeypatch.setattr(serv, "update_auto_turn", lambda *_args: (250., "none", 250., 0.))
+  monkeypatch.setattr(serv, "_vehicle_navigation_display", lambda _cs: (False, 0, False))
+  monkeypatch.setattr(serv, "_rear_camera_speed", lambda *_args: (False, 0.0))
+  monkeypatch.setattr(serv, "_vehicle_speed_camera_enabled", lambda _cs: False)
+  monkeypatch.setattr(serv, "_vehicle_speed_bump_enabled", lambda _cs: False)
+  monkeypatch.setattr(serv, "_vehicle_section_zone_enabled", lambda _cs: False)
+  monkeypatch.setattr(serv, "_vehicle_school_zone_speed", lambda _cs: 250)
+  return serv, {}
+
+
+def publish(serv: CarrotServ, clock: list, sent: dict, t: float, msg) -> bool:
+  """One update_navi() tick (which runs _update_cmd and the fusion itself); returns the published tlvTopExit."""
+  clock[0] = t
+  sm = PublishSM(carrotTlv=msg, carState=_car_state(v_ego=speed_mps(t)),
+                 selfdriveState=SimpleNamespace(distanceTraveled=0.))
+  pm = SimpleNamespace(send=lambda name, message: sent.update({name: message}))
+  serv.update_navi("", sm, pm, 0., [], [], 0., "gpsLocationExternal")
+  return sent["carrotMan"].carrotMan.tlvTopExit
+
+
+def test_publish_top_exit_true_only_while_red_held(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv, sent = publish_serv(monkeypatch)
+  drive_red_phase(serv, clock)
+
+  # A tracked red is not a top-exit hold: nothing for the prompt to show.
+  assert publish(serv, clock, sent, RED_ROWS[-1][0], red_msg(RED_ROWS[-1][1])) is False
+
+  published = []
+  t = LOST_AT
+  while t <= REPLAY_END + 1e-9:
+    published.append((t, publish(serv, clock, sent, t, lost_msg())))
+    t = round(t + 0.05, 3)
+
+  assert at(published, 8.33)[1] is True   # 479: the model green started the car here
+  assert at(published, 9.2)[1] is True
+  assert at(published, REPLAY_END)[1] is True
+
+
+def test_publish_top_exit_false_when_red_expired_but_state_stale(monkeypatch):
+  clock = freeze(monkeypatch)
+  serv, sent = publish_serv(monkeypatch)
+  # Plant the state the publish reads and skip the two tick steps that would rewrite it
+  # (_update_cmd expires a lapsed red; the fusion ends a stale hold): only the publish
+  # expression is under test here.
+  monkeypatch.setattr(serv, "_update_tlv_fusion", lambda _sm: None)
+  monkeypatch.setattr(serv, "_update_cmd", lambda: None)
+  serv.tlv_top_exit = {"since": 0, "dist": 0.0, "t": 0.0}
+  serv.traffic_state = 0
+  serv.traffic_state_src = 0
+  assert publish(serv, clock, sent, 7.5, lost_msg()) is False
+
+  # The prompt also needs the published red to still be a TLV (src 1) red, not a navi red.
+  serv.traffic_state = 1
+  assert publish(serv, clock, sent, 7.55, lost_msg()) is False
+
+  serv.traffic_state_src = 1
+  assert publish(serv, clock, sent, 7.6, lost_msg()) is True
+
+

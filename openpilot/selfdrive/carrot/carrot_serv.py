@@ -1931,6 +1931,10 @@ class CarrotServ:
     msg.carrotMan.trafficState = self.traffic_state
     msg.carrotMan.trafficStateSrc = int(self.traffic_state_src)
     msg.carrotMan.tlvDetSupport = int(self.tlv_det_support)
+    # WTOP1: the C3X draws the manual-start prompt while this hold is up, so the
+    # UI needs the same three conditions _tlv_top_exit_hold() uses to keep it.
+    msg.carrotMan.tlvTopExit = bool(self.tlv_top_exit is not None and self.traffic_state == 1
+                                    and self.traffic_state_src == 1)
 
     msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)

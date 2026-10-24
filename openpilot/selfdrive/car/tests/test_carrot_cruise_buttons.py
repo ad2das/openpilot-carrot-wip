@@ -418,6 +418,21 @@ def test_remote_set_keeps_soft_hold_cancel_behavior():
   assert helper._activate_cruise == -1
 
 
+def test_soft_hold_event_is_not_emitted():
+  from openpilot.cereal import log
+  from openpilot.selfdrive.car.car_specific import CarSpecificEvents
+
+  events = CarSpecificEvents(SimpleNamespace(pcmCruise=False, openpilotLongitudinalControl=True))
+  CS = car.CarState.new_message(softHoldActive=1, activateCruise=-1)
+
+  names = events.create_common_events(CS, car.CarState.new_message(), pcm_enable=False).names
+
+  # The C3X HUD draws SoftHold as one centre pill now, so the cruise-button block still
+  # runs (buttonCancel) but selfdrived no longer banners the state.
+  assert log.OnroadEvent.EventName.buttonCancel in names
+  assert log.OnroadEvent.EventName.softHold not in names
+
+
 @pytest.mark.parametrize('pcm', [False, True])
 def test_remote_cancel_reaches_existing_disengagement_state_machine(pcm):
   from openpilot.cereal import log

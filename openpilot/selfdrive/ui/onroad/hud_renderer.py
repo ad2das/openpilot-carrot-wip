@@ -78,6 +78,12 @@ NEXT_UNIT_SIZE = 34
 CLOCK_SIZE = 132
 DATE_SIZE = 56
 CLOCK_H = 160
+SOFTHOLD_SIZE = 100  # SoftHold pill, screen centre
+SOFTHOLD_H = 160
+TOPX_HEAD_SIZE = 56   # top-exit prompt (WTOP1 hold): head line, then the amber pedal hint
+TOPX_HINT_SIZE = 46
+TOPX_LAMP_W = 128
+TOPX_LAMP_H = 54
 BADGE_SIZE = 44
 BADGE_H = 80
 TPMS_W = 340
@@ -393,7 +399,11 @@ class HudRenderer(Widget):
     self._plot_renderer.draw(rect, self._font_display, self._show_plot_mode)
 
     if not self._banner_alert_active():
-      self._draw_clock(rect)
+      if self._tlv_top_exit():
+        self._draw_top_exit_prompt(rect)
+      else:
+        self._draw_clock(rect)
+    self._draw_soft_hold(rect)
     self._draw_egpu_badge(rect)
     self._draw_cruise_speed_animation(rect)
 
@@ -654,6 +664,13 @@ class HudRenderer(Widget):
       return int(ui_state.sm["carrotMan"].trafficState)
     except Exception:
       return 0
+
+
+  def _tlv_top_exit(self) -> bool:
+    try:
+      return bool(ui_state.sm["carrotMan"].tlvTopExit)
+    except Exception:
+      return False
 
 
   def _get_traffic_state_carrot(self) -> int:
@@ -992,6 +1009,52 @@ class HudRenderer(Widget):
     if date:
       t.draw(date, x, mid + DATE_SIZE * 0.39, DATE_SIZE, hs.TEXT_2, hs.SEMI)
     hs.top_boxes.append((cx - w / 2, top, w, CLOCK_H))
+
+  def _draw_top_exit_prompt(self, rect: rl.Rectangle) -> None:
+    """WTOP1 hold: the red left the frame top at the stop line, so the car waits for the driver's pedal.
+    Takes the clock's place at the top centre, under the light the camera can no longer see."""
+    t = self._type
+    guide, tpms = hs.zones.get("guide"), hs.zones.get("tpms")
+    lo = guide[0] + guide[2] + 24 if guide is not None else rect.x
+    hi = tpms[0] - 24 if tpms is not None else rect.x + rect.width
+    pad, gap = 40.0, 32.0
+    head, hint = "신호등 화면 밖 · 수동 출발", "초록불이면 엑셀을 밟아 주세요"
+    text_w = max(t.width(head, TOPX_HEAD_SIZE, hs.BOLD), t.width(hint, TOPX_HINT_SIZE, hs.SEMI))
+    w = pad * 2 + TOPX_LAMP_W + gap + text_w
+    if w > hi - lo:
+      return
+    cx = min(max(rect.x + rect.width / 2, lo + w / 2), hi - w / 2)
+    x, top = cx - w / 2, rect.y + M_TOP
+    mid = top + CLOCK_H / 2
+    hs.chip(x, top, w, CLOCK_H, ring=hs.with_alpha(hs.PROMPT_AMBER, 210), ring_width=3.0)
+    # The same red/green capsule as the drive card, the red lit: the light is still treated as red.
+    lx = x + pad
+    hs.card(lx, mid - TOPX_LAMP_H / 2, TOPX_LAMP_W, TOPX_LAMP_H, hs.rgba(0, 0, 0, 160), TOPX_LAMP_H / 2,
+            hs.rgba(255, 255, 255, 46), 1.5)
+    rx, gx = lx + TOPX_LAMP_W * 0.28, lx + TOPX_LAMP_W * 0.72
+    hs.glow(rx, mid, 44, hs.with_alpha(hs.WARN_RED, 150))
+    hs.dot(rx, mid, 18, hs.WARN_RED)
+    hs.dot(gx, mid, 18, hs.with_alpha(hs.LIVE_GREEN, 46))
+    tx = lx + TOPX_LAMP_W + gap
+    t.draw_mid(head, tx, mid - 30, TOPX_HEAD_SIZE, hs.TEXT, hs.BOLD)
+    t.draw_mid(hint, tx, mid + 36, TOPX_HINT_SIZE, hs.PROMPT_AMBER, hs.SEMI)
+    hs.top_boxes.append((x, top, w, CLOCK_H))
+
+  def _draw_soft_hold(self, rect: rl.Rectangle) -> None:
+    """SoftHold, once: a solid green pill in the dead centre of the screen (the selfdrived banner is gone)."""
+    try:
+      active = int(ui_state.sm["carState"].softHoldActive) > 0
+    except Exception:
+      active = False
+    if not active:
+      return
+    t = self._type
+    text, size, h = "SoftHold", SOFTHOLD_SIZE, SOFTHOLD_H
+    w = t.width(text, size, hs.BOLD) + h
+    cx, mid = rect.x + rect.width / 2, rect.y + rect.height / 2
+    hs.glow(cx, mid, w * 0.55, hs.with_alpha(hs.LIVE_GREEN, 70))
+    hs.chip(cx - w / 2, mid - h / 2, w, h, hs.LIVE_GREEN)
+    t.draw_mid(text, cx, mid, size, hs.INK, hs.BOLD, align=0.5)
 
   def _system_links(self) -> list[tuple[str, rl.Color]]:
     items = []

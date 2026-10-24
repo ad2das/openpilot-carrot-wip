@@ -51,6 +51,8 @@ struct CarrotMan @0x81c2f05a394cf4af {
 	trafficStateSrc @35 : Int32;
 	# W139c carrotTlv.relevantDetSupport passed through by the fusion (0 when not TLV).
 	tlvDetSupport @36 :UInt8;
+	# WTOP1 top-exit red hold active (carrot_serv tlv_top_exit) while the src-1 red is held; the C3X prompts a manual start.
+	tlvTopExit @37 :Bool;
 }
 
 struct CarrotNaviState @0xaedffd8f31e7b55d {

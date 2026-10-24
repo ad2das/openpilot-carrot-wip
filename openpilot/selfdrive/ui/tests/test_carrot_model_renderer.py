@@ -575,6 +575,36 @@ def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
   ]
 
 
+def test_lead_runs_keep_speed_and_gap_during_soft_hold(monkeypatch):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  renderer = lead_renderer(
+    _carrot_soft_hold_active=True,
+    _carrot_radar_dist=12.5,
+    _carrot_vision_dist=14.3,
+    _carrot_radar_track_id=0,
+    _carrot_lead_status=True,
+    _carrot_lead_speed=30.0,
+    _carrot_lead_closing=False,
+  )
+
+  # SoftHold has its own centre pill now, so an active hold leaves the readout untouched.
+  assert renderer._lead_runs_carrot() == [
+    ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
+    ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+    ("bar",),
+    ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT),
+    ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
+  ]
+
+
+def test_lead_runs_still_show_autohold():
+  renderer = lead_renderer(_carrot_brake_hold_active=True)
+
+  assert renderer._lead_runs_carrot() == [
+    ("text", "AUTOHOLD", model_renderer.LEAD_STATE_SIZE, model_renderer.hs.TEXT),
+  ]
+
+
 @pytest.mark.parametrize("run, weight", [
   (("num", "80", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT), model_renderer.hs.BOLD),
   (("num", "49", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT), model_renderer.hs.SEMI),

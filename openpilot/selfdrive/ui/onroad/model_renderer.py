@@ -912,8 +912,9 @@ class ModelRenderer(Widget):
   def _lead_runs_carrot(self) -> list[tuple]:
     """Readout contents: ('dot', colour, r) and ('num'/'text'/'unit', text, size, colour); a ('bar',) splits the lead's
     speed from the gap, which takes the lighter right segment. The capsule is sized for widest-digit 'num' slots so it does not breathe as digits change."""
-    if self._carrot_soft_hold_active or self._carrot_brake_hold_active or self._carrot_carrot_cruise:
-      text = "AUTOHOLD" if self._carrot_brake_hold_active else ("SOFTHOLD" if self._carrot_soft_hold_active else "CARROT")
+    # SoftHold has its own centre chip in the HUD; the readout keeps the lead's speed and gap.
+    if self._carrot_brake_hold_active or self._carrot_carrot_cruise:
+      text = "AUTOHOLD" if self._carrot_brake_hold_active else "CARROT"
       return [("text", text, LEAD_STATE_SIZE, hs.TEXT)]
     if self._carrot_long_active:
       if self._carrot_x_state in (3, 5):
