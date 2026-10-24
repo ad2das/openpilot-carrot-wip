@@ -31,6 +31,49 @@ def test_enter_below_enter_speed():
   assert stop_latch(False, 0.35, 0.20, 0.3, 0.10) is False
 
 
+def _old_stop_latch(prev, v_target, v_target_1sec, v_ego, release_v):
+  """The pre-fix body, kept to prove which behaviour each departure tick changed."""
+  if release_v >= STOP_ENTER_V:
+    return v_target < release_v and v_target_1sec < release_v
+  if not prev:
+    return v_target < STOP_ENTER_V and v_target_1sec < STOP_ENTER_V
+  if not (v_ego < STOP_LATCH_V_MAX):
+    return False
+  clearly_going = v_target_1sec >= STOP_ENTER_V
+  starting = (v_target >= release_v or v_target_1sec >= release_v) and v_target_1sec > v_target + STOP_RELEASE_RISE
+  return not (clearly_going or starting)
+
+
+def test_starting_plan_does_not_reenter():
+  # Route 6d1 departure: v_target is still far below the entry speed but the
+  # plan is already rising, so entry must not fire again.
+  assert stop_latch(False, 0.010, 0.227, 0.0, 0.10) is False
+  assert _old_stop_latch(False, 0.010, 0.227, 0.0, 0.10) is True
+
+
+def test_route_6d1_departure_no_flicker():
+  # Logged longitudinalPlan.speeds on CONTROL_N_T_IDX for the anchor tick and
+  # the following 0.3 s of the K5 departure (route 000006d1--37af09f1aa).
+  plan = [(0.001, 0.001), (0.006, 0.169), (0.010, 0.227), (0.013, 0.239),
+          (0.018, 0.257), (0.023, 0.260), (0.028, 0.263), (0.034, 0.275),
+          (0.040, 0.285)]
+  new, old = [], []
+  prev_new = prev_old = True
+  for v_target, v_target_1sec in plan:
+    prev_new = stop_latch(prev_new, v_target, v_target_1sec, 0.0, 0.10)
+    prev_old = _old_stop_latch(prev_old, v_target, v_target_1sec, 0.0, 0.10)
+    new.append(prev_new)
+    old.append(prev_old)
+  assert new == [True, False, False, False, False, False, False, False, False]
+  assert old == [True, False, True, False, True, False, True, False, True]
+
+
+def test_falling_or_flat_plan_still_enters():
+  # An approach still enters: the plan is not rising, so no `starting` veto.
+  assert stop_latch(False, 0.25, 0.10, 0.5, 0.10) is True
+  assert stop_latch(False, 0.05, 0.06, 0.0, 0.10) is True
+
+
 def test_latched_flat_crawl_stays_latched():
   assert stop_latch(True, 0.14, 0.13, 0.3, 0.10) is True
   # A rise of exactly 0.01 is below STOP_RELEASE_RISE, so it stays latched.

@@ -125,12 +125,14 @@ def stop_latch(prev, v_target, v_target_1sec, v_ego, release_v):
   release_v >= STOP_ENTER_V -> today's stateless rule (both below release_v), byte-identical."""
   if release_v >= STOP_ENTER_V:
     return v_target < release_v and v_target_1sec < release_v
+  starting = (v_target >= release_v or v_target_1sec >= release_v) and v_target_1sec > v_target + STOP_RELEASE_RISE
   if not prev:
-    return v_target < STOP_ENTER_V and v_target_1sec < STOP_ENTER_V
+    # A plan that is already starting must not re-enter the stop it just released: the re-entry
+    # flickered StopReq at departure and faulted a K5 ESC hold (route 6d1, 10-24).
+    return v_target < STOP_ENTER_V and v_target_1sec < STOP_ENTER_V and not starting
   if not (v_ego < STOP_LATCH_V_MAX):          # also False for NaN
     return False
   clearly_going = v_target_1sec >= STOP_ENTER_V
-  starting = (v_target >= release_v or v_target_1sec >= release_v) and v_target_1sec > v_target + STOP_RELEASE_RISE
   return not (clearly_going or starting)
 
 
