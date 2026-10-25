@@ -23,6 +23,7 @@ from openpilot.selfdrive.selfdrived.camera_config import get_camera_packets
 from openpilot.selfdrive.selfdrived.events import Events, ET, EmptyAlert
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
+from openpilot.selfdrive.selfdrived.stop_creep import StopCreepWarning
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.controls.lib.cutin_alert import (
@@ -127,6 +128,7 @@ class SelfdriveD:
 
     self.initialized = False
     self.enabled = False
+    self.stop_creep = StopCreepWarning(DT_CTRL)
     self.active = False
     self.mismatch_counter = 0
     self.cruise_mismatch_counter = 0
@@ -533,6 +535,11 @@ class SelfdriveD:
     planner_fcw = self.sm['longitudinalPlan'].fcw and self.enabled
     if (planner_fcw or model_fcw) and not self.CP.notCar:
       self.events.add(EventName.fcw)
+
+    # Stop creep warning: the car rolls on while openpilot asks it to stop (route 6db, 10-25)
+    if self.stop_creep.update(self.enabled, self.sm['longitudinalPlan'].shouldStop, CS.vEgo,
+                              CS.gasPressed, CS.brakePressed) and not self.CP.notCar:
+      self.events.add(EventName.stopCreepWarning)
 
     # TODO: fix simulator
     if not SIMULATION or REPLAY:

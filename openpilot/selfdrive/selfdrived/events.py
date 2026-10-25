@@ -1138,6 +1138,14 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
     #  AlertStatus.normal, AlertSize.small,
     #  Priority.LOW, VisualAlert.none, AudibleAlert.trafficSignGreen, 3.),
   },
+  EventName.stopCreepWarning: {
+    ET.PERMANENT: Alert(
+      "브레이크를 밟으세요",
+      "정지 유지 실패: 차가 움직이고 있습니다",
+      AlertStatus.critical, AlertSize.mid,
+      Priority.HIGH, VisualAlert.none, AudibleAlert.warningImmediate, .1),
+  },
+
   EventName.trafficSignChanged: {
     ET.WARNING: Alert(
       "신호가바뀌었어요.",
