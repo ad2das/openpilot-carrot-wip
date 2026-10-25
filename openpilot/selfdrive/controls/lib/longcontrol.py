@@ -22,6 +22,17 @@ CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 HYUNDAI_LONGITUDINAL_KP = 1.0
 HYUNDAI_LONGITUDINAL_KI = 0.0
 HYUNDAI_LONGITUDINAL_KF = 1.0
+
+# Departure guard: right after leaving a stop the car surges ahead of vTargetNow (the planner's
+# v_desired_filter lags by ~2 s) and the speed-error term cut the command to ~0 while the plan
+# still accelerated, so the K5 hesitated for ~1 s (route 6db). While the lead pulls away, the
+# command stays >= aTarget + DEPART_P_FLOOR for DEPART_WINDOW_T after leaving rest.
+DEPART_START_V = 0.3       # m/s, the stop -> pid transition must start from rest
+DEPART_WINDOW_T = 4.0      # s
+DEPART_P_FLOOR = -0.2      # m/s^2 below aTarget
+DEPART_MIN_DREL = 4.0      # m
+DEPART_RELEASE_JERK = 1.0  # m/s^3, floor relax when the window ends or the plan stops accelerating
+
 STOPPING_ACCEL_DEFAULT = -50  # Params use hundredths of m/s^2
 STOPPING_ACCEL_MIN = -100
 STOPPING_ACCEL_MAX = -50
@@ -94,6 +105,9 @@ class LongControl:
     self._butter_creep_logged = False
     self._butter_near_rest = False
     self._butter_rest_floor = None
+    self._depart_t = None
+    self._depart_floor = None
+    self.depart_guard_last = False
     self.butter_floor_last = None
     self.butter_floor_raw_last = None
     self.butter_bound_last = None
@@ -226,6 +240,41 @@ class LongControl:
     self.pid.reset()
     self.coasting.reset()
 
+  def _depart_guard(self, output_accel, a_target_ff, should_stop, CS, radarState):
+    self.depart_guard_last = False
+    if not self.butter_stop:
+      self._depart_t = None
+      self._depart_floor = None
+      return output_accel
+    if self._depart_t is None and self._depart_floor is None:
+      return output_accel
+    try:
+      v_ego = float(CS.vEgo)
+      a_ff = float(a_target_ff)
+      lead = radarState.leadOne
+      lead_ok = (not lead.status) or (float(lead.vLead) >= v_ego and float(lead.dRel) >= DEPART_MIN_DREL)
+    except (TypeError, ValueError, AttributeError):
+      v_ego = a_ff = float("nan")
+      lead_ok = False
+    if not (lead_ok and not should_stop and math.isfinite(v_ego) and math.isfinite(a_ff)):
+      # Safety exits drop the guard at once and end it for this departure.
+      self._depart_t = None
+      self._depart_floor = None
+      return output_accel
+    if self._depart_t is not None and self._depart_t <= DEPART_WINDOW_T and a_ff > 0.0:
+      self._depart_floor = a_ff + DEPART_P_FLOOR
+    else:
+      # Window over or the plan stopped accelerating: end the guard and relax its floor.
+      self._depart_t = None
+      if self._depart_floor is not None:
+        self._depart_floor -= DEPART_RELEASE_JERK * DT_CTRL
+    if self._depart_floor is None or output_accel >= self._depart_floor:
+      if self._depart_t is None:
+        self._depart_floor = None
+      return output_accel
+    self.depart_guard_last = True
+    return self._depart_floor
+
   def update(self, active, CS, long_plan, accel_limits, t_since_plan, radarState):
 
     soft_hold_active = CS.softHoldActive > 0
@@ -247,11 +296,23 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
+    prev_long_control_state = self.long_control_state
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
                                                        CS.cruiseState.standstill, CS.aEgo, self.stopping_accel, radarState)
     if active and soft_hold_active:
       self.long_control_state = LongCtrlState.stopping
+
+    if self.long_control_state == LongCtrlState.pid:
+      if (prev_long_control_state in (LongCtrlState.stopping, LongCtrlState.starting)
+          and float(CS.vEgo) < DEPART_START_V):
+        self._depart_t = 0.0
+        self._depart_floor = None
+      elif self._depart_t is not None:
+        self._depart_t += DT_CTRL
+    else:
+      self._depart_t = None
+      self._depart_floor = None
 
     # ButterStop episode bookkeeping. This only decides how much braking the
     # taper may remove while still rolling and how fast the confirmed hold
@@ -404,6 +465,11 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
         output_accel = min(0.0, max(output_accel, butter_floor_value))
+      guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
+      if guarded > output_accel:
+        # Do not integrate the speed error the guard is overriding.
+        self.pid.i = previous_integral
+        output_accel = guarded
 
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel, a_target_ff, j_target_now
