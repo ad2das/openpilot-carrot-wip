@@ -85,8 +85,8 @@ def test_window_end_relaxes_then_releases(monkeypatch):
     outs.append(_run(control, 2.06))
     if tick <= 350:
       assert outs[-1] == pytest.approx(0.29, abs=1e-6)
-  # 4.0 s window at 100 Hz: the floor starts relaxing at tick 401.
-  assert 0.15 < outs[499] < 0.25
+  # 4.0 s window at 100 Hz: the floor relaxes from tick 401 and meets the PID output (-0.05) near tick 434.
+  assert 0.15 < outs[409] < 0.25
   assert np.all(np.diff(outs[349:800]) <= 1e-9)
   assert outs[799] == pytest.approx(-0.05, abs=1e-6)
   assert control._depart_floor is None
