@@ -1,3 +1,7 @@
+import importlib.util
+import subprocess
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -6,7 +10,9 @@ from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
-from opendbc.car.hyundai.stopping import CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, STOP_LOWER_BAND, ZERO_CONFIRM_FRAMES
+from opendbc.car.hyundai.stopping import (CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, RESCUE_ACCEL,
+                                          RESCUE_ACCEL_MIN, RESCUE_JERK, RESCUE_MAX_CYCLES, RESCUE_SPEED, STOP_LOWER_BAND,
+                                          ZERO_CONFIRM_FRAMES)
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -656,3 +662,275 @@ def test_pass_accel_approach_hard_keeps_floor():
   cmd = step(controller, speed=1.0, accel=-0.6, previous_value=-0.6)
   assert controller.phase == StopPhase.approach
   butter_cmd(cmd, (0, -0.6, -0.6, 0.0))
+
+
+# --- Creep rescue: the ESC lets go short of rest and the car re-accelerates --
+# Route 6db 18:02: StopReq 1 with aReq -1.5 was ignored for 30 s while the car
+# crawled 7.7 m. The same ESC follows StopReq 0 decel, so a re-acceleration
+# under StopReq drops the request and brakes until rest, then asks again.
+
+REPO_ROOT = Path(__file__).resolve().parents[5]
+STOPPING_REL = "opendbc_repo/opendbc/car/hyundai/stopping.py"
+BASE_REVS = ("rescue-base", "95590fa26221d5cd370687e35caf67014f8c02f1", "HEAD^",
+             "pr-fork/carrot-wip", "origin/carrot-wip", "carrot-wip")
+
+
+def load_base_stopping():
+  """The pre-rescue controller (95590fa26 == fc31fe2ec for this file), from git."""
+  for rev in BASE_REVS:
+    try:
+      source = subprocess.run(["git", "-C", str(REPO_ROOT), "-c", "safe.directory=*",
+                               "show", f"{rev}:{STOPPING_REL}"],
+                              check=True, capture_output=True, text=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+      continue
+    if not source:
+      continue
+    with tempfile.TemporaryDirectory() as tmp:
+      path = Path(tmp) / "base_stopping.py"
+      path.write_text(source)
+      spec = importlib.util.spec_from_file_location("rescue_base_stopping", path)
+      module = importlib.util.module_from_spec(spec)
+      spec.loader.exec_module(module)
+    return module
+  pytest.skip("pre-rescue stopping module is unavailable in this checkout")
+
+
+def creep_approach(controller, *, accel=-0.2, start=0.34, end=0.03, plateau=20, held=False):
+  """The 6db profile up to the last still tick: v 0.34 -> 0.03, then a plateau."""
+  previous = -0.5
+  seen = []
+  for i in range(int(round((start - end) / 0.01)) + 1):
+    speed = round(start - 0.01 * i, 3)
+    cmd = step(controller, speed=speed, held=held, accel=accel, previous_value=previous)
+    seen.append((speed, cmd))
+    previous = cmd.value
+  for _ in range(plateau):
+    cmd = step(controller, speed=end, held=held, accel=-0.51, previous_value=previous)
+    seen.append((end, cmd))
+    previous = cmd.value
+  return seen, previous
+
+
+def creep_rise(controller, previous, *, accel=-1.5, steps=14, base=0.03, held=False):
+  """v climbs 0.035, 0.04, ... at the rate the car used in 6db."""
+  out = []
+  for i in range(1, steps + 1):
+    speed = round(base + 0.005 * i, 4)
+    cmd = step(controller, speed=speed, held=held, accel=accel, previous_value=previous)
+    out.append((speed, cmd))
+    previous = cmd.value
+  return out, previous
+
+
+def test_creep_rescue_drops_stop_req():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  before, previous = creep_approach(controller)
+  rising, _ = creep_rise(controller, previous)
+
+  assert controller.phase == StopPhase.rescue
+  assert controller.reason == "creep_rescue"
+  trigger = next(cmd for speed, cmd in rising if speed >= RESCUE_SPEED)
+  assert trigger.stop_req == 0
+  assert trigger.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+
+  for _, cmd in before:
+    assert cmd.stop_req == 1
+  for speed, cmd in rising:
+    if speed < RESCUE_SPEED:
+      assert cmd.stop_req == 1
+
+
+def test_rescue_rerequests_after_rest():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller)
+  creep_rise(controller, previous)
+  assert controller.phase == StopPhase.rescue
+
+  previous = -1.0
+  cmd = None
+  tick = -1
+  for tick in range(15):
+    cmd = step(controller, speed=0.02, accel=-1.5, previous_value=previous)
+    previous = cmd.value
+    if cmd.stop_req == 1:
+      break
+  assert cmd.stop_req == 1
+  assert tick <= 10  # 0.2 s of stopped_time at 50 Hz is 10 ticks
+  assert controller.phase == StopPhase.held
+  assert controller.reason == "rescue_stopped"
+  assert controller.rescue_cycles == 1
+
+
+def test_no_rescue_while_avh():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, held=False)
+  for i in range(1, 21):
+    speed = round(0.03 + 0.005 * i, 4)
+    cmd = step(controller, speed=speed, held=True, accel=-1.5, previous_value=previous)
+    previous = cmd.value
+    assert cmd.stop_req == 1
+    assert controller.phase != StopPhase.rescue
+
+
+def test_normal_stop_never_rescues():
+  base = load_base_stopping()
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  reference = base.CanfdStopping()
+  reference.pass_accel = True
+
+  speeds = [round(0.35 - 0.01 * i, 3) for i in range(36)]  # 0.35 -> 0.0
+  speeds += [0.0] * 100                                    # 2 s at rest
+  speeds += [0.02, 0.06, 0.02]                             # jitter near rest
+  previous = -0.5
+  for i, speed in enumerate(speeds):
+    held = i >= 36 + 50  # AVH engages 1 s after rest
+    cmd = step(controller, speed=speed, held=held, accel=-0.5, previous_value=previous)
+    ref = step(reference, speed=speed, held=held, accel=-0.5, previous_value=previous)
+    assert controller.phase != StopPhase.rescue
+    assert (cmd.stop_req, cmd.raw, cmd.value, cmd.lower) == (ref.stop_req, ref.raw, ref.value, ref.lower)
+    previous = cmd.value
+
+
+def test_rescue_max_cycles_keeps_braking():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  previous = -0.5
+  for cycle in range(3):
+    if cycle == 0:
+      _, previous = creep_approach(controller)
+      rising, previous = creep_rise(controller, previous)
+    else:
+      rising = []
+      for i in range(1, 9):  # reset -> 0.10 at 0.01 per tick
+        speed = round(0.02 + 0.01 * i, 4)
+        cmd = step(controller, speed=speed, accel=-1.5, previous_value=previous)
+        rising.append((speed, cmd))
+        previous = cmd.value
+    assert rising[-1][1].stop_req == 0
+    assert controller.phase == StopPhase.rescue
+
+    cmd = None
+    for _ in range(100):  # 2 s held at rest
+      cmd = step(controller, speed=0.02, accel=-1.5, previous_value=previous)
+      previous = cmd.value
+
+    if cycle < RESCUE_MAX_CYCLES:
+      assert controller.rescue_cycles == cycle + 1
+      assert controller.phase == StopPhase.held
+      assert controller.reason == "rescue_stopped"
+      assert cmd.stop_req == 1
+    else:
+      assert controller.rescue_cycles == RESCUE_MAX_CYCLES
+      assert controller.phase == StopPhase.rescue
+      assert cmd.stop_req == 0
+      assert RESCUE_ACCEL_MIN <= cmd.raw <= RESCUE_ACCEL
+
+
+def test_rescue_releases_when_not_requested():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller)
+  for speed in (0.10, 0.11):
+    cmd = step(controller, speed=speed, accel=-1.5, previous_value=previous)
+    previous = cmd.value
+  assert controller.phase == StopPhase.rescue
+
+  assert step(controller, requested=False, speed=0.12) is None
+  assert controller.phase == StopPhase.idle
+
+
+def test_rescue_without_pass_accel():
+  controller = CanfdStopping()
+  assert controller.pass_accel is False
+  _, previous = creep_approach(controller)
+  rising, _ = creep_rise(controller, previous)
+
+  assert controller.phase == StopPhase.rescue
+  trigger = next(cmd for speed, cmd in rising if speed >= RESCUE_SPEED)
+  assert trigger.stop_req == 0
+  assert trigger.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+
+
+def test_rescue_ramp_reaches_braking_before_the_warning():
+  """-0.51 -> -2.5 within 20 ticks (0.4 s): the driver warning needs 1 s of creep."""
+  controller = CanfdStopping()
+  value = -0.51  # the 6db entry: the creep plateau sat at -0.51
+  reached = 0
+  first_step = None
+  for tick in range(1, 21):
+    cmd = controller._rescue_command(RESCUE_ACCEL, value, 2.0, 1.0)
+    assert cmd.stop_req == 0
+    assert cmd.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+    step_size = value - cmd.value
+    assert step_size <= RESCUE_JERK * DT + 1e-9, f"tick {tick} stepped {step_size:.4f}"
+    if first_step is None:
+      first_step = step_size
+    value = cmd.value
+    if cmd.value <= RESCUE_ACCEL + 1e-9:
+      reached = tick
+      break
+  # The stock 1.0 m/s^3 lower limit (passed here as jerk_l) would need 2 s.
+  assert first_step == pytest.approx(RESCUE_JERK * DT, abs=1e-9)
+  assert reached > 0, f"rescue aReq stuck at {value:.3f}"
+  assert reached * DT <= 0.4 + 1e-9
+
+  # The same cap holds on the real update() path, whatever jerk_l the caller passes.
+  live = CanfdStopping()
+  live.pass_accel = True
+  _, previous = creep_approach(live)
+  trigger = None
+  for i in range(1, 15):
+    speed = round(0.03 + 0.005 * i, 4)
+    cmd = step(live, speed=speed, accel=-2.5, previous_value=previous, jerk_l=1.0)
+    if live.phase == StopPhase.rescue:
+      trigger = cmd
+      break
+    previous = cmd.value
+  assert trigger is not None, "rescue never triggered"
+  assert previous - trigger.value <= RESCUE_JERK * DT + 1e-9
+
+
+def test_rescue_passes_a_harder_op_accel():
+  """A harder request than -2.5 is passed down to the -3.5 floor, not clamped upward."""
+  raw = {}
+  for accel in (-3.0, -5.0):
+    fresh = CanfdStopping()
+    fresh.pass_accel = True
+    _, previous = creep_approach(fresh)
+    trigger = None
+    for i in range(1, 15):
+      speed = round(0.03 + 0.005 * i, 4)
+      cmd = step(fresh, speed=speed, accel=accel, previous_value=previous)
+      if fresh.phase == StopPhase.rescue:
+        trigger = cmd
+        break
+      previous = cmd.value
+    assert trigger is not None
+    raw[accel] = trigger.raw
+
+  assert raw[-3.0] == pytest.approx(-3.0, abs=1e-9)
+  assert raw[-5.0] == pytest.approx(RESCUE_ACCEL_MIN, abs=1e-9)
+
+
+def test_rescue_never_eases_with_a_soft_op_accel():
+  """OP asking 0.0 or a positive accel in the creep still gets the full rescue braking."""
+  for accel in (0.0, 0.6):
+    controller = CanfdStopping()
+    controller.pass_accel = True
+    _, previous = creep_approach(controller)
+    trigger = None
+    for i in range(1, 15):
+      speed = round(0.03 + 0.005 * i, 4)
+      cmd = step(controller, speed=speed, accel=accel, previous_value=previous)
+      if controller.phase == StopPhase.rescue:
+        trigger = cmd
+        break
+      previous = cmd.value
+    assert trigger is not None
+    assert trigger.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+    assert trigger.stop_req == 0

@@ -19,12 +19,26 @@ PASS_ACCEL_MIN = -0.45  # approach (StopReq 0): ButterStop accel passes only whi
 ZERO_SPEED = 0.01  # m/s; all wheels truly stopped
 ZERO_CONFIRM_FRAMES = 50  # 1.0 s at 50 Hz truly stopped without AVH -> stock zeros anyway
 
+# Creep rescue (route 6db 18:02, 10-25): the ESC let go just short of rest, the car re-accelerated and
+# crawled 7.7 m while it ignored aReq -1.5 under StopReq 1 for 30 s. A re-acceleration under StopReq
+# now drops StopReq and brakes at StopReq 0 with -2.5 or harder until rest, then requests the stop
+# again. At walking speed the ESC delivered only ~14 % of a StopReq 0 request in the two logged cases
+# (6d5 09:49:01, 6d6 10:25:39), so the request is hard; the jolt is accepted (user, 10-25).
+RESCUE_LOW_SPEED = 0.15   # m/s; the stop must first have come down to this
+RESCUE_RISE = 0.05        # m/s above the lowest speed of this episode
+RESCUE_SPEED = 0.10       # m/s; and the car must be moving at least this fast
+RESCUE_ACCEL = -2.5       # m/s^2; at walking speed the ESC delivers only ~14 % of a StopReq 0 request (6d5/6d6)
+RESCUE_ACCEL_MIN = -3.5   # m/s^2 floor (panda allows -4.0)
+RESCUE_JERK = 5.0         # m/s^3; reach the rescue braking within ~0.4 s, before the driver warning (1 s)
+RESCUE_MAX_CYCLES = 2     # re-requests per episode; after that the episode keeps braking with StopReq 0
+
 
 class StopPhase(StrEnum):
   idle = "idle"
   approach = "approach"
   request = "request"
   held = "held"
+  rescue = "rescue"
 
 
 @dataclass(frozen=True)
@@ -60,6 +74,8 @@ class CanfdStopping:
     self.stopped_time = 0.0
     self.release_frames = 0
     self.zero_frames = 0
+    self.v_min = float("inf")
+    self.rescue_cycles = 0
 
   def enter(self, phase: StopPhase, reason: str):
     self.phase = phase
@@ -69,6 +85,11 @@ class CanfdStopping:
     raw = min(accel, 0.0)
     value = min(0.0, max(previous_value - jerk_l * DT, min(raw, previous_value + jerk_u * DT)))
     return StopCommand(1, raw, value, 0.0)
+
+  def _rescue_command(self, accel: float, previous_value: float, jerk_u: float, jerk_l: float) -> StopCommand:
+    raw = max(min(accel, RESCUE_ACCEL), RESCUE_ACCEL_MIN)
+    value = min(0.0, max(previous_value - max(jerk_l, RESCUE_JERK) * DT, min(raw, previous_value + jerk_u * DT)))
+    return StopCommand(0, raw, value, 0.0)
 
   def update(self, *, active: bool, requested: bool, speed: float, held: bool,
              accel: float, previous_value: float, jerk_u: float, jerk_l: float) -> StopCommand | None:
@@ -95,13 +116,29 @@ class CanfdStopping:
     self.stopped_time = self.stopped_time + DT if speed <= STOP_SPEED else 0.0
     self.zero_frames = self.zero_frames + 1 if speed <= ZERO_SPEED else 0
     stopped = (held and speed <= MOVING_SPEED) or self.stopped_time >= STOP_CONFIRM_TIME
-    if stopped:
+    if self.phase == StopPhase.rescue:
+      if held and speed <= MOVING_SPEED:
+        self.enter(StopPhase.held, "rescue_held")
+      elif self.stopped_time >= STOP_CONFIRM_TIME and self.rescue_cycles < RESCUE_MAX_CYCLES:
+        self.rescue_cycles += 1
+        self.v_min = speed
+        self.enter(StopPhase.held, "rescue_stopped")
+      else:
+        return self._rescue_command(accel, previous_value, jerk_u, jerk_l)
+    elif stopped:
       if self.phase != StopPhase.held:
         self.enter(StopPhase.held, "stop_observed")
     elif self.phase == StopPhase.held:
-      # Motion changes diagnostics only. Never release StopReq to retry, even
-      # when speed rises above the initial entry threshold after a request.
+      # Motion changes diagnostics only. Never release StopReq to retry, except the creep rescue below,
+      # even when speed rises above the initial entry threshold after a request.
       self.enter(StopPhase.request, "motion_after_hold")
+
+    if self.phase in (StopPhase.request, StopPhase.held):
+      self.v_min = min(self.v_min, speed)
+      if (not held and self.v_min <= RESCUE_LOW_SPEED and speed >= self.v_min + RESCUE_RISE
+          and speed >= RESCUE_SPEED):
+        self.enter(StopPhase.rescue, "creep_rescue")
+        return self._rescue_command(accel, previous_value, jerk_u, jerk_l)
 
     # ButterStop: keep OP's decel (taper, stop ramp, creep guard) under StopReq until the ESC holds.
     # Zero aReq while the car still rolled at 0.03 m/s never reached a hold and let a K5 creep 3-4 m
