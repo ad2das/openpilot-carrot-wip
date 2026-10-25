@@ -155,9 +155,22 @@ def test_background_frames_throttled_and_speed_gated(tmp_path):
   rec.close()
 
 
+def offer_drained(rec, now, **kwargs) -> bool:
+  """offer() with a synthetic timestamp, then wait for the writer.
+
+  The sampling times here are synthetic (0.1 s steps burned in microseconds), so
+  without this the 4-slot ring overruns and saves are lost to dropped_full. The
+  policy under test is a function of the timestamps only, so draining between
+  offers keeps the expected save list exact without changing the rule.
+  """
+  ok = offer(rec, now, **kwargs)
+  assert rec.wait_idle()
+  return ok
+
+
 def test_far_background_one_hz_when_moving(tmp_path):
   rec = make_recorder(tmp_path)
-  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far")]
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer_drained(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far")]
   assert rec.wait_idle()
   assert saved == [200.0, 201.0, 202.0, 203.0, 204.0, 205.0]
   assert rec.stats()["saved"] == 6
@@ -167,7 +180,7 @@ def test_far_background_one_hz_when_moving(tmp_path):
 
 def test_near_background_stays_five_seconds(tmp_path):
   rec = make_recorder(tmp_path)
-  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="near")]
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer_drained(rec, 200.0 + 0.1 * i, v_ego=10.0, view="near")]
   assert rec.wait_idle()
   assert saved == [200.0, 205.0]
   assert rec.stats()["saved"] == 2
@@ -176,7 +189,7 @@ def test_near_background_stays_five_seconds(tmp_path):
 
 def test_far_background_slow_stays_five_seconds(tmp_path):
   rec = make_recorder(tmp_path)
-  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=5.0, view="far")]
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer_drained(rec, 200.0 + 0.1 * i, v_ego=5.0, view="far")]
   assert rec.wait_idle()
   assert saved == [200.0, 205.0]
   assert rec.stats()["saved"] == 2
@@ -187,7 +200,7 @@ def test_far_background_resets_shared_clock(tmp_path):
   rec = make_recorder(tmp_path)
   saved = [round(200.0 + 0.1 * i, 6)
            for i in range(101)
-           if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far" if i % 2 == 0 else "near")]
+           if offer_drained(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far" if i % 2 == 0 else "near")]
   assert rec.wait_idle()
   # FAR saves every 1 s; a per-view NEAR clock would fire at 205.1, but the FAR
   # save at 205.0 is shared, so NEAR is never due inside this window.
