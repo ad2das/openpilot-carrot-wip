@@ -10,7 +10,7 @@ call is defensive, and offer() returns False instead of raising.
 Sampling (decided on the hot path with cheap comparisons only):
   light      >=1 det OR >=1 track OR red_likely OR state != none:
              at most 1 per 0.5 s while v_ego >= 1 m/s, 1 per 3 s below;
-  background none of the above: at most 1 per 5 s and only while v_ego >= 3;
+  background none of the above: at most 1 per 5 s while v_ego >= 3, or 1 per 1 s on the FAR view while v_ego >= 8;
   transition machine state changed vs the previous processed frame: saved
              immediately (bypasses the intervals), at most 4 per 10 s.
 
@@ -65,6 +65,10 @@ STANDSTILL_INTERVAL_S = 3.0
 STANDSTILL_V_MS = 1.0
 BACKGROUND_INTERVAL_S = 5.0
 BACKGROUND_MIN_V_MS = 3.0
+# FAR background frames feed the far-light detector training set (WFAR1, 10-26): before a light's
+# first detection only background saves exist, so keep them dense on the FAR view while moving.
+FAR_BACKGROUND_INTERVAL_S = 1.0
+FAR_BACKGROUND_MIN_V_MS = 8.0
 TRANSITION_WINDOW_S = 10.0
 TRANSITION_MAX = 4
 RESCAN_INTERVAL_S = 60.0
@@ -173,7 +177,8 @@ class TlvRecorder:
         reason = "transition"
       elif light and now - self._last_light >= (LIGHT_INTERVAL_S if speed >= STANDSTILL_V_MS else STANDSTILL_INTERVAL_S):
         reason = "light"
-      elif (not light) and speed >= BACKGROUND_MIN_V_MS and now - self._last_background >= BACKGROUND_INTERVAL_S:
+      elif (not light) and speed >= BACKGROUND_MIN_V_MS and now - self._last_background >= (
+          FAR_BACKGROUND_INTERVAL_S if (view == "far" and speed >= FAR_BACKGROUND_MIN_V_MS) else BACKGROUND_INTERVAL_S):
         reason = "background"
       if reason is None:
         if light or speed >= BACKGROUND_MIN_V_MS:

@@ -53,10 +53,10 @@ def make_track(vote=None) -> tracker.Track:
 
 
 def offer(rec, now, *, v_ego=10.0, state=0, dets=None, tracks=None, red_likely=False,
-          state_conf=0.0, relevant_track_id=-1, model_input=None, gated=()) -> bool:
+          state_conf=0.0, relevant_track_id=-1, model_input=None, gated=(), view="far") -> bool:
   return rec.offer(
     model_input if model_input is not None else make_input(),
-    now=now, frame_id=1, view="far", raised=False, geom=GEOM,
+    now=now, frame_id=1, view=view, raised=False, geom=GEOM,
     horizon_y=600.0, calib_rpy=[0.0, 0.0, 0.0],
     v_ego=v_ego, a_ego=0.0, yaw_rate=0.0, steering_angle_deg=0.0,
     left_blinker=False, right_blinker=False,
@@ -140,18 +140,61 @@ def test_standstill_light_throttled_to_three_seconds(tmp_path):
 
 def test_background_frames_throttled_and_speed_gated(tmp_path):
   rec = make_recorder(tmp_path)
-  assert offer(rec, 200.0, v_ego=10.0) is True
-  assert offer(rec, 204.0, v_ego=10.0) is False
-  assert offer(rec, 205.0, v_ego=10.0) is True
+  assert offer(rec, 200.0, v_ego=10.0, view="near") is True
+  assert offer(rec, 204.0, v_ego=10.0, view="near") is False
+  assert offer(rec, 205.0, v_ego=10.0, view="near") is True
   # below 3 m/s a background frame is not a candidate at all
-  assert offer(rec, 206.0, v_ego=2.0) is False
-  assert offer(rec, 300.0, v_ego=2.0) is False
+  assert offer(rec, 206.0, v_ego=2.0, view="near") is False
+  assert offer(rec, 300.0, v_ego=2.0, view="near") is False
   assert rec.wait_idle()
   stats = rec.stats()
   assert stats["saved"] == 2
   assert stats["dropped_rate"] == 1
   reasons = [m["reason"] for m in read_index(str(tmp_path))]
   assert reasons == ["background", "background"]
+  rec.close()
+
+
+def test_far_background_one_hz_when_moving(tmp_path):
+  rec = make_recorder(tmp_path)
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far")]
+  assert rec.wait_idle()
+  assert saved == [200.0, 201.0, 202.0, 203.0, 204.0, 205.0]
+  assert rec.stats()["saved"] == 6
+  assert [m["reason"] for m in read_index(str(tmp_path))] == ["background"] * 6
+  rec.close()
+
+
+def test_near_background_stays_five_seconds(tmp_path):
+  rec = make_recorder(tmp_path)
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="near")]
+  assert rec.wait_idle()
+  assert saved == [200.0, 205.0]
+  assert rec.stats()["saved"] == 2
+  rec.close()
+
+
+def test_far_background_slow_stays_five_seconds(tmp_path):
+  rec = make_recorder(tmp_path)
+  saved = [round(200.0 + 0.1 * i, 6) for i in range(51) if offer(rec, 200.0 + 0.1 * i, v_ego=5.0, view="far")]
+  assert rec.wait_idle()
+  assert saved == [200.0, 205.0]
+  assert rec.stats()["saved"] == 2
+  rec.close()
+
+
+def test_far_background_resets_shared_clock(tmp_path):
+  rec = make_recorder(tmp_path)
+  saved = [round(200.0 + 0.1 * i, 6)
+           for i in range(101)
+           if offer(rec, 200.0 + 0.1 * i, v_ego=10.0, view="far" if i % 2 == 0 else "near")]
+  assert rec.wait_idle()
+  # FAR saves every 1 s; a per-view NEAR clock would fire at 205.1, but the FAR
+  # save at 205.0 is shared, so NEAR is never due inside this window.
+  assert saved == [200.0, 201.0, 202.0, 203.0, 204.0, 205.0, 206.0, 207.0, 208.0, 209.0, 210.0]
+  rows = read_index(str(tmp_path))
+  assert [m["reason"] for m in rows] == ["background"] * 11
+  assert {m["view"] for m in rows} == {"far"}
   rec.close()
 
 
