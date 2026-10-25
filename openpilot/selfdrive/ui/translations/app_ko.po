@@ -1464,6 +1464,14 @@ msgstr "✓ 구독됨"
 msgid "신호가바뀌었어요."
 msgstr "신호가바뀌었어요."
 
+#: openpilot/selfdrive/selfdrived/events.py
+msgid "브레이크를 밟으세요"
+msgstr "브레이크를 밟으세요"
+
+#: openpilot/selfdrive/selfdrived/events.py
+msgid "정지 유지 실패: 차가 움직이고 있습니다"
+msgstr "정지 유지 실패: 차가 움직이고 있습니다"
+
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "🔥 Firehose Mode 🔥"
 msgstr "🔥 파이어호스 모드 🔥"

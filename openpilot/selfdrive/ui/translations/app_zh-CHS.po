@@ -1471,6 +1471,14 @@ msgstr "✓ 已订阅"
 msgid "신호가바뀌었어요."
 msgstr "信号灯已变化"
 
+#: openpilot/selfdrive/selfdrived/events.py
+msgid "브레이크를 밟으세요"
+msgstr "请踩刹车"
+
+#: openpilot/selfdrive/selfdrived/events.py
+msgid "정지 유지 실패: 차가 움직이고 있습니다"
+msgstr "停车保持失败：车辆正在移动"
+
 #: openpilot/selfdrive/ui/widgets/setup.py
 msgid "🔥 Firehose Mode 🔥"
 msgstr "🔥 Firehose 模式 🔥"
