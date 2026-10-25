@@ -575,11 +575,13 @@ def test_butter_floor_last_telemetry(monkeypatch):
 def test_standstill_latch_and_faster_hold_ramp(monkeypatch):
   control, _ = make_control(monkeypatch)
   control.long_control_state = LongCtrlState.stopping
-  # CS.standstill confirms immediately.
+  # The hold is confirmed after STANDSTILL_T below STANDSTILL_V (CS.standstill alone does not confirm).
   cs, plan, radar = stopping_inputs(v_ego=0.03, standstill=True)
+  for _ in range(int(STANDSTILL_T / lc.DT_CTRL)):
+    control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._butter_standstill_confirmed
   control.last_output_accel = 0.0
   accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
-  assert control._butter_standstill_confirmed
   assert accel == pytest.approx(-HOLD_RAMP * lc.DT_CTRL)
   # After confirmation the floor is gone even though a taper would exist. Gas
   # holds the creep guard latch off so the ramp rate itself is visible.
@@ -632,8 +634,9 @@ def test_creep_guard_fires_latches_and_logs_once(monkeypatch):
   control.long_control_state = LongCtrlState.stopping
   cs, plan, radar = stopping_inputs(v_ego=0.03, standstill=True)
   control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
-  assert control._butter_standstill_confirmed
-  # Creep appears after the standstill was confirmed.
+  # Near rest arms the guard before the hold is confirmed.
+  assert control._butter_near_rest and not control._butter_standstill_confirmed
+  # Creep appears after the car was near rest.
   cs.vEgo = 0.2
   control.last_output_accel = -0.1
   accel, _, _ = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
@@ -657,7 +660,9 @@ def test_creep_guard_does_not_fight_gas_before_latch(monkeypatch):
   control, _ = make_control(monkeypatch)
   control.long_control_state = LongCtrlState.stopping
   cs, plan, radar = stopping_inputs(v_ego=0.03, standstill=True)
-  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  for _ in range(int(STANDSTILL_T / lc.DT_CTRL)):
+    control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._butter_standstill_confirmed
   control.last_output_accel = -0.1
   cs.vEgo = 0.2
   cs.gasPressed = True

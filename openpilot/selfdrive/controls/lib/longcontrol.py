@@ -92,6 +92,8 @@ class LongControl:
     self._butter_standstill_confirmed = False
     self._butter_creep_latched = False
     self._butter_creep_logged = False
+    self._butter_near_rest = False
+    self._butter_rest_floor = None
     self.butter_floor_last = None
     self.butter_floor_raw_last = None
     self.butter_bound_last = None
@@ -262,16 +264,23 @@ class LongControl:
         self._butter_standstill_confirmed = False
         self._butter_creep_latched = False
         self._butter_creep_logged = False
+        self._butter_near_rest = False
+        self._butter_rest_floor = None
       else:
         try:
           v_ego_now = float(CS.vEgo)
         except (TypeError, ValueError):
           v_ego_now = float("nan")
-        if v_ego_now < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
+        # The hold is confirmed only after STANDSTILL_T below STANDSTILL_V. CS.standstill
+        # (Hyundai: wheel speed <= 0.104 m/s) comes ~0.4 s before the car is at rest, and
+        # confirming on it ramped to the hold decel while still rolling (K5 6d5/6d6).
+        if v_ego_now < STANDSTILL_V:
           self._butter_standstill_time = min(STANDSTILL_T, self._butter_standstill_time + DT_CTRL)
         else:
           self._butter_standstill_time = 0.0
-        if bool(getattr(CS, "standstill", False)) or self._butter_standstill_time >= STANDSTILL_T:
+        if v_ego_now < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
+          self._butter_near_rest = True
+        if self._butter_standstill_time >= STANDSTILL_T:
           self._butter_standstill_confirmed = True
       floor_live = (self.long_control_state == LongCtrlState.pid
                     or (self.long_control_state == LongCtrlState.stopping
@@ -337,11 +346,16 @@ class LongControl:
       if output_accel > self.stopping_accel:
         output_accel = min(output_accel, 0.0)
         output_accel -= ramp_rate * DT_CTRL
-      if self.butter_stop and not self._butter_standstill_confirmed and butter_floor_value is not None:
-        # The taper only limits braking while the car is still rolling.
-        output_accel = max(output_accel, butter_floor_value)
-      if self.butter_stop and self._butter_standstill_confirmed:
-        # Creep guard: while holding, never let the car creep toward the lead.
+      if self.butter_stop and not self._butter_standstill_confirmed:
+        if butter_floor_value is not None:
+          # The taper only limits braking while the car is still rolling.
+          output_accel = max(output_accel, butter_floor_value)
+          self._butter_rest_floor = butter_floor_value
+        elif self._butter_rest_floor is not None and float(CS.vEgo) < STANDSTILL_V:
+          # Below STANDSTILL_V the taper is ineligible; keep its last value until the hold is confirmed.
+          output_accel = max(output_accel, self._butter_rest_floor)
+      if self.butter_stop and (self._butter_standstill_confirmed or self._butter_near_rest):
+        # Creep guard: once the car was near rest, never let it creep toward the lead.
         if float(CS.vEgo) > CREEP_V and not bool(getattr(CS, "gasPressed", False)):
           self._butter_creep_latched = True
         if self._butter_creep_latched:
