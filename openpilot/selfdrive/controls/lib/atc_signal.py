@@ -209,8 +209,10 @@ class RequestArbiter:
   Live stop gates apply even when the accompanying request is old or malformed.
   """
 
-  def __init__(self, max_age_seconds=2.0):
+  def __init__(self, max_age_seconds=2.0, transition_grace_seconds=0.3):
     self._max_age_ns = _duration_ns(max_age_seconds)
+    self._transition_grace_ns = _duration_ns(transition_grace_seconds)
+    self._not_ready_since = None
     self._request = AtcRequest()
     self._last_now = 0
     self._armed = False
@@ -280,6 +282,7 @@ class RequestArbiter:
       self._blocked = True
       self._active_seen = False
       self._direction = Direction.NONE
+      self._not_ready_since = None
 
     if request.episode > self.episode:
       initial_prepare = self.episode == 0 and request.phase == "prepare" and request.reason != "helper_not_ready"
@@ -287,6 +290,7 @@ class RequestArbiter:
       self._armed = False
       self._active_seen = False
       self._direction = Direction.NONE
+      self._not_ready_since = None
     self._request = request
 
     if request.phase == "none":
@@ -300,6 +304,13 @@ class RequestArbiter:
     if unsafe:
       self._blocked = True
     if request.phase == "prepare":
+      if self._active_seen and request.reason == "helper_not_ready" and not self._blocked:
+        # DesireHelper skips one frame when the same maneuver changes token
+        # (atc/fork -> turn). Hold output off briefly instead of ending it.
+        if self._not_ready_since is None:
+          self._not_ready_since = now_ns
+        if now_ns - self._not_ready_since <= self._transition_grace_ns:
+          return replace(request, reason="helper_not_ready")
       if self._active_seen:
         self._blocked = True
       if self._blocked:
@@ -308,6 +319,7 @@ class RequestArbiter:
       return replace(request, reason="helper_not_ready" if request.reason == "helper_not_ready" else "prepare_request")
 
     self._active_seen = True
+    self._not_ready_since = None
     if self._direction not in (Direction.NONE, request.direction):
       self._blocked = True
     self._direction = request.direction

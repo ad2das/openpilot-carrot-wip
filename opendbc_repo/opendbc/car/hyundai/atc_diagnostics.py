@@ -21,6 +21,9 @@ import math
 
 
 REQUEST_ADDRESS = 0x770
+# Panda drops a same-side release sooner than 10 ms after the previous one;
+# keep retries clear of that bound so every counted attempt can reach the bus.
+RELEASE_RETRY_MIN_S = 0.02
 RESPONSE_ADDRESS = 0x778
 
 
@@ -131,6 +134,7 @@ class PalisadeAtcDiagnosticPlanner:
     self._fault: str | None = None
     self._pending: _Pending | None = None
     self._release_queue: list[Side] = []
+    self._deferred_retry: tuple[Side, int, float] | None = None
     self._after_release: Side | None = None
     self._active_since: float | None = None
     self._last_now: float | None = None
@@ -208,6 +212,7 @@ class PalisadeAtcDiagnosticPlanner:
 
   def _next_release(self, now: float) -> tuple[PlannedCan, ...]:
     self._pending = None
+    self._deferred_retry = None
     if self._release_queue:
       return self._emit(Operation.RELEASE, self._release_queue.pop(0), now)
     after, self._after_release = self._after_release, None
@@ -223,11 +228,22 @@ class PalisadeAtcDiagnosticPlanner:
       assert self._pending is not None
       frame = self._pending.frame
       if frame.attempt < self.timing.release_attempts:
+        due = self._pending.sent_at + RELEASE_RETRY_MIN_S
+        if now < due:
+          self._pending = None
+          self._deferred_retry = (frame.side, frame.attempt + 1, due)
+          return ()
         return self._emit(Operation.RELEASE, frame.side, now, frame.attempt + 1)
       return self._next_release(now)  # Keep this side uncertain; still try the other.
     return self._begin_release(now)
 
   def _expire(self, now: float) -> tuple[PlannedCan, ...]:
+    if self._deferred_retry is not None:
+      side, attempt, due = self._deferred_retry
+      if now < due:
+        return ()
+      self._deferred_retry = None
+      return self._emit(Operation.RELEASE, side, now, attempt)
     if self._active_since is not None and now >= self._active_since + self.timing.max_active_s:
       return self._fail("maximum_active_duration", now)
     if self._pending is not None and now >= self._pending.deadline:

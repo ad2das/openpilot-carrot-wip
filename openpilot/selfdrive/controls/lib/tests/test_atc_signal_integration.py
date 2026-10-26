@@ -425,3 +425,39 @@ class TestAtcSignalIntegration:
     ]:
       tree = ast.parse((ROOT / rel).read_text(encoding='utf8'))
       assert sum(isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and (n.func.id == expected) for n in ast.walk(tree)) == 1
+
+
+@pytest.mark.parametrize('first', ['atc left', 'fork left'])
+def test_same_direction_token_change_keeps_signal(first):
+  # DesireHelper skips one frame on atc/fork -> turn; that must not end the episode.
+  c = Chain(use_switches=True)
+  c.warm()
+  assert c.active(first).atcSignal.direction == 1
+  results = [c.step('turn left').atcSignal.direction for _ in range(10)]
+  assert results[-1] == 1
+
+
+def test_helper_not_ready_beyond_grace_still_blocks():
+  from openpilot.selfdrive.controls.lib.atc_signal import AtcRequest, Direction, RequestGates
+  arb = RequestArbiter()
+  gates = RequestGates(enabled=True, lateral_active=True, can_valid=True, model_fresh=True, navigation_fresh=True, driver_input_known=True)
+  t = 10_000_000_000
+  base = {'source_id': t - 10, 'episode': 1, 'source_mono_time': t, 'valid': True}
+  arb.update(AtcRequest(direction=Direction.NONE, phase='prepare', **base), gates, now_ns=t)
+  assert arb.update(AtcRequest(direction=Direction.LEFT, phase='turn', **base), gates, now_ns=t + 50_000_000).direction == Direction.LEFT
+  not_ready = AtcRequest(direction=Direction.NONE, phase='prepare', reason='helper_not_ready', **base)
+  for k in range(1, 10):
+    arb.update(not_ready, gates, now_ns=t + 50_000_000 * (k + 1))
+  assert arb.update(AtcRequest(direction=Direction.LEFT, phase='turn', **base), gates, now_ns=t + 600_000_000).direction == Direction.NONE
+
+
+def test_opposite_manual_lever_ignores_automatic_lamp_feedback():
+  c = Chain(use_switches=True)
+  c.step(car_changes={'vEgo': 20.0})
+  c.cs.atcSignalStatus = {'enabled': True, 'phase': 'acknowledged', 'lastCommandMonoTime': c.now}
+  c.step(raw=1 << 19, car_changes={'leftBlinker': True})
+  c.step(raw=(1 << 41) | (1 << 19), car_changes={'leftBlinker': True, 'rightBlinker': False})
+  assert c.helper.driver_blinker_state == 2
+  for _ in range(8):
+    c.step(raw=(1 << 41) | (1 << 62), car_changes={'leftBlinker': True, 'rightBlinker': True})
+  assert c.helper.driver_blinker_state == 2

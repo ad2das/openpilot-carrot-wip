@@ -287,6 +287,26 @@ class TestAtcDiagnostics(unittest.TestCase):
     with self.assertRaises(TypeError):
       p.request("left", 2)
 
+  def test_release_retry_waits_for_panda_interval(self):
+    # Panda rejects same-side releases < 10 ms apart; fast NRCs must not burn attempts.
+    p = self.planner(attempts=3)
+    p.initialize(0)
+    first = self.reply(p, bytes.fromhex("5003"), .1)[0]
+    self.assertEqual(first.payload, bytes.fromhex("2fbc1500"))
+    sent = [.1]
+    now = .1
+    for _ in range(40):
+      now = round(now + .009, 6)
+      out = self.reply(p, bytes.fromhex("7f2f22"), now - .0001) if p._pending is not None else ()
+      out += p.tick(now)
+      for frame in out:
+        if frame.side is Side.LEFT and frame.operation is Operation.RELEASE:
+          sent.append(now)
+    self.assertEqual(len(sent), 3)
+    self.assertTrue(all(b - a >= atc.RELEASE_RETRY_MIN_S - 1e-9 for a, b in zip(sent, sent[1:], strict=False)))
+    self.assertEqual(p.status.fault, "negative_response")
+    self.assertIn(Side.LEFT, p.status.uncertain_sides)
+
 
 if __name__ == "__main__":
   unittest.main()

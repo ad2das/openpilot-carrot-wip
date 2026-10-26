@@ -73,6 +73,7 @@ class AtcDriverInput:
     self._last_manual_press = 0
     self._suppress_lamps = False
     self._manual_lamps = False
+    self._manual_dir = 0
 
   def update(self, cs, now_ns):
     raw = driver_signal_state(cs, now_ns)
@@ -87,13 +88,22 @@ class AtcDriverInput:
     self._last_manual_press = max(self._last_manual_press, press)
     if not owned and not lamps:
       self._suppress_lamps = False
-    if raw in (1, 2) or new_press:
+    if raw in (1, 2):
+      self._manual_lamps = True
+      self._manual_dir = raw
+    elif new_press:
       self._manual_lamps = True
     elif raw == 0 and not lamps:
       self._manual_lamps = False
-    # None selects the original DesireHelper lamp-based driver path. After an
-    # explicit manual press, preserve it until the stock lamp hold goes dark.
-    return raw if self._suppress_lamps and not self._manual_lamps else None
+      self._manual_dir = 0
+    if not self._suppress_lamps:
+      # None selects the original DesireHelper lamp-based driver path.
+      return None
+    if self._manual_lamps:
+      # Our lamp feedback may still be retained on the other side; follow the
+      # driver's lever (and its one-touch hold) instead of the lamp flags.
+      return self._manual_dir if self._manual_dir else None
+    return raw
 
 
 def navigation_candidate(producer, sm, now_ns, *, atc_type, uses_nav_instruction, carrot_navi_active, legacy_source_ns, source_changed):
