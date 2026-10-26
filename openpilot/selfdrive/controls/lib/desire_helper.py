@@ -46,6 +46,9 @@ class DesireHelper:
     self.carrot_cmd_index_last = 0
     self.atc_type = ""
     self.atc_active = 0  # 0: 없음, 1: ATC 동작, 2: 충돌
+    self.atc_signal_from_navigation = False
+    self.atc_signal_direction = BLINKER_NONE
+    self.atc_signal_phase = "none"
 
     # auto lane change
     self.auto_lane_change_enable = False
@@ -93,8 +96,8 @@ class DesireHelper:
   # ─────────────────────────────────────────────
   # blinkers/ATC (원본 로직 유지, side 계산은 별개)
   # ─────────────────────────────────────────────
-  def _update_driver_blinker(self, carstate):
-    st = carstate.leftBlinker * 1 + carstate.rightBlinker * 2
+  def _update_driver_blinker(self, carstate, driver_signal=None):
+    st = carstate.leftBlinker * 1 + carstate.rightBlinker * 2 if driver_signal is None else driver_signal
     changed = st != self.driver_blinker_state
     self.driver_blinker_state = st
 
@@ -106,6 +109,7 @@ class DesireHelper:
   def _update_atc_blinker(self, carrotMan, driver_blinker_state, remote=None):
     atc_type = carrotMan.atcType
     atc_blinker_state = BLINKER_NONE
+    self.atc_signal_from_navigation = False
 
     # 유지 카운트는 DesireHelper에서 관리
     if self.carrot_lane_change_count > 0:
@@ -121,11 +125,13 @@ class DesireHelper:
       atc_blinker_state = self.carrot_blinker_state
     elif atc_type in ("turn left", "turn right"):
       if self.atc_active != 2:
+        self.atc_signal_from_navigation = True
         atc_blinker_state = BLINKER_LEFT if atc_type == "turn left" else BLINKER_RIGHT
         self.atc_active = 1
         self.blinker_ignore = False
     elif atc_type in ("fork left", "fork right", "atc left", "atc right"):
       if self.atc_active != 2:
+        self.atc_signal_from_navigation = True
         atc_blinker_state = BLINKER_LEFT if atc_type in ("fork left", "atc left") else BLINKER_RIGHT
         self.atc_active = 1
     else:
@@ -214,7 +220,7 @@ class DesireHelper:
   # ─────────────────────────────────────────────
   # main update
   # ─────────────────────────────────────────────
-  def update(self, carstate, modeldata, lateral_active, lane_change_prob, carrotMan, radarState):
+  def update(self, carstate, modeldata, lateral_active, lane_change_prob, carrotMan, radarState, driver_signal=None):
     self.frame += 1
     self._update_params_periodic()
 
@@ -241,7 +247,7 @@ class DesireHelper:
     self._check_desire_state(modeldata, carstate, self.maneuver_type)
 
     # blinkers
-    driver_st, driver_changed, driver_enabled = self._update_driver_blinker(carstate)
+    driver_st, driver_changed, driver_enabled = self._update_driver_blinker(carstate, driver_signal)
     remote = self.bluetooth_commands.read(allowed=(lateral_active and carstate.canValid and
       not below_lane_change_speed and not trailer_maneuver_blocked))
     atc_st, atc_enabled = self._update_atc_blinker(carrotMan, driver_st, remote)
@@ -481,4 +487,18 @@ class DesireHelper:
       elif self.desire in (log.Desire.keepLeft, log.Desire.keepRight):
         self.desire = log.Desire.none
 
+    # Resolved navigation intent only. Episode lifecycle, freshness and current
+    # independent switch inputs are checked again by the runtime consumer.
+    self.atc_signal_direction = BLINKER_NONE
+    self.atc_signal_phase = "none"
+    if (self.atc_signal_from_navigation and atc_enabled and self.atc_active == 1 and
+        driver_st == BLINKER_NONE and lateral_active and carstate.canValid and
+        not trailer_maneuver_blocked and not steering_pressed_cancel):
+      expected = log.Desire.turnLeft if atc_st == BLINKER_LEFT else log.Desire.turnRight
+      if self.atc_type in ("turn left", "turn right") and self.desire == expected:
+        self.atc_signal_direction, self.atc_signal_phase = atc_st, "turn"
+      elif (self.atc_type in ("fork left", "fork right", "atc left", "atc right") and
+            self.lane_change_state != LaneChangeState.off and self.lane_change_direction == atc_st):
+        self.atc_signal_direction = atc_st
+        self.atc_signal_phase = "fork_pending" if self.lane_change_state == LaneChangeState.preLaneChange else "fork_active"
     return self.desire

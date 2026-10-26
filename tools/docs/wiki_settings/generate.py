@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CATALOG = REPO_ROOT / "openpilot" / "selfdrive" / "carrot_settings.json"
+DEFAULT_SEEDS = Path(__file__).resolve().parent / "seeds"
 INDEX_NAME = "Settings-Catalog.json"
 CATALOG_PAGE_NAME = "Settings-Catalog.md"
 SIDEBAR_NAME = "_Sidebar.md"
@@ -964,6 +965,7 @@ def generate(
   *,
   wiki_dir: Path | None = None,
   index_dir: Path | None = None,
+  seed_dir: Path | None = DEFAULT_SEEDS,
   locales: Iterable[str] = DEFAULT_LOCALES,
   catalog_commit: str | None = None,
   wiki_commit: str | None = None,
@@ -980,6 +982,14 @@ def generate(
     raise GenerationError("wiki commit must contain 7 to 40 lowercase hexadecimal characters")
 
   existing, warnings = scan_existing_settings(wiki_dir)
+  seeds, seed_warnings = scan_existing_settings(seed_dir)
+  warnings.extend(f"seed: {warning}" for warning in seed_warnings)
+  # Seed only missing MANUAL regions. Even an empty or legacy-language Wiki
+  # MANUAL is authoritative; a seed never replaces an author's existing text.
+  render_existing = dict(existing)
+  for key, seed in seeds.items():
+    if key not in existing and ("*", key[1]) not in existing:
+      render_existing[key] = seed
   existing_pages = _read_candidate_pages(wiki_dir)
   existing_catalog_page = existing_pages.get(CATALOG_PAGE_NAME)
   if (
@@ -1002,7 +1012,7 @@ def generate(
   existing_managed_pages = {item.page for item in existing.values()}
   for locale in requested_locales:
     for setting in settings:
-      page, metadata = _render_setting_page(setting, locale, existing)
+      page, metadata = _render_setting_page(setting, locale, render_existing)
       page_name = setting.page_name(locale)
       normalized_name = unicodedata.normalize("NFKC", page_name).casefold()
       prior_owner = generated_name_owners.get(normalized_name)

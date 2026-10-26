@@ -37,6 +37,17 @@ The same maneuver can feel faster or slower with different scenes or installed m
 
 ## What the lane-change settings control
 
+### `AutoTurnSignal` — Experimental ATC Turn Signals
+
+This setting is off by default. When enabled, it sends diagnostic turn-signal pulses for actual navigation ATC turns and forks while driving and lateral control are active, only on classic-CAN Palisade using the normal Hyundai safety mode. It does not apply to CAN-FD or other vehicles; turning it off disables this diagnostic transmission.
+
+Driver turn-signal input, hazards, opposite steering torque, disengagement, a connected trailer, or stale or invalid input cancel the request. The same canceled maneuver cannot restart, and a diagnostic response error or timeout locks the feature until restart. Setting changes take effect after restarting the vehicle or device.
+
+> [!CAUTION]
+> Enabling this setting sends diagnostic commands to the vehicle. Physical flashing, driver-input priority, return of control and release after a process crash have not been verified on a vehicle. Do not assume other road users see a normal signal; stop using the feature if behavior is unexpected, turn it off and restart.
+
+Each pulse activates only the requested side with `2F BC15/BC16 03`, then returns both sides to ECU control with `00`. Manual one-touch lamp holds retain the existing lane-change behavior; automatic lamp feedback is excluded from driver input. Receiving a diagnostic response does not prove the physical lamp operated.
+
 ### `LaneChangeNeedTorque` — entry confirmation
 
 | Value | Behavior |

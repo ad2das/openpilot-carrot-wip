@@ -36,6 +36,8 @@ from openpilot.selfdrive.monitoring.config import disabled_mode
 
 from openpilot.selfdrive.carrot.carrot_controls import CarrotControls
 from openpilot.selfdrive.carrot.carrot_man_input import get_carrot_man
+from openpilot.selfdrive.controls.lib.atc_signal import RequestArbiter
+from openpilot.selfdrive.controls.lib.atc_signal_integration import control_candidate
 from openpilot.selfdrive.monitoring.dm_alerts import driver_monitoring_hud_alert
 
 State = log.SelfdriveState.OpenpilotState
@@ -85,6 +87,7 @@ class Controls:
                                                       pos_limit=MEB_CURVATURE_MAX, neg_limit=-MEB_CURVATURE_MAX)
                               if self.is_vw_meb else None)
     self.atc_turn_speed = self.params.get_int("AutoTurnControlSpeedTurn")
+    self.atc_signal_arbiter = RequestArbiter(max_age_seconds=2.0)
 
     self.pose_calibrator = PoseCalibrator()
     self.calibrated_pose: Pose | None = None
@@ -171,6 +174,7 @@ class Controls:
     if model_v2.meta.laneChangeState != LaneChangeState.off:
       CC.leftBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.left
       CC.rightBlinker = model_v2.meta.laneChangeDirection == LaneChangeDirection.right
+    CC.atcSignal = control_candidate(self.atc_signal_arbiter, self.sm, CC, time.monotonic_ns())
 
     if not CC.latActive:
       self.LaC.reset()

@@ -62,6 +62,8 @@ python -m unittest discover -s tools/docs/wiki_settings/tests -p "test_*.py" -v
 
 `generate.py`는 기본적으로 결과와 Diff만 계산하는 `dry-run`이다. 기존 Wiki의 수동 영역을 반영하려면 `--wiki-dir <Wiki 체크아웃>`을 지정한다. 별도 준비 디렉터리에 결과를 쓸 때만 `--write --output-dir <디렉터리>`를 함께 사용한다. 같은 파라미터의 `MANUAL` 영역은 페이지가 이동해도 그대로 보존되고, 의미 관련 자동 정보가 달라지면 `needs_review`로 계산된다.
 
+새 설정의 최초 설명은 `seeds/`의 언어별 생성 페이지에 보관할 수 있다. 생성기는 기존 Wiki에 해당 설정·언어의 `MANUAL`이 없을 때만 시드의 `MANUAL`을 사용하며, 비어 있는 기존 영역이나 이전 언어 공통 영역도 우선 보존한다. 시드의 `AUTO` 내용은 복사하지 않고 현재 카탈로그로 다시 생성하므로, 시드 검토 후 동작·기본값 등이 달라지면 같은 의미 해시 정책에 따라 `needs_review`가 된다. 시드 작성에도 `AUTHORING_GUIDE.md`의 수동 영역·검토 규칙을 적용하고 `validate.py seeds/`와 생성기 테스트를 실행한다.
+
 `.github/workflows/wiki-settings-check.yaml`은 `carrot-wip` 대상 Pull Request에서 공개 Wiki를 쓰기 자격 증명 없이 읽고 `ci_check.py`를 실행한다. 저장소 권한은 `contents: read`만 사용하며 `summary.json`, `summary.md`, `pages.diff`만 GitHub Actions Artifact로 올린다.
 
 `.github/workflows/wiki-settings-publish.yaml`은 GitHub Actions에서 `cp-set-wiki`로 표시된다. `carrot-wip` 설정 변경, Wiki `gollum`, 수동 실행에서만 동작하며, 신뢰된 기본 브랜치의 생성기와 검사기를 사용해 실제 GitHub Wiki의 자동 영역·전체 설정 목록·한국어 사이드바 설정 트리와 `Settings-Catalog.json`을 한 Wiki 커밋으로 동기화한다. 개발 브랜치나 별도의 생성물 브랜치는 만들지 않는다.

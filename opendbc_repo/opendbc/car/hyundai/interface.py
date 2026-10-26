@@ -28,6 +28,28 @@ class CarInterface(CarInterfaceBase):
   CarController = CarController
   RadarInterface = RadarInterface
 
+  def update(self, can_packets):
+    # Snapshot only received classic ICU replies before parsing CarState. Bus
+    # 128+ TX echoes never become acknowledgments; each batch is consumed once.
+    self.CS.atc_diagnostic_replies = []
+    if self.CP.flags & HyundaiFlags.CLASSIC_ATC:
+      reply_count = 0
+      for timestamp_ns, frames in can_packets:
+        if type(timestamp_ns) is not int or timestamp_ns <= 0:
+          continue
+        for address, data, src in frames:
+          if address == 0x541 and src == 0 and len(data) == 8:
+            raw = int.from_bytes(data, 'little')
+            switches = ((raw >> 42) & 1) | (((raw >> 41) & 1) << 1)
+            previous = getattr(self.CS, 'atc_previous_switches', 0)
+            if switches & ~previous:
+              self.CS.atc_last_manual_press_ns = max(getattr(self.CS, 'atc_last_manual_press_ns', 0), timestamp_ns)
+            self.CS.atc_previous_switches = switches
+          if address == 0x778 and src == 0 and len(data) == 8 and reply_count < 32:
+            self.CS.atc_diagnostic_replies.append((address, bytes(data), src, timestamp_ns))
+            reply_count += 1
+    return super().update(can_packets)
+
   @staticmethod
   def _get_params(ret: structs.CarParams, candidate, fingerprint, car_fw, alpha_long, is_release, docs) -> structs.CarParams:
 
@@ -178,6 +200,16 @@ class CarInterface(CarInterfaceBase):
         print("$$$CAMERA_SCC")
 
     # Common lateral control setup
+
+    # Startup-only opt-in: this diagnostic path does not use the CAN-FD
+    # ENABLE_BLINKERS flag and never disables an ICU/BCM ECU.
+    ret.flags &= ~HyundaiFlags.CLASSIC_ATC.value
+    if (candidate == CAR.HYUNDAI_PALISADE and not ret.flags & (HyundaiFlags.CANFD | HyundaiFlags.LEGACY) and
+        len(ret.safetyConfigs) == 1 and
+        ret.safetyConfigs[-1].safetyModel == structs.CarParams.SafetyModel.hyundai and
+        params.get_bool("AutoTurnSignal")):
+      ret.flags |= HyundaiFlags.CLASSIC_ATC.value
+      ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.CLASSIC_ATC.value
 
     ret.centerToFront = ret.wheelbase * 0.4
     ret.steerActuatorDelay = 0.1

@@ -278,6 +278,32 @@ struct CarState {
   vehicleNaviAvailable @92 :Bool; # stock-navigation 0x4BE has been observed during this drive
   radarInput @93 :RadarInput;
   steeringTouch @94 :SteeringTouch;
+  turnSignalInput @100 :TurnSignalInput;
+  atcSignalStatus @101 :AtcSignalStatus;
+
+  # Diagnostic command/reply status, never physical lamp confirmation.
+  struct AtcSignalStatus {
+    enabled @0 :Bool;
+    phase @1 :Text;
+    acknowledgedDirection @2 :UInt8;
+    fault @3 :Text;
+    lastCommandMonoTime @4 :UInt64;
+    lastResponseMonoTime @5 :UInt64;
+    txCount @6 :UInt32;
+  }
+
+  # Raw, received CGW1 candidates. Valid means fresh/decodable, not verified
+  # independence from diagnostic lamp actuation. Never a physical-output ACK.
+  struct TurnSignalInput {
+    valid @0 :Bool;
+    sampleMonoTime @1 :UInt64;
+    leftSwitch @2 :UInt8;
+    rightSwitch @3 :UInt8;
+    hazardSwitch @4 :UInt8;
+    leftLamp @5 :UInt8;
+    rightLamp @6 :UInt8;
+    lastManualPressMonoTime @7 :UInt64; # last received raw switch rising edge, retained across model frames
+  }
 
   # Optional original vehicle receive signal. Separate from torque/override.
   struct SteeringTouch {
@@ -442,6 +468,7 @@ struct CarControl {
   # Blinker controls
   leftBlinker @15: Bool;
   rightBlinker @16: Bool;
+  atcSignal @18 :AtcSignalRequest; # separately gated experimental vehicle request
 
   orientationNED @13 :List(Float32);
   angularVelocity @14 :List(Float32);
@@ -581,6 +608,19 @@ struct CarControl {
   rollDEPRECATED @8 :Float32;
   pitchDEPRECATED @9 :Float32;
   actuatorsOutputDEPRECATED @10 :Actuators;
+}
+
+# This is intent, NOT confirmation that a lamp lit or flashed. Kept separate
+# from the existing leftBlinker/rightBlinker vehicle-control contract.
+struct AtcSignalRequest {
+  sourceId @0 :UInt64;
+  episode @1 :UInt64;
+  sourceMonoTime @2 :UInt64;
+  direction @3 :UInt8; # 0 none, 1 left, 2 right
+  phase @4 :Text;
+  valid @5 :Bool;
+  reason @6 :Text;
+  requestMonoTime @7 :UInt64; # control publication time; zero never authorizes output
 }
 
 struct CarOutput {
