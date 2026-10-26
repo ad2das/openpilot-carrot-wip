@@ -115,6 +115,7 @@ TLV_FAST_GATE_RESET_S = 0.5
 # 450: 3 runs, max 0.26 s. V1b: a 1.0 s guard removes all simulated false starts.
 TLV_START_MODEL_CLEAR_S = 1.0
 TLV_RED_VETO_GRACE_S = 3.0  # a TLV red keeps vetoing the model green start through 0/redLikely gaps this long (6e1 169.77)
+TLV_RED_VETO_SLOW_MPS = 3.0  # held/grace veto only while this slow (6e1 0.33, 6e3 1.0-1.4 m/s)
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
 # W147 v2: the model stop cue is unlocked above 82 km/h only when the on-device
@@ -738,6 +739,11 @@ class CarrotPlanner:
       # (2/3) ends it at once: it clears the stamp, and the stored red only
       # counts while the stamp is armed, so the (0,0) that follows a real
       # departure never re-arms the veto.
+      # W-VETO1 v2: those two remembered sources must not speak for a moving
+      # car. Both real red departures happened below 1.7 m/s (6e1 0.33, 6e3
+      # 1.0-1.4), while edges the grace was blocking at 6-7.5 m/s had no red in
+      # view. So held/grace only veto while slow; a live published red still
+      # vetoes at any speed.
       now_t = time.monotonic()
       if tlv_src and state_in in (1, 4):
         self.tlv_red_seen_t = now_t
@@ -748,7 +754,8 @@ class CarrotPlanner:
       red_held = (self.trafficState_carrot == 1 and self.trafficState_carrot_src == 1
                   and red_stamp > -1e8)
       red_recent = now_t - red_stamp < TLV_RED_VETO_GRACE_S
-      self.tlv_red_veto = ((tlv_src and state_in == 1) or ((red_held or red_recent) and not tlv_go)) \
+      slow = v_ego_kph < TLV_RED_VETO_SLOW_MPS * CV.MS_TO_KPH
+      self.tlv_red_veto = ((tlv_src and state_in == 1) or (slow and (red_held or red_recent) and not tlv_go)) \
         and not cooldown and not gas and not self.lead_follow_active
       # A start trigger produced by the on-device carrotTlv detector may start
       # the car only while the supercombo model is not signalling a stop, i.e.

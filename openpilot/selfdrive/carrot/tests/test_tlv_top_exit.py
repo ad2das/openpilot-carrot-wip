@@ -404,7 +404,9 @@ def veto_planner(monkeypatch, start: float = 100.0) -> tuple[CarrotPlanner, list
 
 
 def man_tick(planner, clock: list, t: float, state: int, src: int = 1,
-             v_ego_kph: float = 20.0, speed: int = 60, **gate_kw) -> bool:
+             v_ego_kph: float = 1.2, speed: int = 60, **gate_kw) -> bool:
+  """One carrotMan tick. The default speed is 0.33 m/s, the 6e1 169.704 value:
+  the remembered-red veto is slow-only, so the flicker tests have to be slow."""
   clock[0] = t
   sm = gate_sm(carrot_man_message(state=state, src=src, speed=speed), **gate_kw)
   # FakeSM stamps every service at construction time; keep carrotMan fresh on the
@@ -429,12 +431,13 @@ def test_v2_the_veto_survives_a_redLikely_gap(monkeypatch):
 
 def test_v3_the_grace_expires(monkeypatch):
   planner, clock = veto_planner(monkeypatch)
-  assert man_tick(planner, clock, 100.0, 1) is False
-  # Moving (20 km/h), so the B1 standstill hold cannot carry the red either.
-  assert man_tick(planner, clock, 100.5, 0) is False
-  assert man_tick(planner, clock, 101.5, 0) is False
-  assert man_tick(planner, clock, 102.9, 0) is False
-  assert man_tick(planner, clock, 103.1, 0) is True
+  # 1.2 km/h (0.33 m/s): slow enough for the grace, above the 0.3 m/s B1 arm
+  # threshold so the standstill hold cannot carry the red either.
+  assert man_tick(planner, clock, 100.0, 1, v_ego_kph=1.2) is False
+  assert man_tick(planner, clock, 100.5, 0, v_ego_kph=1.2) is False
+  assert man_tick(planner, clock, 101.5, 0, v_ego_kph=1.2) is False
+  assert man_tick(planner, clock, 102.9, 0, v_ego_kph=1.2) is False
+  assert man_tick(planner, clock, 103.1, 0, v_ego_kph=1.2) is True
 
 
 def test_v4_the_b1_standstill_hold_keeps_the_veto_past_the_grace(monkeypatch):
@@ -485,3 +488,28 @@ def test_v8_a_missing_carrot_man_clears_the_stamp(monkeypatch):
   assert man_tick(planner, clock, 100.25, 1, speed=0) is True
   assert planner.tlv_red_seen_t == -1e9
   assert planner.tlv_red_veto is False
+
+
+# ---------------------------------------------------------------------------
+# V9-V10 (W-VETO1 v2): the remembered sources (red_held, red_recent) are
+# slow-only. A moving car that drops out of a red gets no veto from them; a
+# live published red still vetoes at any speed.
+# ---------------------------------------------------------------------------
+
+def test_v9_the_grace_does_not_veto_a_moving_car(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  # Red seen at a crawl, then the fusion drops it while the car is at 5 m/s.
+  assert man_tick(planner, clock, 100.0, 1, v_ego_kph=1.2) is False
+  assert man_tick(planner, clock, 100.25, 0, v_ego_kph=18.0) is True
+  # Still inside the 3 s grace, still moving: still no veto.
+  assert man_tick(planner, clock, 101.0, 0, v_ego_kph=18.0) is True
+  # A live published red vetoes at any speed.
+  assert man_tick(planner, clock, 101.25, 1, v_ego_kph=18.0) is False
+
+
+def test_v10_the_grace_vetoes_the_same_car_at_a_crawl(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1, v_ego_kph=1.2) is False
+  # 3.6 km/h = 1.0 m/s, the 6e3 63.48 departure: below the 3.0 m/s gate.
+  assert man_tick(planner, clock, 100.25, 0, v_ego_kph=3.6) is False
+  assert man_tick(planner, clock, 101.0, 0, v_ego_kph=3.6) is False
