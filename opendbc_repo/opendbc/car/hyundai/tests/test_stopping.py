@@ -815,8 +815,8 @@ def test_rescue_max_cycles_keeps_braking():
     assert controller.phase == StopPhase.rescue
 
     cmd = None
-    for _ in range(100):  # 2 s held at rest
-      cmd = step(controller, speed=0.02, accel=-1.5, previous_value=previous)
+    for _ in range(100):  # 2 s held at rest (0.0: 0.02 m/s without AVH is a stall, see the stall rescue)
+      cmd = step(controller, speed=0.0, accel=-1.5, previous_value=previous)
       previous = cmd.value
 
     if cycle < RESCUE_MAX_CYCLES:
@@ -1070,3 +1070,14 @@ def test_6e1_profile_stall_fires_before_creep_speed():
   assert controller.reason == "stall_rescue"
   assert speed <= 0.05
   assert cmd.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+
+
+def test_no_stall_after_hold_dropout():
+  """AVH held once, then the flag drops at 0.02 m/s: no stall rescue, even past 3 x STALL_T."""
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  for _ in range(50):
+    step(controller, speed=.02, held=True)
+  for _ in range(3 * STALL_TICKS):
+    assert step(controller, speed=.02, held=False).stop_req == 1
+  assert controller.phase == StopPhase.held

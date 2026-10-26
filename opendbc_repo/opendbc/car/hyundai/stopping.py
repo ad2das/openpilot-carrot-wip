@@ -36,6 +36,7 @@ RESCUE_MAX_CYCLES = 2     # re-requests per episode; after that the episode keep
 # aReq -0.51 but never reached zero, so the ESC never set AVH, and idle creep pushed it from 0.03 to
 # 0.09 m/s over ~8 s (0.6 m) before RESCUE_SPEED was reached. A stall near rest without AVH now gets the
 # rescue braking at once, until the wheels read zero.
+# A stop that has held AVH once is not a stall: a later hold-flag dropout keeps StopReq 1 (creep rescue still covers motion).
 STALL_T = 1.0         # s at ZERO_SPEED < speed <= MOVING_SPEED without AVH after reaching STOP_SPEED
 STALL_ZERO_FRAMES = 10      # 0.2 s at <= ZERO_SPEED ends a stall rescue
 STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back to StopReq 1
@@ -87,6 +88,7 @@ class CanfdStopping:
     self.stall_time = 0.0
     self.rescue_kind = ""
     self.rescue_time = 0.0
+    self.ever_held = False
 
   def enter(self, phase: StopPhase, reason: str):
     self.phase = phase
@@ -126,8 +128,10 @@ class CanfdStopping:
 
     self.stopped_time = self.stopped_time + DT if speed <= STOP_SPEED else 0.0
     self.zero_frames = self.zero_frames + 1 if speed <= ZERO_SPEED else 0
+    if held:
+      self.ever_held = True
     if (self.phase not in (StopPhase.request, StopPhase.held) or held or speed <= ZERO_SPEED
-        or speed > MOVING_SPEED or self.v_min > STOP_SPEED):
+        or speed > MOVING_SPEED or self.v_min > STOP_SPEED or self.ever_held):
       self.stall_time = 0.0
     else:
       self.stall_time += DT
