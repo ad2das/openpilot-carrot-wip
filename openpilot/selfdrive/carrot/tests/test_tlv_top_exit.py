@@ -25,9 +25,13 @@ from test_tlv_fusion import (FakeSM, carrot_man_message, gate_sm, make_serv as b
                              planner_for_gate, tlv_message)
 from test_vehicle_speed_camera_control import _car_state
 
+import openpilot.selfdrive.carrot.carrot_functions as carrot_functions
 import openpilot.selfdrive.carrot.carrot_man_input as carrot_man_input
 import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
-from openpilot.selfdrive.carrot.carrot_functions import TrafficState
+from openpilot.common.realtime import DT_MDL
+from openpilot.selfdrive.carrot.carrot_functions import (
+  TLV_GAS_COOLDOWN_FRAMES, CarrotPlanner, TrafficState,
+)
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 
 # ---------------------------------------------------------------------------
@@ -379,3 +383,105 @@ def test_publish_top_exit_false_when_red_expired_but_state_stale(monkeypatch):
   assert publish(serv, clock, sent, 7.6, lost_msg()) is True
 
 
+
+
+# ---------------------------------------------------------------------------
+# V1-V8 (W-VETO1): the veto has to survive the 1-3 frame (0,0) / redLikely (4)
+# gaps inside one real TLV red (6e1 169.77), and still end at once on a TLV
+# go, on gas, on the gas cooldown and on a lead-follow latch.
+# ---------------------------------------------------------------------------
+
+def veto_planner(monkeypatch, start: float = 100.0) -> tuple[CarrotPlanner, list]:
+  """planner_for_gate on a mutable clock; carrotMan freshness uses the same clock."""
+  clock = [start]
+  monkeypatch.setattr(carrot_functions.time, "monotonic", lambda: clock[0])
+  planner = planner_for_gate(False)
+  planner.trafficState = TrafficState.green
+  planner.tlv_red_veto = False
+  planner.tlv_red_seen_t = -1e9
+  planner.lead_follow_active = False
+  return planner, clock
+
+
+def man_tick(planner, clock: list, t: float, state: int, src: int = 1,
+             v_ego_kph: float = 20.0, speed: int = 60, **gate_kw) -> bool:
+  clock[0] = t
+  sm = gate_sm(carrot_man_message(state=state, src=src, speed=speed), **gate_kw)
+  # FakeSM stamps every service at construction time; keep carrotMan fresh on the
+  # mutable clock so get_carrot_man's 1 s timeout does not drop the message.
+  sm.recv_time['carrotMan'] = t
+  planner._update_carrot_man(sm, v_ego_kph, 60.0)
+  return planner._model_green_start_allowed()
+
+
+def test_v1_the_veto_survives_the_6e1_flicker(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  # 6e1 169.77: the fusion published (0,0) for 250 ms with the light still red.
+  assert man_tick(planner, clock, 100.25, 0) is False
+
+
+def test_v2_the_veto_survives_a_redLikely_gap(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  assert man_tick(planner, clock, 100.25, 4) is False
+
+
+def test_v3_the_grace_expires(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  # Moving (20 km/h), so the B1 standstill hold cannot carry the red either.
+  assert man_tick(planner, clock, 100.5, 0) is False
+  assert man_tick(planner, clock, 101.5, 0) is False
+  assert man_tick(planner, clock, 102.9, 0) is False
+  assert man_tick(planner, clock, 103.1, 0) is True
+
+
+def test_v4_the_b1_standstill_hold_keeps_the_veto_past_the_grace(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1, v_ego_kph=0.0) is False
+  t = 100.05
+  while t <= 110.0 + 1e-9:
+    assert man_tick(planner, clock, round(t, 3), 0, v_ego_kph=0.0) is False
+    t = round(t + DT_MDL, 3)
+
+
+def test_v5_a_tlv_go_ends_the_veto_at_once(monkeypatch):
+  for go_state in (2, 3):
+    planner, clock = veto_planner(monkeypatch)
+    assert man_tick(planner, clock, 100.0, 1) is False
+    assert man_tick(planner, clock, 100.25, go_state) is True
+    # The (0,0) after a real departure must not re-arm the veto.
+    assert man_tick(planner, clock, 100.5, 0) is True
+
+
+def test_v6_gas_cooldown_and_lead_follow_all_let_the_start_through(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  assert man_tick(planner, clock, 100.25, 0, gas=True) is True
+
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  planner.tlv_gas_cooldown_frames = TLV_GAS_COOLDOWN_FRAMES
+  assert man_tick(planner, clock, 100.25, 0) is True
+
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  planner.lead_follow_active = True
+  assert man_tick(planner, clock, 100.25, 0) is True
+
+
+def test_v7_a_navi_red_never_vetoes(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1, src=0) is True
+  assert planner.tlv_red_seen_t == -1e9
+
+
+def test_v8_a_missing_carrot_man_clears_the_stamp(monkeypatch):
+  planner, clock = veto_planner(monkeypatch)
+  assert man_tick(planner, clock, 100.0, 1) is False
+  assert planner.tlv_red_seen_t == 100.0
+  # desiredSpeed 0 makes get_carrot_man drop the message: the else branch runs.
+  assert man_tick(planner, clock, 100.25, 1, speed=0) is True
+  assert planner.tlv_red_seen_t == -1e9
+  assert planner.tlv_red_veto is False

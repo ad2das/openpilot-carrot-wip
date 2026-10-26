@@ -114,6 +114,7 @@ TLV_FAST_GATE_RESET_S = 0.5
 # non-terminal model-clear runs at standstill during real reds on 44c/44d/44e/
 # 450: 3 runs, max 0.26 s. V1b: a 1.0 s guard removes all simulated false starts.
 TLV_START_MODEL_CLEAR_S = 1.0
+TLV_RED_VETO_GRACE_S = 3.0  # a TLV red keeps vetoing the model green start through 0/redLikely gaps this long (6e1 169.77)
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
 TLV_A4_MEDIAN_DISAGREE_M = 1.0
 # W147 v2: the model stop cue is unlocked above 82 km/h only when the on-device
@@ -238,6 +239,7 @@ class CarrotPlanner:
     self.trafficState_carrot_src = 0
     self.carrot_stay_stop = False
     self.tlv_red_veto = False
+    self.tlv_red_seen_t = -1e9
     self.tlv_standstill_hold_frames = 0
     self.tlv_hold_run = False  # W74D B1: at most one 120 s hold per unknown run
     self.tlv_gas_cooldown_frames = 0
@@ -726,7 +728,28 @@ class CarrotPlanner:
       # WTOP1: a published TLV red (src 1, state 1) vetoes the model's own green
       # start. W150 release (0/0) and W143 green (2) both end it, so TLV starts
       # are unaffected; gas and the gas cooldown end it too.
-      self.tlv_red_veto = tlv_src and state_in == 1 and not cooldown and not gas and not self.lead_follow_active
+      # W-VETO1: the fusion drops the red for 1-3 frames inside one real red
+      # (6e1 169.77 saw (0,0) for 250 ms while the light was red and no lead
+      # existed), and state 4 (redLikely) is never stored. Recomputing the veto
+      # from this tick alone let one (0,0) tick release the model green into a
+      # red. Remember when a TLV red (1 or 4) was last published and keep the
+      # veto for TLV_RED_VETO_GRACE_S after it. The stored red (which includes
+      # the B1 hold, and outlives the grace) is the second source. A TLV go
+      # (2/3) ends it at once: it clears the stamp, and the stored red only
+      # counts while the stamp is armed, so the (0,0) that follows a real
+      # departure never re-arms the veto.
+      now_t = time.monotonic()
+      if tlv_src and state_in in (1, 4):
+        self.tlv_red_seen_t = now_t
+      tlv_go = tlv_src and state_in in (2, 3)
+      if tlv_go:
+        self.tlv_red_seen_t = -1e9
+      red_stamp = getattr(self, 'tlv_red_seen_t', -1e9)
+      red_held = (self.trafficState_carrot == 1 and self.trafficState_carrot_src == 1
+                  and red_stamp > -1e8)
+      red_recent = now_t - red_stamp < TLV_RED_VETO_GRACE_S
+      self.tlv_red_veto = ((tlv_src and state_in == 1) or ((red_held or red_recent) and not tlv_go)) \
+        and not cooldown and not gas and not self.lead_follow_active
       # A start trigger produced by the on-device carrotTlv detector may start
       # the car only while the supercombo model is not signalling a stop, i.e.
       # both cues agree (ONE extra gate for tlv-originated red->green AND
@@ -856,6 +879,7 @@ class CarrotPlanner:
       self.tlv_hold_run = False
       self.carrot_stay_stop = False
       self.tlv_red_veto = False
+      self.tlv_red_seen_t = -1e9
       self.tlv_red_confirmed_at = None
       self.tlv_veto_active = False
       self.tlv_green_chime_done = False
