@@ -325,3 +325,22 @@ def test_runtime_trace_accepted_by_compiled_panda_hooks(failure):
   assert any(is_on(f) for _, f in rig.history)
   result = run_compiled_probe('\n'.join(trace))
   assert f'HYUNDAI_ATC_REPLAY_EVENTS={len(trace)}' in result
+
+
+def test_pulses_alone_keep_session_alive_through_long_signal():
+  # Simulated ECU drops the extended session after 5 s without a diagnostic
+  # request. ON/release pulses every ~0.35 s must keep it open for 20 s.
+  rig = Rig()
+  rig.start()
+  last_diag, session_open, gaps = rig.now, True, []
+  for _ in range(2000):
+    out = rig.step(respond=False)
+    if session_open and rig.now - last_diag > 5_000_000_000:
+      session_open = False
+    if out:
+      gaps.append(rig.now - last_diag)
+      last_diag = rig.now
+    rig.replies = [(*ack(f), rig.now + 1) if session_open else (0x778, bytes.fromhex('037f2f7faaaaaaaa'), 0, rig.now + 1) for f in out]
+  assert session_open and max(gaps) < 1_000_000_000
+  assert rig.sender.planner is not None and rig.sender.planner.status.fault is None
+  assert any(is_on(f) for t, f in rig.history if t > rig.now - 2_000_000_000)
