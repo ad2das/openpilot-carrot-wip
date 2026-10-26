@@ -11,8 +11,8 @@ from opendbc.car import Bus, structs
 from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
 from opendbc.car.hyundai.stopping import (CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, RESCUE_ACCEL,
-                                          RESCUE_ACCEL_MIN, RESCUE_JERK, RESCUE_MAX_CYCLES, RESCUE_SPEED, STOP_LOWER_BAND,
-                                          ZERO_CONFIRM_FRAMES)
+                                          RESCUE_ACCEL_MIN, RESCUE_JERK, RESCUE_MAX_CYCLES, RESCUE_SPEED, STALL_RESCUE_MAX_T,
+                                          STALL_T, STALL_ZERO_FRAMES, STOP_LOWER_BAND, ZERO_CONFIRM_FRAMES)
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -934,3 +934,139 @@ def test_rescue_never_eases_with_a_soft_op_accel():
     assert trigger is not None
     assert trigger.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
     assert trigger.stop_req == 0
+
+
+# --- Stall rescue: a stop that hangs just above rest without AVH ------------
+# Route 6e1 7.00-7.14 min: the car came down to 0.03-0.05 m/s under StopReq 1 and
+# aReq -0.51, never reached zero, so the ESC never set AVH, and idle creep walked
+# it from 0.03 to 0.09 m/s over ~8 s (0.6 m) before RESCUE_SPEED fired.
+
+STALL_TICKS = round(STALL_T / DT)
+
+
+def stall_plateau(controller, previous, ticks, *, speed=0.04, held=False):
+  """The 6e1 hang: StopReq 1 with the car neither at rest nor moving."""
+  out = []
+  for _ in range(ticks):
+    cmd = step(controller, speed=speed, held=held, accel=-0.51, previous_value=previous)
+    out.append(cmd)
+    previous = cmd.value
+  return out, previous
+
+
+def stalled_controller():
+  """A controller sitting in the first stall rescue, as the 6e1 trigger leaves it."""
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+  _, previous = stall_plateau(controller, previous, STALL_TICKS + 6)
+  assert controller.phase == StopPhase.rescue
+  assert controller.reason == "stall_rescue"
+  return controller, previous
+
+
+def test_stall_rescue_fires_after_stall_t():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+
+  for _ in range(STALL_TICKS - 3):
+    cmd = step(controller, speed=0.04, held=False, accel=-0.51, previous_value=previous)
+    previous = cmd.value
+    assert controller.phase != StopPhase.rescue
+    assert cmd.stop_req == 1
+
+  trigger = None
+  for _ in range(6):
+    cmd = step(controller, speed=0.04, held=False, accel=-0.51, previous_value=previous)
+    previous = cmd.value
+    if cmd.stop_req == 0:
+      trigger = cmd
+      break
+    assert controller.phase != StopPhase.rescue
+    assert cmd.stop_req == 1
+  assert trigger is not None, "stall rescue never fired"
+  assert trigger.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+  assert controller.phase == StopPhase.rescue
+  assert controller.reason == "stall_rescue"
+
+
+def test_stall_rescue_ends_at_zero():
+  controller, previous = stalled_controller()
+  _, previous = stall_plateau(controller, previous, STALL_ZERO_FRAMES, speed=0.0)
+  assert controller.phase == StopPhase.held
+  assert controller.reason == "stall_stopped"
+  assert controller.rescue_cycles == 1
+  cmd = step(controller, speed=0.0, held=False, accel=-0.51, previous_value=previous)
+  assert cmd.stop_req == 1
+
+
+def test_stall_rescue_timeout():
+  controller, previous = stalled_controller()
+  _, previous = stall_plateau(controller, previous, round(STALL_RESCUE_MAX_T / DT) + 1, speed=0.03)
+  assert controller.phase == StopPhase.held
+  assert controller.reason == "stall_timeout"
+  cmd = step(controller, speed=0.03, held=False, accel=-0.51, previous_value=previous)
+  assert cmd.stop_req == 1
+
+
+def test_no_stall_with_avh():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+  cmds, _ = stall_plateau(controller, previous, 3 * STALL_TICKS, held=True)
+  for cmd in cmds:
+    assert cmd.stop_req == 1
+  assert controller.phase == StopPhase.held
+
+
+def test_no_stall_when_truly_stopped():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+  cmds, _ = stall_plateau(controller, previous, 3 * STALL_TICKS, speed=0.0)
+  for cmd in cmds:
+    assert cmd.stop_req == 1
+  assert controller.phase != StopPhase.rescue
+
+
+def test_stall_respects_max_cycles():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+  for cycle in range(RESCUE_MAX_CYCLES):
+    rising, previous = stall_plateau(controller, previous, STALL_TICKS + 10)
+    assert any(cmd.stop_req == 0 for cmd in rising), f"cycle {cycle} never triggered"
+    _, previous = stall_plateau(controller, previous, STALL_ZERO_FRAMES, speed=0.0)
+    assert controller.reason == "stall_stopped"
+    assert controller.rescue_cycles == cycle + 1
+
+  cmds, _ = stall_plateau(controller, previous, 3 * STALL_TICKS)
+  for cmd in cmds:
+    assert cmd.stop_req == 1
+  assert controller.phase != StopPhase.rescue
+  assert controller.rescue_cycles == RESCUE_MAX_CYCLES
+
+
+def test_6e1_profile_stall_fires_before_creep_speed():
+  assert STALL_TICKS <= 145, "the 6e1 plateau profile is too short for this STALL_T"
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  _, previous = creep_approach(controller, end=0.04, plateau=0)
+
+  profile = [0.04] * 50 + [0.03] * 50 + [0.05] * 50
+  profile += [round(0.05 + 0.001 * i, 4) for i in range(1, 41)]
+  trigger = None
+  for speed in profile:
+    cmd = step(controller, speed=speed, held=False, accel=-0.51, previous_value=previous)
+    previous = cmd.value
+    if cmd.stop_req == 0:
+      trigger = (speed, cmd)
+      break
+    assert controller.phase != StopPhase.rescue
+
+  assert trigger is not None, "the 6e1 stall never triggered"
+  speed, cmd = trigger
+  assert controller.reason == "stall_rescue"
+  assert speed <= 0.05
+  assert cmd.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)

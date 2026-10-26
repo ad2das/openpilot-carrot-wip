@@ -32,6 +32,14 @@ RESCUE_ACCEL_MIN = -3.5   # m/s^2 floor (panda allows -4.0)
 RESCUE_JERK = 5.0         # m/s^3; reach the rescue braking within ~0.4 s, before the driver warning (1 s)
 RESCUE_MAX_CYCLES = 2     # re-requests per episode; after that the episode keeps braking with StopReq 0
 
+# Stall rescue (route 6e1 7.00-7.14 min, 10-26): the car came down to 0.03-0.05 m/s under StopReq 1 and
+# aReq -0.51 but never reached zero, so the ESC never set AVH, and idle creep pushed it from 0.03 to
+# 0.09 m/s over ~8 s (0.6 m) before RESCUE_SPEED was reached. A stall near rest without AVH now gets the
+# rescue braking at once, until the wheels read zero.
+STALL_T = 1.0         # s at ZERO_SPEED < speed <= MOVING_SPEED without AVH after reaching STOP_SPEED
+STALL_ZERO_FRAMES = 10      # 0.2 s at <= ZERO_SPEED ends a stall rescue
+STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back to StopReq 1
+
 
 class StopPhase(StrEnum):
   idle = "idle"
@@ -76,6 +84,9 @@ class CanfdStopping:
     self.zero_frames = 0
     self.v_min = float("inf")
     self.rescue_cycles = 0
+    self.stall_time = 0.0
+    self.rescue_kind = ""
+    self.rescue_time = 0.0
 
   def enter(self, phase: StopPhase, reason: str):
     self.phase = phase
@@ -115,11 +126,24 @@ class CanfdStopping:
 
     self.stopped_time = self.stopped_time + DT if speed <= STOP_SPEED else 0.0
     self.zero_frames = self.zero_frames + 1 if speed <= ZERO_SPEED else 0
+    if (self.phase not in (StopPhase.request, StopPhase.held) or held or speed <= ZERO_SPEED
+        or speed > MOVING_SPEED or self.v_min > STOP_SPEED):
+      self.stall_time = 0.0
+    else:
+      self.stall_time += DT
     stopped = (held and speed <= MOVING_SPEED) or self.stopped_time >= STOP_CONFIRM_TIME
     if self.phase == StopPhase.rescue:
+      self.rescue_time += DT
       if held and speed <= MOVING_SPEED:
         self.enter(StopPhase.held, "rescue_held")
-      elif self.stopped_time >= STOP_CONFIRM_TIME and self.rescue_cycles < RESCUE_MAX_CYCLES:
+      elif self.rescue_kind == "stall" and (self.zero_frames >= STALL_ZERO_FRAMES
+                                            or self.rescue_time >= STALL_RESCUE_MAX_T):
+        self.rescue_cycles += 1
+        self.v_min = speed
+        self.stall_time = 0.0
+        self.enter(StopPhase.held, "stall_stopped" if self.zero_frames >= STALL_ZERO_FRAMES else "stall_timeout")
+      elif (self.rescue_kind != "stall" and self.stopped_time >= STOP_CONFIRM_TIME
+            and self.rescue_cycles < RESCUE_MAX_CYCLES):
         self.rescue_cycles += 1
         self.v_min = speed
         self.enter(StopPhase.held, "rescue_stopped")
@@ -137,7 +161,15 @@ class CanfdStopping:
       self.v_min = min(self.v_min, speed)
       if (not held and self.v_min <= RESCUE_LOW_SPEED and speed >= self.v_min + RESCUE_RISE
           and speed >= RESCUE_SPEED):
+        self.rescue_kind = "creep"
+        self.rescue_time = 0.0
         self.enter(StopPhase.rescue, "creep_rescue")
+        return self._rescue_command(accel, previous_value, jerk_u, jerk_l)
+
+      if not held and self.stall_time >= STALL_T and self.rescue_cycles < RESCUE_MAX_CYCLES:
+        self.rescue_kind = "stall"
+        self.rescue_time = 0.0
+        self.enter(StopPhase.rescue, "stall_rescue")
         return self._rescue_command(accel, previous_value, jerk_u, jerk_l)
 
     # ButterStop: keep OP's decel (taper, stop ramp, creep guard) under StopReq until the ESC holds.
