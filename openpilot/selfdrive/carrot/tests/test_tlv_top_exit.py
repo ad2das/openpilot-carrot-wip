@@ -136,6 +136,10 @@ def freeze(monkeypatch):
 
 def test_t1_replay_reproduces_the_logged_drop_with_the_hold_disabled(monkeypatch):
   monkeypatch.setattr(carrot_serv, "TLV_TOP_EXIT_Y1_PX", -1.0)
+  # WHOLE1: t1 validates the top-exit hold in isolation. The mid-frame loss it
+  # replays is also exactly what the newer relevance-loss hold (H2) covers, so
+  # neutralise that path rather than change what this test proves.
+  monkeypatch.setattr(CarrotServ, "_tlv_rel_loss_hold", lambda self, sm, msg, now: None)
   clock = freeze(monkeypatch)
   serv = make_serv()
   drive_red_phase(serv, clock)
@@ -161,6 +165,9 @@ def test_t1_replay_keeps_the_red_through_the_loss_and_the_model_green(monkeypatc
 # ---------------------------------------------------------------------------
 
 def test_t2_a_mid_frame_loss_does_not_hold(monkeypatch):
+  # WHOLE1: H2 holds a mid-frame loss on purpose; this test is about the
+  # top-exit hold, so neutralise H2 here too (see t1).
+  monkeypatch.setattr(CarrotServ, "_tlv_rel_loss_hold", lambda self, sm, msg, now: None)
   clock = freeze(monkeypatch)
   serv = make_serv()
   rows = RED_ROWS[:-1] + [(7.022, (970.0, 40.0, 1066.0, 68.0))]

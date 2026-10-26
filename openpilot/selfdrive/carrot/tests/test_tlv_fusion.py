@@ -1773,3 +1773,186 @@ def test_green_override_missing_services_never_overrides(monkeypatch):
   planner, clock = _green_plan(monkeypatch)
   states = _green_run(planner, clock, 5.0)  # no modelV2 / radarState
   assert all(states[t][0] == XState.e2eStopped for t in states)
+
+
+# ---------------------------------------------------------------------------
+# W-HOLE1: a held src-1 red must survive a tlvd suspension (H1), a lost
+# relevant track (H2) and the 20-entry queue gap that follows it (H3).
+# ---------------------------------------------------------------------------
+
+NEW_BOX = (300.0, 600.0, 340.0, 640.0)   # a light at a different spot on screen
+
+
+def _hole_clock(monkeypatch):
+  import openpilot.selfdrive.carrot.carrot_serv as carrot_serv
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  return clock
+
+
+def _slow_car_state(v: float = 1.2, gas: bool = False):
+  return SimpleNamespace(vEgo=v, gasPressed=gas, leftBlinker=False, rightBlinker=False)
+
+
+def _hold_red(serv: CarrotServ) -> None:
+  """Two accepted running red frames: traffic_state = 1, src 1, hold armed.
+
+  The first frame is a first sighting: it only lands in traffic_light_q, so it
+  computes 0/0 (same as 6e3 226.94 in the log). The second one matches it.
+  """
+  for _ in range(2):
+    serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red"),
+                                   carState=_slow_car_state()))
+
+
+def _step(serv: CarrotServ, clock, seconds: float, sm_factory, dt: float = 0.05) -> None:
+  """Drive the 20 Hz loop (count/hold block + fusion) for `seconds`."""
+  for _ in range(int(round(seconds / dt))):
+    clock[0] += dt
+    serv._update_cmd()
+    serv._update_tlv_fusion(sm_factory())
+
+
+def test_h1d_suspension_does_not_hold_a_red_at_speed(monkeypatch):
+  # The holes are stop-line holes (6e1 0.33, 6e3 <= 1.74 m/s). At speed a held
+  # red would brake for a light the car no longer sees, so H1 is slow-gated.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.2, lambda: FakeSM(carrotTlv=tlv_message("red", status="suspended"),
+                                         carState=_slow_car_state(10.0)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h1a_suspension_keeps_a_held_red(monkeypatch):
+  # 6e1 168.95-170.09: tlvd suspended itself for 1.15 s and published status=suspended;
+  # the fusion used to drop the confirmed red after TLV_HOLD_S.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  _step(serv, clock, 1.2, lambda: FakeSM(carrotTlv=tlv_message("red", status="suspended"),
+                                         carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  # The next running red continues the same red (no 0/0 tick in between).
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red"), carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_h1b_suspension_longer_than_the_cap_still_drops(monkeypatch):
+  # The hold is capped at TLV_SUSPEND_HOLD_MAX_S (3.0 s) + TLV_HOLD_S (0.8 s).
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 3.4, lambda: FakeSM(carrotTlv=tlv_message("red", status="suspended"),
+                                         carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  _step(serv, clock, 0.6, lambda: FakeSM(carrotTlv=tlv_message("red", status="suspended"),
+                                         carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h1c_suspension_never_extends_a_held_green(monkeypatch):
+  # Only a held red (1) or redLikely (4) is extended; a held green keeps the old
+  # TLV_HOLD_S expiry.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", go_after_red=True),
+                                 carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  _step(serv, clock, 1.0, lambda: FakeSM(carrotTlv=tlv_message("green", status="suspended"),
+                                         carState=_slow_car_state()))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h2a_relevant_loss_keeps_a_held_red_while_slow(monkeypatch):
+  # 6e3 226.05-227.0: tlvd kept saying red at conf 1.00 but lost the relevant
+  # track; the 6e3 box y1 was 147-174 px, so the top-exit hold cannot cover it.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 2.5, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_h2b_relevant_loss_does_not_hold_a_moving_red(monkeypatch):
+  # TLV_REL_LOSS_MAX_MPS = 3.0: above it the old 0.8 s expiry applies.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.2, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(5.0)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h2c_relevant_loss_does_not_hold_through_gas(monkeypatch):
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.2, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(1.2, gas=True)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h2d_relevant_loss_without_a_red_frame_does_not_hold(monkeypatch):
+  # tlvd says none: the red is over, so the loss hold must not extend it.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.2, lambda: FakeSM(carrotTlv=tlv_message("none", conf=0.0, rel_id=-1),
+                                         carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h3d_red_reacquired_at_a_new_spot_does_not_hold_at_speed(monkeypatch):
+  # Same slow gate as H1/H2: re-acquiring a red at a new spot is a stop-line
+  # behaviour, not a moving one.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.5, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(10.0)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=15, rel_box=NEW_BOX),
+                                 carState=_slow_car_state(10.0)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h3a_red_reacquired_at_a_new_spot_after_a_queue_gap_stays_red(monkeypatch):
+  # The 20-entry traffic_light_q covers ~1 s, so the first red after the gap finds
+  # no match and used to compute 0 even though the fusion held the red.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.5, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=15, rel_box=NEW_BOX),
+                                 carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_h3b_first_sighting_red_with_no_queue_match_is_still_ignored():
+  # No held red: H3 must not invent a red, the first-sighting rule is unchanged.
+  serv = make_serv(2)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=15, rel_box=NEW_BOX),
+                                 carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+
+
+def test_h3c_red_to_green_edge_still_fires_after_a_queue_gap(monkeypatch):
+  # H3 re-appends the re-acquired red, so the existing red->green trigger still
+  # finds the same spot and publishes the start.
+  clock = _hole_clock(monkeypatch)
+  serv = make_serv(2)
+  _hold_red(serv)
+  _step(serv, clock, 1.5, lambda: FakeSM(carrotTlv=tlv_message("red", rel_id=-1),
+                                         carState=_slow_car_state(1.2)))
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("red", rel_id=15, rel_box=NEW_BOX),
+                                 carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  serv._update_tlv_fusion(FakeSM(carrotTlv=tlv_message("green", go_after_red=True, rel_id=15,
+                                                       rel_box=NEW_BOX),
+                                 carState=_slow_car_state(1.2)))
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)

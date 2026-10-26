@@ -125,6 +125,16 @@ TLV_GREEN_FAMILY_STATES = (3, 4, 6)     # green, left, greenLeft
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
 # Hold a src-1 TLV state for this long since the last accepted message.
 TLV_HOLD_S = 0.8
+# WHOLE1: the two holes where a confirmed TLV red vanished although the light was
+# still red. (a) tlvd suspends itself under CPU contention (status 2) and publishes
+# status=suspended (no detections) for 1.1-1.2 s while the red is still there;
+# (b) the tracker loses the relevance (relevantTrackId -1) while the car creeps up
+# to the stop line. Both keep the last accepted red through tlv_hold_until, so
+# extend it while the reason lasts, capped so a real green can only be delayed by
+# a bounded amount.
+TLV_SUSPEND_HOLD_MAX_S = 3.0    # longest tlvd suspension that keeps the red
+TLV_REL_LOSS_HOLD_MAX_S = 5.0   # longest relevance loss that keeps the red
+TLV_HOLE_HOLD_MAX_MPS = 3.0     # H1/H2/H3 only below this (6e1 0.33, 6e3 <= 1.74 m/s)
 # WTOP1: a red whose relevant box touched the frame top (the head passed out of
 # view at a stop line right under it) stays held after the track is lost while
 # the car is slow, so the model cannot start into it (route 479 18:57:07).
@@ -173,6 +183,13 @@ class CarrotServ:
   tlv_last_stopped = None
   tlv_xstate_left_at = -1e9
   tlv_green_event_at = -1e9
+  # WHOLE1: when the current tlvd suspension / relevance loss started, so the red
+  # hold is extended only for a bounded time (None = not in that condition).
+  tlv_suspend_since = None
+  tlv_rel_lost_since = None
+  # WHOLE1: slow enough to be at the stop line (vEgo <= TLV_HOLE_HOLD_MAX_MPS and
+  # no gas), so a phantom red is never held at speed.
+  tlv_hole_slow = False
 
   def __init__(self):
     self.params = Params()
@@ -293,6 +310,10 @@ class CarrotServ:
     self.tlv_navi_road_category_t = -1e9
     self.tlv_highway_gate = False
     self.tlv_highway_clear_since = None
+    # WHOLE1: start times of the current tlvd suspension / relevance loss.
+    self.tlv_suspend_since = None
+    self.tlv_rel_lost_since = None
+    self.tlv_hole_slow = False
 
     self.left_spd_sec = 100
     self.left_tbt_sec = 100
@@ -416,6 +437,10 @@ class CarrotServ:
         pass
 
   def traffic_light(self, x, y, color, cnf, src=0):
+    # WHOLE1: remember what the queue match produced on the previous call, so a
+    # red re-acquired at a new spot (the old entry aged out of the 20-entry deque
+    # while the light was held) can continue the held red instead of reading 0.
+    prev = (self.traffic_state, self.traffic_state_src)
     traffic_red = 0
     traffic_green = 0
     traffic_left = 0
@@ -464,6 +489,13 @@ class CarrotServ:
       self.traffic_state = 0
       #print("TrafficLight none")
 
+    # WHOLE1: the previous call left a src-1 red held and this call's queue match
+    # came up empty (every matching entry has aged out), yet the detector still
+    # reports a red. Keep the red rather than publishing a 0 tick, so the model
+    # does not start on a light that is still red.
+    if src == 1 and color == "Red Light" and self.traffic_state == 0 and prev == (1, 1) and self.tlv_hole_slow:
+      self.traffic_state = 1
+
     self.traffic_state_src = src if self.traffic_state != 0 else 0
 
     self.traffic_light_q.append((x,y,color,cnf))
@@ -509,6 +541,14 @@ class CarrotServ:
     `dets[0]`, which can be an unrelated light on frames where the relevant track
     has no detector match. Coordinates are full-frame pixels."""
     now = time.monotonic()
+    # WHOLE1: H1/H2/H3 exist for the stop line, where the car creeps at 0.3-1.7 m/s
+    # (6e1 0.33, 6e3 <= 1.74). At speed a held red would brake for a light the car
+    # no longer sees, so gate all three on being slow and off the gas.
+    try:
+      car_state = sm['carState']
+      self.tlv_hole_slow = float(car_state.vEgo) <= TLV_HOLE_HOLD_MAX_MPS and not bool(car_state.gasPressed)
+    except Exception:
+      self.tlv_hole_slow = False
     # W139c: default to no detector support; set below only when a TLV state is
     # accepted. Every early-return path (mode off, not valid/updated, not
     # running, no relevant track, no confirmed color) leaves 0.
@@ -537,17 +577,34 @@ class CarrotServ:
     if not sm.updated['carrotTlv']:
       return
     msg = sm['carrotTlv']
-    if int(msg.status.raw) != 1:  # Status.running only
+    status_raw = int(msg.status.raw)
+    if status_raw != 1:  # Status.running only
+      # WHOLE1: tlvd suspends itself (status 2) on CPU contention for 1.1-1.2 s
+      # and publishes status=suspended (no detections) every loop, so the last
+      # accepted red never reaches this branch and used to fall out of
+      # tlv_hold_until and read 0 while still red.
+      # Keep extending the last accepted src-1 red while the suspension lasts,
+      # capped at TLV_SUSPEND_HOLD_MAX_S so a real green is delayed by at most that.
+      red_held = self.traffic_state in (1, TLV_GRADED_TRAFFIC_STATE) and self.traffic_state_src == 1
+      if status_raw == 2 and red_held and self.tlv_hole_slow:
+        if self.tlv_suspend_since is None:
+          self.tlv_suspend_since = now
+        if now - self.tlv_suspend_since <= TLV_SUSPEND_HOLD_MAX_S:
+          self.tlv_hold_until = max(self.tlv_hold_until, now + TLV_HOLD_S)
       return
+    self.tlv_suspend_since = None
     # W138: require the relevant track and a non-degenerate relevantBox; dets[0]
     # is no longer a fallback (it may be an unrelated light).
     if int(msg.relevantTrackId) < 0:
+      self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
       return
     rb = msg.relevantBox
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
+      self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
       return
+    self.tlv_rel_lost_since = None
     self.tlv_top_exit = None  # WTOP1: a visible relevant track ends the hold
     state_raw = int(msg.state.raw)
     released_flag = bool(getattr(msg, "relevantReleased", False))
@@ -606,6 +663,35 @@ class CarrotServ:
     self.tlv_det_support = int(msg.relevantDetSupport)
     self.tlv_hold_until = now + TLV_HOLD_S
     self.traffic_light_count = int(0.5 / 0.1)
+
+  def _tlv_rel_loss_hold(self, sm, msg, now: float) -> None:
+    """WHOLE1: keep a confirmed src-1 red while the relevant track is lost.
+
+    The tracker drops the relevance (relevantTrackId -1) while the car creeps up
+    to the stop line, because the light's box leaves the top of the relevant
+    region. _tlv_top_exit_hold covers only the case where the box touched the
+    frame top (y1 <= 4 px); at 6e3 the box sat at y1 147-174 px, so the red was
+    dropped. Hold instead while tlvd itself still reports a red family state at
+    >= TLV_CONF_MIN and the car is slow enough to be at the line, capped at
+    TLV_REL_LOSS_HOLD_MAX_S.
+    """
+    try:
+      cs = sm['carState']
+      v = float(cs.vEgo)
+      gas = bool(cs.gasPressed)
+    except Exception:
+      self.tlv_rel_lost_since = None
+      return
+    red_held = self.traffic_state == 1 and self.traffic_state_src == 1
+    tlv_red = (int(msg.state.raw) in TLV_RED_FAMILY_STATES
+               and float(msg.stateConf) >= TLV_CONF_MIN)
+    if not (red_held and tlv_red and not gas and v <= TLV_HOLE_HOLD_MAX_MPS):
+      self.tlv_rel_lost_since = None
+      return
+    if self.tlv_rel_lost_since is None:
+      self.tlv_rel_lost_since = now
+    if now - self.tlv_rel_lost_since <= TLV_REL_LOSS_HOLD_MAX_S:
+      self.tlv_hold_until = max(self.tlv_hold_until, now + TLV_HOLD_S)
 
   def _tlv_top_exit_hold(self, sm, now: float) -> None:
     """WTOP1: keep a src-1 red whose box left through the frame top while slow."""
