@@ -14,7 +14,7 @@ from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
   CREEP_ACCEL, CREEP_V, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, HOLD_RAMP,
   LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
-  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, final_roll_limit,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, final_roll_limit, rest_ramp_floor,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -105,6 +105,7 @@ class LongControl:
     self._butter_creep_logged = False
     self._butter_near_rest = False
     self._butter_rest_floor = None
+    self._butter_v_min = float("inf")
     self._depart_t = None
     self._depart_floor = None
     self.depart_guard_last = False
@@ -327,6 +328,7 @@ class LongControl:
         self._butter_creep_logged = False
         self._butter_near_rest = False
         self._butter_rest_floor = None
+        self._butter_v_min = float("inf")
       else:
         try:
           v_ego_now = float(CS.vEgo)
@@ -341,6 +343,8 @@ class LongControl:
           self._butter_standstill_time = 0.0
         if v_ego_now < STANDSTILL_V or bool(getattr(CS, "standstill", False)):
           self._butter_near_rest = True
+        if math.isfinite(v_ego_now):
+          self._butter_v_min = min(self._butter_v_min, v_ego_now)
         if self._butter_standstill_time >= STANDSTILL_T:
           self._butter_standstill_confirmed = True
       floor_live = (self.long_control_state == LongCtrlState.pid
@@ -408,13 +412,20 @@ class LongControl:
         output_accel = min(output_accel, 0.0)
         output_accel -= ramp_rate * DT_CTRL
       if self.butter_stop and not self._butter_standstill_confirmed:
+        floor = None
         if butter_floor_value is not None:
           # The taper only limits braking while the car is still rolling.
-          output_accel = max(output_accel, butter_floor_value)
+          floor = butter_floor_value
           self._butter_rest_floor = butter_floor_value
         elif self._butter_rest_floor is not None and float(CS.vEgo) < STANDSTILL_V:
           # Below STANDSTILL_V the taper is ineligible; keep its last value until the hold is confirmed.
-          output_accel = max(output_accel, self._butter_rest_floor)
+          floor = self._butter_rest_floor
+        if floor is not None:
+          # Rest ramp: near rest the floor eases down to the stop decel, so the ESC does not let go
+          # on the taper's soft end; the one-way ramp above still limits how fast braking grows.
+          if math.isfinite(self._butter_v_min):
+            floor = min(floor, rest_ramp_floor(self._butter_v_min, self.stopping_accel))
+          output_accel = max(output_accel, floor)
       if self.butter_stop and (self._butter_standstill_confirmed or self._butter_near_rest):
         # Creep guard: once the car was near rest, never let it creep toward the lead.
         if float(CS.vEgo) > CREEP_V and not bool(getattr(CS, "gasPressed", False)):

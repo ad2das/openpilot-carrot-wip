@@ -49,7 +49,7 @@ def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, 
   command = controller.update(
     active=values["ACCMode"] == 1 and not blocked, requested=bool(values["StopReq"]), speed=speed,
     held=CS.canfdSccHoldActive, accel=accel, previous_value=previous_value,
-    jerk_u=max(0.0, min(jerk_u, 5.0)), jerk_l=max(1.0, min(jerk_l, 5.0)),
+    jerk_u=max(0.0, min(jerk_u, 5.0)), jerk_l=max(1.0, min(jerk_l, 5.0)), a_ego=CS.out.aEgo if finite else 0.0,
   )
   if blocked or values["ACCMode"] != 1:
     values.update(StopReq=0, aReqRaw=0.0, aReqValue=0.0)

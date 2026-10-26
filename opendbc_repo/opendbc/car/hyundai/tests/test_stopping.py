@@ -12,7 +12,8 @@ from opendbc.car.hyundai import carcontroller
 from opendbc.car.hyundai.hyundaicanfd import create_acc_control, create_acc_control_scc2
 from opendbc.car.hyundai.stopping import (CanfdStopping, StopPhase, DT, ENTRY_SPEED, RELEASE_CONFIRM_FRAMES, RESCUE_ACCEL,
                                           RESCUE_ACCEL_MIN, RESCUE_JERK, RESCUE_MAX_CYCLES, RESCUE_SPEED, STALL_RESCUE_MAX_T,
-                                          STALL_T, STALL_ZERO_FRAMES, STOP_LOWER_BAND, ZERO_CONFIRM_FRAMES)
+                                          STALL_T, STALL_ZERO_FRAMES, STOP_LOWER_BAND, STOP_SPEED, SURGE_ACCEL, SURGE_RISE,
+                                          ZERO_CONFIRM_FRAMES)
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
 
 
@@ -1081,3 +1082,94 @@ def test_no_stall_after_hold_dropout():
   for _ in range(3 * STALL_TICKS):
     assert step(controller, speed=.02, held=False).stop_req == 1
   assert controller.phase == StopPhase.held
+
+
+def surge_profile(controller, *, a_peak, held=False):
+  """6e3 2.39 min: down to 0.04 m/s under StopReq 1, then the ESC lets go and idle creep surges."""
+  creep_approach(controller, end=0.04, plateau=10, held=held)
+  out = []
+  previous = -0.5
+  for speed, a_ego in ((0.05, 0.02), (0.05, 0.03), (0.065, a_peak), (0.08, a_peak), (0.09, a_peak), (0.10, a_peak)):
+    cmd = step(controller, speed=speed, held=held, accel=-0.51, previous_value=previous, a_ego=a_ego)
+    out.append((speed, a_ego, cmd))
+    previous = cmd.value
+  return out
+
+
+def test_surge_rescue_fires_before_creep_speed():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  out = surge_profile(controller, a_peak=0.12)
+  first = next(i for i, (_, _, cmd) in enumerate(out) if cmd.stop_req == 0)
+  speed, a_ego, cmd = out[first]
+  assert speed == pytest.approx(0.065) and speed < RESCUE_SPEED
+  assert a_ego >= SURGE_ACCEL
+  assert cmd.raw == pytest.approx(RESCUE_ACCEL, abs=1e-9)
+  assert controller.phase == StopPhase.rescue
+  assert controller.reason == "surge_rescue"
+  assert controller.rescue_kind == "creep"
+  assert all(cmd.stop_req == 1 for _, _, cmd in out[:first])
+
+
+def test_surge_rescue_rerequests_after_rest():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  surge_profile(controller, a_peak=0.12)
+  previous = -1.0
+  for tick in range(15):
+    cmd = step(controller, speed=0.0, accel=-1.5, previous_value=previous)
+    previous = cmd.value
+    if cmd.stop_req == 1:
+      break
+  assert cmd.stop_req == 1
+  assert controller.reason == "rescue_stopped"
+  assert controller.rescue_cycles == 1
+
+
+def test_no_surge_rescue_below_surge_accel():
+  """Stops that held peaked at +0.06 m/s^2 before AVH (routes 6d5..6e3): no rescue."""
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  out = surge_profile(controller, a_peak=0.06)
+  assert all(cmd.stop_req == 1 for speed, _, cmd in out if speed < RESCUE_SPEED)
+
+
+def test_no_surge_rescue_while_avh():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  out = surge_profile(controller, a_peak=0.25, held=True)
+  assert all(cmd.stop_req == 1 for _, _, cmd in out)
+  assert controller.phase != StopPhase.rescue
+
+
+def test_no_surge_rescue_before_stop_speed():
+  """aEgo noise while the car is still above STOP_SPEED is the approach, not a surge."""
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  creep_approach(controller, end=STOP_SPEED + 0.02, plateau=10)
+  cmd = step(controller, speed=STOP_SPEED + 0.02 + SURGE_RISE, accel=-0.51, a_ego=0.3)
+  assert cmd.stop_req == 1
+  assert controller.phase != StopPhase.rescue
+
+
+def test_no_surge_rescue_without_rise():
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  creep_approach(controller, end=STOP_SPEED, plateau=10)
+  cmd = step(controller, speed=STOP_SPEED + SURGE_RISE / 2, accel=-0.51, a_ego=0.3)
+  assert cmd.stop_req == 1
+  assert controller.phase != StopPhase.rescue
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_caller_passes_measured_acceleration(camera):
+  cs = make_cs()
+  controller = CanfdStopping()
+  controller.pass_accel = True
+  for speed, a_ego in [(round(0.3 - 0.01 * i, 2), -0.2) for i in range(27)] + [(0.04, -0.05)] * 10 + [(0.065, 0.15)]:
+    cs.out.vEgo = cs.out.vEgoRaw = speed
+    cs.out.wheelSpeeds = SimpleNamespace(fl=speed, fr=speed, rl=speed, rr=speed)
+    cs.out.aEgo = a_ego
+    values = send(camera, controller, cs)
+  assert controller.reason == "surge_rescue"
+  assert values["StopReq"] == 0

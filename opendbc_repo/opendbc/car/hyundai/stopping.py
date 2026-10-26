@@ -31,6 +31,11 @@ RESCUE_ACCEL = -2.5       # m/s^2; at walking speed the ESC delivers only ~14 % 
 RESCUE_ACCEL_MIN = -3.5   # m/s^2 floor (panda allows -4.0)
 RESCUE_JERK = 5.0         # m/s^3; reach the rescue braking within ~0.4 s, before the driver warning (1 s)
 RESCUE_MAX_CYCLES = 2     # re-requests per episode; after that the episode keeps braking with StopReq 0
+# Surge catch (route 6e3, 10-26): when the ESC lets go near rest, the idle-creep surge shows in aEgo
+# (+0.11..+0.25 m/s^2 in 5 stops) while the speed is still 0.06 m/s, ~0.1 s before RESCUE_SPEED.
+# Stops that held peaked at +0.06 before AVH (routes 6d5..6e3). The same rescue starts there.
+SURGE_ACCEL = 0.10        # m/s^2
+SURGE_RISE = 0.02         # m/s above the lowest speed, which must have reached STOP_SPEED
 
 # Stall rescue (route 6e1 7.00-7.14 min, 10-26): the car came down to 0.03-0.05 m/s under StopReq 1 and
 # aReq -0.51 but never reached zero, so the ESC never set AVH, and idle creep pushed it from 0.03 to
@@ -105,7 +110,8 @@ class CanfdStopping:
     return StopCommand(0, raw, value, 0.0)
 
   def update(self, *, active: bool, requested: bool, speed: float, held: bool,
-             accel: float, previous_value: float, jerk_u: float, jerk_l: float) -> StopCommand | None:
+             accel: float, previous_value: float, jerk_u: float, jerk_l: float,
+             a_ego: float = 0.0) -> StopCommand | None:
     # Caller validates sensor values and applies pedal/CAN/hold interlocks.
     if not active:
       self.reset()
@@ -163,11 +169,13 @@ class CanfdStopping:
 
     if self.phase in (StopPhase.request, StopPhase.held):
       self.v_min = min(self.v_min, speed)
-      if (not held and self.v_min <= RESCUE_LOW_SPEED and speed >= self.v_min + RESCUE_RISE
-          and speed >= RESCUE_SPEED):
+      creep = self.v_min <= RESCUE_LOW_SPEED and speed >= self.v_min + RESCUE_RISE and speed >= RESCUE_SPEED
+      surge = (self.v_min <= STOP_SPEED and speed > STOP_SPEED and speed >= self.v_min + SURGE_RISE
+               and a_ego >= SURGE_ACCEL)
+      if not held and (creep or surge):
         self.rescue_kind = "creep"
         self.rescue_time = 0.0
-        self.enter(StopPhase.rescue, "creep_rescue")
+        self.enter(StopPhase.rescue, "creep_rescue" if creep else "surge_rescue")
         return self._rescue_command(accel, previous_value, jerk_u, jerk_l)
 
       if not held and self.stall_time >= STALL_T and self.rescue_cycles < RESCUE_MAX_CYCLES:

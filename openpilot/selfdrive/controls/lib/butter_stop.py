@@ -37,6 +37,11 @@ STANDSTILL_T = 0.2
 HOLD_RAMP = 2.0
 CREEP_V = 0.15
 CREEP_ACCEL = -1.5
+# Rest ramp (K5 routes 6da..6e3, 10-26): ending the stop on the taper's last value (~-0.13) let the
+# ESC let go at 0.04-0.05 m/s, and idle creep surged at +0.11..+0.25 m/s^2 in 5 of 10 stops; the
+# -0.5 request at that speed before (routes 6d5..6d8) held in 11 of 16. Below REST_RAMP_V the floor
+# eases down with the lowest speed of the stop and reaches the stop decel at STANDSTILL_V.
+REST_RAMP_V = 0.3
 PLAN_STOP_V = 0.05
 AVAIL_MIN = 0.05
 LEAD_ACCEL_MIN = -1.5
@@ -165,6 +170,11 @@ def solve_taper_a_end(v, avail, k):
     else:
       lo = mid
   return hi
+
+
+def rest_ramp_floor(v_min, stopping_accel):
+  """Braking floor near rest: 0 at REST_RAMP_V, stopping_accel at STANDSTILL_V and below."""
+  return float(np.interp(v_min, [STANDSTILL_V, REST_RAMP_V], [min(stopping_accel, 0.0), 0.0]))
 
 
 def slew_floor(prev, floor_raw, dt=DT_CTRL):
