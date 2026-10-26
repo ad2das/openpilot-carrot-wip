@@ -149,6 +149,7 @@ from openpilot.selfdrive.carrot.carrot_functions import (
 )
 from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
 from openpilot.selfdrive.carrot.driving_mode import DrivingMode
+from openpilot.selfdrive.carrot.tlv_green_override import GreenHold
 
 BOX = (900.0, 400.0, 940.0, 440.0)
 
@@ -561,6 +562,9 @@ def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   # long enough unless a test explicitly simulates the transition.
   planner.model_stop_clear_since = None if stop_sign else time.monotonic() - 10.0
   planner.tlv_green_chime_done = False
+  # W-GREENFIX1: the front-of-queue TLV green override state.
+  planner.tlv_green_hold = GreenHold()
+  planner.tlv_green_override_logged = False
   planner.add_event = lambda *_a, **_k: None
   return planner
 
@@ -1291,17 +1295,17 @@ def test_tlv_start_veto_rate_limited_within_2s(monkeypatch):
 # W143: sustained model-clear requirement for TLV starts
 # ---------------------------------------------------------------------------
 
-def test_tlv_green_edge_with_model_clear_09s_still_vetoed():
+def test_tlv_green_edge_with_model_clear_05s_still_vetoed():
   planner = planner_for_gate(stop_sign=False)
-  planner.model_stop_clear_since = time.monotonic() - 0.9
+  planner.model_stop_clear_since = time.monotonic() - 0.5
   planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
   assert planner.xState == XState.e2eStopped
   assert planner.trafficState_carrot == 1  # the blocked edge keeps holding red
 
 
-def test_tlv_green_edge_with_model_clear_105s_triggers():
+def test_tlv_green_edge_with_model_clear_065s_triggers():
   planner = planner_for_gate(stop_sign=False)
-  planner.model_stop_clear_since = time.monotonic() - 1.05
+  planner.model_stop_clear_since = time.monotonic() - 0.65
   planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
   assert planner.xState == XState.e2eCruise
   assert planner.trafficState_carrot == 2
@@ -1324,7 +1328,7 @@ def test_model_stop_flicker_resets_the_clear_timer(monkeypatch):
   planner.check_model_stopping(0.0, np.array([0.0] * 70 + [0.0]), 0.0, 0.0, 60.0,
                                np.zeros(70), 100.0)
   assert planner.model_stop_clear_since is not None
-  clock[0] += 0.6
+  clock[0] += 0.4
   planner._update_carrot_man(gate_sm(carrot_man_message(state=2, src=1)), 20.0, 60.0)
   assert planner.xState == XState.e2eStopped
 
@@ -1654,3 +1658,118 @@ def test_yellow_run_ends_after_a_gap(monkeypatch):
   assert serv._tlv_yellow_after_green(clock[0] + 0.5, 920 / 1928.0, 420 / 1208.0)
   # 4 s later: green is stale and the run has a > 1 s gap -> a new yellow is rejected.
   assert not serv._tlv_yellow_after_green(clock[0] + 4.5, 920 / 1928.0, 420 / 1208.0)
+
+
+# ---------------------------------------------------------------------------
+# W-GREENFIX1: front-of-queue TLV green start when the model stop cue is spurious
+# ---------------------------------------------------------------------------
+
+# The autouse frozen_clock pins carrot_man_input.time.monotonic (the same module
+# object) at 100.0, and get_carrot_man rejects a carrotMan older than 1.0 s. The
+# gate keeps its own clock and republishes carrotMan every tick, like the live
+# 20 Hz publisher does.
+GREEN_TICK_S = 0.05
+
+
+def _green_run(planner, clock, seconds, model=None, radar=None, state=2, src=1, v_ego_kph=0.0):
+  """Tick _update_carrot_man every GREEN_TICK_S up to `seconds`, returning
+  {rounded dt: (xState, trafficState_carrot)}."""
+  sm = gate_sm(carrot_man_message(state=state, src=src), model=model, radar=radar)
+  out = {}
+  n = int(round(seconds / GREEN_TICK_S))
+  for i in range(n + 1):
+    dt = round(i * GREEN_TICK_S, 2)
+    clock[0] = 100.0 + dt
+    sm.recv_time['carrotMan'] = clock[0]
+    planner._update_carrot_man(sm, v_ego_kph, 60.0)
+    out[dt] = (planner.xState, planner.trafficState_carrot)
+  return out
+
+
+def _green_plan(monkeypatch, stop_sign=True):
+  planner = planner_for_gate(stop_sign=stop_sign)
+  clock = [100.0]
+  monkeypatch.setattr(carrot_functions.time, "monotonic", lambda: clock[0])
+  return planner, clock
+
+
+def _no_lead_radar():
+  return SimpleNamespace(leadOne=SimpleNamespace(status=False, dRel=0.0),
+                         leadTwo=SimpleNamespace(status=False, dRel=0.0))
+
+
+def _clear_model(prob=0.01):
+  return SimpleNamespace(leadsV3=[SimpleNamespace(prob=prob)])
+
+
+def test_green_override_starts_after_15s_with_nothing_ahead(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  states = _green_run(planner, clock, 5.0, model=_clear_model(0.01), radar=_no_lead_radar())
+  assert states[1.4][0] == XState.e2eStopped
+  assert states[1.55][0] == XState.e2eCruise
+  assert states[1.55][1] == 2
+
+
+def test_green_override_blocked_by_radar_lead_inside_30m(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  radar = SimpleNamespace(leadOne=SimpleNamespace(status=True, dRel=25.0),
+                          leadTwo=SimpleNamespace(status=False, dRel=0.0))
+  states = _green_run(planner, clock, 5.0, model=_clear_model(0.01), radar=radar)
+  assert all(states[t][0] == XState.e2eStopped for t in states)
+
+
+def test_green_override_blocked_by_model_lead_prob(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  states = _green_run(planner, clock, 5.0, model=_clear_model(0.36), radar=_no_lead_radar())
+  assert all(states[t][0] == XState.e2eStopped for t in states)
+
+
+def test_green_override_needs_standstill(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  states = _green_run(planner, clock, 5.0, model=_clear_model(0.01), radar=_no_lead_radar(),
+                      v_ego_kph=5.0)
+  assert all(states[t][0] == XState.e2eStopped for t in states)
+
+
+def test_green_override_hold_restarts_after_a_gap(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  model, radar = _clear_model(0.01), _no_lead_radar()
+  sm_green = gate_sm(carrot_man_message(state=2, src=1), model=model, radar=radar)
+  sm_none = gate_sm(carrot_man_message(state=0, src=1), model=model, radar=radar)
+
+  def tick(sm, dt):
+    clock[0] = 100.0 + dt
+    sm.recv_time['carrotMan'] = clock[0]
+    planner._update_carrot_man(sm, 0.0, 60.0)
+
+  for i in range(21):                      # green for 1.00 s (since = 100.00)
+    tick(sm_green, round(i * GREEN_TICK_S, 2))
+  for i in range(8):                       # a 0.40 s break at 1.05 .. 1.40 s
+    tick(sm_none, round(1.05 + i * GREEN_TICK_S, 2))
+  assert planner.xState == XState.e2eStopped
+  for i in range(30):                      # green again from 1.45 s (since = 101.45)
+    tick(sm_green, round(1.45 + i * GREEN_TICK_S, 2))
+  assert clock[0] == pytest.approx(102.90, abs=0.001)
+  assert planner.xState == XState.e2eStopped  # 1.45 s since the restart
+  tick(sm_green, 2.95)
+  assert planner.xState == XState.e2eCruise    # 1.50 s after the restart, not the 1.00 s run
+  assert planner.trafficState_carrot == 2
+
+
+def test_green_override_ignores_navi_source(monkeypatch):
+  # src == 0 keeps the pre-existing red->green trigger byte-identical: the start
+  # fires on the first tick, not after the 1.5 s hold.
+  planner = planner_for_gate(stop_sign=True)
+  clock = [100.0]
+  monkeypatch.setattr(carrot_functions.time, "monotonic", lambda: clock[0])
+  sm = gate_sm(carrot_man_message(state=2, src=0), model=_clear_model(0.01), radar=_no_lead_radar())
+  sm.recv_time['carrotMan'] = clock[0]
+  assert planner._update_carrot_man(sm, 0.0, 60.0) == (60.0, False)
+  assert planner.xState == XState.e2eCruise
+  assert planner.trafficState_carrot == 2
+
+
+def test_green_override_missing_services_never_overrides(monkeypatch):
+  planner, clock = _green_plan(monkeypatch)
+  states = _green_run(planner, clock, 5.0)  # no modelV2 / radarState
+  assert all(states[t][0] == XState.e2eStopped for t in states)

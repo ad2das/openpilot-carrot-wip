@@ -19,6 +19,7 @@ except ImportError:  # PC test environment has no zmq; the vehicle always import
 
   cloudlog = _NullCloudlog()
 from openpilot.selfdrive.carrot.carrot_man_input import CARROT_MAN_TIMEOUT, get_carrot_man
+from openpilot.selfdrive.carrot.tlv_green_override import GreenHold, override_ok
 from openpilot.selfdrive.carrot.t_follow import (
   get_t_follow_mode_factor, get_t_follow_mode_max, get_speed_t_follow_factor, get_lead_response_for_gap, ramp_t_follow,
   ramp_mode_t_follow_factor,
@@ -113,7 +114,8 @@ TLV_FAST_GATE_RESET_S = 0.5
 # CLEAR for this long, so a momentary clear is not taken as the green. Measured
 # non-terminal model-clear runs at standstill during real reds on 44c/44d/44e/
 # 450: 3 runs, max 0.26 s. V1b: a 1.0 s guard removes all simulated false starts.
-TLV_START_MODEL_CLEAR_S = 1.0
+# W-GREENFIX1: 1.0 -> 0.6 (still 2.3x the 0.26 s max real-red flicker); 1.0 s added 0.4 s to every start.
+TLV_START_MODEL_CLEAR_S = 0.6
 TLV_RED_VETO_GRACE_S = 3.0  # a TLV red keeps vetoing the model green start through 0/redLikely gaps this long (6e1 169.77)
 TLV_RED_VETO_SLOW_MPS = 3.0  # held/grace veto only while this slow (6e1 0.33, 6e3 1.0-1.4 m/s)
 TLV_A4_STANDSTILL_MIN_FRAMES = int(1.0 / DT_MDL)
@@ -307,6 +309,9 @@ class CarrotPlanner:
     # W143: monotonic time since the model stop cue was last False (None while
     # the model is signalling a stop).
     self.model_stop_clear_since = None
+    # W-GREENFIX1: steady TLV green/left hold + one log per overridden edge.
+    self.tlv_green_hold = GreenHold()
+    self.tlv_green_override_logged = False
     # W144: one "green light" chime per held red episode when the model guard is
     # the only thing blocking a TLV green/left start.
     self.tlv_green_chime_done = False
@@ -761,13 +766,40 @@ class CarrotPlanner:
       # the car only while the supercombo model is not signalling a stop, i.e.
       # both cues agree (ONE extra gate for tlv-originated red->green AND
       # red->left edges).
-      tlv_start_disagrees = (
+      # W-GREENFIX1: at the front of the queue the model can keep a stop cue on a
+      # real green (6e3 20:19:52). After 1.5 s of steady TLV green with nothing
+      # ahead (radar and model lead), the TLV green alone may start the car.
+      hold = getattr(self, 'tlv_green_hold', None)
+      if hold is None:
+        hold = self.tlv_green_hold = GreenHold()
+      green_since = hold.update(now_t, tlv_src and state_in in (2, 3))
+      green_override = False
+      lead_prob = 1.0
+      if tlv_src and state_in in (2, 3) and self.trafficState_carrot == 1:
+        try:
+          rs = sm['radarState']
+          md = sm['modelV2']
+          lead_prob = float(md.leadsV3[0].prob) if len(md.leadsV3) > 0 else 1.0
+          green_override = override_ok(now_t, green_since, v_ego_kph,
+                                       bool(rs.leadOne.status), float(rs.leadOne.dRel),
+                                       bool(rs.leadTwo.status), float(rs.leadTwo.dRel), lead_prob)
+        except Exception:
+          green_override = False
+      model_disagrees = (
         tlv_src
         and state_in in (2, 3)
         and (getattr(self, 'last_model_stop_sign', False)
              or self.model_stop_clear_since is None
              or time.monotonic() - self.model_stop_clear_since < TLV_START_MODEL_CLEAR_S)
       )
+      tlv_start_disagrees = model_disagrees and not green_override
+      if model_disagrees and green_override and not getattr(self, 'tlv_green_override_logged', False):
+        cloudlog.event("tlv_green_override", state_in=int(state_in), v_ego=float(v_ego_kph * CV.KPH_TO_MS),
+                       green_s=float(now_t - green_since), lead_prob=float(lead_prob),
+                       model_stop=bool(getattr(self, 'last_model_stop_sign', False)))
+        self.tlv_green_override_logged = True
+      if self.trafficState_carrot != 1:
+        self.tlv_green_override_logged = False
       # W74D (A): a TLV red->left start also needs a nearby routed left
       # (carrotMan.atcType; carrotMan.xDistToTurn <= 150 m, int metres from
       # navInstruction.maneuverDistance) or a left blinker already on before
@@ -890,6 +922,8 @@ class CarrotPlanner:
       self.tlv_red_confirmed_at = None
       self.tlv_veto_active = False
       self.tlv_green_chime_done = False
+      self.tlv_green_hold = GreenHold()
+      self.tlv_green_override_logged = False
       self.activeCarrot = 0
       self.xDistToTurn = 0
       self.atcType = ""
