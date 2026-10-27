@@ -1,3 +1,4 @@
+from collections import defaultdict
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,10 @@ def navigation_update(monkeypatch):
 
   class SubMaster(dict):
     alive = {"carState": True, "selfdriveState": True, "navInstruction": False}
+    seen = defaultdict(bool)
+    valid = defaultdict(bool)
+    logMonoTime = defaultdict(int)
+    recv_time = defaultdict(float)
 
   sm = SubMaster(carState=CS, selfdriveState=SimpleNamespace(distanceTraveled=0.))
   sent = {}

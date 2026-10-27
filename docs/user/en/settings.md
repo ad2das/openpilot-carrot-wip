@@ -111,7 +111,7 @@ Ignoring `x0.01`, `x0.001`, `cm`, `km/h`, or `%` can make a value appear one hun
 
 ## Settings map
 
-The current `carrot_settings.json` contains **189 parameters**. Two driver-monitoring exceptions are search only and are excluded from this map and the public Wiki index; the remaining entries appear in these menus:
+The current `carrot_settings.json` contains **190 parameters**. Two driver-monitoring exceptions are search only and are excluded from this map and the public Wiki index; the remaining entries appear in these menus:
 
 | Category | Count | Groups |
 |---|---:|---|
