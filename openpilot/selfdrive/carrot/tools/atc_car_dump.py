@@ -17,8 +17,10 @@ import sys
 import time
 
 BASEDIR = os.environ.get("BASEDIR", "/data/openpilot")
-if BASEDIR not in sys.path:
-  sys.path.insert(0, BASEDIR)
+# Same order as launch_chffrplus.sh: pydeps first (pyserial etc.), then the repo.
+for path in (BASEDIR, os.path.join(BASEDIR, "pydeps")):
+  if path not in sys.path:
+    sys.path.insert(0, path)
 
 from openpilot.common.swaglog import cloudlog  # noqa: E402
 
