@@ -172,7 +172,6 @@ class Car:
 
     self.is_metric = self.params.get_bool("IsMetric")
     self.experimental_mode = self.params.get_bool("ExperimentalMode")
-    self.atc_test_result = None
 
     #self.t1 = time.monotonic()
     #self.t2 = self.t1
@@ -373,9 +372,7 @@ class Car:
       now_nanos = self.can_log_mono_time if REPLAY else int(time.monotonic() * 1e9)
       model_v2 = self.sm['modelV2'] if self.sm.valid['modelV2'] and self.sm.alive['modelV2'] else None
       radar_state = self.sm['radarState'] if self.sm.valid['radarState'] and self.sm.alive['radarState'] else None
-      self.CI.CS.atc_control_valid = bool(self.sm.seen['carControl'] and self.sm.valid['carControl'])
       self.last_actuators_output, can_sends = self.CI.apply(CC, now_nanos, model_v2, radar_state)
-      self.atc_test_publish()
       apply_done_ns = time.monotonic_ns()
       self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=CS.canValid))
       sendcan_done_ns = time.monotonic_ns()
@@ -426,24 +423,6 @@ class Car:
         self.card_diag_stage_max_us = dict.fromkeys(self.card_diag_stage_names, 0)
 
       self.CC_prev = CC
-    else:
-      self.atc_cleanup()
-
-  def atc_test_publish(self):
-    result = getattr(self.CI.CS, 'atc_test_result', None)
-    if result is not None and result is not self.atc_test_result:
-      self.atc_test_result = result
-      cloudlog.event('atc_signal_test', **{k: v for k, v in result.items() if k != 'samples'})
-      self.params.put_nonblocking("AtcSignalTestResult", json.dumps(result))
-
-  def atc_cleanup(self, shutdown=False):
-    """Send only ATC return-control frames when normal apply cannot run."""
-    stop = getattr(self.CI.CC, 'shutdown_atc' if shutdown else 'stop_atc', None)
-    if stop is not None:
-      now_ns = self.can_log_mono_time if REPLAY else time.monotonic_ns()
-      can_sends = stop(self.CI.CS, now_ns)
-      if can_sends:
-        self.pm.send('sendcan', can_list_to_can_capnp(can_sends, msgtype='sendcan', valid=True))
 
   def step(self):
     cpu_start = time.thread_time()
@@ -466,8 +445,6 @@ class Car:
                    self.sm.seen['onroadEvents'])
     if not self.CP.passive and initialized:
       self.controls_update(CS, self.sm['carControl'])
-    else:
-      self.atc_cleanup()
 
     self.initialized_prev = initialized
     self.CS_prev = CS
@@ -482,8 +459,6 @@ class Car:
     while not evt.is_set():
       self.is_metric = self.params.get_bool("IsMetric")
       self.experimental_mode = self.params.get_bool("ExperimentalMode") and self.CP.openpilotLongitudinalControl
-      if getattr(self.CI.CC, 'atc_blinker', None) is not None:
-        self.CI.CS.atc_test_request = self.params.get("AtcSignalTestRequest") or 0  # int64 monotonic ns
       time.sleep(0.1)
 
   def card_thread(self):
@@ -498,10 +473,6 @@ class Car:
         #  print(f"elapsed time = {(self.t1 - start)*1000.:.2f}, {(self.t2 - self.t1)*1000.:.2f}, {(self.t3 - self.t1)*1000.:.2f}, {(time.monotonic() - self.t1)*1000.:.2f}")
         self.rk.monitor_time()
     finally:
-      try:
-        self.atc_cleanup(shutdown=True)
-      except Exception:
-        cloudlog.exception('ATC return-control send failed during shutdown')
       e.set()
       t.join()
     

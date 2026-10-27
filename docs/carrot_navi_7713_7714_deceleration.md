@@ -664,18 +664,6 @@ km/h다.
   확인하여 suspended/section off-route도 반영하지 않는다. 따라서 control parser가 감속을 억제해도
   패널에는 SDI 또는 SECTION이 보일 수 있다.
 
-## ATC 방향지시등 요청의 원본 시각
-
-`AutoTurnSignal` 실험 설정은 팰리세이드의 실제 내비 ATC 요청을 별도
-`carrotMan.atcSignal`로 전달합니다. 기존 감속 후보·우선순위·목표속도를 바꾸지 않습니다.
-7713은 실제 `nTBTTurnType` 수신 시각, 7714는 현재 guidance 항목의
-`receivedMonoTimeNanos`, 선택된 `navInstruction`은 해당 이벤트 시각을 사용합니다.
-반복 publication, 위치·과속카메라 패킷만으로 오래된 회전 요청을 갱신하지 않습니다.
-송신자·7714 session·선택된 내비 소스 변경은 현재 maneuver를 취소하며,
-새로운 유효 `none` 구간 전에는 같은 요청을 재개하지 않습니다.
-실제 CAN 명령과 실패 시 해제, 실차 검증의 한계는
-[`atc_signal_integration.md`](atc_signal_integration.md)에 설명합니다.
-
 ## 검증 근거
 
 - 7714 control parser의 focused test 함수들은 현재 체크아웃에서 직접 실행하여 통과했다.

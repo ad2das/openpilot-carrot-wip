@@ -10,7 +10,6 @@ from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.steering_touch import HyundaiSteeringTouch
-from opendbc.car.hyundai.turn_signal_input import from_parser as turn_signal_input_from_parser
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
                                        EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
                                        EV_MODE_STATUS_SIGNAL
@@ -481,8 +480,6 @@ class CarState(CarStateBase):
       return self.update_canfd(can_parsers)
 
     ret = structs.CarState()
-    if hasattr(self, 'atc_signal_status'):
-      ret.atcSignalStatus = self.atc_signal_status
     cp_cruise = cp_cam if self.CP.flags & HyundaiFlags.CAMERA_SCC else cp
     self.is_metric = cp.vl["CLU11"]["CF_Clu_SPEED_UNIT"] == 0
     speed_conv = CV.KPH_TO_MS if self.is_metric else CV.MPH_TO_MS
@@ -523,11 +520,6 @@ class CarState(CarStateBase):
     ret.yawRate = cp.vl["ESP12"]["YAW_RATE"]
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(
       50, cp.vl["CGW1"]["CF_Gway_TurnSigLh"], cp.vl["CGW1"]["CF_Gway_TurnSigRh"])
-    if self.CP.carFingerprint == CAR.HYUNDAI_PALISADE:
-      candidate = turn_signal_input_from_parser(cp)
-      for field, value in vars(candidate).items():
-        setattr(ret.turnSignalInput, field, value)
-      ret.turnSignalInput.lastManualPressMonoTime = getattr(self, 'atc_last_manual_press_ns', 0)
     ret.steeringTorque = cp.vl["MDPS12"]["CR_Mdps_StrColTq"]
     ret.steeringTorqueEps = cp.vl["MDPS12"]["CR_Mdps_OutTq"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)

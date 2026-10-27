@@ -37,29 +37,6 @@ The same maneuver can feel faster or slower with different scenes or installed m
 
 ## What the lane-change settings control
 
-### `AutoTurnSignal` — Experimental ATC Turn Signals
-
-This setting is off by default. When enabled, it sends diagnostic turn-signal pulses for actual navigation ATC turns and forks while driving and lateral control are active, only on classic-CAN Palisade using the normal Hyundai safety mode. It does not apply to CAN-FD or other vehicles; turning it off disables this diagnostic transmission.
-
-Driver turn-signal input, hazards, opposite steering torque, disengagement, a connected trailer, or stale or invalid input cancel the request. The same canceled maneuver cannot restart, and a diagnostic response error or timeout locks the feature until restart. Setting changes take effect after restarting the vehicle or device.
-
-> [!CAUTION]
-> Enabling this setting sends diagnostic commands to the vehicle. Physical flashing, driver-input priority, return of control and release after a process crash have not been verified on a vehicle. Do not assume other road users see a normal signal; stop using the feature if behavior is unexpected, turn it off and restart.
-
-Each pulse activates only the requested side with `2F BC15/BC16 03`, then returns both sides to ECU control with `00`. Manual one-touch lamp holds retain the existing lane-change behavior; automatic lamp feedback is excluded from driver input. Receiving a diagnostic response does not prove the physical lamp operated.
-
-#### Stationary test
-
-Use **Device → ATC turn signal test** in the web settings to check the feature before a real turn. It runs only while stopped in D with cruise engaged and holding the car; pressing the brake disengages and cancels it. Lever, hazard or steering input, moving off, disengagement or a navigation turn request cancels it and returns both sides.
-
-The test turns the left side on once for 0.9 s, then pulses as usual until about 3 s. It then returns both sides and watches the lamp for 1 s. The result shows:
-
-- whether the ICU replied, that is whether commands reach the ICU;
-- whether the CAN lamp signal stayed on or flashed during the first 0.9 s;
-- whether the lamp went out after release.
-
-The CAN lamp signal does not guarantee the physical bulb state, so also watch the cluster and the outside lamp. A diagnostic fault locks the feature until restart, as it does while driving.
-
 ### `LaneChangeNeedTorque` — entry confirmation
 
 | Value | Behavior |

@@ -1,7 +1,6 @@
 from aiohttp import web
 
 from . import (
-  atc_signal_test,
   bluetooth,
   carrot_navi,
   cars,
@@ -57,7 +56,6 @@ def register_all(app: web.Application) -> None:
   xiaoge.register(app)
   mapbox_tokens.register(app)
   vision_test.register(app)
-  atc_signal_test.register(app)
   vision_diag.register(app)
   web_sound.register(app)
   tlv_rec.register(app)

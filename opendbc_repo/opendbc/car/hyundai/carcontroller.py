@@ -6,7 +6,6 @@ from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, common_f
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.carstate import CarState
-from opendbc.car.hyundai.atc_blinker import PalisadeAtcBlinker, classic_atc_enabled
 from opendbc.car.hyundai.stopping import CanfdStopping
 from opendbc.car.hyundai.steering_handover import SteeringHandover
 from opendbc.car.carlog import carlog
@@ -192,7 +191,6 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
 class CarController(CarControllerBase):
   def __init__(self, dbc_names, CP):
     super().__init__(dbc_names, CP)
-    self.atc_blinker = PalisadeAtcBlinker() if classic_atc_enabled(CP) else None
     self.CAN = CanBus(CP)
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
@@ -682,8 +680,6 @@ class CarController(CarControllerBase):
       if self.frame % 50 == 0 and self.CP.openpilotLongitudinalControl and not camera_scc:
         can_sends.append(hyundaican.create_frt_radar_opt(self.packer))
 
-    can_sends.extend(self.update_atc(CC, CS, now_nanos))
-
     new_actuators = actuators.as_builder()
     new_actuators.torque = apply_torque / self.params.STEER_MAX
     # torqueOutputCan reflects the steering authority value actually sent over CAN.
@@ -695,28 +691,6 @@ class CarController(CarControllerBase):
 
     self.frame += 1
     return new_actuators, can_sends
-
-  def update_atc(self, CC, CS, now_nanos):
-    if self.atc_blinker is None:
-      return []
-    replies = getattr(CS, 'atc_diagnostic_replies', ())
-    CS.atc_diagnostic_replies = []  # Consume each CAN batch once.
-    frames = self.atc_blinker.update(CC, CS.out, replies, now_nanos,
-                                   control_valid=getattr(CS, 'atc_control_valid', False),
-                                   test_request=getattr(CS, 'atc_test_request', 0))
-    CS.atc_signal_status = self.atc_blinker.status
-    CS.atc_test_result = self.atc_blinker.test_result
-    return frames
-
-  def stop_atc(self, CS, now_nanos):
-    # card calls this without applying stale steering/acceleration controls.
-    return self.update_atc(None, CS, now_nanos)
-
-  def shutdown_atc(self, CS, now_nanos):
-    # Best effort only: process death/power loss cannot guarantee ECU cleanup.
-    if self.atc_blinker is None or self.atc_blinker.tx_count == 0:
-      return []
-    return [(0x770, bytes((4, 0x2f, 0xbc, side, 0, 0, 0, 0)), 0) for side in (0x15, 0x16)]
 
 
   def create_button_messages(self, CC: structs.CarControl, CS: CarState, use_clu11: bool):

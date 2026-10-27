@@ -1099,7 +1099,6 @@ struct ModelDataV2 {
     modelTurnSpeed @17 :Float32;
     laneChangeAvailableLeft @18 :Bool;
     laneChangeAvailableRight @19 :Bool;
-    atcSignal @20 :Car.AtcSignalRequest;
 
     deprecated :group {
       brakeDisengageProb @2 :Float32;

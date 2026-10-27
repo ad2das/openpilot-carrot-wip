@@ -111,18 +111,18 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 
 ## 전체 설정 지도
 
-현재 `carrot-wip`의 `carrot_settings.json`에는 **190개 파라미터**가 있습니다. 운전자 감시 예외 설정 2개는 검색으로만 표시되며 이 지도와 공개 Wiki 목록에서 제외되고, 나머지는 아래 메뉴에 표시됩니다.
+현재 `carrot-wip`의 `carrot_settings.json`에는 **188개 파라미터**가 있습니다. 운전자 감시 예외 설정 2개는 검색으로만 표시되며 이 지도와 공개 Wiki 목록에서 제외되고, 나머지는 아래 메뉴에 표시됩니다.
 
 | 대분류 | 항목 수 | 중분류 |
 |---|---:|---|
-| 주행 제어 | 137 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
-| 차량·하드웨어 | 18 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
+| 주행 제어 | 123 | 시작·오토, 버튼·프리셋, 차량 조향, 속도·감속, 크루즈·차간 |
+| 차량·하드웨어 | 17 | 현대·기아, CANFD·HDA, 레이더, 운전자 모니터링, 차량 보조, 기기 하드웨어 |
 | 화면 표시 | 34 | 정보 표시, 경로 표시, 밝기·주행화면, 외부 HUD |
-| 시스템 | 9 | 녹화·전원, 카메라, 네트워크·지도, 사운드, 소프트웨어 |
+| 시스템 | 12 | 녹화·전원, 네트워크·지도, 사운드, 소프트웨어 |
 
 ## 주행 제어
 
-주행 제어는 차량 움직임에 영향을 줄 수 있는 137개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
+주행 제어는 차량 움직임에 영향을 줄 수 있는 123개 항목입니다. 한 번에 여러 값을 변경하지 마세요.
 
 <a id="start-auto"></a>
 ### 시작·오토 — 9개
@@ -154,14 +154,14 @@ Carrot Web 설정 화면에서는 다음 기능을 사용할 수 있습니다.
 폭스바겐의 별도 `SET`은 현재 속도 설정, `RES`는 이전 설정속도 복원에 사용하고, `+`·`-`는 버튼 모드·속도 단위·길게 누르기 설정을 따릅니다. 오픈파일럿 종방향 제어의 수동 인게이지 버튼은 기존 물리 `SET`·`RES`로 유지됩니다.
 
 <a id="vehicle-steering"></a>
-### 차량 조향 — 상위 38개 + ONNX 상세 5개
+### 차량 조향 — 상위 37개 + ONNX 상세 5개
 
 | 세부 구역 | 파라미터 | 용도 |
 |---|---|---|
 | ONNX 차선·BSD | `ShareData`, `OnnxLaneThreshold`, `OnnxLaneIntervalMs`, `OnnxBsdThreshold`, `OnnxBsdSmoothingMs`, `OnnxBsdIntervalMs` | 장치의 차선 종류, 카메라 BSD 감지 출처 표시와 세부 조정 |
 | 중앙 보정 | `PathOffset`, `CameraYawTrimDeg` | 레인모드 경로의 좌우 위치와 카메라 YAW 미세 보정 |
 | 조향감 | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | 조향 시점, 평활화, 일시중지 각도와 조향비 |
-| [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnSignal`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건, ATC 동작과 실험적 방향지시등 |
+| [차로 변경](lane-change.md)·자동 턴 | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | 차로 변경 진입 조건과 ATC 동작 |
 | 레인모드 | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset`, `LaneCenterBlend`, `LaneRecenterAssist` | 레인모드 MPC 가중치와 차선 사용 조건 |
 | 고급 토크·토크 계수 | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | 커스텀 토크 제어 계수 |
 | 고급 토크·조향 제한 | `CustomSteerMax`, `CustomSteerDeltaUp`, `CustomSteerDeltaDown`, `CustomSteerDeltaUpLC`, `CustomSteerDeltaDownLC` | 최대 조향 토크와 토크 변화율 제한 |
@@ -379,7 +379,7 @@ Carrot Vision에는 `carrot_settings.json` 카탈로그와 별도로 **AR 표시
 <a id="system"></a>
 ## 시스템
 
-시스템에는 녹화, 전원, 카메라, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 9개 항목이 있습니다.
+시스템에는 녹화, 전원, 네트워크, 지도, 소리와 소프트웨어 메뉴를 다루는 12개 항목이 있습니다.
 
 | 중분류 | 파라미터 | 용도 |
 |---|---|---|

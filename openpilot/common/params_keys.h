@@ -233,9 +233,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoCurveSpeedFactor", {PERSISTENT, INT, "120"}},
 
     {"AutoTurnControl", {PERSISTENT, INT, "0"}},
-    {"AutoTurnSignal", {PERSISTENT, BOOL, "0"}},
-    {"AtcSignalTestRequest", {CLEAR_ON_MANAGER_START, INT}},
-    {"AtcSignalTestResult", {CLEAR_ON_MANAGER_START, STRING}},
     {"AutoTurnControlSpeedTurn", {PERSISTENT, INT, "20"}},
     {"AutoTurnControlTurnEnd", {PERSISTENT, INT, "6"}},
     {"AutoTurnMapChange", {PERSISTENT, INT, "0"}},

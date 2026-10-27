@@ -496,7 +496,6 @@ function renderDeviceGroupItems(groupId, values) {
     html += renderDeviceActionRow(getUIText("driver_camera", "Driver Camera"), getUIText("driver_camera_desc", "Preview the driver facing camera to ensure that driver monitoring has good visibility. (vehicle must be off)"), getUIText("preview", "PREVIEW"), "btnDeviceDriverCamera", "smallBtn", true);
     html += renderDeviceActionRow(getUIText("review_training_guide", "Review Training Guide"), getUIText("review_training_desc", "Review the rules, features, and limitations of openpilot"), getUIText("review", "Review"), "btnDeviceTraining");
     html += renderDeviceActionRow(getUIText("calibration_status", "Calibration Status"), "", getUIText("show_upper", "SHOW"), "btnDeviceCalibrationStatus");
-    html += renderDeviceActionRow(getUIText("atc_test_title", "ATC turn signal test"), getUIText("atc_test_desc", "Check while stopped whether the ICU accepts the turn signal command (Palisade, experimental)"), getUIText("atc_test_run", "Run"), "btnDeviceAtcSignalTest");
     if (getDeviceTypeValue(data) === "tici") {
       html += renderDeviceActionRow(getUIText("regulatory", "Regulatory"), "", getUIText("view_upper", "VIEW"), "btnDeviceRegulatory");
     }

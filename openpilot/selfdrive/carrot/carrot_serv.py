@@ -21,8 +21,6 @@ from openpilot.common.constants import CV
 from openpilot.common.gps import get_gps_location_service
 from openpilot.selfdrive.carrot.carrot_navi_control import CarrotNaviControl, parse_carrot_navi_control
 from openpilot.selfdrive.carrot.tlv.tlvd import LEFT_INTENT_ATCTYPES
-from openpilot.selfdrive.controls.lib.atc_signal import EpisodeProducer
-from openpilot.selfdrive.controls.lib.atc_signal_integration import navigation_candidate, NavigationSourceTracker
 
 try:
   from openpilot.common.swaglog import cloudlog
@@ -196,9 +194,6 @@ class CarrotServ:
   def __init__(self):
     self.params = Params()
     self.params_memory = Params("/dev/shm/params")
-    self.atc_signal_episodes = EpisodeProducer(max_age_seconds=2.0)
-    self.atc_signal_source = NavigationSourceTracker()
-    self.atc_legacy_source_ns = 0
 
     self.nRoadLimitSpeed = 30
     self.nRoadLimitSpeed_last = 30
@@ -1841,8 +1836,7 @@ class CarrotServ:
       self.nTBTTurnType = self.nTBTTurnTypeNext = -1
       self.roadcate = 8
       self.nGoPosDist = 0
-    atc_uses_nav_instruction = self.active_carrot <= 1 or self.active_kisa_count > 0
-    if atc_uses_nav_instruction:
+    if self.active_carrot <= 1 or self.active_kisa_count > 0:
       self.update_nav_instruction(sm)
 
     rear_camera_speed, rear_camera_remaining = self._rear_camera_speed(CS, delta_dist)
@@ -2007,14 +2001,6 @@ class CarrotServ:
     msg.carrotMan.xDistToTurnNext = int(self.xDistToTurnNext)
     msg.carrotMan.xTurnCountDown = int(left_tbt_sec)
     msg.carrotMan.atcType = self.atcType
-    # Preserve the navigation item's receive time. Repeated publication, GPS,
-    # speed-camera or remote-control packets cannot refresh stale turn intent.
-    atc_source_changed = self.atc_signal_source.changed(sm, uses_nav_instruction=atc_uses_nav_instruction,
-      carrot_navi_active=carrot_navi_active, remote_id=remote_ip)
-    msg.carrotMan.atcSignal = navigation_candidate(self.atc_signal_episodes, sm, time.monotonic_ns(),
-      atc_type=self.atcType, uses_nav_instruction=atc_uses_nav_instruction,
-      carrot_navi_active=carrot_navi_active, legacy_source_ns=self.atc_legacy_source_ns,
-      source_changed=navigation_source_changed or atc_source_changed)
     msg.carrotMan.vTurnSpeed = int(vturn_speed)
     msg.carrotMan.szPosRoadName = f"{self.szPosRoadName} {self.debugText}".strip()
     msg.carrotMan.szTBTMainText = self.szTBTMainText
@@ -2235,7 +2221,6 @@ class CarrotServ:
       ## GuidePoint
       self.nTBTDist = int(json.get("nTBTDist", 0))
       self.nTBTTurnType = int(json.get("nTBTTurnType", -1))
-      self.atc_legacy_source_ns = time.monotonic_ns() if 'nTBTTurnType' in json else 0
       self.szTBTMainText = _s(json.get("szTBTMainText"))
       self.szNearDirName = _s(json.get("szNearDirName"))
       self.szFarDirName = _s(json.get("szFarDirName"))

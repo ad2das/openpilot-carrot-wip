@@ -2,7 +2,6 @@
 
 #include "safety_declarations.h"
 #include "safety_hyundai_common.h"
-#include "safety_hyundai_atc.h"
 
 #define HYUNDAI_LIMITS(steer, rate_up, rate_down) { \
   .max_steer = (steer), \
@@ -42,7 +41,6 @@ static const CanMsg HYUNDAI_TX_MSGS[] = {
   {1265, 2, 4},               // CLU11, Bus 0, 2
   {0x7D0, 0, 8}, // radar UDS TX addr Bus 0 (for radar disable)   // 2000
   {0x7b1, 0, 8},
-  {0x770, 0, 8}, // opt-in exact classic ICU commands; gated by hyundai_atc_tx
 };
 
 #define HYUNDAI_COMMON_RX_CHECKS(legacy)                                                                                                                  \
@@ -195,7 +193,6 @@ static void hyundai_rx_hook(const CANPacket_t *to_push) {
     }
     generic_rx_checks(stock_ecu_detected);
   }
-  hyundai_atc_rx(to_push);
 }
 
 uint32_t last_ts_lkas11_from_op = 0;
@@ -207,9 +204,6 @@ uint32_t last_ts_fca12_from_op = 0;
 uint32_t last_ts_lfahda_mfc_from_op = 0;
 
 static bool hyundai_tx_hook(const CANPacket_t *to_send) {
-  if (GET_ADDR(to_send) == 0x770) {
-    return hyundai_atc_tx(to_send);
-  }
   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS = HYUNDAI_LIMITS(512, 10, 10);
   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT = HYUNDAI_LIMITS(512, 10, 10);
   const TorqueSteeringLimits HYUNDAI_STEERING_LIMITS_ALT_2 = HYUNDAI_LIMITS(170, 2, 3);
@@ -384,7 +378,6 @@ static safety_config hyundai_init_carrot(bool legacy_car) {
       {0x38D, 0, 8}, // FCA11 Bus 0
       {0x483, 0, 8}, // FCA12 Bus 0
       {0x7D0, 0, 8}, // radar UDS TX addr Bus 0 (for radar disable)
-      {0x770, 0, 8}, // opt-in exact classic ICU commands
     };
 
     static const CanMsg HYUNDAI_CAMERA_SCC_TX_MSGS[] = {
@@ -400,7 +393,6 @@ static safety_config hyundai_init_carrot(bool legacy_car) {
       {1155, 0, 8},                             // FCA12 Bus 0
       {1186, 0, 8},                             // FRT_RADAR11, Bus 0
       {0x4F1, 0, 4}, // CLU11 Bus 0
-      {0x770, 0, 8}, // opt-in exact classic ICU commands
     };
 
     safety_config ret;
@@ -473,7 +465,6 @@ static safety_config hyundai_init(uint16_t param) {
 
   hyundai_common_init(param);
   hyundai_legacy = false;
-  hyundai_atc_init(GET_FLAG(param, HYUNDAI_PARAM_CLASSIC_ATC) && !hyundai_canfd_hda2);
   return hyundai_init_carrot(hyundai_legacy);
 
   safety_config ret;
@@ -512,7 +503,6 @@ static safety_config hyundai_legacy_init(uint16_t param) {
 
   hyundai_common_init(param);
   hyundai_legacy = true;
-  hyundai_atc_init(false);
 
   return hyundai_init_carrot(hyundai_legacy);
 

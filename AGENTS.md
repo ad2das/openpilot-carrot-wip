@@ -1,16 +1,5 @@
 # Repository memory
 
-- On 2026-10-26, the user requested classic Palisade ATC turn signals. The
-  user authorized publishing them on 2026-10-27 after a port onto this fork
-  branch. AutoTurnSignal defaults off and is scoped to the exact Palisade
-  fingerprint, classic nonlegacy Hyundai and one matching Panda safety config.
-  Preserve other vehicles, ADAS output and manual one-touch behavior. This is a
-  0x770/0x778 ICU implementation, not the deleted CAN-FD parked experiment.
-  Static protocol evidence, simulations and compiled safety tests do not prove
-  lamp operation, switch independence or cleanup after a host/power failure;
-  the web stationary test (Device -> ATC turn signal test) is the first vehicle
-  check. See docs/atc_signal_integration.md and keep this distinction in
-  completion reports.
 - On 2026-10-12, the user requested a butter-smooth final stop that never
   releases or creeps into a lead. Params ButterStop (int, default 1, Carrot
   Web incl. labels) plus lib/butter_stop.py: below 3 m/s the braking ceiling

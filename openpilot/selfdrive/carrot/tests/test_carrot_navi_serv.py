@@ -1,4 +1,3 @@
-from collections import defaultdict
 import pytest
 
 from types import SimpleNamespace
@@ -404,10 +403,6 @@ def test_curve_selection_ignores_retired_model_speed(monkeypatch, mode, expected
 
   class SubMaster(dict):
     alive = {'carState': False, 'selfdriveState': False, 'navInstruction': False}
-    seen = defaultdict(bool)
-    valid = defaultdict(bool)
-    logMonoTime = defaultdict(int)
-    recv_time = defaultdict(float)
 
   sm = SubMaster(modelV2=SimpleNamespace(meta=SimpleNamespace(modelTurnSpeed=16.)))
   sent = {}

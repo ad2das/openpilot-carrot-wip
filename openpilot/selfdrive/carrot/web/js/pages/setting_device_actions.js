@@ -21,11 +21,6 @@ function bindDeviceTabEvents(container) {
     });
   }
 
-  const atcSignalTestButton = container.querySelector("#btnDeviceAtcSignalTest");
-  if (atcSignalTestButton) {
-    atcSignalTestButton.addEventListener("click", () => runAtcSignalTest(atcSignalTestButton));
-  }
-
   const calibrationStatusButton = container.querySelector("#btnDeviceCalibrationStatus");
   if (calibrationStatusButton) {
     calibrationStatusButton.addEventListener("click", () => openCalibrationStatusModal());
@@ -387,73 +382,4 @@ function openTrainingGuide() {
 
   render();
   document.body.appendChild(overlay);
-}
-
-const ATC_SIGNAL_TEST_POLL_MS = 500;
-const ATC_SIGNAL_TEST_WAIT_MS = 15000;
-
-function atcSignalTestReason(code) {
-  return getUIText(`atc_test_reason_${code}`, code || "");
-}
-
-function renderAtcSignalTestHtml(result) {
-  const verdict = getUIText(`atc_test_verdict_${result.verdict}`, result.verdict || "");
-  const lines = [];
-  if (result.cancel) lines.push(`${getUIText("atc_test_cancel", "Canceled")}: ${atcSignalTestReason(result.cancel)}`);
-  if (result.fault) lines.push(`${getUIText("atc_test_fault", "Fault")}: ${result.fault}`);
-  lines.push(getUIText("atc_test_detail", "ICU replies {positive} (rejected {negative}), ON commands {pulses}", {
-    positive: result.icuPositive ?? 0, negative: result.icuNegative ?? 0, pulses: result.pulses ?? 0,
-  }));
-  if (result.pulses) {
-    lines.push(getUIText("atc_test_first_on", "First 0.9 s ON: lamp on {ratio}%, flashes {rises}", {
-      ratio: Math.round(Number(result.firstOnLampRatio || 0) * 100), rises: result.firstOnLampRises ?? 0,
-    }));
-    lines.push(Number(result.lampAfter) > 0
-      ? getUIText("atc_test_lamp_after_on", "Warning: lamp still on 1 s after release")
-      : getUIText("atc_test_lamp_after_off", "Lamp off after release"));
-  }
-  return `<div><b>${escapeHtml(verdict)}</b></div>` + lines.map((line) => `<div>${escapeHtml(line)}</div>`).join("");
-}
-
-async function runAtcSignalTest(button) {
-  const ok = await appConfirm(getUIText("atc_test_confirm", "Engage cruise and stop in D. The left turn signal turns on for about 3 s. Do not touch the lever, hazards or wheel."), {
-    title: getUIText("atc_test_title", "ATC turn signal test"),
-    confirmLabel: getUIText("atc_test_run", "Run"),
-    cancelLabel: getUIText("cancel", "Cancel"),
-  });
-  if (!ok) return;
-  const originalText = button.textContent;
-  button.disabled = true;
-  button.textContent = getUIText("loading", "Loading...");
-  try {
-    let start;
-    try {
-      start = await postJson("/api/atc_signal_test", {});
-    } catch (err) {
-      if (err.payload?.error === "disabled") throw new Error(getUIText("atc_test_disabled", "Turn on Experimental ATC Turn Signals and restart first."));
-      throw err;
-    }
-    const deadline = Date.now() + ATC_SIGNAL_TEST_WAIT_MS;
-    let result = null;
-    while (Date.now() < deadline) {
-      await waitMs(ATC_SIGNAL_TEST_POLL_MS);
-      const payload = await getJson("/api/atc_signal_test");
-      if (payload.result && payload.result.request === start.request) {
-        result = payload.result;
-        break;
-      }
-    }
-    if (!result) throw new Error(getUIText("atc_test_no_answer", "No answer from the car. The car may be unsupported, or a restart is needed after changing the setting."));
-    await appAlert("", {
-      title: getUIText("atc_test_title", "ATC turn signal test"),
-      html: true,
-      messageHtml: renderAtcSignalTestHtml(result),
-      confirmLabel: getUIText("close", "Close"),
-    });
-  } catch (err) {
-    showAppToast(err.message || getUIText("failed", "Failed"), { tone: "error" });
-  } finally {
-    button.disabled = false;
-    button.textContent = originalText;
-  }
 }

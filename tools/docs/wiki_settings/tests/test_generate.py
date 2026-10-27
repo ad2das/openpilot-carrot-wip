@@ -97,7 +97,7 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
       catalog_commit=COMMIT,
       generated_at=STAMP,
     )
-    self.assertEqual(len(result.generated_settings), 188)
+    self.assertEqual(len(result.generated_settings), 186)
     self.assertNotIn("SteerHandoverMode", result.index["settings"])
     self.assertIn("CruiseCoastingPercent", result.index["settings"])
     self.assertIn("RadarTrackFlip", result.index["settings"])
@@ -108,15 +108,15 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
     for retired in ("ClusterHudPriority", "ClusterHudCoreMode", "ClusterHudLiveFps", "CanfdStopRetry", "DisableDM",
                     "CarrotYouTubeLive", "CarrotYouTubeQuality", "CarrotYouTubeTimestamp"):
       self.assertNotIn(retired, result.index["settings"])
-    self.assertEqual(result.index["review"], {"current": 1, "needs_review": 187})
+    self.assertEqual(result.index["review"], {"current": 0, "needs_review": 186})
     self.assertEqual(result.index["locales"], ["ko", "en", "zh"])
-    self.assertEqual(len(result.pages), (188 * 3) + 2)
+    self.assertEqual(len(result.pages), (186 * 3) + 2)
     setting_pages = {
       name: text
       for name, text in result.pages.items()
       if GENERATOR.GENERATED_PAGE_RE.fullmatch(name)
     }
-    self.assertEqual(len(setting_pages), 188 * 3)
+    self.assertEqual(len(setting_pages), 186 * 3)
     self.assertTrue(all(text.count("<!-- CARROT:SETTING:BEGIN ") == 1 for text in setting_pages.values()))
     for name, text in result.pages.items():
       if name.endswith(".md"):
@@ -145,60 +145,6 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
       catalog_page,
     )
     self.assertIn("### 주행 제어\n\n#### 시작·오토\n\n##### 시작 동작", catalog_page)
-
-  def test_missing_atc_manual_is_seeded_in_all_locales_without_hiding_added_setting(self):
-    result = GENERATOR.generate(catalog_commit=COMMIT, generated_at=STAMP)
-    seeds, warnings = GENERATOR.scan_existing_settings(GENERATOR.DEFAULT_SEEDS)
-    self.assertEqual(warnings, [])
-    self.assertIn("AutoTurnSignal", result.setting_changes["added"])
-    for locale in ("ko", "en", "zh"):
-      item = result.index["settings"]["AutoTurnSignal"]["locales"][locale]
-      manual = GENERATOR.MANUAL_BLOCK_RE.search(result.pages[item["page"]]).group(0)
-      self.assertEqual(manual, seeds[(locale, "AutoTurnSignal")].manual_block)
-      self.assertEqual(item["reviewStatus"], "current")
-
-  def test_existing_atc_manual_even_empty_takes_precedence_over_seed(self):
-    initial = GENERATOR.generate(catalog_commit=COMMIT, generated_at=STAMP, seed_dir=None)
-    name = initial.index["settings"]["AutoTurnSignal"]["locales"]["en"]["page"]
-    original = initial.pages[name]
-    empty = GENERATOR.MANUAL_BLOCK_RE.search(original).group(0)
-    authored = empty.replace("<!-- CARROT:MANUAL:END", "An existing author's exact text.  \n<!-- CARROT:MANUAL:END")
-    with tempfile.TemporaryDirectory() as temp:
-      wiki = Path(temp)
-      for manual in (empty, authored):
-        (wiki / name).write_text(original.replace(empty, manual), encoding="utf-8", newline="\n")
-        result = GENERATOR.generate(wiki_dir=wiki, catalog_commit=COMMIT, generated_at=STAMP)
-        actual = GENERATOR.MANUAL_BLOCK_RE.search(result.pages[name]).group(0)
-        self.assertEqual(actual, manual)
-        self.assertEqual(result.index["settings"]["AutoTurnSignal"]["locales"]["en"]["reviewStatus"], "needs_review")
-
-  def test_atc_seed_semantic_change_requires_review_without_rewriting_manual(self):
-    initial = GENERATOR.generate(catalog_commit=COMMIT, generated_at=STAMP)
-    payload = json.loads(GENERATOR.DEFAULT_CATALOG.read_text(encoding="utf-8"))
-    next(item for item in payload["params"] if item["name"] == "AutoTurnSignal")["default"] = 1
-    with tempfile.TemporaryDirectory() as temp:
-      path = write_catalog(Path(temp), payload)
-      changed = GENERATOR.generate(path, catalog_commit=COMMIT, generated_at=STAMP)
-    self.assertEqual(changed.index["settings"]["AutoTurnSignal"]["reviewStatus"], "needs_review")
-    for locale in ("ko", "en", "zh"):
-      name = initial.index["settings"]["AutoTurnSignal"]["locales"][locale]["page"]
-      before = GENERATOR.MANUAL_BLOCK_RE.search(initial.pages[name]).group(0)
-      after = GENERATOR.MANUAL_BLOCK_RE.search(changed.pages[name]).group(0)
-      self.assertEqual(before, after)
-
-  def test_legacy_language_agnostic_manual_takes_precedence_over_localized_seed(self):
-    initial = GENERATOR.generate(catalog_commit=COMMIT, generated_at=STAMP, seed_dir=None)
-    name = initial.index["settings"]["AutoTurnSignal"]["locales"]["en"]["page"]
-    block = GENERATOR.SETTING_BLOCK_RE.search(initial.pages[name]).group(0)
-    manual = GENERATOR.MANUAL_BLOCK_RE.search(block).group(0)
-    authored = manual.replace("<!-- CARROT:MANUAL:END", "Legacy authored explanation.\n<!-- CARROT:MANUAL:END")
-    with tempfile.TemporaryDirectory() as temp:
-      wiki = Path(temp)
-      (wiki / "Settings-ATC.md").write_text(block.replace(manual, authored), encoding="utf-8", newline="\n")
-      result = GENERATOR.generate(wiki_dir=wiki, catalog_commit=COMMIT, generated_at=STAMP)
-    for locale in ("ko", "en", "zh"):
-      name = result.index["settings"]["AutoTurnSignal"]["locales"][locale]["page"]
-      self.assertEqual(GENERATOR.MANUAL_BLOCK_RE.search(result.pages[name]).group(0), authored)
 
   def test_manual_region_is_byte_preserved_and_semantic_change_requires_review(self):
     with tempfile.TemporaryDirectory() as temp:
