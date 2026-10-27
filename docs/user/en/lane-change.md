@@ -48,6 +48,18 @@ Driver turn-signal input, hazards, opposite steering torque, disengagement, a co
 
 Each pulse activates only the requested side with `2F BC15/BC16 03`, then returns both sides to ECU control with `00`. Manual one-touch lamp holds retain the existing lane-change behavior; automatic lamp feedback is excluded from driver input. Receiving a diagnostic response does not prove the physical lamp operated.
 
+#### Stationary test
+
+Use **Device → ATC turn signal test** in the web settings to check the feature before a real turn. It runs only while stopped in D with cruise engaged and holding the car; pressing the brake disengages and cancels it. Lever, hazard or steering input, moving off, disengagement or a navigation turn request cancels it and returns both sides.
+
+The test turns the left side on once for 0.9 s, then pulses as usual until about 3 s. It then returns both sides and watches the lamp for 1 s. The result shows:
+
+- whether the ICU replied, that is whether commands reach the ICU;
+- whether the CAN lamp signal stayed on or flashed during the first 0.9 s;
+- whether the lamp went out after release.
+
+The CAN lamp signal does not guarantee the physical bulb state, so also watch the cluster and the outside lamp. A diagnostic fault locks the feature until restart, as it does while driving.
+
 ### `LaneChangeNeedTorque` — entry confirmation
 
 | Value | Behavior |

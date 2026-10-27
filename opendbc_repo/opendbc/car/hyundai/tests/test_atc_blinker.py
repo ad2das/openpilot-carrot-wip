@@ -344,3 +344,186 @@ def test_pulses_alone_keep_session_alive_through_long_signal():
   assert session_open and max(gaps) < 1_000_000_000
   assert rig.sender.planner is not None and rig.sender.planner.status.fault is None
   assert any(is_on(f) for t, f in rig.history if t > rig.now - 2_000_000_000)
+
+
+class CheckRig(Rig):
+  """Engaged, stopped in D; lamp(rig) models the CGW1 left lamp."""
+  def __init__(self, lamp=lambda rig: 0):
+    super().__init__()
+    self.cs.vEgo = self.cs.vEgoRaw = 0.0
+    self.cs.standstill = True
+    self.lamp = lamp
+    self.request = 0
+
+  def step(self, *, dt=10_000_000, respond=True, switches=(0, 0, 0), **_):
+    self.now += dt
+    lamp = self.lamp(self)
+    self.cs.turnSignalInput = dict(valid=True, sampleMonoTime=self.now, leftSwitch=switches[0],
+                                   rightSwitch=switches[1], hazardSwitch=switches[2], leftLamp=lamp)
+    self.cs.leftBlinker = bool(lamp)
+    self.cc.atcSignal = dict(sourceId=100, episode=self.episode, sourceMonoTime=self.now, direction=self.direction,
+                             phase=self.phase, valid=True, requestMonoTime=self.now)
+    incoming, self.replies = self.replies, []
+    out = self.sender.update(self.cc, self.cs, incoming, self.now, control_valid=True, test_request=self.request)
+    self.history.extend((self.now, f) for f in out)
+    if respond:
+      self.replies = [(*ack(f), self.now + 1) for f in out]
+    return out
+
+  def run(self, steps=700, **kwargs):
+    self.step()
+    self.request = self.now
+    for _ in range(steps):
+      self.step(**kwargs)
+      if self.sender.test_result is not None and self.sender.test is None:
+        break
+    return self.sender.test_result
+
+
+def steady_lamp(rig):
+  return int(rig.sender._on_since is not None)
+
+
+def flashing_lamp(rig):
+  since = rig.sender._on_since
+  return 0 if since is None else int((rig.now / 1e9 - since) // 0.33 % 2 == 0)
+
+
+def test_stationary_check_steady_lamp_long_first_on_then_pulses_and_release():
+  rig = CheckRig(steady_lamp)
+  result = rig.run()
+  assert result['verdict'] == 'steady', result
+  assert result['icuPositive'] >= 3 and result['icuNegative'] == 0 and not result['fault']
+  assert result['firstOnLampRatio'] >= 0.95 and result['firstOnLampRises'] == 0
+  assert result['lampAfter'] == 0 and result['pulses'] >= 3
+  on = [t for t, f in rig.history if is_on(f)]
+  assert all(f[1][3] == 0x15 for t, f in rig.history if is_on(f))  # left only
+  first_release = next(t for t, f in rig.history if t > on[0] and f[1][4] == 0)
+  assert 0.9e9 <= first_release - on[0] <= 0.91e9 < 1.0e9  # below planner max_active_s
+  assert on[-1] - rig.request < 3.0e9
+  last = rig.history[-1][1][1]
+  assert last[1] == 0x2f and last[4] == 0  # ends by returning control
+  assert {f[1][3] for t, f in rig.history if t > on[-1] and f[1][4] == 0} == {0x15, 0x16}
+  assert rig.sender.planner is None and rig.sender.test is None
+
+
+def test_stationary_check_detects_icu_self_flash():
+  result = CheckRig(flashing_lamp).run()
+  assert result['verdict'] == 'icu_flashes', result
+  assert result['firstOnLampRises'] >= 1 and result['firstOnLampRatio'] < 0.8
+
+
+def test_stationary_check_reports_lamp_left_on_after_release():
+  rig = CheckRig(lambda r: int(r.sender._on_since is not None or r.sender.test_result is None and r.request and r.now - r.request > 1e9))
+  result = rig.run()
+  assert result['lampAfter'] == 1
+
+
+def test_stationary_check_without_icu_reply_faults_and_never_turns_on():
+  rig = CheckRig()
+  result = rig.run(respond=False)
+  assert result['verdict'] == 'no_icu_response' and result['fault'] == 'ack_timeout', result
+  assert not any(is_on(f) for _, f in rig.history)
+
+
+@pytest.mark.parametrize('block', ['not_engaged', 'not_stopped', 'gear', 'driver_signal', 'steering', 'car_fault'])
+def test_stationary_check_refuses_unsafe_start_without_sending(block):
+  rig = CheckRig()
+  kwargs = {}
+  if block == 'not_engaged':
+    rig.cc.enabled = False
+  elif block == 'not_stopped':
+    rig.cs.standstill, rig.cs.vEgo = False, 2.0
+  elif block == 'gear':
+    rig.cs.gearShifter = 'park'
+  elif block == 'driver_signal':
+    kwargs['switches'] = (0, 1, 0)
+  elif block == 'steering':
+    rig.cs.steeringPressed = True
+  elif block == 'car_fault':
+    rig.cs.steerFaultTemporary = True
+  result = rig.run(steps=5, **kwargs)
+  assert result['verdict'] == 'canceled' and result['cancel'] == block, result
+  assert rig.history == []
+
+
+def test_navigation_signal_preempts_check_and_check_never_starts_over_it():
+  rig = CheckRig(steady_lamp)
+  rig.step()
+  rig.request = rig.now
+  while not any(is_on(f) for _, f in rig.history):
+    rig.step()
+  rig.direction, rig.phase, rig.episode = 2, 'turn', 1
+  cut = rig.now
+  for _ in range(300):
+    rig.step()
+  assert rig.sender.test_result['cancel'] == 'navigation_request'
+  after = [(t, f) for t, f in rig.history if t > cut]
+  left_on_after = [t for t, f in after if is_on(f) and f[1][3] == 0x15]
+  first_right = next(t for t, f in after if is_on(f) and f[1][3] == 0x16)
+  assert not left_on_after and {f[1][3] for t, f in after if t < first_right and f[1][1] == 0x2f and f[1][4] == 0} == {0x15, 0x16}
+  rig.request = rig.now  # navigation owns the ICU: a new check is refused unsent
+  sent = len(rig.history)
+  rig.step(respond=False)
+  assert rig.sender.test_result['cancel'] == 'busy' and rig.sender.test is None
+  assert all(f[1][3] == 0x16 or f[1][4] == 0 or f[1][1] == 0x10 for _, f in rig.history[sent:])
+
+
+def test_stale_or_repeated_request_never_runs():
+  rig = CheckRig()
+  rig.step()
+  rig.request = rig.now - 3_000_000_000
+  rig.step()
+  assert rig.sender.test_result['cancel'] == 'stale_request' and rig.history == []
+  first = rig.sender.test_result
+  for _ in range(50):
+    rig.step()
+  assert rig.sender.test_result is first and rig.history == []
+
+
+@pytest.mark.parametrize('stop', ['driver_signal', 'not_stopped', 'not_engaged'])
+def test_stationary_check_cancel_mid_test_releases_both_and_stops(stop):
+  rig = CheckRig(steady_lamp)
+  rig.step()
+  rig.request = rig.now
+  while not any(is_on(f) for _, f in rig.history):
+    rig.step()
+  kwargs = {}
+  if stop == 'driver_signal':
+    kwargs['switches'] = (1, 0, 0)
+  elif stop == 'not_stopped':
+    rig.cs.standstill, rig.cs.vEgo = False, 1.0
+  else:
+    rig.cc.enabled = False
+  cut = rig.now
+  for _ in range(300):
+    rig.step(**kwargs)
+  result = rig.sender.test_result
+  assert result['verdict'] == 'canceled' and result['cancel'] == stop, result
+  after = [f for t, f in rig.history if t > cut]
+  assert not any(is_on(f) for f in after)
+  assert {f[1][3] for f in after if f[1][4] == 0} == {0x15, 0x16}
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_stationary_check_trace_accepted_by_compiled_panda_hooks(cancel):
+  from opendbc.safety.tests.test_hyundai_atc_c import run_compiled_probe
+  rig, trace = CheckRig(steady_lamp), []
+  for i in range(500):
+    if i == 1:
+      rig.request = rig.now
+    if cancel and i == 60:  # during the first 0.9 s ON
+      rig.cc.enabled = False
+    frames = rig.step(respond=False)
+    stamp, controls = rig.now // 1000, int(rig.cc.enabled)
+    trace.append(f'{stamp} {controls} R 541 0 0 0000000000000000 1')
+    for frame in frames:
+      address, data, bus = frame
+      trace.append(f'{stamp} {controls} T {address:x} {bus} 0 {data.hex()} 1')
+      response = ack(frame)[1]
+      rig.replies.append((0x778, response, 0, rig.now + 1_000_000))
+      trace.append(f'{stamp + 1000} {controls} R 778 0 0 {response.hex()} 1')
+  assert sum(is_on(f) for _, f in rig.history) == (1 if cancel else 4)
+  assert rig.sender.test_result['verdict'] == ('canceled' if cancel else 'steady')
+  result = run_compiled_probe('\n'.join(trace))
+  assert f'HYUNDAI_ATC_REPLAY_EVENTS={len(trace)}' in result

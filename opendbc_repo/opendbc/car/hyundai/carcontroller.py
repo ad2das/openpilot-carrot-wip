@@ -702,8 +702,10 @@ class CarController(CarControllerBase):
     replies = getattr(CS, 'atc_diagnostic_replies', ())
     CS.atc_diagnostic_replies = []  # Consume each CAN batch once.
     frames = self.atc_blinker.update(CC, CS.out, replies, now_nanos,
-                                   control_valid=getattr(CS, 'atc_control_valid', False))
+                                   control_valid=getattr(CS, 'atc_control_valid', False),
+                                   test_request=getattr(CS, 'atc_test_request', 0))
     CS.atc_signal_status = self.atc_blinker.status
+    CS.atc_test_result = self.atc_blinker.test_result
     return frames
 
   def stop_atc(self, CS, now_nanos):
