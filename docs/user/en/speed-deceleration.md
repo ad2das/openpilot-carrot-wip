@@ -338,6 +338,10 @@ When TrafficLightDetectMode is 1 or more, the C3X camera traffic-light vision ru
 
 With `CarrotTlvShowBox` on, the driving screen draws a bracket and a state/distance chip on the traffic light the camera vision is currently following. Colours are red / amber / green; `빨간불?` marks a red not yet confirmed, and a white bracket means the light is being tracked before a colour is decided. The distance is an estimate from the box size. This is display only and does not affect control. Nothing is shown when TrafficLightDetectMode is 0.
 
+### Camera signal stop (experimental)
+
+With `CarrotTlvStopGo` on, a red confirmed by the camera traffic-light vision makes the car actually decelerate to a stop instead of only cutting acceleration. The stop point is the driving model's stop distance exactly; the lamp colour never creates a distance. The usable range is at least `max(5 m, v²/(2·comfort brake))` and at most 220 m, and the feature stays inactive with a lead, a turn signal, a large steering angle, or at 82 km/h and above. Departure follows TrafficLightDetectMode (2 = stop and go), so in mode 1 the driver has to pull away. False detections can brake; pressing the gas releases it immediately and it stays off for 10 s. It does nothing when TrafficLightDetectMode is 0.
+
 ## Quick troubleshooting
 
 | Symptom | Check first |

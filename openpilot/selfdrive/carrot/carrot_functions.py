@@ -132,6 +132,14 @@ TLV_HI_STOP_MODEL_S = 0.3            # model expression continuously true
 # for ~0.1-0.2 s inside one episode, which must not restart the 0.5 s clock.
 TLV_HI_STOP_RED_GAP_FRAMES = int(TLV_FAST_GATE_RESET_S / DT_MDL)
 
+# W-TSG1 (user 2026-11-03, experimental CarrotTlvStopGo): a confirmed TLV red commits the
+# existing e2eStop at the model's stop distance. Never derives a distance from the lamp.
+TLV_STOPGO_MIN_MPS = 0.3
+TLV_STOPGO_MAX_MPS = 82.0 / 3.6
+TLV_STOPGO_MIN_DIST_M = 5.0
+TLV_STOPGO_MAX_DIST_M = 220.0
+TLV_STOPGO_MAX_Y_M = 5.0
+
 class CarrotPlanner:
   def __init__(self, signal_assist=None, start_guard=None, stop_prepare=None):
     # Per-device opt-in only; no flag means the original controller path.
@@ -278,6 +286,9 @@ class CarrotPlanner:
     self.tlv_red_active = False
     self.coast_cap_active = False
     self.lead_follow_active = False
+    # W-TSG1: experimental camera signal stop (CarrotTlvStopGo).
+    self.tlvStopGo = 0
+    self.tlv_stop_committed = False
     self.lead_follow_arm_frames = 0
     self.lead_follow_d_stop = None
     self.lead_follow_d_prev = 0.0
@@ -334,6 +345,7 @@ class CarrotPlanner:
     if self.params_count == 10:
       self.myHighModeFactor = 1.2 #float(self.params.get_int("MyHighModeFactor")) / 100.
       self.trafficLightDetectMode = self.params.get_int("TrafficLightDetectMode") # 0: None, 1:Stop, 2:Stop&Go
+      self.tlvStopGo = self.params.get_int("CarrotTlvStopGo")
     elif self.params_count == 20:
       self.tFollowGap1 = self.params.get_float("TFollowGap1") / 100.
       self.tFollowGap2 = self.params.get_float("TFollowGap2") / 100.
@@ -633,6 +645,7 @@ class CarrotPlanner:
       self.coast_cap_active
       or self.tlv_standstill_hold_frames > 0
       or (self.carrot_stay_stop and self.trafficState_carrot_src == 1)
+      or getattr(self, 'tlv_stop_committed', False)
     )
     if carstate.gasPressed and (effect_active or self.tlv_gas_cooldown_frames > 0):
       self.tlv_gas_cooldown_frames = TLV_GAS_COOLDOWN_FRAMES
@@ -952,6 +965,25 @@ class CarrotPlanner:
     except Exception:
       return False
 
+  def _read_tlv_confirmed_red(self, sm) -> bool:
+    """W-TSG1: carrotMan carries a CONFIRMED (state 1) TLV red right now.
+
+    Same freshness/TLV-source gate as _read_tlv_red_active; only the graded
+    state 4 (redLikely) is excluded, because that grade may not commit a stop
+    the driver did not ask for.
+    """
+    try:
+      service = 'carrotMan'
+      if not (sm.seen[service] and sm.alive[service] and sm.valid[service]):
+        return False
+      if time.monotonic() - sm.recv_time[service] > CARROT_MAN_TIMEOUT:
+        return False
+      carrot_man = sm[service]
+      return (int(getattr(carrot_man, 'trafficStateSrc', 0)) == 1
+              and int(getattr(carrot_man, 'trafficState', 0)) == 1)
+    except Exception:
+      return False
+
   def _apply_fast_gate(self, raw_red: bool, sm, v_ego: float) -> bool:
     """W139c fast-road phantom gate: G-det OR G-model, only at >= 22.2 m/s.
 
@@ -1050,6 +1082,57 @@ class CarrotPlanner:
       self.tlv_coast_moving_frames = 0
       self.tlv_coast_stop_sign_seen = False
     self.coast_cap_active = cap and not self.tlv_coast_released and not self.lead_follow_active
+
+  def _log_tlv_stop_go(self, action: str, reason: str, v_ego: float, stop_x: float) -> None:
+    try:
+      cloudlog.event('tlvStopGo', action=action, reason=reason, v_ego=float(v_ego),
+                     stop_x=float(stop_x), x_state=str(self.xState),
+                     mode=int(self.trafficLightDetectMode))
+    except Exception:
+      pass
+
+  def _update_tlv_stop_go(self, sm, carstate, v_ego, lead, y_end, stop_x, comfort_brake) -> None:
+    """W-TSG1 (experimental CarrotTlvStopGo): a confirmed TLV red commits the
+    existing e2eStop path. The distance is always the model's (stop_model_x_rl),
+    never derived from the lamp colour; the commit only gates plausibility.
+
+    Once committed, trafficState is held at red so the e2eStop/e2eStopped
+    branches keep braking; departure is left entirely to the existing start
+    logic (TLV green in mode 2, driver in mode 1). Any exit edge releases."""
+    if getattr(self, 'tlvStopGo', 0) != 1 and not getattr(self, 'tlv_stop_committed', False):
+      return  # toggle off: touch nothing (byte-identical behaviour)
+    enabled = (getattr(self, 'tlvStopGo', 0) == 1 and self.trafficLightDetectMode >= 1
+               and self.myDrivingMode != DrivingMode.High)
+    reason = None
+    if not enabled:
+      reason = 'disabled'
+    elif not self.tlv_red_active:
+      reason = 'red_end'
+    elif carstate.gasPressed or self.tlv_gas_cooldown_frames > 0:
+      reason = 'gas'
+    elif lead or self.lead_follow_active:
+      reason = 'lead'
+    if reason is not None:
+      if self.tlv_stop_committed:
+        self.tlv_stop_committed = False
+        if (self.xState == XState.e2eStop and v_ego > TLV_STOPGO_MIN_MPS
+            and not self.last_model_stop_sign):
+          self.xState = XState.e2eCruise
+        self._log_tlv_stop_go('release', reason, v_ego, stop_x)
+      return
+    if not self.tlv_stop_committed:
+      min_dist = max(TLV_STOPGO_MIN_DIST_M, v_ego * v_ego / (2.0 * comfort_brake)) if comfort_brake > 0 else float('inf')
+      if (self._read_tlv_confirmed_red(sm)
+          and TLV_STOPGO_MIN_MPS < v_ego < TLV_STOPGO_MAX_MPS
+          and not (carstate.leftBlinker or carstate.rightBlinker)
+          and is_traffic_stop_entry_allowed(carstate.steeringAngleDeg)
+          and self.traffic_starting_count == 0
+          and abs(y_end) < TLV_STOPGO_MAX_Y_M
+          and min_dist <= stop_x <= TLV_STOPGO_MAX_DIST_M):
+        self.tlv_stop_committed = True
+        self._log_tlv_stop_go('commit', 'confirmed_red', v_ego, stop_x)
+    if self.tlv_stop_committed:
+      self.trafficState = TrafficState.red
 
   def _update_lead_follow(self, lead, v_ego: float) -> None:
     """WLF2: latch a stopped lead's departure; see the LEAD_FOLLOW_* constants."""
@@ -1251,6 +1334,7 @@ class CarrotPlanner:
     else:
       self._apply_fast_gate(False, sm, v_ego)
     self._update_coast_cap(v_ego)
+    self._update_tlv_stop_go(sm, carstate, v_ego, bool(lead_detected), float(y[-1]), float(stop_model_x_rl), float(mode_comfort_brake))
 
     start_hold = False
     if self.start_guard is not None:

@@ -395,6 +395,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CarrotTlvDisabled", {CLEAR_ON_MANAGER_START, BOOL}},  // tlvd crash-loop / rss_hard latch; cleared every manager start
     {"CarrotTlvRecentStarts", {CLEAR_ON_MANAGER_START, STRING}},  // tlvd crash-loop guard (monotonic start times)
     {"CarrotTlvShowBox", {PERSISTENT, INT, "1"}},  // W136 onroad box on the light tlvd is following (UI only)
+    {"CarrotTlvStopGo", {PERSISTENT, INT, "0"}},  // experimental: confirmed TLV red brakes to a stop (default off)
     {"MuteDoor", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "0"}},
 
