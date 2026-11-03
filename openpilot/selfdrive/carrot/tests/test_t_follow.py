@@ -371,7 +371,8 @@ def test_live_auto_selection_releases_accelerating_lead_and_preserves_manual_ove
 
 def test_stored_mode_change_still_disables_automatic_selection():
   from types import SimpleNamespace as NS
-  values = {'MyDrivingMode': DrivingMode.Eco.value, 'MyDrivingModeAuto': 1, 'TrafficLightDetectMode': 1}
+  values = {'MyDrivingMode': DrivingMode.Eco.value, 'MyDrivingModeAuto': 1, 'TrafficLightDetectMode': 1,
+            'CarrotTlvStopGo': 0}
   planner = CarrotPlanner.__new__(CarrotPlanner)
   planner.params = NS(get_int=values.__getitem__)
   planner.frame = planner.params_count = 9
