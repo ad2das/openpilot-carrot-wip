@@ -1338,6 +1338,7 @@ window.CarrotTranslations.register("en", {
     upload_summary_label: "Upload summary",
     upload_scope_default: "Default: qcamera + rlog",
     upload_scope_all: "All files in selected folders",
+    upload_scope_mine: "All files to my PC (log sync server)",
     upload_scope_help: "Choose which files to send. All files includes ecamera, fcamera and other files in the selected folders, and may take longer.",
     upload_other_count: "Other {count}",
     upload_total_count: "{count} files total",

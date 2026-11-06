@@ -60,8 +60,8 @@ def test_dashcam_upload_endpoints_preserve_scope(monkeypatch, tmp_path, include_
   assert [item["name"] for item in summary["files"]] == expected
   assert summary["totalSize"] == len(expected) * 4
 
-  async def fake_run(segments, *, include_all_files=False):
-    return {"segments": segments, "includeAllFiles": include_all_files}
+  async def fake_run(segments, *, include_all_files=False, target="web"):
+    return {"segments": segments, "includeAllFiles": include_all_files, "target": target}
 
   monkeypatch.setattr(upload_jobs, "run_upload_segments", fake_run)
   response = asyncio.run(routes.api_dashcam_upload(Request()))
@@ -800,3 +800,138 @@ def test_dashcam_web_upload_honors_cancellation_before_network(tmp_path: Path, m
       lambda: True,
     ))
   assert FakeSession.instances == []
+
+
+def _upload_request(body):
+  class Request:
+    async def json(self):
+      return body
+
+  return Request()
+
+
+@pytest.mark.parametrize("target, include_all_files", [("mine", False), ("mine", True), ("web", False)])
+def test_dashcam_upload_options_force_all_files_for_mine(monkeypatch, target, include_all_files):
+  monkeypatch.setattr(routes, "segment_is_complete", lambda segment: True)
+  body = {"segments": ["route--0"], "target": target, "includeAllFiles": include_all_files}
+  assert asyncio.run(routes.request_upload_options(_upload_request(body))) == (
+    ["route--0"],
+    include_all_files or target == "mine",
+    target,
+  )
+
+
+def test_dashcam_upload_options_reject_unknown_target(monkeypatch):
+  monkeypatch.setattr(routes, "segment_is_complete", lambda segment: True)
+  with pytest.raises(web.HTTPBadRequest) as exc_info:
+    asyncio.run(routes.request_upload_options(_upload_request({"segments": ["route--0"], "target": "nas"})))
+  assert exc_info.value.text == "target must be 'web' or 'mine'"
+
+
+def test_dashcam_upload_options_default_to_web(monkeypatch):
+  monkeypatch.setattr(routes, "segment_is_complete", lambda segment: True)
+  assert asyncio.run(routes.request_upload_options(_upload_request({"segments": ["route--0"]}))) == (
+    ["route--0"],
+    False,
+    "web",
+  )
+
+
+def test_dashcam_upload_target_mine_uses_log_sync_url(monkeypatch):
+  monkeypatch.setattr(upload_jobs, "read_web_settings", lambda: {
+    "log_sync_url": "https://mine.example",
+    "web_upload_url": "https://web.example",
+  })
+  assert upload_jobs.upload_target("mine") == ("https://mine.example", "")
+
+
+def test_dashcam_upload_target_mine_refuses_shared_server(monkeypatch):
+  monkeypatch.setattr(upload_jobs, "read_web_settings", lambda: {
+    "log_sync_url": web_upload.DEFAULT_WEB_UPLOAD_URL,
+    "web_upload_url": "https://web.example",
+  })
+  with pytest.raises(ValueError, match="shared upload server"):
+    upload_jobs.upload_target("mine")
+
+
+def test_dashcam_upload_target_web_matches_upload_settings(monkeypatch):
+  clear_upload_env(monkeypatch)
+  settings = {"log_sync_url": "https://mine.example", "web_upload_url": "https://web.example"}
+  monkeypatch.setattr(upload_jobs, "read_web_settings", lambda: dict(settings))
+  monkeypatch.setattr(upload, "read_web_settings", lambda: dict(settings))
+  assert upload_jobs.upload_target("web") == upload.upload_target_settings() == ("https://web.example", "")
+
+
+def _stub_upload_network(monkeypatch, tmp_path, notifications, uploads):
+  async def fake_upload_folder(segment_path, device_id, segment, base_url, token, should_cancel, filenames=None, on_progress=None):
+    uploads.append((base_url, token, segment, list(filenames or [])))
+    return True
+
+  async def fake_web_complete(base_url, token, payload):
+    notifications.append(("web", base_url, token))
+    return {"ok": True, "status": 200}
+
+  async def fake_discord(webhook_url, payload):
+    notifications.append(("discord", webhook_url, payload.get("target")))
+    return {"configured": True, "ok": True, "status": 204}
+
+  async def fake_session(base_url, meta, purpose):
+    return "session-token"
+
+  monkeypatch.setattr(upload_jobs, "HAS_PARAMS", False)
+  monkeypatch.setattr(upload_jobs, "segment_dir", lambda segment: str(tmp_path))
+  monkeypatch.setattr(upload_jobs, "segment_file_summary", lambda path, include_all: [
+    {"name": "qcamera.ts", "size": 12},
+  ])
+  monkeypatch.setattr(upload_jobs, "upload_folder_to_web", fake_upload_folder)
+  monkeypatch.setattr(upload_jobs, "send_web_upload_complete", fake_web_complete)
+  monkeypatch.setattr(upload_jobs, "create_web_upload_session", fake_session)
+  monkeypatch.setattr(upload, "upload_metadata", lambda params: {"carName": "TEST_CAR", "dongleId": "0123456789abcdef"})
+  monkeypatch.setattr(upload, "upload_share_text", lambda payload: "shared upload report")
+  monkeypatch.setattr(upload, "discord_webhook_url", lambda params: "https://discord.example/webhook")
+  monkeypatch.setattr(upload, "send_discord_webhook", fake_discord)
+
+
+def test_dashcam_upload_mine_sends_everything_to_log_sync_receiver(monkeypatch, tmp_path):
+  notifications, uploads = [], []
+  _stub_upload_network(monkeypatch, tmp_path, notifications, uploads)
+  monkeypatch.setattr(upload_jobs, "read_web_settings", lambda: {
+    "log_sync_url": "https://mine.example",
+    "web_upload_url": "https://web.example",
+  })
+
+  result = asyncio.run(upload_jobs.run_upload_segments(["route--0"], target="mine"))
+
+  assert [item[0] for item in uploads] == ["https://mine.example"]
+  assert uploads[0][1] == "session-token"
+  assert notifications == [("web", "https://mine.example", "session-token")]
+  assert result["target"] == "mine"
+  assert result["discord"] == {"configured": False, "skipped": "mine"}
+
+
+def test_dashcam_upload_web_target_still_notifies_discord(monkeypatch, tmp_path):
+  notifications, uploads = [], []
+  _stub_upload_network(monkeypatch, tmp_path, notifications, uploads)
+  monkeypatch.setattr(upload, "upload_target_settings", lambda: ("https://web.example", "web-token"))
+
+  result = asyncio.run(upload_jobs.run_upload_segments(["route--0"], target="web"))
+
+  assert [item[0] for item in uploads] == ["https://web.example"]
+  assert uploads[0][1] == "web-token"
+  assert notifications == [
+    ("web", "https://web.example", "web-token"),
+    ("discord", "https://discord.example/webhook", "web"),
+  ]
+  assert result["target"] == "web"
+  assert result["discord"] == {"configured": True, "ok": True, "status": 204}
+
+
+def test_dashcam_upload_job_snapshot_carries_target():
+  upload_jobs.jobs().clear()
+  mine = upload_jobs.create_job(["route--0"], include_all_files=True, target="mine")
+  default = upload_jobs.create_job(["route--1"])
+
+  assert upload_jobs.snapshot(mine)["target"] == "mine"
+  assert upload_jobs.snapshot(mine)["includeAllFiles"] is True
+  assert upload_jobs.snapshot(default)["target"] == "web"
+  upload_jobs.jobs().clear()

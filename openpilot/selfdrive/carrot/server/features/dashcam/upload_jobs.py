@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from openpilot.selfdrive.carrot.web_upload import (
+  DEFAULT_WEB_UPLOAD_URL,
   create_web_upload_session,
   send_web_upload_complete,
   upload_device_id,
@@ -16,6 +17,7 @@ from openpilot.selfdrive.carrot.web_upload import (
 )
 
 from ...services.params import HAS_PARAMS, Params
+from ...services.web_settings import _normalize_log_sync_url, read_web_settings
 from . import upload
 from .catalog import segment_file_summary
 from .paths import route_name, segment_dir, segment_index
@@ -182,6 +184,7 @@ def snapshot(job: dict[str, Any]) -> dict[str, Any]:
     "id": job["id"],
     "action": job["action"],
     "includeAllFiles": bool(job.get("include_all_files")),
+    "target": job.get("target") or "web",
     "status": job["status"],
     "done": job["status"] in ("done", "failed", "canceled"),
     "cancel_requested": bool(job.get("cancel_requested")),
@@ -281,7 +284,7 @@ def prune() -> None:
     _jobs.pop(old["id"], None)
 
 
-def create_job(segments: list[str], *, include_all_files: bool = False) -> dict[str, Any]:
+def create_job(segments: list[str], *, include_all_files: bool = False, target: str = "web") -> dict[str, Any]:
   job_id = uuid.uuid4().hex[:12]
   now = time.time()  # noqa: TID251
   job = {
@@ -289,6 +292,7 @@ def create_job(segments: list[str], *, include_all_files: bool = False) -> dict[
     "action": "dashcam_upload",
     "segments": list(segments),
     "include_all_files": include_all_files,
+    "target": target,
     "status": "running",
     "log": "",
     "progress": 0,
@@ -334,11 +338,25 @@ def start_job(job: dict[str, Any]) -> asyncio.Task:
   return task
 
 
+def upload_target(target: str) -> tuple[str, str]:
+  """'web' = the configured upload server (shared NAS by default); 'mine' = the owner's log-sync receiver."""
+  if target != "mine":
+    return upload.upload_target_settings()
+  try:
+    settings = read_web_settings()
+  except Exception:
+    settings = {}
+  base_url = _normalize_log_sync_url(settings.get("log_sync_url"))
+  if base_url.rstrip("/").casefold() == DEFAULT_WEB_UPLOAD_URL.rstrip("/").casefold():
+    raise ValueError("log_sync_url points at the shared upload server")
+  return base_url, ""  # no static token: create_web_upload_session issues one (existing code below)
+
+
 async def run_upload_segments(
-  segments: list[str], job: dict[str, Any] | None = None, *, include_all_files: bool = False,
+  segments: list[str], job: dict[str, Any] | None = None, *, include_all_files: bool = False, target: str = "web",
 ) -> dict[str, Any]:
   params = Params() if HAS_PARAMS else None
-  base_url, token = upload.upload_target_settings()
+  base_url, token = upload_target(target)
   meta = upload.upload_metadata(params)
   device_id = upload_device_id(meta)
   car_selected = meta.get("carName") or "none"
@@ -352,7 +370,7 @@ async def run_upload_segments(
   if job:
     job["upload_meta"] = meta
     job["remote_base_path"] = remote_base_path
-    job["upload_target"] = "web"
+    job["upload_target"] = target
     job["partial_results"] = []
     progress(
       job,
@@ -572,7 +590,7 @@ async def run_upload_segments(
     "uploaded": ok_count,
     "total": len(results),
     "uploadedAt": uploaded_at,
-    "target": "web",
+    "target": target,
     "deviceId": device_id,
     "remoteBasePath": remote_base_path,
     "meta": meta,
@@ -609,9 +627,10 @@ async def run_upload_segments(
       phase_current=1,
       phase_total=2,
     )
-  response_payload["discord"] = await upload.send_discord_webhook(
-    upload.discord_webhook_url(params),
-    response_payload,
+  response_payload["discord"] = (
+    {"configured": False, "skipped": "mine"}
+    if target == "mine"
+    else await upload.send_discord_webhook(upload.discord_webhook_url(params), response_payload)
   )
   if job:
     progress(
@@ -630,7 +649,9 @@ async def run_upload_segments(
 async def run_job(job: dict[str, Any]) -> None:
   try:
     result = await run_upload_segments(
-      list(job.get("segments") or []), job, include_all_files=bool(job.get("include_all_files")),
+      list(job.get("segments") or []), job,
+      include_all_files=bool(job.get("include_all_files")),
+      target=job.get("target") or "web",
     )
     finish(job, ok=bool(result.get("ok")), result=result)
   except UploadCanceled as exc:
