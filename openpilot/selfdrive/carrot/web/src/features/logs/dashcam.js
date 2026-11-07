@@ -1800,6 +1800,7 @@ async function showDashcamSegmentMenu(route, segment, options = {}) {
     choices: [
       { label: getUIText("play", "Play"), value: "play" },
       { label: getUIText("drive_replay", "Replay"), value: "drive_replay" },
+      ...(files.length > 1 ? [{ label: getUIText("download_pick_files", "Pick several files to download"), value: "download_multi" }] : []),
       ...files.map((file) => ({ label: dashcamDownloadLabel(file), value: `download_${file.kind}` })),
     ],
   });
@@ -1807,6 +1808,7 @@ async function showDashcamSegmentMenu(route, segment, options = {}) {
     options.activePlayerClose?.();
     await openDashcamDriveReplay(route, segment);
   } else if (selected === "play" && typeof options.activePlayerClose !== "function") openDashcamPlayer(route, segment);
+  else if (selected === "download_multi") await downloadDashcamSegments([segment], { files });
   else if (selected?.startsWith?.("download_")) {
     const kind = selected.replace("download_", "");
     startDashcamDownload(segment, kind);
@@ -1845,35 +1847,52 @@ function startDashcamDownload(segment, kind) {
   link.remove();
 }
 
-async function downloadDashcamSegments(segments) {
+function dashcamDownloadChoiceLabel(file) {
+  const size = Number(file?.size || 0);
+  return size > 0 ? `${file.kind} · ${formatLogBytes(size)}` : file.kind;
+}
+
+async function chooseDashcamDownloadKinds(files) {
+  const kinds = await openAppDialog({
+    mode: "choice",
+    multiple: true,
+    title: getUIText("download_selected", "Download selected"),
+    message: getUIText("download_choose_kind", "Choose files to download (several allowed)"),
+    choiceLayout: "list",
+    confirmLabel: getUIText("download", "Download"),
+    choices: files.map((file) => ({ label: dashcamDownloadChoiceLabel(file), value: file.kind })),
+  });
+  return Array.isArray(kinds) ? kinds.filter((kind) => DASHCAM_DOWNLOAD_KINDS.includes(kind)) : [];
+}
+
+async function downloadDashcamSegments(segments, options = {}) {
   const targets = Array.from(new Set(segments || [])).filter(Boolean);
   if (!targets.length) {
     showAppToast(getUIText("no_selected_segments", "No segments selected."), { tone: "error" });
     return;
   }
-  const kind = await openAppDialog({
-    mode: "choice",
-    title: getUIText("download_selected", "Download selected"),
-    message: getUIText("download_choose_kind", "Choose the file to download"),
-    choiceLayout: "list",
-    choices: DASHCAM_DOWNLOAD_KINDS.map((value) => ({ label: value, value })),
-  });
-  if (!DASHCAM_DOWNLOAD_KINDS.includes(kind)) return;
+  const knownFiles = Array.isArray(options.files) && options.files.length && targets.length === 1 ? options.files : null;
+  const kinds = await chooseDashcamDownloadKinds(knownFiles || DASHCAM_DOWNLOAD_KINDS.map((kind) => ({ kind })));
+  if (!kinds.length) return;
   let started = 0;
   let missing = 0;
+  let camera = false;
   for (const segment of targets) {
-    const files = await dashcamSegmentFiles(segment);
-    if (!files.some((file) => file.kind === kind)) {
-      missing += 1;
-      continue;
+    const files = knownFiles || await dashcamSegmentFiles(segment);
+    for (const kind of kinds) {
+      if (!files.some((file) => file.kind === kind)) {
+        missing += 1;
+        continue;
+      }
+      if (started > 0) await new Promise((resolve) => setTimeout(resolve, DASHCAM_DOWNLOAD_GAP_MS));
+      startDashcamDownload(segment, kind);
+      started += 1;
+      if (DASHCAM_CAMERA_DOWNLOAD_KINDS.includes(kind)) camera = true;
     }
-    if (started > 0) await new Promise((resolve) => setTimeout(resolve, DASHCAM_DOWNLOAD_GAP_MS));
-    startDashcamDownload(segment, kind);
-    started += 1;
   }
   let message = getUIText("download_started_count", "{count} downloads started", { count: started });
-  if (missing) message += ` · ${getUIText("download_missing_count", "{count} without this file", { count: missing })}`;
-  if (started && DASHCAM_CAMERA_DOWNLOAD_KINDS.includes(kind)) message += ` · ${getUIText("download_preparing_video", "Preparing video; the download starts shortly")}`;
+  if (missing) message += ` · ${getUIText("download_missing_count", "{count} missing files skipped", { count: missing })}`;
+  if (camera) message += ` · ${getUIText("download_preparing_video", "Preparing video; the download starts shortly")}`;
   showAppToast(message, started ? { duration: 4200 } : { tone: "error", duration: 4200 });
 }
 // --- end dashcam downloads ---

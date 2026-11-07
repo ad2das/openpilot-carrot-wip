@@ -316,7 +316,9 @@ export function createDialogController(environment = {}) {
     if (!activeDialog || activeDialog.submitting) return;
     const state = activeDialog;
     const isInputMode = state.mode === "prompt" || state.mode === "form";
-    const result = isInputMode ? (appDialogInput ? appDialogInput.value : "") : true;
+    const result = state.multiple
+      ? state.choiceValues.filter((value) => state.selectedValues.has(value))
+      : isInputMode ? (appDialogInput ? appDialogInput.value : "") : true;
     if (state.mode !== "form" || typeof state.onSubmit !== "function") {
       resolveDialogState(state, result);
       return;
@@ -387,6 +389,7 @@ export function createDialogController(environment = {}) {
     const choices = choiceGroups.flatMap((group) => group.items);
     const hasChoices = choices.length > 0;
     const isChoice = mode === "choice" || hasChoices;
+    const isMultiple = isChoice && options.multiple === true;
     const choiceLayout = appDialogChoiceLayout(choiceGroups, options);
     const showCancel = mode !== "alert" && options.showCancel !== false;
     const hideTitle = options.hideTitle === true;
@@ -420,8 +423,8 @@ export function createDialogController(environment = {}) {
     appDialogCancel.disabled = false;
     appDialogCancel.hidden = !showCancel;
     appDialogCancel.setAttribute("aria-hidden", showCancel ? "false" : "true");
-    appDialogConfirm.hidden = isChoice;
-    appDialogConfirm.setAttribute("aria-hidden", isChoice ? "true" : "false");
+    appDialogConfirm.hidden = isChoice && !isMultiple;
+    appDialogConfirm.setAttribute("aria-hidden", isChoice && !isMultiple ? "true" : "false");
 
     if (appDialogDefault) {
       appDialogDefault.hidden = !hasDefaultAction;
@@ -470,8 +473,23 @@ export function createDialogController(environment = {}) {
         button.className = buttonClass;
         if (choice.labelHtml) button.innerHTML = choice.labelHtml;
         else button.textContent = String(choice.label);
-        if (choice.current || choice.selected) button.setAttribute("aria-current", "true");
-        button.addEventListener("click", () => resolveAppDialog(choice.value));
+        const initiallySelected = Boolean(choice.current || choice.selected);
+        if (isMultiple) button.setAttribute("aria-pressed", initiallySelected ? "true" : "false");
+        else if (initiallySelected) button.setAttribute("aria-current", "true");
+        button.addEventListener("click", () => {
+          if (!isMultiple) {
+            resolveAppDialog(choice.value);
+            return;
+          }
+          const state = activeDialog;
+          if (!state?.multiple || state.closing) return;
+          if (state.selectedValues.has(choice.value)) state.selectedValues.delete(choice.value);
+          else state.selectedValues.add(choice.value);
+          const on = state.selectedValues.has(choice.value);
+          button.classList.toggle("is-current", on);
+          button.setAttribute("aria-pressed", on ? "true" : "false");
+          appDialogConfirm.disabled = state.selectedValues.size === 0;
+        });
         return button;
       };
 
@@ -540,8 +558,12 @@ export function createDialogController(environment = {}) {
         focusTrap: null,
         openFrame: null,
         closeTimer: null,
+        multiple: isMultiple,
+        choiceValues: choices.map((choice) => choice.value),
+        selectedValues: new Set(isMultiple ? choices.filter((choice) => choice.current || choice.selected).map((choice) => choice.value) : []),
       };
       activeDialog = state;
+      if (isMultiple) appDialogConfirm.disabled = state.selectedValues.size === 0;
       pushDialogHistory();
       appDialog.hidden = false;
       syncModalBodyLock();

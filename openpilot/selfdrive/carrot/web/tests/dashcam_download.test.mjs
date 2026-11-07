@@ -68,37 +68,45 @@ function loadBlock(overrides = {}) {
   return { ...context.__exports, clicks, gaps, toasts, jsonCalls, dialogCalls };
 }
 
-test("downloadDashcamSegments skips segments without the chosen kind", async () => {
+test("downloadDashcamSegments downloads every ticked kind and counts the missing files", async () => {
   const harness = loadBlock({
-    dialogResult: "fcamera",
+    dialogResult: ["fcamera", "rlog"],
     filesBySegment: {
-      a: [{ kind: "fcamera" }],
-      b: [{ kind: "qcamera" }],
+      a: [{ kind: "fcamera" }, { kind: "rlog" }],
+      b: [{ kind: "rlog" }],
       c: [{ kind: "fcamera" }],
     },
   });
 
   await harness.downloadDashcamSegments(["a", "b", "c"]);
 
-  assert.deepEqual(harness.clicks, ["/api/dashcam/download/a/fcamera", "/api/dashcam/download/c/fcamera"]);
-  assert.deepEqual(harness.gaps, [2000]);
+  assert.deepEqual(harness.clicks, [
+    "/api/dashcam/download/a/fcamera",
+    "/api/dashcam/download/a/rlog",
+    "/api/dashcam/download/b/rlog",
+    "/api/dashcam/download/c/fcamera",
+  ]);
+  assert.deepEqual(harness.gaps, [2000, 2000, 2000]);
   assert.equal(harness.toasts.length, 1);
-  assert.match(harness.toasts[0].message, /2 downloads started/);
-  assert.match(harness.toasts[0].message, /1 without this file/);
+  assert.match(harness.toasts[0].message, /4 downloads started/);
+  assert.match(harness.toasts[0].message, /2 missing files skipped/);
+  assert.match(harness.toasts[0].message, /Preparing video/);
 });
 
-test("downloadDashcamSegments aborts without touching the network when the dialog is dismissed", async () => {
-  const harness = loadBlock({ dialogResult: null });
+test("downloadDashcamSegments aborts without touching the network when the dialog is dismissed or empty", async () => {
+  for (const dialogResult of [null, []]) {
+    const harness = loadBlock({ dialogResult });
 
-  await harness.downloadDashcamSegments(["a", "b"]);
+    await harness.downloadDashcamSegments(["a", "b"]);
 
-  assert.deepEqual(harness.jsonCalls, []);
-  assert.deepEqual(harness.clicks, []);
-  assert.deepEqual(harness.toasts, []);
+    assert.deepEqual(harness.jsonCalls, []);
+    assert.deepEqual(harness.clicks, []);
+    assert.deepEqual(harness.toasts, []);
+  }
 });
 
 test("downloadDashcamSegments rejects an empty selection before opening the dialog", async () => {
-  const harness = loadBlock({ dialogResult: "fcamera" });
+  const harness = loadBlock({ dialogResult: ["fcamera"] });
 
   await harness.downloadDashcamSegments([]);
 
@@ -109,15 +117,42 @@ test("downloadDashcamSegments rejects an empty selection before opening the dial
 });
 
 test("downloadDashcamSegments falls back to every kind when the file listing fails", async () => {
-  const harness = loadBlock({ dialogResult: "fcamera", getJsonThrows: true });
+  const harness = loadBlock({ dialogResult: ["fcamera", "rlog"], getJsonThrows: true });
 
   await harness.downloadDashcamSegments(["a", "b", "c"]);
 
   assert.deepEqual(harness.clicks, [
     "/api/dashcam/download/a/fcamera",
+    "/api/dashcam/download/a/rlog",
     "/api/dashcam/download/b/fcamera",
+    "/api/dashcam/download/b/rlog",
     "/api/dashcam/download/c/fcamera",
+    "/api/dashcam/download/c/rlog",
   ]);
+  assert.match(harness.toasts[0].message, /6 downloads started/);
+  assert.doesNotMatch(harness.toasts[0].message, /missing files skipped/);
+});
+
+test("downloadDashcamSegments lists the segment's own files with sizes and skips the listing request", async () => {
+  const harness = loadBlock({ dialogResult: ["rlog"] });
+
+  await harness.downloadDashcamSegments(["s"], {
+    files: [{ kind: "fcamera", size: 1048576 }, { kind: "rlog", size: 0 }],
+  });
+
+  assert.deepEqual(harness.jsonCalls, []);
+  assert.equal(harness.dialogCalls.length, 1);
+  const options = harness.dialogCalls[0];
+  assert.equal(options.mode, "choice");
+  assert.equal(options.multiple, true);
+  assert.equal(options.confirmLabel, "Download");
+  assert.deepEqual(options.choices.map((choice) => choice.value), ["fcamera", "rlog"]);
+  assert.deepEqual(options.choices.map((choice) => choice.label), ["fcamera · 1 MB", "rlog"]);
+
+  assert.deepEqual(harness.clicks, ["/api/dashcam/download/s/rlog"]);
+  assert.equal(harness.toasts.length, 1);
+  assert.match(harness.toasts[0].message, /1 downloads started/);
+  assert.doesNotMatch(harness.toasts[0].message, /Preparing video/);
 });
 
 test("dashcamDownloadLabel shows the size only when the server reported one", () => {
@@ -125,6 +160,14 @@ test("dashcamDownloadLabel shows the size only when the server reported one", ()
 
   assert.equal(harness.dashcamDownloadLabel({ kind: "fcamera", size: 1048576 }), "fcamera Download · 1 MB");
   assert.equal(harness.dashcamDownloadLabel({ kind: "fcamera", size: 0 }), "fcamera Download");
+});
+
+test("the segment menu offers the multi-file download before the per-kind items", () => {
+  assert.match(dashcamSource, /value: "download_multi"/);
+  const multiIndex = dashcamSource.indexOf('selected === "download_multi"');
+  const perKindIndex = dashcamSource.indexOf('selected?.startsWith?.("download_")');
+  assert.ok(multiIndex >= 0, "the multi-file branch is missing");
+  assert.ok(perKindIndex > multiIndex, "the multi-file branch must come before the per-kind branch");
 });
 
 test("dashcam upload entry points are gone from the source", () => {
