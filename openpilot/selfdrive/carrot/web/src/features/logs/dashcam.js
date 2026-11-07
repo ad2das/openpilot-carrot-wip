@@ -1634,7 +1634,6 @@ async function uploadDashcamSegments(segments, options = {}) {
     bytes: 0,
   };
   let includeAllFiles = false;
-  let uploadTarget = "web";
   if (options.confirm !== false) {
     const scope = await openAppDialog({
       mode: "choice",
@@ -1644,12 +1643,10 @@ async function uploadDashcamSegments(segments, options = {}) {
       choices: [
         { label: getUIText("upload_scope_default", "Default: qcamera + rlog"), value: "default", current: true },
         { label: getUIText("upload_scope_all", "All files in selected folders"), value: "all" },
-        { label: getUIText("upload_scope_mine", "All files to my PC (log sync server)"), value: "mine" },
       ],
     });
-    if (scope !== "default" && scope !== "all" && scope !== "mine") return;
-    includeAllFiles = scope === "all" || scope === "mine";
-    uploadTarget = scope === "mine" ? "mine" : "web";
+    if (scope !== "default" && scope !== "all") return;
+    includeAllFiles = scope === "all";
     try {
       const summary = await postJson("/api/dashcam/upload/summary", { segments: targets, includeAllFiles });
       if (!Array.isArray(summary?.summaries) || summary.summaries.length !== targets.length) {
@@ -1716,7 +1713,7 @@ async function uploadDashcamSegments(segments, options = {}) {
       progress: null,
     }, targets.length);
     if (cancelRequested) throw makeDashcamUploadCanceledError();
-    const started = await postJson("/api/dashcam/upload/start", { segments: targets, includeAllFiles, target: uploadTarget });
+    const started = await postJson("/api/dashcam/upload/start", { segments: targets, includeAllFiles });
     jobId = started.job_id;
     rememberDashcamUploadJob(jobId);
     if (cancelRequested) {

@@ -1240,7 +1240,6 @@ window.CarrotTranslations.register("zh", {
     upload_summary_label: "发送摘要",
     upload_scope_default: "默认：qcamera + rlog",
     upload_scope_all: "所选文件夹中的所有文件",
-    upload_scope_mine: "所有文件发送到我的电脑（日志同步服务器）",
     upload_scope_help: "请选择要发送的文件范围。所有文件包括所选文件夹中的 ecamera、fcamera 等文件，数据量和发送时间可能会增加。",
     upload_other_count: "其他 {count} 个",
     upload_total_count: "共 {count} 个文件",

@@ -1336,7 +1336,6 @@ window.CarrotTranslations.register("ko", {
     upload_summary_label: "전송 요약",
     upload_scope_default: "기본: qcamera + rlog",
     upload_scope_all: "선택한 폴더의 모든 파일",
-    upload_scope_mine: "내 PC로 보내기 (모든 파일, 로그 동기화 서버)",
     upload_scope_help: "전송할 파일 범위를 선택하세요. 모든 파일을 선택하면 ecamera, fcamera 등 선택한 폴더의 파일을 모두 포함하므로 용량과 전송 시간이 늘어날 수 있습니다.",
     upload_other_count: "기타 {count}개",
     upload_total_count: "총 {count}개",
