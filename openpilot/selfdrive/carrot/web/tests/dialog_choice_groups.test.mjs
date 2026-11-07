@@ -102,7 +102,7 @@ test("the logs menu is a grouped choice dialog instead of an inline dropdown", (
 
   assert.match(runtime, /mode: "choice"/);
   assert.match(runtime, /\{ heading: getUIText\("logs_sort", "Sort"\) \}/);
-  assert.match(runtime, /\{ heading: getUIText\("recent_log_upload", "Upload recent logs"\) \}/);
+  assert.doesNotMatch(runtime, /recent_log_upload/);
   // Sort state and labels are read when the menu opens, not cached in markup.
   assert.match(runtime, /choices: logsMenuChoices\(\)/);
 });

@@ -14,6 +14,7 @@ import {
   dashcamSortDirection,
   dashcamState,
   dashcamWindowNeedsRender,
+  downloadDashcamSegments,
   loadDashcamReadState,
   loadDashcamRoutes,
   markDashcamScrollBusy,
@@ -21,7 +22,6 @@ import {
   openDashcamPlayer,
   renderDashcamRoute,
   renderDashcamRoutes,
-  resumeDashcamUploadJobIfNeeded,
   scheduleDashcamWindowRender,
   scheduleSegmentListScrollPersist,
   setDashcamLoadingMoreUi,
@@ -31,8 +31,6 @@ import {
   startDashcamAutoRefresh,
   toggleDashcamRouteSelectAll,
   updateDashcamRouteSelectionUi,
-  uploadDashcamSegments,
-  uploadRecentDashcamSegments,
 } from "./dashcam.js";
 import {
   loadScreenrecordVideos,
@@ -51,8 +49,6 @@ import {
 
 const LOGS_TAB_SELECTOR = "[data-logs-tab]";
 const LOGS_MENU_SORT = "sort";
-const LOGS_MENU_UPLOAD = "upload_recent";
-const LOGS_RECENT_UPLOAD_LIMITS = Object.freeze([2, 5, 10]);
 
 let logsActiveTab = "dashcam";
 const logsScrollTops = { dashcam: 0, screen: 0 };
@@ -133,18 +129,12 @@ function logsMenuChoices() {
       value: `${LOGS_MENU_SORT}:desc`,
       selected: sort === "desc",
     },
-    { heading: getUIText("recent_log_upload", "Upload recent logs") },
-    ...LOGS_RECENT_UPLOAD_LIMITS.map((count) => ({
-      label: getUIText("upload_recent_logs", "Upload recent {count}", { count }),
-      value: `${LOGS_MENU_UPLOAD}:${count}`,
-    })),
   ];
 }
 
 async function runLogsMenuAction(selected) {
   const [action, argument] = String(selected || "").split(":");
   if (action === LOGS_MENU_SORT) await setDashcamSort(argument === "desc" ? "desc" : "asc");
-  else if (action === LOGS_MENU_UPLOAD) await uploadRecentDashcamSegments(Number(argument) || 0);
 }
 
 async function openLogsMenu() {
@@ -898,10 +888,10 @@ function bindLogsPage() {
       } else if (action === "select-route") {
         const shouldClear = actionEl.dataset.selected === "1";
         toggleDashcamRouteSelectAll(route, shouldClear).catch(() => {});
-      } else if (action === "upload-selected") {
+      } else if (action === "download-selected") {
         const entry = dashcamState.routes.find((item) => item.route === route);
         const targets = dashcamSelectedForRoute(entry || { segmentFolders: [] });
-        uploadDashcamSegments(targets).catch(() => {});
+        downloadDashcamSegments(targets).catch(() => {});
       }
     });
     routesHost.addEventListener("change", (ev) => {
@@ -945,7 +935,6 @@ function initLogsPage() {
   activateLogsTab(logsActiveTab, { load: false });
   startDashcamAutoRefresh();
   loadDashcamReadState().catch(() => {});
-  resumeDashcamUploadJobIfNeeded().catch(() => {});
   if (logsActiveTab === "screen") {
     if (!screenrecordState.initialized) {
       screenrecordState.initialized = true;

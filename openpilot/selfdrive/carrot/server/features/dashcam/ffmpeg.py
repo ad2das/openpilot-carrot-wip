@@ -1,11 +1,17 @@
 import os
 import shutil
 import subprocess
+import time
+import uuid
 
 from aiohttp import web
 
+from ...config import DASHCAM_CACHE_DIR
 from .catalog import source_video
 from .paths import cache_path, segment_dir
+
+CAMERA_FPS = 20  # loggerd MAIN_FPS (system/loggerd/loggerd.h)
+DOWNLOAD_TMP_MAX_AGE = 3600.0
 
 
 def run_ffmpeg(args: list[str], timeout: float = 90.0) -> subprocess.CompletedProcess:
@@ -116,3 +122,31 @@ def browser_video(segment: str) -> tuple[str, str]:
 
   # Last-resort fallback: some browsers can still handle TS, and this preserves access.
   return source, "video/mp2t"
+
+
+def download_tmp_path(ext: str) -> str:
+  """Fresh temp path for a one-shot download; drops leftovers older than an hour."""
+  directory = os.path.join(DASHCAM_CACHE_DIR, "download")
+  os.makedirs(directory, exist_ok=True)
+  now = time.time()
+  for name in os.listdir(directory):
+    path = os.path.join(directory, name)
+    try:
+      if now - os.path.getmtime(path) > DOWNLOAD_TMP_MAX_AGE:
+        os.remove(path)
+    except OSError:
+      pass
+  return os.path.join(directory, f"{uuid.uuid4().hex}{ext}")
+
+
+def remux_camera_mp4(source: str, out: str) -> bool:
+  """Wrap a raw loggerd HEVC stream in mp4 without re-encoding. False when ffmpeg is missing or fails."""
+  try:
+    result = run_ffmpeg(
+      ["-fflags", "+genpts", "-framerate", str(CAMERA_FPS), "-i", source,
+       "-c", "copy", "-tag:v", "hvc1", "-movflags", "+faststart", out],
+      timeout=180.0,
+    )
+  except (web.HTTPException, OSError, subprocess.TimeoutExpired):
+    return False
+  return result.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0

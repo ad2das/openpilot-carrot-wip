@@ -84,8 +84,7 @@ test("dashcam player direct send shows progress and the shared result without a 
   const dashcam = read("src/features/logs/dashcam.js");
   const runtime = read("src/features/logs/runtime.js");
 
-  assert.match(dashcam, /onSegmentSend:[\s\S]*?showProgress:\s*true,[\s\S]*?showResult:\s*true,[\s\S]*?showSuccessToast:\s*false/);
-  assert.doesNotMatch(dashcam, /onSegmentSend:[\s\S]*?showProgress:\s*false/);
+  assert.doesNotMatch(dashcam, /onSegmentSend:/);
   assert.match(runtime, /dashcam-player-send[\s\S]*?pauseCurrentPlayback\(\);[\s\S]*?runTopAction/);
   assert.match(dashcam, /if \(options\.showSuccessToast !== false\)[\s\S]*?showAppToast\(message/);
   assert.match(dashcam, /if \(options\.showResult !== false\) await showDashcamUploadResult\(result\)/);
@@ -118,7 +117,7 @@ test("dashcam upload confirmation stays compact and uses an explicit send action
     dashcam.match(/function dashcamUploadResultHtml[\s\S]*?\n}\n/)?.[0] || "",
     /app-dialog__metaGroup|app-dialog__metaLabel/,
   );
-  assert.match(dashcam, /onSegmentSend:\s*\(target\)\s*=>\s*uploadDashcamSegments\(\[target\],\s*\{[\s\S]*?showProgress:\s*true/);
+  assert.doesNotMatch(dashcam, /onSegmentSend:/);
 });
 
 test("dashcam upload progress and result reuse the shared dialog components", () => {

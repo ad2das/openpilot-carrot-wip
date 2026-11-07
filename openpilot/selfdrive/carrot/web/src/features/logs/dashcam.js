@@ -844,7 +844,7 @@ function dashcamRouteCardHtml(entry, index = 0, options = {}) {
         <div class="dashcam-selection-row">
           <span class="dashcam-selection-count">${escapeHtml(getUIText("selected_count", "{count} selected", { count: selected.length }))}</span>
           <button class="smallBtn" type="button" data-action="select-route" data-route="${routeAttr}" data-selected="${allSelected ? "1" : "0"}">${escapeHtml(selectLabel)}</button>
-          <button class="smallBtn btn--filled" type="button" data-action="upload-selected" data-route="${routeAttr}" ${selected.length ? "" : "disabled"}>${escapeHtml(getUIText("upload_selected", "Upload selected"))}</button>
+          <button class="smallBtn btn--filled" type="button" data-action="download-selected" data-route="${routeAttr}" ${selected.length ? "" : "disabled"}>${escapeHtml(getUIText("download_selected", "Download selected"))}</button>
           <button class="smallBtn dashcam-group-menu-btn dashcam-group-menu-btn--row" type="button" data-action="route-menu" data-route="${routeAttr}" aria-label="${escapeHtml(getUIText("group_menu", "Group menu"))}" title="${escapeHtml(getUIText("group_menu", "Group menu"))}">
             <svg viewBox="0 0 24 24"><path fill="currentColor" d="M6 10c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m12 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2m-6 0c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2"/></svg>
           </button>
@@ -954,8 +954,8 @@ function updateDashcamRouteSelectionUi(route) {
       : getUIText("select_all", "Select all");
   }
 
-  const uploadBtn = card.querySelector('[data-action="upload-selected"]');
-  if (uploadBtn) uploadBtn.disabled = selected.length === 0;
+  const downloadBtn = card.querySelector('[data-action="download-selected"]');
+  if (downloadBtn) downloadBtn.disabled = selected.length === 0;
 
   card.querySelectorAll('input[data-action="select-segment"]').forEach((input) => {
     const segment = input.dataset.segment || "";
@@ -1197,11 +1197,6 @@ function openDashcamPlayer(route, segment) {
         if (!Number.isFinite(seconds) || seconds <= 0 || targetEndEpoch <= 0) return targetSubtitle;
         return formatDashcamTimeRange(targetEndEpoch - seconds, targetEndEpoch);
       },
-      onSegmentSend: (target) => uploadDashcamSegments([target], {
-        showProgress: true,
-        showResult: true,
-        showSuccessToast: false,
-      }),
       onSegmentMenu: (target, { close } = {}) => {
         return showDashcamSegmentMenu(route, target, { activePlayerClose: close });
       },
@@ -1796,6 +1791,7 @@ async function showDashcamSegmentMenu(route, segment, options = {}) {
   const timeLabel = formatDashcamSegmentTimeLabel(entry, segment);
   const fullTime = formatDashcamSegmentFullTime(entry, segment);
   const message = fullTime ? `${segment}\n${fullTime}` : segment;
+  const files = await dashcamSegmentFiles(segment);
   const selected = await openAppDialog({
     mode: "choice",
     title: timeLabel,
@@ -1804,22 +1800,83 @@ async function showDashcamSegmentMenu(route, segment, options = {}) {
     choices: [
       { label: getUIText("play", "Play"), value: "play" },
       { label: getUIText("drive_replay", "Replay"), value: "drive_replay" },
-      { label: getUIText("log_upload", "Upload Logs"), value: "upload" },
-      { label: `qcamera ${getUIText("download", "Download")}`, value: "download_qcamera" },
-      { label: `rlog ${getUIText("download", "Download")}`, value: "download_rlog" },
-      { label: `qlog ${getUIText("download", "Download")}`, value: "download_qlog" },
+      ...files.map((file) => ({ label: dashcamDownloadLabel(file), value: `download_${file.kind}` })),
     ],
   });
   if (selected === "drive_replay") {
     options.activePlayerClose?.();
     await openDashcamDriveReplay(route, segment);
   } else if (selected === "play" && typeof options.activePlayerClose !== "function") openDashcamPlayer(route, segment);
-  else if (selected === "upload") await uploadDashcamSegments([segment]);
   else if (selected?.startsWith?.("download_")) {
     const kind = selected.replace("download_", "");
-    window.open(dashcamApiPath(`download/${encodeURIComponent(segment)}`, kind), "_blank", "noopener");
+    startDashcamDownload(segment, kind);
+    if (DASHCAM_CAMERA_DOWNLOAD_KINDS.includes(kind)) showAppToast(getUIText("download_preparing_video", "Preparing video; the download starts shortly"), { duration: 4200 });
   }
 }
+
+// --- dashcam downloads ---
+const DASHCAM_DOWNLOAD_KINDS = Object.freeze(["qcamera", "fcamera", "ecamera", "dcamera", "rlog", "qlog"]);
+const DASHCAM_CAMERA_DOWNLOAD_KINDS = Object.freeze(["fcamera", "ecamera", "dcamera"]);
+const DASHCAM_DOWNLOAD_GAP_MS = 2000;
+
+async function dashcamSegmentFiles(segment) {
+  try {
+    const json = await getJson(dashcamApiPath("files", segment));
+    return Array.isArray(json?.files) ? json.files : [];
+  } catch (_) {
+    return DASHCAM_DOWNLOAD_KINDS.map((kind) => ({ kind }));
+  }
+}
+
+function dashcamDownloadLabel(file) {
+  const size = Number(file?.size || 0);
+  const base = `${file.kind} ${getUIText("download", "Download")}`;
+  return size > 0 ? `${base} · ${formatLogBytes(size)}` : base;
+}
+
+function startDashcamDownload(segment, kind) {
+  const link = document.createElement("a");
+  link.href = dashcamApiPath(`download/${encodeURIComponent(segment)}`, kind);
+  link.download = "";
+  link.rel = "noopener";
+  link.style.display = "none";
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+}
+
+async function downloadDashcamSegments(segments) {
+  const targets = Array.from(new Set(segments || [])).filter(Boolean);
+  if (!targets.length) {
+    showAppToast(getUIText("no_selected_segments", "No segments selected."), { tone: "error" });
+    return;
+  }
+  const kind = await openAppDialog({
+    mode: "choice",
+    title: getUIText("download_selected", "Download selected"),
+    message: getUIText("download_choose_kind", "Choose the file to download"),
+    choiceLayout: "list",
+    choices: DASHCAM_DOWNLOAD_KINDS.map((value) => ({ label: value, value })),
+  });
+  if (!DASHCAM_DOWNLOAD_KINDS.includes(kind)) return;
+  let started = 0;
+  let missing = 0;
+  for (const segment of targets) {
+    const files = await dashcamSegmentFiles(segment);
+    if (!files.some((file) => file.kind === kind)) {
+      missing += 1;
+      continue;
+    }
+    if (started > 0) await new Promise((resolve) => setTimeout(resolve, DASHCAM_DOWNLOAD_GAP_MS));
+    startDashcamDownload(segment, kind);
+    started += 1;
+  }
+  let message = getUIText("download_started_count", "{count} downloads started", { count: started });
+  if (missing) message += ` · ${getUIText("download_missing_count", "{count} without this file", { count: missing })}`;
+  if (started && DASHCAM_CAMERA_DOWNLOAD_KINDS.includes(kind)) message += ` · ${getUIText("download_preparing_video", "Preparing video; the download starts shortly")}`;
+  showAppToast(message, started ? { duration: 4200 } : { tone: "error", duration: 4200 });
+}
+// --- end dashcam downloads ---
 
 // Parse a range expression like "1, 1-2, 1,2,3,4" into a Set of segment indices.
 // Supports single numbers and "a-b" / "a~b" ranges (a>b is auto-swapped).
@@ -2052,6 +2109,7 @@ export {
   cancelDashcamRouteRender,
   dashcamDefaultRouteHeight,
   dashcamLayoutKey,
+  downloadDashcamSegments,
   loadDashcamReadState,
   dashcamSelectedForRoute,
   dashcamSortDirection,

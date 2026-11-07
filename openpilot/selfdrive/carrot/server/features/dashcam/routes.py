@@ -22,7 +22,7 @@ from .catalog import (
   source_rlog,
   source_video,
 )
-from .ffmpeg import browser_video, ensure_preview, ensure_thumbnail
+from .ffmpeg import browser_video, download_tmp_path, ensure_preview, ensure_thumbnail, remux_camera_mp4
 from .report import build_route_report
 from .read_state import read_dashcam_read_state, write_dashcam_recent_segment
 from .summary_sources import build_route_summary_source
@@ -445,27 +445,85 @@ async def api_dashcam_replay_source_file(request: web.Request) -> web.StreamResp
   })
 
 
+DOWNLOAD_FILES = {
+  "qcamera": ("qcamera.ts", "qcamera.mp4"),
+  "fcamera": ("fcamera.hevc",),
+  "ecamera": ("ecamera.hevc",),
+  "dcamera": ("dcamera.hevc",),
+  "rlog": ("rlog.zst", "rlog.bz2", "rlog"),
+  "qlog": ("qlog.zst", "qlog.bz2", "qlog"),
+}
+CAMERA_DOWNLOADS = ("fcamera", "ecamera", "dcamera")
+
+
+def download_source(segment_path: str, kind: str) -> tuple[str, str] | None:
+  for name in DOWNLOAD_FILES.get(kind, ()):
+    path = os.path.join(segment_path, name)
+    if os.path.isfile(path):
+      return path, name
+  return None
+
+
+async def send_file_then_delete(request: web.Request, path: str, filename: str, content_type: str) -> web.StreamResponse:
+  try:
+    response = web.StreamResponse(headers={
+      "Content-Type": content_type,
+      "Content-Disposition": f'attachment; filename="{filename}"',
+      "Cache-Control": "no-store",
+    })
+    response.content_length = os.path.getsize(path)
+    await response.prepare(request)
+    with open(path, "rb") as f:
+      while True:
+        chunk = await asyncio.to_thread(f.read, 1 << 20)
+        if not chunk:
+          break
+        await response.write(chunk)
+    await response.write_eof()
+    return response
+  finally:
+    try:
+      os.remove(path)
+    except OSError:
+      pass
+
+
+async def api_dashcam_files(request: web.Request) -> web.Response:
+  segment_path = segment_dir(request.match_info.get("segment", ""))
+  files = []
+  for kind in DOWNLOAD_FILES:
+    found = download_source(segment_path, kind)
+    if found:
+      files.append({"kind": kind, "name": found[1], "size": os.path.getsize(found[0])})
+  return web.json_response({"ok": True, "files": files}, headers={"Cache-Control": "no-store"})
+
+
 async def api_dashcam_download(request: web.Request) -> web.StreamResponse:
   segment = request.match_info.get("segment", "")
   kind = (request.match_info.get("kind", "") or "").strip()
   segment_path = segment_dir(segment)
-  allowed = {
-    "qcamera": ("qcamera.ts", "qcamera.mp4"),
-    "rlog": ("rlog.zst", "rlog.bz2", "rlog"),
-    "qlog": ("qlog.zst", "qlog.bz2", "qlog"),
-  }
-  for name in allowed.get(kind, ()):
-    path = os.path.join(segment_path, name)
-    if os.path.isfile(path):
-      mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-      return web.FileResponse(
-        path,
-        headers={
-          "Content-Type": mime,
-          "Content-Disposition": f'attachment; filename="{segment}--{name}"',
-        },
-      )
-  raise web.HTTPNotFound(text="artifact not found")
+  found = download_source(segment_path, kind)
+  if not found:
+    raise web.HTTPNotFound(text="artifact not found")
+  path, name = found
+  if kind in CAMERA_DOWNLOADS:
+    out = download_tmp_path(".mp4")
+    if await asyncio.to_thread(remux_camera_mp4, path, out):
+      return await send_file_then_delete(request, out, f"{segment}--{kind}.mp4", "video/mp4")
+    try:
+      os.remove(out)
+    except OSError:
+      pass
+    # ffmpeg missing or no hevc demuxer: hand out the raw stream instead of failing
+    return web.FileResponse(path, headers={
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": f'attachment; filename="{segment}--{name}"',
+    })
+  mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+  return web.FileResponse(path, headers={
+    "Content-Type": mime,
+    "Content-Disposition": f'attachment; filename="{segment}--{name}"',
+  })
 
 
 async def api_dashcam_upload_summary(request: web.Request) -> web.Response:
@@ -592,9 +650,5 @@ def register(app: web.Application) -> None:
   app.router.add_get("/api/dashcam/replay-source/{segment}", api_dashcam_replay_source)
   app.router.add_get("/api/dashcam/replay-source/{segment}/{kind}", api_dashcam_replay_source_file)
   app.router.add_get("/api/dashcam/download/{segment}/{kind}", api_dashcam_download)
-  app.router.add_post("/api/dashcam/upload/summary", api_dashcam_upload_summary)
+  app.router.add_get("/api/dashcam/files/{segment}", api_dashcam_files)
   app.router.add_post("/api/dashcam/upload/test", api_dashcam_upload_test)
-  app.router.add_post("/api/dashcam/upload/start", api_dashcam_upload_start)
-  app.router.add_get("/api/dashcam/upload/job", api_dashcam_upload_job)
-  app.router.add_post("/api/dashcam/upload/cancel", api_dashcam_upload_cancel)
-  app.router.add_post("/api/dashcam/upload", api_dashcam_upload)
