@@ -554,7 +554,7 @@ def lead_renderer(**overrides):
   return renderer
 
 
-def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
+def test_lead_runs_are_speed_then_gap_without_trend(monkeypatch):
   monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
   renderer = lead_renderer(
     _carrot_radar_dist=12.5,
@@ -570,7 +570,7 @@ def test_lead_runs_are_speed_then_quieter_gap_without_trend(monkeypatch):
     ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
     ("bar",),
-    ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT),
+    ("num", "12", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
 
@@ -592,7 +592,7 @@ def test_lead_runs_keep_speed_and_gap_during_soft_hold(monkeypatch):
     ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "km/h", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
     ("bar",),
-    ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT),
+    ("num", "12", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT),
     ("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3),
   ]
 
@@ -605,13 +605,94 @@ def test_lead_runs_still_show_autohold():
   ]
 
 
-@pytest.mark.parametrize("run, weight", [
-  (("num", "80", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT), model_renderer.hs.BOLD),
-  (("num", "49", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT), model_renderer.hs.SEMI),
-  (("unit", "m", model_renderer.LEAD_UNIT_SIZE, model_renderer.hs.TEXT_3), model_renderer.hs.SEMI),
-])
-def test_only_the_leading_figure_is_bold(run, weight):
-  assert model_renderer.ModelRenderer._lead_run_weight(run) is weight
+class CardType:
+  """Fixed-advance type: every glyph is half its size wide, tracking adds per character; draws are recorded."""
+  def __init__(self):
+    self.drawn = []
+
+  def width(self, text, size, weight=None, spacing=0.0):
+    return len(text) * size * 0.5 + spacing * len(text)
+
+  def draw(self, text, x, baseline, size, color, weight=None, align=0.0, shadow=False, spacing=0.0):
+    self.drawn.append((text, x, baseline, size, color, weight))
+    return self.width(text, size, weight, spacing)
+
+  def draw_mid(self, text, x, middle, size, color, weight=None, align=0.0, shadow=False, spacing=0.0):
+    return self.draw(text, x, middle, size, color, weight, align, shadow, spacing)
+
+
+def card_renderer(monkeypatch, **state):
+  monkeypatch.setattr(model_renderer.ui_state, "is_metric", True)
+  monkeypatch.setattr(model_renderer.hs, "clear_of_panels", lambda x, y, w, h: y)
+  renderer = lead_renderer(**state)
+  renderer._type = CardType()
+  renderer._float_boxes = []
+  renderer._lead_w = 0.0
+  return renderer
+
+
+def test_lead_card_puts_speed_and_gap_in_two_columns_with_unit_captions(monkeypatch):
+  renderer = card_renderer(monkeypatch, _carrot_radar_dist=49.0, _carrot_radar_track_id=0, _carrot_lead_status=True,
+                           _carrot_lead_speed=80.0)
+  cards = []
+  monkeypatch.setattr(model_renderer.hs, "glass_card", lambda *args, **kwargs: cards.append(args))
+  monkeypatch.setattr(model_renderer.rl, "draw_rectangle_rec", lambda *args, **kwargs: None)
+
+  renderer._layout_lead_capsule_carrot(960.0, 500.0)
+  cols, cx, mid, w, h, car_top = renderer._lead_capsule
+  renderer._draw_lead_capsule_carrot(*renderer._lead_capsule)
+
+  assert [col[0][1] for col in cols] == ["80", "49"]
+  assert h == model_renderer.LEAD_CARD_H
+  # The card sits above the roof estimate and is claimed against the other floating labels.
+  assert mid + h / 2 == pytest.approx(500.0 - model_renderer.LEAD_LIFT)
+  assert renderer._float_boxes == [(cx - w / 2, mid - h / 2, w, h)]
+  assert cards[0][5] is model_renderer.hs.CARD_BODY
+  texts = [d[0] for d in renderer._type.drawn]
+  assert texts == ["80", "KM/H", "49", "M"]
+  figures = [d for d in renderer._type.drawn if d[0] in ("80", "49")]
+  # Both figures share one size, weight and baseline; captions sit below them.
+  assert {(d[2], d[3], d[5]) for d in figures} == {(figures[0][2], model_renderer.LEAD_SIZE, model_renderer.hs.BOLD)}
+  captions = [d for d in renderer._type.drawn if d[0] in ("KM/H", "M")]
+  assert all(c[2] > figures[0][2] for c in captions)
+  # Columns stay inside the card, speed left of gap.
+  assert cx - w / 2 < figures[0][1] < cx < figures[1][1] < cx + w / 2
+
+
+def test_lead_card_width_holds_while_a_digit_changes(monkeypatch):
+  renderer = card_renderer(monkeypatch, _carrot_radar_dist=49.0, _carrot_radar_track_id=0, _carrot_lead_status=True,
+                           _carrot_lead_speed=80.0)
+  renderer._layout_lead_capsule_carrot(960.0, 500.0)
+  w80 = renderer._lead_capsule[3]
+  renderer._carrot_lead_speed = 81.0
+  renderer._layout_lead_capsule_carrot(960.0, 500.0)
+
+  assert renderer._lead_capsule[3] == w80
+
+
+def test_lead_card_turns_red_with_white_figures_when_closing(monkeypatch):
+  renderer = card_renderer(monkeypatch, _carrot_radar_dist=20.0, _carrot_radar_track_id=0, _carrot_lead_status=True,
+                           _carrot_lead_speed=40.0, _carrot_lead_closing=True)
+  cards = []
+  monkeypatch.setattr(model_renderer.hs, "glass_card", lambda *args, **kwargs: cards.append(args))
+  monkeypatch.setattr(model_renderer.rl, "draw_rectangle_rec", lambda *args, **kwargs: None)
+
+  renderer._layout_lead_capsule_carrot(960.0, 500.0)
+  renderer._draw_lead_capsule_carrot(*renderer._lead_capsule)
+
+  assert cards[0][5] is model_renderer.hs.CARD_WARN
+  assert all(d[4] is model_renderer.hs.TEXT for d in renderer._type.drawn if d[0] in ("40", "20"))
+
+
+def test_lead_card_shows_a_state_word_alone(monkeypatch):
+  renderer = card_renderer(monkeypatch, _carrot_brake_hold_active=True)
+  monkeypatch.setattr(model_renderer.hs, "glass_card", lambda *args, **kwargs: None)
+
+  renderer._layout_lead_capsule_carrot(960.0, 500.0)
+  renderer._draw_lead_capsule_carrot(*renderer._lead_capsule)
+
+  assert renderer._lead_capsule[4] == model_renderer.LEAD_STATE_H
+  assert [d[0] for d in renderer._type.drawn] == ["AUTOHOLD"]
 
 
 def test_lead_runs_vision_only_shows_vision_distance_with_tenths_up_close(monkeypatch):
@@ -708,7 +789,7 @@ def test_lead_runs_carrot_tints_speed_amber_when_slower(monkeypatch):
 
   # The lead speed run carries the amber tint; the gap run is unchanged.
   assert runs[0] == ("num", "30", model_renderer.LEAD_SIZE, model_renderer.hs.AMBER)
-  assert ("num", "12", model_renderer.LEAD_GAP_SIZE, model_renderer.hs.TEXT) in runs
+  assert ("num", "12", model_renderer.LEAD_SIZE, model_renderer.hs.TEXT) in runs
 
 
 def speed_tag_renderer():
@@ -729,7 +810,7 @@ def test_speed_tag_drops_when_label_lands_beyond_reach(monkeypatch):
     "place_label",
     lambda x, y, w, h, claimed, gap=0.0: placed.append((x, y, w, h)) or (x + 300.0, y),
   )
-  monkeypatch.setattr(model_renderer.hs, "chip", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "glass_card", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.hs, "triangle", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)
@@ -745,7 +826,7 @@ def test_speed_tag_keeps_label_within_reach(monkeypatch):
   renderer = speed_tag_renderer()
   spot = (960.0 + 120.0, 501.0)
   monkeypatch.setattr(model_renderer.hs, "place_label", lambda *args, **kwargs: spot)
-  monkeypatch.setattr(model_renderer.hs, "chip", lambda *args, **kwargs: None)
+  monkeypatch.setattr(model_renderer.hs, "glass_card", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.hs, "triangle", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.hs, "dot", lambda *args, **kwargs: None)
   monkeypatch.setattr(model_renderer.rl, "draw_line_ex", lambda *args, **kwargs: None)

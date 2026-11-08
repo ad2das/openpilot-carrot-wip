@@ -74,15 +74,24 @@ LEAD_MIN_WIDTH = 190.0  # px: a far lead keeps a crescent wide enough to read at
 LEAD_DROP = 0.11  # crescent drop below the projected road point, in lead widths
 LEAD_DROP_MIN = 14.0
 LEAD_ROOF = 0.7  # readout anchor above the road point, in lead widths: about 1.7 m, a car/SUV roof
-# Lead readout capsule: figures, the secondary distance, units, state words and the capsule height.
-LEAD_SIZE = 80  # the leading figure: the lead's speed, or the gap while its speed is unknown
-LEAD_GAP_SIZE = 58  # the gap beside the speed
-LEAD_UNIT_SIZE = 36
-LEAD_STATE_SIZE = 56
-LEAD_CAPSULE_H = 104.0
-# Gap and speed are two segments of one capsule, the speed's a lighter surface: no captions needed to tell them apart.
-LEAD_SEG_PAD = 30.0
-LEAD_SEG_FILL = rl.Color(255, 255, 255, 36)
+# Lead readout card: the HUD's glass card, one column per figure (speed, gap) with its unit as a caption underneath.
+LEAD_SIZE = 56  # every figure, speed and gap alike
+LEAD_UNIT_SIZE = 21  # caption under a figure, upper case and tracked
+LEAD_CAPTION_SPACING = 2.0
+LEAD_STATE_SIZE = 44  # a state word (AUTOHOLD, Signal Ready) alone in the card
+LEAD_CARD_H = 100.0
+LEAD_STATE_H = 82.0
+LEAD_CARD_R = 26.0
+LEAD_PAD = 32.0  # card edge to column
+LEAD_DIV_GAP = 30.0  # column to the hairline between the columns
+LEAD_DIV = rl.Color(255, 255, 255, 46)
+LEAD_NUM_TOP = 22.0  # card top to the figures' cap line
+LEAD_CAPTION_GAP = 16.0  # figure baseline to the caption's cap line
+LEAD_LIFT = 22.0  # card bottom above the roof estimate
+# Speed tags over the other tracked cars: the same card, smaller, the radar state as a dot before the figure.
+TAG_SIZE_NEAR, TAG_SIZE_FAR = 46, 42
+TAG_H_NEAR, TAG_H_FAR = 64.0, 58.0
+TAG_R = 20.0
 LEAD_BLUE = rl.Color(10, 132, 255, 255)
 LEAD_TWO = rl.Color(240, 243, 247, 150)
 
@@ -505,7 +514,6 @@ class ModelRenderer(Widget):
     self._carrot_lead_vrel = 0.0
     self._carrot_lead_trend = 0
     self._lead_w = 0.0
-    self._lead_w2 = 0.0
     self._float_boxes: list[tuple[float, float, float, float]] = []
     self._lead_capsule = None
     self._carrot_x_state = 0
@@ -910,8 +918,8 @@ class ModelRenderer(Widget):
 
 
   def _lead_runs_carrot(self) -> list[tuple]:
-    """Readout contents: ('dot', colour, r) and ('num'/'text'/'unit', text, size, colour); a ('bar',) splits the lead's
-    speed from the gap, which takes the lighter right segment. The capsule is sized for widest-digit 'num' slots so it does not breathe as digits change."""
+    """Readout contents: ('num'/'text'/'unit', text, size, colour); a ('bar',) splits the lead's speed from the gap.
+    Each figure becomes a column of the readout card with its unit as the caption underneath."""
     # SoftHold has its own centre chip in the HUD; the readout keeps the lead's speed and gap.
     if self._carrot_brake_hold_active or self._carrot_carrot_cruise:
       text = "AUTOHOLD" if self._carrot_brake_hold_active else "CARROT"
@@ -926,8 +934,8 @@ class ModelRenderer(Widget):
 
     text_color = hs.TEXT if self._carrot_x_state == 0 else (hs.rgba(191, 191, 191) if self._carrot_x_state == 1 else hs.GREEN)
     runs: list[tuple] = []
-    # Two readings, nothing else: the lead's speed first and loudest, then the gap a step quieter.
-    # The source colour lives on the crescent under the car, not in the capsule.
+    # Two readings, nothing else: the lead's speed (tinted by its trend), then the gap.
+    # The source colour lives on the crescent under the car, not in the card.
     if self._carrot_lead_status and self._carrot_lead_speed > 0.5:
       runs += [("num", f"{self._carrot_lead_speed:.0f}", LEAD_SIZE, self._lead_speed_color_carrot()),
                ("unit", "km/h" if ui_state.is_metric else "mph", LEAD_UNIT_SIZE, hs.TEXT_3)]
@@ -936,112 +944,79 @@ class ModelRenderer(Widget):
       if runs:
         runs.append(("bar",))
       # Whole metres while far (tenths would flicker without meaning); tenths only up close.
-      runs += [("num", f"{dist:.1f}" if round(dist, 1) < 10.0 else f"{dist:.0f}", LEAD_GAP_SIZE if runs else LEAD_SIZE,
-                text_color), ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
+      runs += [("num", f"{dist:.1f}" if round(dist, 1) < 10.0 else f"{dist:.0f}", LEAD_SIZE, text_color),
+               ("unit", "m", LEAD_UNIT_SIZE, hs.TEXT_3)]
     return runs
 
-  _LEAD_GAPS = {"dot": 10.0, "num": 0.0, "text": 0.0, "unit": 8.0}
+  def _lead_columns_carrot(self, runs) -> list[tuple]:
+    """(figure run, unit run or None, column width) per figure; a state word is one column of its own."""
+    t = self._type
+    split = runs.index(("bar",)) if ("bar",) in runs else len(runs)
+    cols = []
+    for group in (runs[:split], runs[split + 1:]):
+      if not group:
+        continue
+      head = group[0]
+      if head[0] == "text":
+        cols.append((head, None, t.width(head[1], head[2], hs.SEMI)))
+        continue
+      unit = next((run for run in group if run[0] == "unit"), None)
+      # Widest-digit slot (the figures are proportional), so the card does not breathe as digits change.
+      slot = "".join("0" if c.isdigit() else c for c in head[1])
+      width = t.width(slot, head[2], hs.BOLD)
+      if unit is not None:
+        width = max(width, t.width(unit[1].upper(), unit[2], hs.SEMI, LEAD_CAPTION_SPACING))
+      cols.append((head, unit, width))
+    return cols
 
   @staticmethod
-  def _lead_run_weight(run):
-    # The leading figure is bold; everything else semi-bold.
-    return hs.BOLD if run[0] == "num" and run[2] == LEAD_SIZE else hs.SEMI
-
-  def _lead_run_width(self, run, slot: bool = False) -> float:
-    kind = run[0]
-    if kind == "dot":
-      return run[2] * 2.0
-    if kind == "num" and slot:
-      # Widest-digit slot: Inter's figures are proportional.
-      return self._type.width("".join("0" if c.isdigit() else c for c in run[1]), run[2], self._lead_run_weight(run))
-    return self._type.width(run[1], run[2], self._lead_run_weight(run))
-
-  def _lead_run_gap(self, prev, kind) -> float:
-    if prev is None:
-      return 0.0
-    if prev == "dot":
-      return 9.0
-    return (18.0 if prev == "unit" else 24.0) if kind == "dot" else self._LEAD_GAPS[kind]
-
-  def _place_lead_runs(self, runs, slot: bool = False):
-    """Left offsets of runs laid out on one line, and the line's width."""
-    placed: list[tuple[tuple, float]] = []
-    x = 0.0
-    prev = None
-    for run in runs:
-      x += self._lead_run_gap(prev, run[0])
-      placed.append((run, x))
-      x += self._lead_run_width(run, slot)
-      prev = run[0]
-    return placed, x
+  def _lead_card_width(cols) -> float:
+    return 2.0 * LEAD_PAD + sum(col[2] for col in cols) + (len(cols) - 1) * (2.0 * LEAD_DIV_GAP + 1.5)
 
   def _layout_lead_capsule_carrot(self, cx: float, car_top: float) -> None:
     runs = self._lead_runs_carrot()
     if not runs:
       self._lead_w = 0.0
       return
-    split = runs.index(("bar",)) if ("bar",) in runs else len(runs)
-    first, second = runs[:split], runs[split + 1:]
-    p1, w1 = self._place_lead_runs(first)
-    p2, w2 = self._place_lead_runs(second)
-    s1 = self._place_lead_runs(first, slot=True)[1]
-    s2 = self._place_lead_runs(second, slot=True)[1]
-    h = LEAD_CAPSULE_H
-    # Each segment is sized for its widest-digit slots; width changes (a figure gaining a digit, a state word
-    # replacing the figures) ease instead of snapping.
-    def ease(cur, target):
-      return target if cur <= 0.0 or abs(target - cur) > 160.0 else cur * 0.7 + target * 0.3
-    self._lead_w = ease(self._lead_w, s1 + 2.0 * LEAD_SEG_PAD if second else s1 + 64.0)
-    self._lead_w2 = ease(self._lead_w2, s2 + 2.0 * LEAD_SEG_PAD) if second else 0.0
-    seg1 = max(self._lead_w, w1 + 40.0)
-    seg2 = max(self._lead_w2, w2 + 40.0) if second else 0.0
-    w = seg1 + seg2
-    # The tail tip sits just above the roof estimate.
-    mid = hs.clear_of_panels(cx, car_top - 18.0 - h / 2, w, h)
+    cols = self._lead_columns_carrot(runs)
+    h = LEAD_STATE_H if cols[0][0][0] == "text" else LEAD_CARD_H
+    target = self._lead_card_width(cols)
+    # A figure gaining a digit widens the card at once; losing one eases it back.
+    self._lead_w = target if self._lead_w < target or self._lead_w - target > 160.0 else self._lead_w * 0.7 + target * 0.3
+    w = self._lead_w
+    mid = hs.clear_of_panels(cx, car_top - LEAD_LIFT - h / 2, w, h)
     self._float_boxes.append((cx - w / 2, mid - h / 2, w, h))
-    self._lead_capsule = ((p1, w1), (p2, w2), cx, mid, w, h, car_top, seg1)
+    self._lead_capsule = (cols, cx, mid, w, h, car_top)
 
-  def _draw_lead_runs(self, placed, left: float, base: float) -> None:
+  def _draw_lead_capsule_carrot(self, cols, cx: float, mid: float, w: float, h: float, car_top: float) -> None:
     t = self._type
-    for i, (run, ox) in enumerate(placed):
-      kind = run[0]
-      x = left + ox
-      if kind == "dot":
-        # A source dot is centred on the cap height of the figure it labels.
-        nxt = placed[i + 1][0] if i + 1 < len(placed) else None
-        size = nxt[2] if nxt is not None and nxt[0] == "num" else LEAD_SIZE
-        hs.dot(x + run[2], base - size * hs.INTER_CAP / 2, run[2], run[1])
-      else:
-        t.draw(run[1], x, base, run[2], run[3], self._lead_run_weight(run))
-
-  def _draw_lead_capsule_carrot(self, line1, line2, cx: float, mid: float, w: float, h: float, car_top: float,
-                                seg1: float) -> None:
-    bottom = mid + h / 2
-    tail = 14.0
-    if bottom + tail < car_top - 40.0:
-      # Pushed up by a HUD card: extend the tail with a stem that fades out (the lead's real height is unknown).
-      rl.draw_rectangle_gradient_v(int(cx) - 1, int(bottom + tail - 2.0), 3, int(car_top - bottom - tail),
+    left, top = cx - w / 2, mid - h / 2
+    bottom = top + h
+    if bottom < car_top - 40.0:
+      # Pushed up by a HUD card: a stem that fades out towards the lead (its real height is unknown).
+      rl.draw_rectangle_gradient_v(int(cx) - 1, int(bottom), 3, int(car_top - bottom),
                                    hs.rgba(255, 255, 255, 150), hs.rgba(255, 255, 255, 0))
-    left = cx - w / 2
-    hs.chip(left, mid - h / 2, w, h)
-    split = left + seg1
-    tip = bottom + tail < car_top
-    if tip:
-      hs.triangle((cx - tail, bottom - 1.0), (cx + tail, bottom - 1.0), (cx, bottom + tail), hs.CHIP_FILL)
-    (p1, w1), (p2, w2) = line1, line2
-    if p2:
-      # The gap on the capsule's lighter right segment: square where it meets the speed, round at the end.
-      r = h / 2 - 1.5
-      right = left + w - 1.5
-      rl.draw_rectangle_rec(rl.Rectangle(split, mid - r, right - r - split, 2.0 * r), LEAD_SEG_FILL)
-      rl.draw_circle_sector(rl.Vector2(right - r, mid), r, -90.0, 90.0, 24, LEAD_SEG_FILL)
-      if tip and cx > split:
-        hs.triangle((cx - tail, bottom - 1.0), (cx + tail, bottom - 1.0), (cx, bottom + tail), LEAD_SEG_FILL)
-    cap1 = max((run[2] for run, _ in p1 if run[0] in ("num", "text")), default=LEAD_SIZE) * hs.INTER_CAP
-    self._draw_lead_runs(p1, left + (seg1 - w1) / 2, mid + cap1 / 2)
-    if p2:
-      cap2 = max(run[2] for run, _ in p2 if run[0] == "num") * hs.INTER_CAP
-      self._draw_lead_runs(p2, split + (w - seg1 - w2) / 2, mid + cap2 / 2)
+    # Closing in fast turns the whole card red, like the HUD's camera warning; its figures then stay white.
+    closing = self._carrot_lead_closing
+    hs.glass_card(left, top, w, h, LEAD_CARD_R, hs.CARD_WARN if closing else hs.CARD_BODY)
+    head = cols[0][0]
+    if head[0] == "text":
+      t.draw_mid(head[1], cx, mid, head[2], head[3], hs.SEMI, align=0.5)
+      return
+    extra = (w - self._lead_card_width(cols)) / len(cols)
+    figure_base = top + LEAD_NUM_TOP + LEAD_SIZE * hs.INTER_CAP
+    caption_base = figure_base + LEAD_CAPTION_GAP + LEAD_UNIT_SIZE * hs.INTER_CAP
+    x = left + LEAD_PAD
+    for i, (figure, unit, width) in enumerate(cols):
+      width += extra
+      if i:
+        rl.draw_rectangle_rec(rl.Rectangle(x + LEAD_DIV_GAP, top + h * 0.24, 1.5, h * 0.52), LEAD_DIV)
+        x += 2.0 * LEAD_DIV_GAP + 1.5
+      t.draw(figure[1], x + width / 2, figure_base, figure[2], hs.TEXT if closing else figure[3], hs.BOLD, align=0.5)
+      if unit is not None:
+        t.draw(unit[1].upper(), x + width / 2, caption_base, unit[2], unit[3], hs.SEMI, align=0.5,
+               spacing=LEAD_CAPTION_SPACING)
+      x += width
 
   @staticmethod
   def _lead_closing_next(closing: bool, d_rel: float, v_rel: float) -> bool:
@@ -1545,13 +1520,14 @@ class ModelRenderer(Widget):
     return abs(float(track.dRel) - lead_d) < max(2.5, 0.08 * lead_d) and abs(float(track.yRel) - float(lead_one.yRel)) < 1.5
 
   def _draw_speed_tag_carrot(self, x: float, y: float, text: str, ring: "rl.Color | None", d_rel: float):
-    """Speed callout pinned above a tracked car's roof: the figure alone; the ring keeps the radar-state colour.
+    """Speed tag above a tracked car's roof: the figure on a small glass card, the radar state as a dot before it.
 
     Returns (centre x, centre y, height) or None."""
     near = d_rel < 40.0
-    size = 62 if near else 56
-    h = 86.0 if near else 78.0
-    w = max(h * 1.6, self._type.width(text, size, hs.SEMI) + h * 0.8)
+    size = TAG_SIZE_NEAR if near else TAG_SIZE_FAR
+    h = TAG_H_NEAR if near else TAG_H_FAR
+    dot_room = 20.0 if ring is not None else 0.0
+    w = max(h * 1.3, self._type.width(text, size, hs.SEMI) + 48.0 + dot_room)
     tail = 10.0
     spot = hs.place_label(x, y - tail - h / 2, w, h, self._float_boxes, gap=8.0)
     if spot is None or abs(spot[0] - x) - w / 2 > self.TAG_DROP_REACH:
@@ -1560,22 +1536,24 @@ class ModelRenderer(Widget):
       return None
     tx, mid = spot
     left, bottom = tx - w / 2, mid + h / 2
-    ex = min(max(x, left + h / 2), left + w - h / 2)
+    ex = min(max(x, left + TAG_R), left + w - TAG_R)
     if abs(tx - x) >= 1.0 and self._crosses_ar_sign(ex, bottom, x, y):
       # A leader drawn across the turn sign would read as part of it; the sign wins.
       return None
     self._float_boxes.append((tx - w / 2, mid - h / 2, w, h))
-    fill = hs.CHIP_FILL
     if abs(tx - x) < 1.0:
-      # Directly above: a callout tail, extended by a hairline stem if the label had to rise.
+      # Directly above: a hairline stem only if the tag had to rise.
       if y - bottom > tail + 2.0:
-        rl.draw_line_ex(rl.Vector2(x, bottom + tail - 1.0), rl.Vector2(x, y), 2.0, hs.rgba(255, 255, 255, 110))
-      hs.triangle((x - tail * 0.7, bottom - 1.0), (x + tail * 0.7, bottom - 1.0), (x, bottom + tail * 0.7), fill)
+        rl.draw_line_ex(rl.Vector2(x, bottom), rl.Vector2(x, y), 2.0, hs.rgba(255, 255, 255, 110))
     else:
       rl.draw_line_ex(rl.Vector2(ex, bottom - 2.0), rl.Vector2(x, y), 2.5, hs.rgba(255, 255, 255, 150))
       hs.dot(x, y, 4.0, hs.rgba(255, 255, 255, 200))
-    hs.chip(left, mid - h / 2, w, h, fill=fill, ring=hs.with_alpha(ring, 230) if ring is not None else None, ring_width=3.0)
-    self._type.draw_mid(text, tx, mid, size, hs.TEXT, hs.SEMI, align=0.5)
+    hs.glass_card(left, mid - h / 2, w, h, TAG_R)
+    if ring is not None:
+      hs.dot(left + 26.0, mid, 6.0, ring)
+      self._type.draw_mid(text, left + 26.0 + 18.0 + (w - 44.0 - 24.0) / 2, mid, size, hs.TEXT_2, hs.SEMI, align=0.5)
+    else:
+      self._type.draw_mid(text, tx, mid, size, hs.TEXT_2, hs.SEMI, align=0.5)
     return tx, mid, h
 
 
