@@ -393,6 +393,13 @@
   builds pass; actual warning resolution and physical timing remain unvalidated.
   See docs/canfd_cluster_rx_forwarding.md. Keep incident data local.
 
+- On 2026-11-08, C3/C3X main UI onroad affinity became core7 only (nice19,
+  SCHED_OTHER), superseding cores0,1,2,3,6,7. Palisade logs showed the UI on
+  isolated core6 in 30/30 procLog samples with ~600 ms/s runqueue wait against
+  ~270 ms/s CPU and 13-19 fps. modeld/DM on core7 are FIFO and still preempt it.
+  C4 stays core6; offroad and offline fallback stay little cores. Device FPS and
+  model impact remain to be checked in the next drive.
+
 - On 2026-10-03, the user explicitly approved adding core7 to C3/C3X main UI
   onroad affinity: cores0,1,2,3,6,7 with SCHED_OTHER/nice19 for all UI threads.
   This supersedes the earlier core7 exclusion for this UI. C4 stays core6;

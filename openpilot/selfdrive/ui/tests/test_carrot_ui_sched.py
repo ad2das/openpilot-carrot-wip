@@ -1,4 +1,4 @@
-"""UI normal-scheduler contract; C3 shares little/core6/core7, C4 retains core6."""
+"""UI normal-scheduler contract; C3 uses core7 only, C4 retains core6."""
 import ast
 import os
 import sys
@@ -107,10 +107,16 @@ class TestEnsureSchedOtherContract:
 class TestUiStartupAst:
   """ui.py 시작/재affine 구조 고정 — import 부작용 때문에 AST 검증."""
 
-  def test_ui_uses_onroad_core6_policy(self):
+  def test_ui_uses_core7_on_c3_and_core6_on_c4(self):
     tree = _ui_py_tree()
     calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id == "DisplayScheduler"]
-    assert len(calls) == 1 and calls[0].args[0].value == 6
+    assert len(calls) == 1
+    core = calls[0].args[0]
+    # C3 leaves isolated core6 (camera/control) for core7; C4 keeps core6
+    assert isinstance(core, ast.IfExp) and isinstance(core.test, ast.Name) and core.test.id == "c3"
+    assert core.body.value == 7 and core.orelse.value == 6
+    # no little cores or extra big cores: a shared mask strands the UI on isolated core6
+    assert {k.arg for k in calls[0].keywords} == {"enabled"}
 
   def test_bootstrap_core0_and_runtime_transition(self):
     assert ("const_list", (0,)) in _affinity_shapes(_ui_py_tree())
