@@ -93,12 +93,12 @@ SYS_W = TPMS_W         # link + device card: the tyre card's width, so the right
 SYS_R = 30
 SYS_PAD = 26
 SYS_LINK_H = 66
-SYS_LINK_SIZE = 34
+SYS_LINK_SIZE = 38
 SYS_DEVICE_H = 150
 SYS_VALUE_SIZE = 80    # only CPU temperature and memory, large
 SYS_VALUE_MID = 62
 SYS_MIN_GAP = 14
-SYS_LABEL_SIZE = 26
+SYS_LABEL_SIZE = 34
 SYS_LABEL_MID = 124
 TRIP_STATS_H = 172     # three-column stats row
 TRIP_HEAD_H = 74       # road-name header above it
@@ -941,12 +941,12 @@ class HudRenderer(Widget):
     y = top
     if links:
       # Justified across the card, each active link lit in its own colour (APM keeps its blue).
-      widths = [t.width(label, SYS_LINK_SIZE, hs.BOLD, 1.5) for label, _ in links]
+      widths = [t.width(label, SYS_LINK_SIZE, hs.BOLD, 0.5) for label, _ in links]
       space = (inner - sum(widths)) / (len(widths) - 1) if len(widths) > 1 else 0.0
       lx = x + SYS_PAD if len(widths) > 1 else x + (SYS_W - widths[0]) / 2
       mid = y + SYS_LINK_H / 2 + (2 if device else 0)
       for (label, color), item_w in zip(links, widths, strict=True):
-        t.draw_mid(label, lx, mid, SYS_LINK_SIZE, color, hs.BOLD, spacing=1.5)
+        t.draw_mid(label, lx, mid, SYS_LINK_SIZE, color, hs.BOLD, spacing=0.5)
         lx += item_w + space
       y += SYS_LINK_H
       if device:

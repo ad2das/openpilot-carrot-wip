@@ -29,7 +29,7 @@ BORDER_COLORS = {
 }
 BLINKER_OFF = rl.Color(10, 12, 16, 255)
 BORDER_CORNER_RADIUS = 36.0
-BORDER_TEXT = rl.Color(255, 255, 255, 170)  # debug read-outs in the band: legible, never louder than the HUD
+BORDER_TEXT = rl.Color(255, 255, 255, 255)  # debug read-outs in the band: legible, never louder than the HUD
 
 WIDE_CAM_MAX_SPEED = 10.0  # m/s (22 mph)
 ROAD_CAM_MIN_SPEED = 15.0  # m/s (34 mph)
