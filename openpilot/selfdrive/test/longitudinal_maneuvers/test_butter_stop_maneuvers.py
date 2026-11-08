@@ -57,6 +57,7 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.maneuver import Maneuver
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
   PLANT_A_GATE, PLANT_SCC_BRAKE, PLANT_TAU, plant_creep,
 )
+from openpilot.selfdrive.test.longitudinal_maneuvers.fitted_plant import FittedPlant
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_longitudinal import create_maneuvers
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
@@ -127,7 +128,8 @@ def _no_floor(*_args, **_kwargs):
 
 
 class ButterStopLoop:
-  def __init__(self, maneuver, butter, neutralize=False, plant=False, scc_stop=False):
+  def __init__(self, maneuver, butter, neutralize=False, plant=False, scc_stop=False,
+               fitted=None):
     _seed_param_defaults()
     params = Params()
     params.put_int("ButterStop", int(butter))
@@ -136,6 +138,9 @@ class ButterStopLoop:
     self.neutralize = neutralize
     self.plant = bool(plant)
     self.scc_stop = bool(scc_stop)
+    assert not (fitted is not None and (self.plant or self.scc_stop)), \
+      "fitted replaces the plant: do not combine it with plant= or scc_stop="
+    self.fitted_plant = FittedPlant(fitted) if fitted is not None else None
     self._plant_lag = 0.0
     self.radar_noise_std = float(getattr(maneuver, "radar_noise_std", 0.0))
     self._radar_rng = np.random.default_rng(int(getattr(maneuver, "radar_noise_seed", 0)))
@@ -144,6 +149,8 @@ class ButterStopLoop:
     self.cp = cp
 
     self.ego_v = float(maneuver.speed)
+    if self.fitted_plant is not None:
+      self.fitted_plant.reset(float(maneuver.speed))
     self.ego_x = 0.0
     self.lead_x = float(maneuver.distance_lead)
     self.v_lead_prev = 0.0
@@ -206,8 +213,12 @@ class ButterStopLoop:
     model.modelV2.meta.disengagePredictions.gasPressProbs = [float(prob_throttle)] * 6
 
     car_state = messaging.new_message('carState')
-    car_state.carState.vEgo = float(self.ego_v)
-    car_state.carState.aEgo = float(self.long_control.last_output_accel)
+    if self.fitted_plant is not None:
+      car_state.carState.vEgo = float(self.fitted_plant.v_kf)
+      car_state.carState.aEgo = float(self.fitted_plant.a_kf)
+    else:
+      car_state.carState.vEgo = float(self.ego_v)
+      car_state.carState.aEgo = float(self.long_control.last_output_accel)
     car_state.carState.vCluRatio = 1.0
     car_state.carState.standstill = bool(standstill)
     car_state.carState.vCruise = float(v_cruise_ms * 3.6)
@@ -248,8 +259,11 @@ class ButterStopLoop:
     )
 
   def _cs_view(self, v_cruise_ms, standstill):
+    v_ego = float(self.fitted_plant.v_kf) if self.fitted_plant is not None else float(self.ego_v)
+    a_ego = float(self.fitted_plant.a_kf) if self.fitted_plant is not None \
+      else float(self.long_control.last_output_accel)
     return types.SimpleNamespace(
-      vEgo=float(self.ego_v), aEgo=float(self.long_control.last_output_accel),
+      vEgo=v_ego, aEgo=a_ego,
       brakePressed=False, gasPressed=False, softHoldActive=0,
       standstill=bool(standstill),
       cruiseState=types.SimpleNamespace(standstill=False),
@@ -286,7 +300,8 @@ class ButterStopLoop:
       pitch = float(np.interp(t, maneuver.breakpoints, maneuver.pitch_values))
       prob_lead = float(np.interp(t, maneuver.breakpoints, maneuver.prob_lead_values))
       prob_throttle = float(np.interp(t, maneuver.breakpoints, maneuver.prob_throttle_values))
-      standstill = self.ego_v < 0.01
+      standstill = self.fitted_plant.standstill if self.fitted_plant is not None \
+        else self.ego_v < 0.01
 
       if frame % PLANNER_PERIOD == 0:
         a_lead = (v_lead - self.v_lead_prev) / (PLANNER_PERIOD * dt)
@@ -321,7 +336,11 @@ class ButterStopLoop:
         bool(maneuver.enabled), self._cs_view(v_cruise_ms, standstill), plan_view,
         limits, t_since_plan, radar_view)
       accel = float(accel)
-      if self.plant:
+      if self.fitted_plant is not None:
+        a_true, v_true, _, _, _ = self.fitted_plant.step(
+          accel, int(self.long_control.long_control_state), dt)
+        applied = a_true
+      elif self.plant:
         self._plant_lag += (dt / PLANT_TAU) * (accel - self._plant_lag)
         applied = self._plant_lag
         if accel < PLANT_A_GATE and self.ego_v > 0.01:
@@ -344,7 +363,8 @@ class ButterStopLoop:
                      floor_raw if floor_raw is not None else 0.0,
                      a_end if a_end is not None else 0.0,
                      applied, float(self.long_control.long_control_state), fcw)
-      self.ego_v = max(0.0, self.ego_v + applied * dt)
+      self.ego_v = v_true if self.fitted_plant is not None \
+        else max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       self.lead_x = self.lead_x + v_lead * dt
     return logs

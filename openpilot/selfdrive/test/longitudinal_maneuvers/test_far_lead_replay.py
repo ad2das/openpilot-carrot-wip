@@ -50,6 +50,7 @@ from openpilot.selfdrive.controls.lib.longitudinal_planner import LongitudinalPl
 from openpilot.selfdrive.controls.lib.longcontrol import LongControl, LongCtrlState
 from openpilot.selfdrive.controls.lib.longitudinal_mpc_lib import long_mpc
 from openpilot.selfdrive.carrot.carrot_functions import CarrotPlanner
+from openpilot.selfdrive.test.longitudinal_maneuvers.fitted_plant import FittedPlant
 from opendbc.car.hyundai.interface import CarInterface
 from opendbc.car.hyundai.values import CAR
 
@@ -274,7 +275,8 @@ class SyntheticProfile:
 
 
 class FarLeadLoop:
-  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False, telemetry=None):
+  def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False, telemetry=None,
+               fitted=None):
     _seed_param_defaults()
     params = Params()
     _apply_header_params(params, header)
@@ -291,6 +293,11 @@ class FarLeadLoop:
     self.ego_x = 0.0
     self.plant = bool(plant)
     self.scc_stop = bool(scc_stop)
+    assert not (fitted is not None and (self.plant or self.scc_stop)), \
+      "fitted replaces the plant: do not combine it with plant= or scc_stop="
+    self.fitted_plant = FittedPlant(fitted) if fitted is not None else None
+    if self.fitted_plant is not None:
+      self.fitted_plant.reset(float(profile.initial_speed), float(profile.initial_accel))
     self.telemetry = telemetry
     if telemetry is not None:
       for key in ("t", "v", "v_lead", "gap", "floor", "margin", "stopped_pair",
@@ -374,8 +381,12 @@ class FarLeadLoop:
     model.modelV2.meta.disengagePredictions.gasPressProbs = [1.0] * 6
 
     car_state = messaging.new_message('carState')
-    car_state.carState.vEgo = float(self.ego_v)
-    car_state.carState.aEgo = float(self.long_control.last_output_accel)
+    if self.fitted_plant is not None:
+      car_state.carState.vEgo = float(self.fitted_plant.v_kf)
+      car_state.carState.aEgo = float(self.fitted_plant.a_kf)
+    else:
+      car_state.carState.vEgo = float(self.ego_v)
+      car_state.carState.aEgo = float(self.long_control.last_output_accel)
     car_state.carState.vCluRatio = 1.0
     car_state.carState.standstill = bool(standstill)
     car_state.carState.vCruise = float(v_cruise_kph)
@@ -417,8 +428,11 @@ class FarLeadLoop:
     )
 
   def _cs_view(self, v_cruise_kph, standstill):
+    v_ego = float(self.fitted_plant.v_kf) if self.fitted_plant is not None else float(self.ego_v)
+    a_ego = float(self.fitted_plant.a_kf) if self.fitted_plant is not None \
+      else float(self.long_control.last_output_accel)
     return types.SimpleNamespace(
-      vEgo=float(self.ego_v), aEgo=float(self.long_control.last_output_accel),
+      vEgo=v_ego, aEgo=a_ego,
       brakePressed=False, gasPressed=False, softHoldActive=0,
       standstill=bool(standstill),
       cruiseState=types.SimpleNamespace(standstill=False),
@@ -433,6 +447,7 @@ class FarLeadLoop:
     log_gap, log_active, log_vlead, log_atarget = [], [], [], []
     log_a_actual, log_should_stop, log_lc_state = [], [], []
     log_desired_distance = []
+    log_v_kf, log_a_kf = [], []
     fcw_steps = 0
     msgs = None
     plan_view = None
@@ -441,7 +456,8 @@ class FarLeadLoop:
     stopped = False
     for frame in range(max_frames):
       t = frame * dt
-      standstill = self.ego_v < 0.01
+      standstill = self.fitted_plant.standstill if self.fitted_plant is not None \
+        else self.ego_v < 0.01
       v_cruise_kph = profile.v_cruise_kph(t)
       v_cruise_ms = v_cruise_kph / 3.6
 
@@ -466,7 +482,11 @@ class FarLeadLoop:
         limits, t_since_plan, radar_view)
       accel = float(accel)
 
-      if self.plant:
+      if self.fitted_plant is not None:
+        a_true, v_true, _, _, _ = self.fitted_plant.step(
+          accel, int(self.long_control.long_control_state), dt)
+        applied = a_true
+      elif self.plant:
         self._plant_lag += (dt / PLANT_TAU) * (accel - self._plant_lag)
         applied = self._plant_lag
         if accel < PLANT_A_GATE and self.ego_v > 0.01:
@@ -499,8 +519,12 @@ class FarLeadLoop:
       log_should_stop.append(bool(plan_view.shouldStop))
       log_lc_state.append(int(self.long_control.long_control_state))
       log_desired_distance.append(float(plan_view.desiredDistance))
+      if self.fitted_plant is not None:
+        log_v_kf.append(float(self.fitted_plant.v_kf))
+        log_a_kf.append(float(self.fitted_plant.a_kf))
 
-      self.ego_v = max(0.0, self.ego_v + applied * dt)
+      self.ego_v = v_true if self.fitted_plant is not None \
+        else max(0.0, self.ego_v + applied * dt)
       self.ego_x = self.ego_x + self.ego_v * dt
       if self.ego_v < 0.05:
         standstill_frames += 1
@@ -509,13 +533,20 @@ class FarLeadLoop:
           break
       else:
         standstill_frames = 0
-    return {
+    out = {
       "t": log_t, "v": log_v, "accel": log_accel, "x": log_x,
       "gap": log_gap, "active": log_active, "v_lead": log_vlead, "a_target": log_atarget,
       "a_actual": log_a_actual, "should_stop": log_should_stop, "lc_state": log_lc_state,
       "desired_distance": log_desired_distance,
       "fcw_steps": fcw_steps, "stopped": bool(stopped or self.ego_v < 0.05),
     }
+    if self.fitted_plant is not None:
+      # The car's reported speed/accel (what the log's census is measured on);
+      # absent when the loop runs without the fitted plant, so the default
+      # result dict stays byte-identical.
+      out["v_kf"] = log_v_kf
+      out["a_kf"] = log_a_kf
+    return out
 
 
 def compute_metrics(run):
