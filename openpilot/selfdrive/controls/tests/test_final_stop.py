@@ -93,8 +93,9 @@ sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib import longcontrol as lc
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  FINAL_A0_MAX, FINAL_A_END, FINAL_FB_V, FINAL_HOLD_T, FINAL_KV, FINAL_U_MAX,
-  FINAL_U_MIN, FINAL_V_MAX, STANDSTILL_V, final_profile,
+  FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_A_END, FINAL_FB_V, FINAL_HOLD_T,
+  FINAL_KV, FINAL_U_MAX, FINAL_U_MIN, FINAL_V_MAX, MIN_FINAL_GAP_ABS, STANDSTILL_V,
+  STOCK_ROLL_DECEL, final_a0_dist, final_profile,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongCtrlState, long_control_state_trans,
@@ -247,10 +248,12 @@ def test_final_hold_keeps_pid_past_the_speed_handoff():
   assert long_control_state_trans(*args, final_hold=True) == LongCtrlState.pid
 
 
-def test_final_hold_never_overrides_fcw():
+def test_final_hold_stays_pid_inside_the_lead_gap():
+  """Inside the window a lead between the gap and the fcw radius keeps pid."""
   cp = make_cp()
   args = (cp, True, LongCtrlState.pid, 0.3, True, False, False, -0.2, -0.5, _radar(True, 3.9))
-  assert long_control_state_trans(*args, final_hold=True) == LongCtrlState.stopping
+  assert long_control_state_trans(*args) == LongCtrlState.stopping, "base hands off at 3.9 m"
+  assert long_control_state_trans(*args, final_hold=True) == LongCtrlState.pid
 
 
 def test_final_hold_never_delays_a_starting_exit():
@@ -389,16 +392,32 @@ def test_window_exits_on_timeout(monkeypatch):
   assert control._final_done
 
 
-def test_window_exits_on_fcw(monkeypatch):
+def test_window_survives_a_lead_inside_the_fcw_radius(monkeypatch):
+  """A lead between MIN_FINAL_GAP_ABS and 4.0 m no longer ends the window."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
   control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=30.0)
   assert control._final_t is not None
 
-  _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=3.9)
+  _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True,
+              d_rel=MIN_FINAL_GAP_ABS + 0.5)
+  assert control._final_t is not None, "3.5 m is inside the fcw radius but outside the gap"
+  assert not control._final_done
+
+
+def test_window_exits_close_lead_and_hands_off_the_same_tick(monkeypatch):
+  """Below MIN_FINAL_GAP_ABS the window ends and the ordinary fcw hand-off runs."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=30.0)
+  assert control._final_t is not None
+
+  _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=2.9)
   assert control._final_t is None
   assert control._final_done
+  assert control.long_control_state == LongCtrlState.stopping
 
 
 def test_window_exits_when_should_stop_clears(monkeypatch):
@@ -485,6 +504,57 @@ def test_window_distance_guard_uses_lead_gap(monkeypatch):
   radar_far = SimpleNamespace(leadOne=SimpleNamespace(status=True, dRel=30.0))
   out_far = control._final_window_accel(cs, plan, radar_far)
   assert out_far == pytest.approx(-0.5, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# final_a0_dist: the stock-distance-closed entry decel
+# ---------------------------------------------------------------------------
+
+def test_final_a0_dist_matches_the_closed_form():
+  assert final_a0_dist() == pytest.approx(0.65497, abs=1e-4)
+  assert FINAL_A0_DIST == pytest.approx(0.65497, abs=1e-4)
+  # Independent of the end decel only through its own argument.
+  assert final_a0_dist(a_end=0.10, a_stock=STOCK_ROLL_DECEL) == pytest.approx(FINAL_A0_DIST)
+  # With no end decel the profile is a pure linear ramp: D = 2 v0^2 / (3 a0),
+  # so a0 = 2/3 for a stock decel of 0.5.
+  assert final_a0_dist(a_end=0.0, a_stock=0.5) == pytest.approx(2.0 / 3.0, abs=1e-6)
+
+
+@pytest.mark.parametrize("v0", [0.3, 0.5, 0.6])
+def test_final_a0_dist_profile_travels_the_stock_distance(v0):
+  """With a0 = FINAL_A0_DIST the profile covers exactly v0^2/(2*STOCK_ROLL_DECEL)."""
+  _, _, T = final_profile(0.0, v0, FINAL_A0_DIST)
+  steps = 20000
+  dt = T / steps
+  travelled = sum(final_profile(i * dt, v0, FINAL_A0_DIST)[1] for i in range(steps)) * dt
+  stock = v0 * v0 / (2.0 * STOCK_ROLL_DECEL)
+  assert travelled == pytest.approx(stock, abs=1e-3), (travelled, stock)
+
+
+def test_window_entry_never_brakes_softer_than_final_a0_dist(monkeypatch):
+  """A gentle entry is raised to FINAL_A0_DIST so the stop does not run long."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control.long_control_state = LongCtrlState.pid
+  control.last_output_accel = -FINAL_A0_MIN  # gentler than the stock-distance decel
+  cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=_decaying_speeds(0.5))
+  cs.aEgo = -FINAL_A0_MIN
+  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._final_t is not None
+  assert control._final_a0 == pytest.approx(FINAL_A0_DIST)
+
+  # A stronger entry is clamped to FINAL_A0_MAX. aEgo must still clear the
+  # stopping threshold for the window to open, so it is the last command, not
+  # the measured decel, that carries the harder value.
+  control._final_t = None
+  control._final_done = False
+  control.long_control_state = LongCtrlState.pid
+  control.last_output_accel = -FINAL_A0_MAX
+  cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=_decaying_speeds(0.5))
+  cs.aEgo = -0.4
+  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._final_t is not None
+  assert control._final_a0 == pytest.approx(FINAL_A0_MAX)
 
 
 def test_butter_stop_off_forces_final_stop_false(monkeypatch):

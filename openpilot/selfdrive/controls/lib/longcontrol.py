@@ -12,7 +12,7 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 )
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
+  CREEP_ACCEL, CREEP_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
   FINAL_KV, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX, FINAL_U_MIN,
   FINAL_V_MAX, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
   STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, final_profile, final_roll_limit,
@@ -75,7 +75,7 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
       if stopping_condition:
         leadOne = radarState.leadOne
         fcw_stop = leadOne.status and leadOne.dRel < 4.0
-        if fcw_stop or (a_ego > stopping_accel and not final_hold):
+        if (fcw_stop and not final_hold) or (a_ego > stopping_accel and not final_hold):
           long_control_state = LongCtrlState.stopping
         elif long_control_state == LongCtrlState.starting:
           long_control_state = LongCtrlState.stopping
@@ -352,16 +352,20 @@ class LongControl:
     self.pid.pos_limit = accel_limits[1]
 
     # ButterStopFinal window, resolved before the state machine so final_hold
-    # can suppress the ordinary hand-off this tick. Partial stand-ins (no
-    # leadOne, or a lead without dRel) cannot be within the fcw radius.
+    # can suppress the ordinary hand-off this tick. The window keeps its own
+    # lead threshold: the 4 m fcw radius would end it while the distance guard
+    # is still able to stop the car inside the lead gap, and the ordinary
+    # stopping state that follows is exactly the hard end this removes.
+    # Partial stand-ins (no leadOne, or a lead without dRel) are never close.
     _lead = getattr(radarState, "leadOne", None)
-    fcw_stop = bool(getattr(_lead, "status", False)
-                    and float(getattr(_lead, "dRel", float("inf"))) < 4.0)
+    _d_rel = float(getattr(_lead, "dRel", float("inf")))
+    _lead_on = bool(getattr(_lead, "status", False))
+    final_close = _lead_on and _d_rel < MIN_FINAL_GAP_ABS
     if self._final_t is not None:
       _, _, final_T = final_profile(self._final_t, self._final_v0, self._final_a0)
       exit_window = (not (active and should_stop and self.final_stop)
                      or self.long_control_state != LongCtrlState.pid
-                     or fcw_stop
+                     or final_close
                      or CS.vEgo < STANDSTILL_V
                      or self._final_t >= final_T + FINAL_HOLD_T)
       if exit_window:
@@ -370,10 +374,10 @@ class LongControl:
     elif (not self._final_done and self.final_stop and active and should_stop
           and self.long_control_state == LongCtrlState.pid
           and CS.aEgo > self.stopping_accel and CS.vEgo <= FINAL_V_MAX
-          and not fcw_stop):
+          and not final_close):
       self._final_t = 0.0
       self._final_v0 = max(float(CS.vEgo), 0.05)
-      self._final_a0 = min(FINAL_A0_MAX, max(FINAL_A0_MIN, -float(self.last_output_accel)))
+      self._final_a0 = min(FINAL_A0_MAX, max(FINAL_A0_DIST, FINAL_A0_MIN, -float(self.last_output_accel)))
       cloudlog.event("butterStopFinal", vEgo=float(CS.vEgo), a0=float(self._final_a0))
     if CS.vEgo > 1.0:
       self._final_done = False

@@ -38,6 +38,7 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import
   FixtureProfile,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _kf_end_decel
+from openpilot.selfdrive.controls.lib.butter_stop import MIN_FINAL_GAP_ABS
 
 _SCRATCH = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-08-perf"
 FIX = f"{_SCRATCH}/W-PLANT3B/fixtures"
@@ -200,21 +201,23 @@ class FinalStopLoop(FarLeadLoop):
     now = self.long_control._final_t
     tick_t = self.tick * DT_CTRL
     self.tick += 1
-    fcw = bool(radarState.leadOne.status and radarState.leadOne.dRel < 4.0)
+    _lead = getattr(radarState, "leadOne", None)
+    lead_close = bool(getattr(_lead, "status", False)
+                      and float(getattr(_lead, "dRel", float("inf"))) < MIN_FINAL_GAP_ABS)
     self.window["t"].append(tick_t)
     self.window["final_t"].append(now)
     self.window["v"].append(float(CS.vEgo))
     self.window["accel"].append(float(out[0]))
     self.window["lc_state"].append(int(self.long_control.long_control_state))
-    self.window["fcw"].append(fcw)
+    self.window["fcw"].append(lead_close)
     if not was_open and now is not None:
       self.entries.append({"t": tick_t, "v": float(CS.vEgo),
                            "a0": float(self.long_control._final_a0)})
     elif was_open and now is None:
       if not (active and long_plan.shouldStop and self.long_control.final_stop):
         reason = "inactive_or_should_stop_cleared"
-      elif fcw:
-        reason = "fcw"
+      elif lead_close:
+        reason = "lead_close"
       elif float(CS.vEgo) < STANDSTILL:
         reason = "standstill"
       else:
@@ -262,17 +265,30 @@ def test_final_stop_gate(car, eid):
 
   # G2 input: the window-entry tick and the time from it to arm-1 standstill.
   entries = on_run["entries"]
+  exits = on_run["exits"]
   entry_t = float(entries[0]["t"]) if entries else float("nan")
   entry_v = float(entries[0]["v"]) if entries else float("nan")
   on_time = on["t_stop"] - entry_t if entries else float("nan")
   off_time = off["t_stop"] - entry_t if entries else float("nan")
+
+  # G3 is a statement about the window's own command, so it can only be judged
+  # on events where the window owned the last 0.3 s: it opened and ended by
+  # reaching standstill or by timing out. Events with no window, or whose
+  # window ended on a closing lead and handed off early, measure the base
+  # stopping state and are reported separately.
+  g3_applies = bool(entries) and bool(exits) and exits[-1]["reason"] in ("standstill", "timeout")
+  g3_ok = (on_cmd >= G3_MAX_DECEL) if g3_applies else None
+  g3_note = ("window" if g3_applies
+             else ("no_window" if not entries else f"exit_{exits[-1]['reason']}"))
+
   G2_ROWS.append({"car": car, "eid": eid, "entry_t": entry_t, "entry_v": entry_v,
                   "on_time": on_time, "off_time": off_time,
-                  "n_entries": len(entries), "exits": on_run["exits"]})
-  G3_ROWS.append({"car": car, "eid": eid, "on_cmd": on_cmd, "off_cmd": off_cmd})
+                  "n_entries": len(entries), "exits": exits})
+  G3_ROWS.append({"car": car, "eid": eid, "on_cmd": on_cmd, "off_cmd": off_cmd,
+                  "g3_note": g3_note, "g3_ok": g3_ok})
 
   gap_ok = on["gap_stop"] >= off["gap_stop"] - G1_GAP_SLACK
-  g3_ok = on_cmd >= G3_MAX_DECEL
+
   _write(eid + ".json", {
     "eid": eid,
     "car": car,
@@ -285,9 +301,11 @@ def test_final_stop_gate(car, eid):
     "off_cmd": off_cmd,
     "entry_t": entry_t,
     "entry_v": entry_v,
-    "exits": on_run["exits"],
+    "exits": exits,
     "g1_gap_ok": bool(gap_ok),
-    "g3_ok": bool(g3_ok),
+    "g3_applies": g3_applies,
+    "g3_ok": g3_ok,
+    "g3_note": g3_note,
   })
 
   entry_shown = "none" if not np.isfinite(entry_v) else f"{entry_v:.3f}"
@@ -307,9 +325,10 @@ def test_final_stop_gate(car, eid):
   assert gap_ok, (
     f"FAIL_g1_gap {car} {eid}: gap_stop(1)={on['gap_stop']:.3f} < "
     + f"gap_stop(0)-{G1_GAP_SLACK:.2f}={off['gap_stop'] - G1_GAP_SLACK:.3f}")
-  assert g3_ok, (
-    f"FAIL_g3 {car} {eid}: arm-1 mean command {on_cmd:.4f} over the last "
-    + f"{G3_WINDOW:.1f} s < {G3_MAX_DECEL:.2f}")
+  if g3_applies:
+    assert g3_ok, (
+      f"FAIL_g3 {car} {eid}: arm-1 mean command {on_cmd:.4f} over the last "
+      + f"{G3_WINDOW:.1f} s < {G3_MAX_DECEL:.2f}")
 
 
 def test_final_stop_g2_report():
@@ -344,6 +363,30 @@ def test_final_stop_g2_report():
   print(
     f"SUMMARY entries={len(rows)}/{len(G2_ROWS)} {dist} "
     + f"exits={exit_reasons} multi_entry_events={len(multi)}", flush=True)
+
+  # The three G3 buckets, report-only: the gate itself applies to the first.
+  all_rows = G3_ROWS
+  buckets = {"window": [], "no_window": [], "lead_close": [], "other_exit": []}
+  for r in all_rows:
+    note = r["g3_note"]
+    if note == "window":
+      buckets["window"].append(r)
+    elif note == "no_window":
+      buckets["no_window"].append(r)
+    elif note.startswith("exit_lead_close"):
+      buckets["lead_close"].append(r)
+    else:
+      buckets["other_exit"].append(r)
+  for name in ("window", "no_window", "lead_close", "other_exit"):
+    items = buckets[name]
+    if not items:
+      continue
+    ids = " ".join(r["eid"].split("_")[-2] + "_" + r["eid"].split("_")[-1] for r in items)
+    print(f"G3_BUCKET {name:10s} n={len(items):2d} ids={ids}", flush=True)
+    for r in items:
+      verdict = "n/a" if r["g3_ok"] is None else ("PASS" if r["g3_ok"] else "FAIL")
+      print(f"  G3 {name:10s} {r['car']:9s} {r['eid']:34s} on_cmd={r['on_cmd']:+.4f} "
+            + f"off_cmd={r['off_cmd']:+.4f} {verdict}", flush=True)
   _write("g3.json", G3_ROWS)
 
   bad = {car: s for car, s in summary.items() if not s["ok"]}

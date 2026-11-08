@@ -85,6 +85,16 @@ FINAL_U_MAX = -0.05   # the window never commands less braking than this
 FINAL_U_MIN = -1.5
 
 
+def final_a0_dist(a_end=None, a_stock=STOCK_ROLL_DECEL):
+  """Entry decel magnitude whose constant-jerk profile travels exactly v0^2/(2*a_stock) (independent of v0)."""
+  a = FINAL_A_END if a_end is None else a_end
+  s = (4.0 * a_stock + math.sqrt(16.0 * a_stock * a_stock + 48.0 * a * a_stock)) / 6.0
+  return s - a
+
+
+FINAL_A0_DIST = final_a0_dist()   # 0.65497 for A_END 0.10, stock 0.5
+
+
 def final_profile(t, v0, a0):
   """Constant-jerk stop: decel magnitude falls linearly from a0 to FINAL_A_END and v reaches 0 at T.
 
