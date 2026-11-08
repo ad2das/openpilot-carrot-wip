@@ -276,7 +276,7 @@ class SyntheticProfile:
 
 class FarLeadLoop:
   def __init__(self, header, profile, speed_tf=None, plant=False, scc_stop=False, telemetry=None,
-               fitted=None):
+               fitted=None, full_run=False):
     _seed_param_defaults()
     params = Params()
     _apply_header_params(params, header)
@@ -293,6 +293,10 @@ class FarLeadLoop:
     self.ego_x = 0.0
     self.plant = bool(plant)
     self.scc_stop = bool(scc_stop)
+    # Opt-in full-length mode: keep integrating after the sim comes to rest so a
+    # late (event) standstill in a multistop fixture is still reached. Default
+    # off, so every existing caller keeps the 3 s rest exit unchanged.
+    self.full_run = bool(full_run)
     assert not (fitted is not None and (self.plant or self.scc_stop)), \
       "fitted replaces the plant: do not combine it with plant= or scc_stop="
     self.fitted_plant = FittedPlant(fitted) if fitted is not None else None
@@ -530,7 +534,10 @@ class FarLeadLoop:
         standstill_frames += 1
         if standstill_frames >= 300:
           stopped = True
-          break
+          # full_run: no break -- nothing after this point feeds back into the
+          # loop state, so keeping the loop alive only appends samples.
+          if not self.full_run:
+            break
       else:
         standstill_frames = 0
     out = {

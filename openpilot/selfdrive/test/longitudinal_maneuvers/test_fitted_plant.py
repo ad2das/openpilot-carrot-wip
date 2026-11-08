@@ -167,6 +167,36 @@ def test_b1_palisade_runs_to_standstill():
           + f"crawl_time_s={m['crawl_time_s']} kf_end_decel={m['kf_end_decel']} stopped={m['stopped']}")
 
 
+def test_full_run_extends_without_changing_prefix():
+  """full_run=True appends steps; every sample the default run produced is identical."""
+  fixture = load_fixture("b1")
+  header = dict(fixture["params"])
+  profile_duration = FixtureProfile(fixture).duration
+
+  a = FarLeadLoop(header, FixtureProfile(fixture), fitted="palisade").run()
+  b = FarLeadLoop(header, FixtureProfile(fixture), fitted="palisade", full_run=True).run()
+
+  assert len(b["t"]) > len(a["t"]), \
+    f"full_run did not extend the run ({len(b['t'])} <= {len(a['t'])} steps)"
+
+  per_step = [k for k, v in a.items() if isinstance(v, list)]
+  assert len(per_step) >= 10, f"unexpected per-step key set: {per_step}"
+  for key in per_step:
+    assert len(b[key]) >= len(a[key]), f"{key}: full run shorter ({len(b[key])} < {len(a[key])})"
+    prefix = b[key][:len(a[key])]
+    assert prefix == a[key], f"{key}: prefix diverged between default and full_run"
+
+  # Explicitly pin the two stops' shared samples too, so a change that only
+  # alters the shared tail is caught even if list equality above is relaxed.
+  assert b["stopped"] == a["stopped"], "stopped flag changed"
+  assert b["fcw_steps"] >= a["fcw_steps"], "fcw step count decreased"
+
+  # The full run integrates to the fixture's last possible step.
+  # max_frames = profile.n_steps * PLANNER_PERIOD, dt = DT_CTRL (test_far_lead_replay.py:444)
+  assert b["t"][-1] >= profile_duration - 0.05, \
+    f"full run ended at {b['t'][-1]:.2f} s, before the fixture end {profile_duration:.2f} s"
+
+
 def test_butter_stop_loop_k5_runs_to_standstill():
   group, maneuver = _CASES[0]
   logs = ButterStopLoop(maneuver, butter=1, fitted="k5").run()
