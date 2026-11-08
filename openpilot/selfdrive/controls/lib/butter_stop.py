@@ -11,6 +11,14 @@ bound, and LongControl may only relax the floor at FLOOR_RELAX_JERK (tightening
 is instant). All standstill hold/release logic lives unchanged in the
 LongControl stopping state machine; this module provides the floor and the
 creep guard constants used there.
+
+ButterStopFinal (experimental, off by default) adds the opposite tool at the
+very end of the stop: instead of handing the last part to the car's own stop,
+LongControl keeps pid and follows final_profile -- a constant-jerk decel whose
+magnitude reaches FINAL_A_END exactly at standstill, so the car stops with
+almost no residual deceleration. The profile is time-based because vEgo
+over-reads near zero. The constants and the profile live here; the window
+state machine lives in LongControl.
 """
 import math
 
@@ -58,6 +66,35 @@ FINAL_ROLL_V = 0.6       # latch when v_ego <= this (m/s)
 FINAL_ROLL_RESET_V = 1.0 # a latch above this speed is stale, drop it (m/s)
 FINAL_ROLL_VLEAD = 0.3   # lead must be slower than this to latch (m/s)
 STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling distance
+
+# Final-stop window (ButterStopFinal, experimental). The car physically stops
+# while still decelerating ~0.3 m/s^2, and that residual decel is the jolt, so
+# behind this toggle the last part of a stop stays in pid and is driven by a
+# constant-jerk profile whose decel magnitude falls from the entry decel to
+# FINAL_A_END exactly at the planned standstill. The window is time-based:
+# vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s after the
+# physical stop, and is ~0.08 m/s at it), so speed cannot drive the profile.
+FINAL_V_MAX = 0.6     # window may start only at v_ego <= this (m/s)
+FINAL_A_END = 0.10    # decel magnitude at the planned standstill (m/s^2)
+FINAL_A0_MIN = 0.25   # entry decel magnitude clip (m/s^2)
+FINAL_A0_MAX = 0.8
+FINAL_KV = 0.5        # speed feedback gain (1/s), only while v_ref >= FINAL_FB_V and v_ego >= FINAL_FB_V
+FINAL_FB_V = 0.2
+FINAL_HOLD_T = 1.5    # after T, keep -FINAL_A_END at most this long before handing off (s)
+FINAL_U_MAX = -0.05   # the window never commands less braking than this
+FINAL_U_MIN = -1.5
+
+
+def final_profile(t, v0, a0):
+  """Constant-jerk stop: decel magnitude falls linearly from a0 to FINAL_A_END and v reaches 0 at T.
+
+  Returns (a_ref, v_ref, T). a0 > 0 is a magnitude.
+  """
+  T = 2.0 * v0 / (a0 + FINAL_A_END)
+  j = (a0 - FINAL_A_END) / T
+  if t >= T:
+    return -FINAL_A_END, 0.0, T
+  return -(a0 - j * t), max(0.0, v0 - a0 * t + 0.5 * j * t * t), T
 
 
 def final_roll_limit(v_ego, d_eff, s_ego):

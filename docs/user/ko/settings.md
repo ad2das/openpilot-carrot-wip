@@ -226,7 +226,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 |---|---|---|
 | [가속 성향·드라이브 모드](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | 연비, 안전, 일반, 고속 모드와 자동 전환 |
 | [가속 성향·속도별 가속값](cruise-gap.md#acceleration-table) | `CruiseMaxVals0`, `CruiseMaxVals1`, `CruiseMaxVals2`, `CruiseMaxVals3`, `CruiseMaxVals4`, `CruiseMaxVals5`, `CruiseMaxVals6` | 속도 구간별 최대 가속 성향 |
-| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입, 부드러운 정차와 재출발 특성 |
+| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `ButterStopFinal`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입, 부드러운 정차, 마지막 정지 제어와 재출발 특성 |
 | [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차 `100/0/100`, 토요타·렉서스 `0/0/100` 고정·숨김; VW MEB(ID.4 포함)는 저장 게인 적용 |
 | [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollowLC`, `SpeedTFFactor`, `TFollowDecelBoost` | 차간 단계별 시간, 정상 선택 앞차 기준 차로 변경 완화와 감속 여유(기본 0%) |
 | [추종응답성](cruise-gap.md#lead-response) | `LeadAccelResponse`, `LeadAccelResponseTF1`–`LeadAccelResponseTF4` | 모든 차간 단계의 앞차 출발·가속 추종과 접근 반응 |
@@ -251,7 +251,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 `StoppingAccel`(정지시작가속도)은 기본 `-50`, 범위 `-100~-50`, 변경 단위 `10`으로 다시 조정할 수 있습니다. 저장값에 0.01을 곱한 가속도를 사용하며, 제어에서도 범위를 제한합니다. 기존 정지 진입·감속 방식과 차종별 소프트홀드를 사용하고 변경은 약 1초 안에 반영됩니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
 
-`ButterStop`(버터스톱, 기본 켜짐)은 약 3m/s 이하 정지 마지막 구간의 감속 상한을 낮춰 더 부드럽게 정차하고, 정차 확인 후 밀림을 즉시 잡습니다. `0`으로 끄면 기존 동작과 완전히 동일합니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
+`ButterStop`(버터스톱, 기본 켜짐)은 약 3m/s 이하 정지 마지막 구간의 감속 상한을 낮춰 더 부드럽게 정차하고, 정차 확인 후 밀림을 즉시 잡습니다. `0`으로 끄면 기존 동작과 완전히 동일합니다. `ButterStopFinal`(기본 `0`, 끔)을 켜면 약 0.6m/s 이하 마지막 정지를 직접 제어해 멈추는 순간 감속이 거의 0이 되게 하며, `ButterStop`이 켜져 있을 때만 동작합니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
 
 `VEgoStopping`(정지출발민감도)은 범위 `10~100`, 기본 `50`이며, `10`은 `0.10m/s`입니다. 기존의 `10` 미만 저장값은 자동으로 `10`으로 올리고, 주행 중에도 같은 최저값을 적용합니다.
 

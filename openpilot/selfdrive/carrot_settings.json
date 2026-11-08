@@ -332,6 +332,7 @@
                 "StopDistanceCarrot",
                 "StoppingAccel",
                 "ButterStop",
+                "ButterStopFinal",
                 "VEgoStopping",
                 "AChangeCostStarting"
               ]
@@ -3391,6 +3392,22 @@
       "min": 0,
       "max": 1,
       "default": 1,
+      "unit": 1
+    },
+    {
+      "group": "주행튜닝",
+      "name": "ButterStopFinal",
+      "title": "버터스톱 마지막 정지 직접 제어(실험):(0)",
+      "descr": "켜면 시속 약 2km(0.6 m/s) 이하 마지막 정지를 차량 자체 정지 대신 오픈파일럿이 직접 제어해, 감속이 서서히 줄어 멈추는 순간 거의 0이 되게 합니다(멈출 때 덜컹 감소, 느린 접근 단축). 앞차 4 m 이내·정지 지점 부족 시 더 강하게 감속하거나 즉시 기존 방식으로 넘깁니다. 버터스톱이 켜져 있어야 동작. 0이면 기존과 동일.",
+      "egroup": "LONG",
+      "etitle": "ButterStop final stop by openpilot (experimental):(0)",
+      "edescr": "When on, openpilot drives the last stop itself below about 2 km/h (0.6 m/s) instead of handing it to the car's own stop, following a profile whose deceleration falls smoothly to almost nothing at the moment of standstill (less jolt at the stop, shorter slow crawl). A lead within 4 m or a short stop distance makes it brake harder or hand off to the existing behaviour at once. Requires ButterStop on. 0 is identical to before.",
+      "cgroup": "纵向控制",
+      "ctitle": "ButterStop最后停车由openpilot控制(实验):(0)",
+      "cdescr": "开启后，约2km/h(0.6 m/s)以下的最后停车不再交给车辆自身停车，而由openpilot直接控制；减速度平滑降到接近0时正好停住(停车冲击减小，慢速爬行缩短)。前车在4 m以内或停车距离不足时会加大制动或立即切回原方式。需开启ButterStop。0时与原行为一致。",
+      "min": 0,
+      "max": 1,
+      "default": 0,
       "unit": 1
     },
     {

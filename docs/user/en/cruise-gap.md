@@ -106,6 +106,7 @@ Tune the speed band containing the symptom instead of changing the whole table. 
 | `StopDistanceCarrot` | `600` → 6.00 m | Increases fixed clearance to a stopped lead |
 | `VEgoStopping` | `50` → 0.50 m/s | Higher values enter stopping state at a higher planned speed |
 | `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s for a gentler stop |
+| `ButterStopFinal` | `1` → on, `0` → off | Drives the last stop itself below about 0.6 m/s so deceleration reaches almost zero at standstill |
 | `AChangeCostStarting` | MPC acceleration-change cost | Higher values smooth initial acceleration changes |
 
 ### `StopDistanceCarrot`
@@ -137,6 +138,18 @@ Default `1` (on); set `0` to carefully disable. While enabled, control tapers th
 
 > [!NOTE]
 > In simulation with the real MPC solver there were no collisions, the standstill gap was 0.2–0.8 m longer than before, and the mean deceleration over the last 0.5 s fell from about 0.5~0.51 to 0.3 m/s². Not tested on a vehicle.
+
+### `ButterStopFinal` · Final stop driven by openpilot
+
+Default `0` (off) is identical to the previous behavior; turn it on to test it. When on, once the stop is requested and the reported speed is at or below about `0.6 m/s`, control stops handing the last part of the stop to the car's own stop request and instead follows a fixed profile: the deceleration magnitude falls in a straight line from the value in force when the window opened down to `0.10 m/s²` exactly at the planned standstill. The car therefore arrives at rest with almost no residual deceleration, which removes most of the pre-stop nod and shortens the slow crawl.
+
+- The profile is timed, not speed-driven: reported speed over-reads near zero (the wheel sensor latches to `0` about a second after the physical stop and reads about `0.08 m/s` at it), so a speed-based law would end the stop early.
+- The window ends and the ordinary stopping state takes over at once when the car drops below `0.05 m/s`, when a lead is within 4 m, when the stop request clears or control disengages, or at about `1.5 s` past the profile's planned standstill. The window opens at most once per stop and becomes available again above `1 m/s`.
+- While the window is open the command is limited to `-1.5…-0.05 m/s²`, and braking is increased beyond the profile when the remaining plan distance or the lead gap cannot absorb the current speed.
+- It works only while `ButterStop` is on; with `ButterStop` at `0` this setting does nothing.
+
+> [!NOTE]
+> Not tested on a vehicle. The fitted-plant replay is the only check made so far, and it cannot judge the jolt itself; the field test is the only way to confirm the improvement.
 
 The description above concerns upstream control. The final CANFD request override is described below.
 
