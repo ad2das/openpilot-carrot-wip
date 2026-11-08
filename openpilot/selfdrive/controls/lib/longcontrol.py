@@ -352,8 +352,11 @@ class LongControl:
     self.pid.pos_limit = accel_limits[1]
 
     # ButterStopFinal window, resolved before the state machine so final_hold
-    # can suppress the ordinary hand-off this tick.
-    fcw_stop = bool(radarState.leadOne.status and radarState.leadOne.dRel < 4.0)
+    # can suppress the ordinary hand-off this tick. Partial stand-ins (no
+    # leadOne, or a lead without dRel) cannot be within the fcw radius.
+    _lead = getattr(radarState, "leadOne", None)
+    fcw_stop = bool(getattr(_lead, "status", False)
+                    and float(getattr(_lead, "dRel", float("inf"))) < 4.0)
     if self._final_t is not None:
       _, _, final_T = final_profile(self._final_t, self._final_v0, self._final_a0)
       exit_window = (not (active and should_stop and self.final_stop)
