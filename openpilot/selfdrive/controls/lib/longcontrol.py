@@ -15,7 +15,8 @@ from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
   CREEP_ACCEL, CREEP_V, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
   FINAL_KV, FINAL_PLAN_GUARD_MAX, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX,
-  FINAL_U_MIN, FINAL_V_MAX, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
+  FINAL_U_MIN, FINAL_V_MAX, FINAL_WINDOW_ENABLED, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS,
+  STANDSTILL_T, STANDSTILL_V,
   STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, early_req_gap_ok, final_profile,
   final_profile_travel, final_roll_limit, plan_stop_distance, rest_ramp_floor,
 )
@@ -182,10 +183,11 @@ class LongControl:
       final_value = 0.0
     self.final_stop = math.isfinite(final_value) and final_value > 0.0
     # One switch, two behaviours: classic-CAN Hyundai/Kia hand the stop to the
-    # car early and never open the window; CAN-FD and every other brand drive
-    # the window and never hand off early.
+    # car early and never open the window; CAN-FD and every other brand would
+    # drive the window, but FINAL_WINDOW_ENABLED holds the window off for every
+    # car until a version passes the sim gap gate.
     self.early_req = self.final_stop and self._early_req_capable
-    self.final_window = self.final_stop and not self._early_req_capable
+    self.final_window = self.final_stop and not self._early_req_capable and FINAL_WINDOW_ENABLED
     try:
       dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
     except (TypeError, ValueError, AttributeError):

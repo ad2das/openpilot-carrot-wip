@@ -39,6 +39,7 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import
   FixtureProfile,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _kf_end_decel
+from openpilot.selfdrive.controls.lib import longcontrol as longcontrol_module
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_PLAN_GUARD_MAX, FINAL_U_MAX, FINAL_U_MIN, FINAL_V_MAX, MIN_FINAL_GAP_ABS, final_profile,
@@ -303,10 +304,17 @@ def _run(car, fixture, final):
   # FarLeadLoop builds every fixture on the Palisade CP (classic CAN), K5 rows
   # included, so the per-car capability has to be set from here. ButterStopFinal
   # then resolves to the early hand-off on classic CAN and to the window on the
-  # rest, exactly as on the car.
-  loop.long_control._early_req_capable = car in CLASSIC_CAN_CARS
-  loop.long_control._refresh_butter_stop()
-  run = loop.run()
+  # rest, exactly as on the car. The window is off for every car in the shipped
+  # build (FINAL_WINDOW_ENABLED = False), but this gate exists to measure it, so
+  # turn the constant on for the run and restore it afterwards.
+  saved_window_enabled = longcontrol_module.FINAL_WINDOW_ENABLED
+  longcontrol_module.FINAL_WINDOW_ENABLED = True
+  try:
+    loop.long_control._early_req_capable = car in CLASSIC_CAN_CARS
+    loop.long_control._refresh_butter_stop()
+    run = loop.run()
+  finally:
+    longcontrol_module.FINAL_WINDOW_ENABLED = saved_window_enabled
   run["entries"] = loop.entries
   run["exits"] = loop.exits
   run["window"] = loop.window

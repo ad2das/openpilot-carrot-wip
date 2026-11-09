@@ -122,6 +122,9 @@ def _window_control(monkeypatch, values=None, starting_state=False):
     stored.update(values)
   params = DictParams(stored)
   monkeypatch.setattr(lc, "Params", lambda: params)
+  # The window is off for every car by default (FINAL_WINDOW_ENABLED = False);
+  # these tests exercise the window itself, so turn it on for this one.
+  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
   cp = make_cp("hyundai", starting_state)
   cp.flags = int(HyundaiFlags.CANFD)
   return lc.LongControl(cp), params
@@ -336,6 +339,9 @@ def _control_for(monkeypatch, brand, flags, values):
 def test_v2e_butter_stop_final_picks_the_mode_per_car(monkeypatch):
   on = {"ButterStop": 1, "ButterStopFinal": 1}
   off = {"ButterStop": 1, "ButterStopFinal": 0}
+  # Per-car mode selection is what this test pins, so the global window switch
+  # (off by default) is turned on; the default-off behaviour is M1/M2.
+  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
 
   classic = _control_for(monkeypatch, "hyundai", 0, on)
   assert classic.final_stop and classic.early_req
@@ -783,3 +789,52 @@ def test_window_profile_drives_the_command(monkeypatch):
   a_ref, v_ref, _ = final_profile(DT_CTRL, v0, a0)
   expected = a_ref + FINAL_KV * (v_ref - 0.5) if v_ref >= FINAL_FB_V else a_ref
   assert out == pytest.approx(max(FINAL_U_MIN, min(FINAL_U_MAX, expected)), abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# M1/M2: the window is switched off for every car by the module constant
+# ---------------------------------------------------------------------------
+
+def test_m1_canfd_final_stop_is_a_no_op_while_the_window_is_disabled(monkeypatch):
+  """FINAL_WINDOW_ENABLED False: ButterStopFinal=1 on a CAN-FD car does nothing.
+
+  Both halves of the switch are shut on CAN-FD (early_req needs classic CAN,
+  final_window needs the constant), so the run must be tick-identical to
+  ButterStopFinal=0.
+  """
+  assert lc.FINAL_WINDOW_ENABLED is False, "the default constant must keep the window off"
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  on = _control_for(monkeypatch, "hyundai", HyundaiFlags.CANFD, {"ButterStop": 1, "ButterStopFinal": 1})
+  off = _control_for(monkeypatch, "hyundai", HyundaiFlags.CANFD, {"ButterStop": 1, "ButterStopFinal": 0})
+
+  assert on.final_stop, "the switch itself is read"
+  assert not on.final_window, "the window must not open anywhere"
+  assert not on.early_req, "CAN-FD is never early-req capable"
+  assert not off.final_stop
+
+  on.long_control_state = LongCtrlState.pid
+  off.long_control_state = LongCtrlState.pid
+
+  v = 1.2
+  for tick in range(260):
+    speeds = _decaying_speeds(v)
+    out_on = _stop_frame(on, v, a_ego=-0.6, speeds=speeds, lead_status=True, d_rel=9.0)
+    out_off = _stop_frame(off, v, a_ego=-0.6, speeds=speeds, lead_status=True, d_rel=9.0)
+    assert on.long_control_state == off.long_control_state, tick
+    assert out_on == pytest.approx(out_off, abs=1e-12), tick
+    assert on._final_t is None and on._final_done is False, tick
+    v = max(0.0, v - 0.6 * DT_CTRL)
+
+  # Ending state must match the ButterStopFinal=0 run exactly; that identity is
+  # the whole claim, and the per-tick loop above already pins every tick.
+  assert on.long_control_state == off.long_control_state
+
+
+def test_m2_classic_can_early_hand_off_survives_the_window_switch(monkeypatch):
+  """The early hand-off is the shipped behaviour and does not depend on the constant."""
+  for window in (False, True):
+    monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", window)
+    control = _control_for(monkeypatch, "hyundai", 0, {"ButterStop": 1, "ButterStopFinal": 1})
+    assert control.final_stop
+    assert control.early_req, window
+    assert not control.final_window, window

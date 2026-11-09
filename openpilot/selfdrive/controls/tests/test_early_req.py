@@ -459,6 +459,7 @@ def test_canfd_never_hands_off_early_and_opens_the_window_instead(monkeypatch):
   """T6: a CAN-FD car (K5) drives the window; the early hand-off never fires."""
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
+  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
   control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
@@ -492,6 +493,7 @@ def test_non_hyundai_brands_never_hand_off_early(monkeypatch):
   for brand in ("toyota", "gm", "tesla", "ford"):
     events = _EventLog()
     monkeypatch.setattr(lc, "cloudlog", events)
+    monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
     control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1}, brand=brand)
     assert control.final_stop is True, brand
     assert control.early_req is False, brand
@@ -582,6 +584,7 @@ def test_t5_canfd_opens_the_window_and_never_hands_off_early(monkeypatch):
   """T5 control: the other half of the switch, on a CAN-FD car."""
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
+  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
   control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)

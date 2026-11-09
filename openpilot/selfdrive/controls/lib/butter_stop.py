@@ -83,6 +83,7 @@ STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling dista
 # FINAL_A_END exactly at the planned standstill. The window is time-based:
 # vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s after the
 # physical stop, and is ~0.08 m/s at it), so speed cannot drive the profile.
+FINAL_WINDOW_ENABLED = False  # the final-stop window failed the K5 sim gap gate (W-FINAL2/3); off for every car until a version passes
 FINAL_V_MAX = 0.6     # window may start only at v_ego <= this (m/s)
 FINAL_A_END = 0.10    # decel magnitude at the planned standstill (m/s^2)
 FINAL_A0_MIN = 0.25   # entry decel magnitude clip (m/s^2)
