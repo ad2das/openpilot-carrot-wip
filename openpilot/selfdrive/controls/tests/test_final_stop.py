@@ -91,21 +91,40 @@ sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_
 sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_generated_code.acados_ocp_solver_pyx", _solver_module)
 
 from openpilot.common.realtime import DT_CTRL
+from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.selfdrive.controls.lib import longcontrol as lc
 from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_A_END, FINAL_FB_V, FINAL_HOLD_T,
-  FINAL_KV, FINAL_U_MAX, FINAL_U_MIN, FINAL_V_MAX, MIN_FINAL_GAP_ABS, STANDSTILL_V,
-  STOCK_ROLL_DECEL, final_a0_dist, final_profile,
+  FINAL_KV, FINAL_PLAN_GUARD_MAX, FINAL_U_MAX, FINAL_U_MIN, FINAL_V_MAX, MIN_FINAL_GAP_ABS,
+  STANDSTILL_V, STOCK_ROLL_DECEL, final_a0_dist, final_profile, final_profile_travel,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongCtrlState, long_control_state_trans,
 )
 from openpilot.selfdrive.controls.tests.test_butter_stop import (
-  make_control, make_cp, stopping_inputs,
+  DictParams, make_control, make_cp, stopping_inputs,
 )
 
 STATES = (LongCtrlState.off, LongCtrlState.stopping, LongCtrlState.starting, LongCtrlState.pid)
 PLAN_T = np.asarray(CONTROL_N_T_IDX, dtype=float)
+
+
+def _window_control(monkeypatch, values=None, starting_state=False):
+  """LongControl on a CAN-FD car, the configuration where the window is the mode.
+
+  ButterStopFinal picks one behaviour per car: classic-CAN Hyundai/Kia hand the
+  stop off early and never open the window, so every test of the window itself
+  has to build a CAN-FD car.
+  """
+  stored = {"StoppingAccel": -50, "StopDistanceCarrot": 550, "ButterStop": 1,
+            "LongTuningKpV": 100, "LongTuningKiV": 200, "LongTuningKf": 100}
+  if values:
+    stored.update(values)
+  params = DictParams(stored)
+  monkeypatch.setattr(lc, "Params", lambda: params)
+  cp = make_cp("hyundai", starting_state)
+  cp.flags = int(HyundaiFlags.CANFD)
+  return lc.LongControl(cp), params
 
 
 def base_long_control_state_trans(CP, active, long_control_state, v_ego,
@@ -299,11 +318,66 @@ def test_toggle_off_matches_base_state_machine_and_never_opens_a_window(monkeypa
     assert control.long_control_state == expected, frame
 
 
+# ---------------------------------------------------------------------------
+# V2-e: one switch, two behaviours, chosen per car
+# ---------------------------------------------------------------------------
+
+def _control_for(monkeypatch, brand, flags, values):
+  stored = {"StoppingAccel": -50, "StopDistanceCarrot": 550, "ButterStop": 1,
+            "LongTuningKpV": 100, "LongTuningKiV": 200, "LongTuningKf": 100}
+  stored.update(values)
+  params = DictParams(stored)
+  monkeypatch.setattr(lc, "Params", lambda: params)
+  cp = make_cp(brand)
+  cp.flags = int(flags)
+  return lc.LongControl(cp)
+
+
+def test_v2e_butter_stop_final_picks_the_mode_per_car(monkeypatch):
+  on = {"ButterStop": 1, "ButterStopFinal": 1}
+  off = {"ButterStop": 1, "ButterStopFinal": 0}
+
+  classic = _control_for(monkeypatch, "hyundai", 0, on)
+  assert classic.final_stop and classic.early_req
+  assert not classic.final_window, "classic-CAN Hyundai hands off early, never opens the window"
+
+  canfd = _control_for(monkeypatch, "hyundai", HyundaiFlags.CANFD, on)
+  assert canfd.final_stop and canfd.final_window
+  assert not canfd.early_req, "CAN-FD drives the window, never hands off early"
+
+  toyota = _control_for(monkeypatch, "toyota", 0, on)
+  assert toyota.final_stop and toyota.final_window
+  assert not toyota.early_req
+
+  for brand, flags in (("hyundai", 0), ("hyundai", HyundaiFlags.CANFD), ("toyota", 0)):
+    quiet = _control_for(monkeypatch, brand, flags, off)
+    assert not quiet.final_stop, brand
+    assert not quiet.early_req and not quiet.final_window, brand
+
+
+def test_v2e_classic_can_hyundai_never_opens_the_window(monkeypatch):
+  """The early hand-off owns the stop on those cars: the window stays shut."""
+  events = []
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: events.append(name)))
+  control = _control_for(monkeypatch, "hyundai", 0, {"ButterStop": 1, "ButterStopFinal": 1})
+  control.long_control_state = LongCtrlState.pid
+
+  v = 1.2
+  for _ in range(260):
+    _stop_frame(control, v, a_ego=-0.6, speeds=_decaying_speeds(v), lead_status=True, d_rel=9.0)
+    if control._final_t is not None:
+      raise AssertionError("the final window must never open on classic-CAN Hyundai")
+    v = max(0.0, v - 0.6 * DT_CTRL)
+  assert "butterStopFinal" not in events
+  assert "butterStopEarlyReq" in events, "the early hand-off must fire instead"
+  assert control.long_control_state == LongCtrlState.stopping
+
+
 def test_toggle_on_changes_the_command_of_the_same_frames(monkeypatch):
   """The window is live: at identical inputs the toggle-on run commands differently."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
   off, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 0})
-  on, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  on, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   off.long_control_state = LongCtrlState.pid
   on.long_control_state = LongCtrlState.pid
 
@@ -321,7 +395,7 @@ def test_toggle_on_changes_the_command_of_the_same_frames(monkeypatch):
 
 def test_window_opens_only_below_final_v_max(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   assert control.final_stop
 
   above = FINAL_V_MAX + 0.2
@@ -338,7 +412,7 @@ def test_window_opens_only_below_final_v_max(monkeypatch):
 
 def test_window_entry_captures_clipped_decel_and_speed(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   control.last_output_accel = -2.0  # far stronger than FINAL_A0_MAX
 
@@ -350,7 +424,7 @@ def test_window_entry_captures_clipped_decel_and_speed(monkeypatch):
 
 def test_window_output_stays_inside_final_clip(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
 
   v = 0.5
@@ -365,7 +439,7 @@ def test_window_output_stays_inside_final_clip(monkeypatch):
 
 def test_window_exits_at_standstill_speed(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
 
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5))
@@ -377,7 +451,7 @@ def test_window_exits_at_standstill_speed(monkeypatch):
 
 def test_window_exits_on_timeout(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5))
   assert control._final_t is not None
@@ -395,7 +469,7 @@ def test_window_exits_on_timeout(monkeypatch):
 def test_window_survives_a_lead_inside_the_fcw_radius(monkeypatch):
   """A lead between MIN_FINAL_GAP_ABS and 4.0 m no longer ends the window."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=30.0)
   assert control._final_t is not None
@@ -409,7 +483,7 @@ def test_window_survives_a_lead_inside_the_fcw_radius(monkeypatch):
 def test_window_exits_close_lead_and_hands_off_the_same_tick(monkeypatch):
   """Below MIN_FINAL_GAP_ABS the window ends and the ordinary fcw hand-off runs."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5), lead_status=True, d_rel=30.0)
   assert control._final_t is not None
@@ -422,7 +496,7 @@ def test_window_exits_close_lead_and_hands_off_the_same_tick(monkeypatch):
 
 def test_window_exits_when_should_stop_clears(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5))
   assert control._final_t is not None
@@ -438,7 +512,7 @@ def test_window_exits_when_should_stop_clears(monkeypatch):
 
 def test_window_never_reopens_in_the_same_stop(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
 
   _stop_frame(control, 0.5, speeds=_decaying_speeds(0.5))
@@ -459,34 +533,151 @@ def test_window_never_reopens_in_the_same_stop(monkeypatch):
   assert control._final_t is not None
 
 
-def test_window_distance_guard_limits_braking(monkeypatch):
-  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
-  control.long_control_state = LongCtrlState.pid
+# ---------------------------------------------------------------------------
+# V2: the frozen plan target and the split plan / lead guards
+# ---------------------------------------------------------------------------
 
-  # A plan that stops within 0.1 m and no lead: the guard demands v^2/(2*0.1).
-  speeds = np.array([0.5 - 5.0 * x for x in PLAN_T])
-  speeds = np.maximum(0.0, speeds)
+WINDOW_V0 = 0.4779      # field seg 1 closing speed (W-FROOT1 table E)
+FIELD_V = 0.367         # the speed at which the live plan guard demanded -1.347
+COLLAPSED_S_PLAN = 0.0409  # plan_stop_distance on that tick (W-FROOT1 table E)
+
+
+def _entry_speeds(v):
+  """Plan speeds that still owe at least 1 m at window entry."""
+  speeds = np.full(len(PLAN_T), float(v))
+  speeds[-1] = 0.0
+  return speeds
+
+
+def _open_window(control, monkeypatch):
+  """Open the window at WINDOW_V0 and return the frozen target."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
   control.long_control_state = LongCtrlState.pid
-  cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=speeds)
-  cs.aEgo = -0.3
-  out = control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)[0]
-  assert out <= -1.25 + 1e-6, out
+  control.last_output_accel = -0.5
+  _stop_frame(control, WINDOW_V0, a_ego=-0.32, speeds=_entry_speeds(WINDOW_V0))
+  assert control._final_t is not None, "the window must open at WINDOW_V0"
+  return control._final_s_target
+
+
+def test_window_freezes_the_plan_target_at_entry(monkeypatch):
+  """The target is the entry plan distance, never shorter than the profile travel."""
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  target = _open_window(control, monkeypatch)
+  travel = final_profile_travel(control._final_v0, control._final_a0)
+  assert target >= travel - 1e-9
+  assert target == pytest.approx(1.1224, abs=1e-3), "entry plan owes 1.12 m"
+  # The entry tick itself runs the window, so trav already holds one tick of v_ego.
+  assert control._final_s_trav == pytest.approx(WINDOW_V0 * DT_CTRL, abs=1e-12)
+
+  # A plan that has already collapsed below the profile's own travel cannot
+  # shorten the window: the floor is the profile's travel.
+  control2, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control2.long_control_state = LongCtrlState.pid
+  control2.last_output_accel = -0.5
+  collapsed = np.zeros(len(PLAN_T))
+  _stop_frame(control2, WINDOW_V0, a_ego=-0.32, speeds=collapsed)
+  assert control2._final_t is not None
+  travel2 = final_profile_travel(control2._final_v0, control2._final_a0)
+  assert control2._final_s_target == pytest.approx(travel2, abs=1e-9)
+
+
+def test_v2a_plan_collapse_is_capped_at_stock_stopping(monkeypatch):
+  """V2-a: plan speeds all zero, target already passed -> exactly -FINAL_PLAN_GUARD_MAX."""
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  target = _open_window(control, monkeypatch)
+
+  # Advance the window until the profile is weaker than the cap, with the ego
+  # following the reference so the speed feedback cannot apply (v_ref < 0.2).
+  while control._final_t is not None and control._final_t < 0.7:
+    _, v_ref, _ = final_profile(control._final_t, control._final_v0, control._final_a0)
+    _stop_frame(control, v_ref, a_ego=-0.32, speeds=_entry_speeds(WINDOW_V0))
+  assert control._final_t is not None, "the window must still be open at 0.7 s"
+  _, v_ref, _ = final_profile(control._final_t, control._final_v0, control._final_a0)
+  assert v_ref < FINAL_FB_V, "the feedback term must be off for this tick"
+
+  # The field state: plan collapsed to zero, ego still rolling at 0.367 m/s,
+  # travel already past the frozen target.
+  control._final_s_trav = target + 0.1
+  out = _stop_frame(control, FIELD_V, a_ego=-0.32, speeds=np.zeros(len(PLAN_T)))[0]
+
+  # The uncapped guard would demand -1.347 here; the cap holds it at -0.5.
+  assert max(-(FIELD_V ** 2) / (2.0 * max(COLLAPSED_S_PLAN, 0.05)),
+             -FINAL_PLAN_GUARD_MAX) == pytest.approx(-FINAL_PLAN_GUARD_MAX)
+  assert out == pytest.approx(-FINAL_PLAN_GUARD_MAX, abs=1e-9), out
+  assert out >= -FINAL_PLAN_GUARD_MAX - 1e-9, "the plan guard must never brake harder than stock"
+
+
+def test_v2b_frozen_target_keeps_the_guard_off_the_profile(monkeypatch):
+  """V2-b: plan at zero from the next tick, ego on v_ref -> the guard never binds."""
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  target = _open_window(control, monkeypatch)
+  assert target > final_profile_travel(control._final_v0, control._final_a0)
+
+  ticks = 0
+  while control._final_t is not None:
+    t = control._final_t
+    a_ref, v_ref, _ = final_profile(t, control._final_v0, control._final_a0)
+    if v_ref < STANDSTILL_V:
+      break  # the next tick exits the window at standstill speed
+    expected = float(np.clip(a_ref, FINAL_U_MIN, FINAL_U_MAX))
+    assert control._final_s_trav < target - 1e-9, "trav must stay short of the target"
+    out = _stop_frame(control, v_ref, a_ego=-0.32, speeds=np.zeros(len(PLAN_T)))[0]
+    assert out == pytest.approx(expected, abs=1e-9), (t, out, expected)
+    ticks += 1
+    if ticks > 400:
+      break
+  # The window exits the moment v_ref drops under STANDSTILL_V, 97 ticks in.
+  assert ticks > 90, "the window must have run its profile"
+
+
+def test_v2c_lead_guard_keeps_full_strength(monkeypatch):
+  """V2-c: a lead 3.2 m away at 0.5 m/s still commands -0.625, below the plan cap."""
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  _open_window(control, monkeypatch)
+  # Push the profile past 0.35 s so the profile itself is weaker than -0.5.
+  while control._final_t is not None and control._final_t < 0.6:
+    _, v_ref, _ = final_profile(control._final_t, control._final_v0, control._final_a0)
+    _stop_frame(control, v_ref, a_ego=-0.32, speeds=_entry_speeds(WINDOW_V0))
+  assert control._final_t is not None
+  _, v_ref, _ = final_profile(control._final_t, control._final_v0, control._final_a0)
+  assert v_ref < FINAL_FB_V
+
+  out = _stop_frame(control, 0.5, a_ego=-0.32, speeds=np.zeros(len(PLAN_T)),
+                    lead_status=True, d_rel=MIN_FINAL_GAP_ABS + 0.2)[0]
+  lead_guard = -(0.5 ** 2) / (2.0 * max((MIN_FINAL_GAP_ABS + 0.2) - MIN_FINAL_GAP_ABS, 0.05))
+  assert lead_guard == pytest.approx(-0.625)
+  assert out <= lead_guard + 1e-6, out
   assert out >= FINAL_U_MIN - 1e-9
 
 
-def test_window_distance_guard_uses_lead_gap(monkeypatch):
+def test_v2d_final_profile_travel_matches_numeric_integration():
+  """V2-d: the closed form equals the integrated profile, and the stock distance."""
+  dt = 1e-4
+  for v0, a0 in ((0.3, FINAL_A0_DIST), (0.45, FINAL_A0_DIST), (0.6, FINAL_A0_DIST),
+                 (0.3, 0.8), (0.45, 0.8), (0.6, 0.8)):
+    _, _, T = final_profile(0.0, v0, a0)
+    steps = int(round(T / dt))
+    travelled = sum(final_profile(i * dt, v0, a0)[1] for i in range(steps)) * dt
+    travelled += final_profile(steps * dt, v0, a0)[1] * (T - steps * dt)
+    assert final_profile_travel(v0, a0) == pytest.approx(travelled, abs=1e-4), (v0, a0)
+
+  for v0 in (0.3, 0.45, 0.6):
+    assert final_profile_travel(v0, FINAL_A0_DIST) == pytest.approx(
+      v0 * v0 / (2.0 * STOCK_ROLL_DECEL), abs=1e-4), v0
+
+
+def test_window_lead_guard_is_not_capped_by_the_plan_cap(monkeypatch):
   """The lead term of the guard, exercised directly on the window helper.
 
-  In update() a lead closer than 4.0 m trips fcw_stop and blocks the window
-  outright, so the smallest lead budget reachable inside the window is
-  4.0 - MIN_FINAL_GAP_ABS = 1.0 m, i.e. 0.125 m/s^2 at FINAL_V_MAX -- weaker
-  than the profile itself. The lead term therefore cannot bind at entry; it
-  exists so a lead that closes mid-window still caps the command. This test
-  drives the helper with that smaller budget to prove the term works.
+  A lead closer than MIN_FINAL_GAP_ABS ends the window in update(), so the
+  smallest lead budget reachable inside the window is 3.0 - 3.0 = 0 m and the
+  term is then unbounded. It carries no FINAL_PLAN_GUARD_MAX cap: the gap is a
+  hard safety budget, so it is allowed to brake harder than stock stopping.
+  This test drives the helper with a small budget to prove the term works and
+  that the plan cap does not clip it.
   """
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   control._final_t = 0.0
   control._final_v0 = 0.5
@@ -534,7 +725,7 @@ def test_final_a0_dist_profile_travels_the_stock_distance(v0):
 def test_window_entry_never_brakes_softer_than_final_a0_dist(monkeypatch):
   """A gentle entry is raised to FINAL_A0_DIST so the stop does not run long."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   control.last_output_accel = -FINAL_A0_MIN  # gentler than the stock-distance decel
   cs, plan, radar = stopping_inputs(v_ego=0.5, plan_speeds=_decaying_speeds(0.5))
@@ -558,7 +749,7 @@ def test_window_entry_never_brakes_softer_than_final_a0_dist(monkeypatch):
 
 
 def test_butter_stop_off_forces_final_stop_false(monkeypatch):
-  control, params = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, params = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   assert control.final_stop
   params.put_int("ButterStop", 0)
   control._refresh_butter_stop()
@@ -577,7 +768,7 @@ def test_final_stop_defaults_off(monkeypatch):
 def test_window_profile_drives_the_command(monkeypatch):
   """While the window is open the command follows final_profile, not the PID."""
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
   control.long_control_state = LongCtrlState.pid
   control.last_output_accel = -0.4
 

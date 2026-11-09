@@ -14,10 +14,10 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
   CREEP_ACCEL, CREEP_V, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
-  FINAL_KV, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX, FINAL_U_MIN,
-  FINAL_V_MAX, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
+  FINAL_KV, FINAL_PLAN_GUARD_MAX, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX,
+  FINAL_U_MIN, FINAL_V_MAX, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
   STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, early_req_gap_ok, final_profile,
-  final_roll_limit, plan_stop_distance, rest_ramp_floor,
+  final_profile_travel, final_roll_limit, plan_stop_distance, rest_ramp_floor,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -98,6 +98,14 @@ class LongControl:
     self.params = Params()
     self.readParamCount = 0
     self.final_stop = False
+    self.final_window = False
+    # Which final-stop behaviour ButterStopFinal selects. The early hand-off is
+    # for the classic-CAN Palisade ESC, which flags standstill while the wheels
+    # still roll. A CAN-FD car (K5, ...) flags it only after the physical stop
+    # (d_ass median +0.92 s), so an early hand-off there is a plain early StopReq
+    # with no upside; those cars, and every other brand, get the final window.
+    # Assigned before the first _refresh_butter_stop() call, which reads it.
+    self._early_req_capable = CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CANFD)
     self._refresh_stopping_accel()
     self._refresh_butter_stop()
     self.j_lead = 0.0
@@ -129,15 +137,13 @@ class LongControl:
     self._final_t = None
     self._final_v0 = 0.0
     self._final_a0 = 0.0
+    self._final_s_target = 0.0
+    self._final_s_trav = 0.0
     self._final_done = False
 
-    # ButterStopEarlyReq log latch: one event per stop, cleared above 1 m/s.
+    # ButterStopFinal early hand-off log latch: one event per stop, cleared
+    # above 1 m/s.
     self._early_logged = False
-    # The probe is for the classic-CAN Palisade ESC, which flags standstill while
-    # the wheels still roll. A CAN-FD car (K5, ...) flags it only after the
-    # physical stop (d_ass median +0.92 s), so handing off early there is a
-    # plain early StopReq with no upside.
-    self._early_req_capable = CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CANFD)
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
@@ -166,6 +172,7 @@ class LongControl:
       value = 0.0
     self.butter_stop = math.isfinite(value) and value != 0.0
     self.final_stop = False
+    self.final_window = False
     self.early_req = False
     if not self.butter_stop:
       return
@@ -174,11 +181,11 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       final_value = 0.0
     self.final_stop = math.isfinite(final_value) and final_value > 0.0
-    try:
-      early_value = float(self.params.get_int("ButterStopEarlyReq"))
-    except (TypeError, ValueError, AttributeError):
-      early_value = 0.0
-    self.early_req = math.isfinite(early_value) and early_value > 0.0
+    # One switch, two behaviours: classic-CAN Hyundai/Kia hand the stop to the
+    # car early and never open the window; CAN-FD and every other brand drive
+    # the window and never hand off early.
+    self.early_req = self.final_stop and self._early_req_capable
+    self.final_window = self.final_stop and not self._early_req_capable
     try:
       dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
     except (TypeError, ValueError, AttributeError):
@@ -312,10 +319,14 @@ class LongControl:
     """One tick of the ButterStopFinal window, then advance its clock.
 
     Follows final_profile from the window's entry state, adds low-speed
-    velocity feedback while the reference is still meaningful, and never
-    commands a deceleration that cannot stop the car inside the remaining plan
-    distance or the lead gap. The PID integrator is reset because nothing in
-    this window is a PID decision.
+    velocity feedback while the reference is still meaningful, and caps the
+    command by two independent guards: the plan guard against the distance
+    still owed to the target frozen at window entry (never harder than stock
+    stopping, so a plan that has already collapsed to zero speed cannot demand
+    the full plan decel), and the lead guard at full strength against the
+    remaining gap to the lead. long_plan is no longer read: the frozen target
+    replaces the live plan distance. The PID integrator is reset because
+    nothing in this window is a PID decision.
     """
     a_ref, v_ref, _ = final_profile(self._final_t, self._final_v0, self._final_a0)
     try:
@@ -325,23 +336,27 @@ class LongControl:
     u = a_ref
     if math.isfinite(v_ego) and v_ref >= FINAL_FB_V and v_ego >= FINAL_FB_V:
       u += FINAL_KV * (v_ref - v_ego)
-    s_rem = None
-    plan_speeds = getattr(long_plan, "speeds", None)
-    if plan_speeds is not None:
-      dist = plan_stop_distance(CONTROL_N_T_IDX, plan_speeds)
-      if dist is not None and math.isfinite(dist):
-        s_rem = dist
+    # Plan guard: the frozen entry target, capped at the stock stopping decel.
+    # Once the plan's speeds reach zero while the car still rolls, the live
+    # distance collapses to ~0 and the bare -(v^2)/(2*s) form demanded -1.35 at
+    # 0.367 m/s in the field (W-FROOT1 seg 1); the cap keeps the guard a floor
+    # rather than a runaway brake.
+    if math.isfinite(v_ego):
+      s_plan_rem = self._final_s_target - self._final_s_trav
+      u = min(u, max(-(v_ego * v_ego) / (2.0 * max(s_plan_rem, 0.05)), -FINAL_PLAN_GUARD_MAX))
+    # Lead guard: unchanged and at full strength. The gap is a hard safety
+    # budget, so it is allowed to brake harder than stock stopping.
     lead = getattr(radarState, "leadOne", None) if radarState is not None else None
     if lead is not None and bool(getattr(lead, "status", False)):
       try:
         gap = float(lead.dRel) - MIN_FINAL_GAP_ABS
       except (TypeError, ValueError, AttributeError):
         gap = None
-      if gap is not None and math.isfinite(gap):
-        s_rem = gap if s_rem is None else min(s_rem, gap)
-    if s_rem is not None and math.isfinite(v_ego):
-      u = min(u, -(v_ego * v_ego) / (2.0 * max(s_rem, 0.05)))
+      if gap is not None and math.isfinite(gap) and math.isfinite(v_ego):
+        u = min(u, -(v_ego * v_ego) / (2.0 * max(gap, 0.05)))
     self.reset()
+    if math.isfinite(v_ego):
+      self._final_s_trav += max(v_ego, 0.0) * DT_CTRL
     self._final_t += DT_CTRL
     return float(np.clip(u, FINAL_U_MIN, FINAL_U_MAX))
 
@@ -378,7 +393,7 @@ class LongControl:
     final_close = _lead_on and _d_rel < MIN_FINAL_GAP_ABS
     if self._final_t is not None:
       _, _, final_T = final_profile(self._final_t, self._final_v0, self._final_a0)
-      exit_window = (not (active and should_stop and self.final_stop)
+      exit_window = (not (active and should_stop and self.final_window)
                      or self.long_control_state != LongCtrlState.pid
                      or final_close
                      or CS.vEgo < STANDSTILL_V
@@ -386,22 +401,36 @@ class LongControl:
       if exit_window:
         self._final_t = None
         self._final_done = True
-    elif (not self._final_done and self.final_stop and active and should_stop
+    elif (not self._final_done and self.final_window and active and should_stop
           and self.long_control_state == LongCtrlState.pid
           and CS.aEgo > self.stopping_accel and CS.vEgo <= FINAL_V_MAX
           and not final_close):
       self._final_t = 0.0
       self._final_v0 = max(float(CS.vEgo), 0.05)
       self._final_a0 = min(FINAL_A0_MAX, max(FINAL_A0_DIST, FINAL_A0_MIN, -float(self.last_output_accel)))
-      cloudlog.event("butterStopFinal", vEgo=float(CS.vEgo), a0=float(self._final_a0))
+      # Freeze the plan target at entry. Once the plan's speeds reach zero the
+      # live plan_stop_distance collapses to ~0 and the plan guard runs away;
+      # the frozen target keeps the guard meaningful for the whole window. The
+      # profile's own travel is the floor, so a plan that has already stopped
+      # short cannot shorten the window into a hard stop.
+      s_plan0 = None
+      plan_speeds = getattr(long_plan, "speeds", None)
+      if plan_speeds is not None:
+        s_plan0 = plan_stop_distance(CONTROL_N_T_IDX, plan_speeds)
+      travel = final_profile_travel(self._final_v0, self._final_a0)
+      self._final_s_target = max(
+        s_plan0 if (s_plan0 is not None and math.isfinite(s_plan0)) else 0.0, travel)
+      self._final_s_trav = 0.0
+      cloudlog.event("butterStopFinal", vEgo=float(CS.vEgo), a0=float(self._final_a0),
+                     sTarget=float(self._final_s_target))
     if CS.vEgo > 1.0:
       self._final_done = False
     final_hold = self._final_t is not None
 
-    # ButterStopEarlyReq: hand the stop to the car before its ESC standstill
-    # timer runs out. Off by default; only on classic-CAN Hyundai/Kia, only with
-    # a lead whose gap survives weak braking. final_hold wins, so a final-stop
-    # window is never cut short.
+    # ButterStopFinal on classic-CAN Hyundai/Kia: hand the stop to the car
+    # before its ESC standstill timer runs out. Only with a lead whose gap
+    # survives weak braking. final_hold wins, so a final-stop window is never
+    # cut short; on those cars the window never opens at all.
     early_handoff = (self.early_req and self._early_req_capable and active and should_stop
                      and self.long_control_state == LongCtrlState.pid
                      and not final_hold and float(CS.vEgo) <= EARLY_V

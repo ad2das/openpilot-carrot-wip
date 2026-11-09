@@ -40,14 +40,14 @@ LEAD_RAW_ALLOW = 0.5   # d_eff may never exceed raw dRel by more than this (m)
 TAU_LEAD = 0.3         # lead-position filter time constant (s)
 FLOOR_RELAX_JERK = 0.8  # max floor relaxation rate (m/s^3); tightening is instant
 MIN_FINAL_GAP_ABS = 3.0
-# Early hand-off (ButterStopEarlyReq, experimental field probe). The Palisade
-# ESC raises StandStill about 0.51 s after vEgo crosses about 0.79 m/s, then
-# releases its braking within ~1 s whatever we command; the ordinary hand-off
-# at 0.395 m/s always arrives after that, which is the pre-stop crawl. This
-# toggle hands the stop to the car as soon as v_ego is at or below EARLY_V, so
-# the field drive can show whether the ESC keeps braking with StopReq already
-# set.
-EARLY_V = 0.80        # ButterStopEarlyReq: hand off at or below this (m/s); the Palisade ESC timer starts ~0.79 m/s
+# Early hand-off (ButterStopFinal on classic-CAN Hyundai, experimental field
+# probe). The Palisade ESC raises StandStill about 0.51 s after vEgo crosses
+# about 0.79 m/s, then releases its braking within ~1 s whatever we command;
+# the ordinary hand-off at 0.395 m/s always arrives after that, which is the
+# pre-stop crawl. On those cars ButterStopFinal hands the stop to the car as
+# soon as v_ego is at or below EARLY_V, so the field drive can show whether the
+# ESC keeps braking with StopReq already set.
+EARLY_V = 0.80        # ButterStopFinal on classic-CAN Hyundai: hand off at or below this (m/s); the Palisade ESC timer starts ~0.79 m/s
 EARLY_A_WEAK = 0.25   # weakest decel assumed once the car owns the stop (m/s^2)
 STANDSTILL_V = 0.05
 STANDSTILL_T = 0.2
@@ -92,6 +92,7 @@ FINAL_FB_V = 0.2
 FINAL_HOLD_T = 1.5    # after T, keep -FINAL_A_END at most this long before handing off (s)
 FINAL_U_MAX = -0.05   # the window never commands less braking than this
 FINAL_U_MIN = -1.5
+FINAL_PLAN_GUARD_MAX = STOCK_ROLL_DECEL   # the plan guard never brakes harder than stock stopping (m/s^2)
 
 
 def final_a0_dist(a_end=None, a_stock=STOCK_ROLL_DECEL):
@@ -114,6 +115,13 @@ def final_profile(t, v0, a0):
   if t >= T:
     return -FINAL_A_END, 0.0, T
   return -(a0 - j * t), max(0.0, v0 - a0 * t + 0.5 * j * t * t), T
+
+
+def final_profile_travel(v0, a0):
+  """Distance final_profile covers from entry to its standstill at T."""
+  _, _, T = final_profile(0.0, v0, a0)
+  j = (a0 - FINAL_A_END) / T
+  return v0 * T - 0.5 * a0 * T * T + j * T ** 3 / 6.0
 
 
 def final_roll_limit(v_ego, d_eff, s_ego):

@@ -216,13 +216,13 @@ While external navigation is connected, deceleration, countdowns, and navigation
 
 When TrafficLightDetectMode is 1 or more, the C3X camera traffic-light vision runs automatically and feeds stops (1) or stops and starts (2). Set TrafficLightDetectMode to 0 to turn it off.
 
-### Cruise and following gap — 30 settings overall, 27 on Hyundai/Kia/Genesis
+### Cruise and following gap — 29 settings overall, 26 on Hyundai/Kia/Genesis
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | [Driving mode](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | Eco, safe, normal, high-speed modes and automatic selection |
 | [Speed-based acceleration](cruise-gap.md#acceleration-table) | `CruiseMaxVals0` through `CruiseMaxVals6` | Maximum acceleration tendency by speed band |
-| [Stopping and restarting](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `ButterStopFinal`, `ButterStopEarlyReq`, `VEgoStopping`, `AChangeCostStarting` | Stop position, stop entry, gentle final stop, final stop control, early stop request, and restart behavior |
+| [Stopping and restarting](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `ButterStopFinal`, `VEgoStopping`, `AChangeCostStarting` | Stop position, stop entry, gentle final stop, final stop control, and restart behavior |
 | [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Hyundai/Kia/Genesis fix/hide `100/0/100`; Toyota/Lexus fix/hide `0/0/100`; VW MEB, including ID.4, applies saved gains |
 | [Following gap](cruise-gap.md#following-gap) | `TFollowGap1` through `TFollowGap4`, `DynamicTFollowLC`, `SpeedTFFactor`, `TFollowDecelBoost` | Gap times, lane-change relief using selected leads, and deceleration margin (default 0%) |
 | [Following responsiveness](cruise-gap.md#lead-response) | `LeadAccelResponse`, `LeadAccelResponseTF1`–`LeadAccelResponseTF4` | Lead-start, acceleration and approach response at every following-distance level |
@@ -247,7 +247,7 @@ Deceleration preview operates independently of the response level. During active
 
 `StoppingAccel` is adjustable again: default `-50`, range `-100 to -50`, step `10`. The stored value is multiplied by 0.01, with the same bounds enforced by control. Original stop-entry and braking behavior and vehicle-specific soft hold are restored; changes apply within about one second. See [Stopping and restarting](cruise-gap.md#stop-resume).
 
-`ButterStop` (default on) tapers the braking ceiling below about 3 m/s for a gentler final stop and adds an immediate standstill creep guard. Set `0` to restore the exact previous behavior. `ButterStopFinal` (default `0`, off) can drive the last stop itself below about 0.6 m/s so the deceleration reaches almost zero at standstill; it only works while `ButterStop` is on. `ButterStopEarlyReq` (default `0`, off, experimental) hands the stop to the car at about `0.8 m/s`, before the ESC standstill timer releases braking, and only with a lead whose gap survives weak braking. See [Stopping and restarting](cruise-gap.md#stop-resume).
+`ButterStop` (default on) tapers the braking ceiling below about 3 m/s for a gentler final stop and adds an immediate standstill creep guard. Set `0` to restore the exact previous behavior. `ButterStopFinal` (default `0`, off, experimental) changes the last stop per car: on classic-CAN Hyundai/Kia such as the Palisade it hands the stop to the car at about `0.8 m/s`, before the ESC standstill timer releases braking; on CAN-FD cars such as the K5 and on every other brand it drives the last stop itself below about 0.6 m/s so the deceleration reaches almost zero at standstill. It only works while `ButterStop` is on. See [Stopping and restarting](cruise-gap.md#stop-resume).
 
 `VEgoStopping` has a range of `10–100` and a default of `50`; `10` means `0.10 m/s`. Previously stored values below `10` are automatically raised to `10`, and control enforces the same minimum during driving.
 

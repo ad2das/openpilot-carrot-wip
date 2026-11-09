@@ -26,6 +26,7 @@ Run with `pytest -s` so the printed rows reach the log:
 """
 
 import json
+import math
 import os
 
 import numpy as np
@@ -38,12 +39,15 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import
   FixtureProfile,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _kf_end_decel
-from openpilot.selfdrive.controls.lib.butter_stop import MIN_FINAL_GAP_ABS
+from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+from openpilot.selfdrive.controls.lib.butter_stop import (
+  FINAL_PLAN_GUARD_MAX, FINAL_U_MAX, FINAL_U_MIN, FINAL_V_MAX, MIN_FINAL_GAP_ABS, final_profile,
+)
 
 _SCRATCH = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-08-perf"
 FIX = f"{_SCRATCH}/W-PLANT3B/fixtures"
 POP = f"{_SCRATCH}/W-PLANTE/raw/sim/head"
-OUT = f"{_SCRATCH}/W-FSTOP1/raw/sim"
+OUT = f"{_SCRATCH}/W-FINAL2/raw/sim"
 
 FINAL_ON = 1
 FINAL_OFF = 0
@@ -56,6 +60,7 @@ G1_BACK, G1_FWD = 15.0, 2.0  # G1 gap window in sim time around the real stop
 G1_GAP_SLACK = 0.05          # m, gap_stop(1) may come this much closer
 G3_WINDOW = 0.3              # s, mean command before standstill
 G3_MAX_DECEL = -0.15         # m/s^2, arm-1 mean command floor
+CLASSIC_CAN_CARS = ("Palisade",)  # ButterStopFinal hands off early on these; the rest open the window
 
 
 def _gate_events():
@@ -192,15 +197,79 @@ class FinalStopLoop(FarLeadLoop):
     self.window = {"t": [], "final_t": [], "v": [], "accel": [], "lc_state": [], "fcw": []}
     self.entries = []
     self.exits = []
+    self.plan_guard_ticks = 0
+    # Why a window-eligible event never opened one. Recorded per tick from the
+    # states update() actually saw; nothing here feeds control.
+    self.probe = {"v_ho": None, "a_ho": None, "sacc": None,
+                  "v_min_pid": None, "first_le_0_6": None}
     self._inner_update = self.long_control.update
     self.long_control.update = self._update
 
+  def _plan_guard_binding(self, CS, radarState, s_rem):
+    """True if the plan guard was the binding term of this tick's command.
+
+    Recomputes the three terms of _final_window_accel from the state the tick
+    actually saw (the frozen target is constant for the window, and _final_s_trav
+    is advanced after the command, so pre-tick trav is what the guard used).
+    """
+    lc_ = self.long_control
+    a_ref, v_ref, _ = final_profile(lc_._final_t, lc_._final_v0, lc_._final_a0)
+    try:
+      v_ego = float(CS.vEgo)
+    except (TypeError, ValueError):
+      return False
+    if not math.isfinite(v_ego):
+      return False
+    u0 = a_ref
+    if v_ref >= 0.2 and v_ego >= 0.2:
+      u0 += 0.5 * (v_ref - v_ego)
+    plan_term = max(-(v_ego * v_ego) / (2.0 * max(s_rem, 0.05)), -FINAL_PLAN_GUARD_MAX)
+    u = min(u0, plan_term)
+    lead = getattr(radarState, "leadOne", None)
+    if lead is not None and bool(getattr(lead, "status", False)):
+      gap = float(lead.dRel) - MIN_FINAL_GAP_ABS
+      if math.isfinite(gap):
+        u = min(u, -(v_ego * v_ego) / (2.0 * max(gap, 0.05)))
+    clipped = min(FINAL_U_MAX, max(FINAL_U_MIN, u))
+    plan_clipped = min(FINAL_U_MAX, max(FINAL_U_MIN, plan_term))
+    return plan_term < u0 - 1e-12 and clipped == plan_clipped
+
+  def _record_probe(self, CS, long_plan, pre_state):
+    """Per-tick facts for a window that never opened: when pid handed off and how fast."""
+    probe = self.probe
+    try:
+      v_ego = float(CS.vEgo)
+      a_ego = float(CS.aEgo)
+    except (TypeError, ValueError):
+      return
+    if probe["sacc"] is None:
+      probe["sacc"] = float(self.long_control.stopping_accel)
+    state = int(self.long_control.long_control_state)
+    should_stop = bool(long_plan.shouldStop)
+    if pre_state == int(LongCtrlState.pid) and state == int(LongCtrlState.stopping) \
+        and probe["v_ho"] is None:
+      probe["v_ho"] = v_ego
+      probe["a_ho"] = a_ego
+    if should_stop:
+      if state == int(LongCtrlState.pid):
+        if probe["v_min_pid"] is None or v_ego < probe["v_min_pid"]:
+          probe["v_min_pid"] = v_ego
+      if v_ego <= FINAL_V_MAX and probe["first_le_0_6"] is None:
+        probe["first_le_0_6"] = (state, a_ego, v_ego)
+
   def _update(self, active, CS, long_plan, accel_limits, t_since_plan, radarState):
     was_open = self.long_control._final_t is not None
+    pre_target = self.long_control._final_s_target
+    pre_trav = self.long_control._final_s_trav
+    pre_state = int(self.long_control.long_control_state)
     out = self._inner_update(active, CS, long_plan, accel_limits, t_since_plan, radarState)
     now = self.long_control._final_t
     tick_t = self.tick * DT_CTRL
     self.tick += 1
+    self._record_probe(CS, long_plan, pre_state)
+    if was_open and now is not None:
+      if self._plan_guard_binding(CS, radarState, pre_target - pre_trav):
+        self.plan_guard_ticks += 1
     _lead = getattr(radarState, "leadOne", None)
     lead_close = bool(getattr(_lead, "status", False)
                       and float(getattr(_lead, "dRel", float("inf"))) < MIN_FINAL_GAP_ABS)
@@ -231,9 +300,20 @@ def _run(car, fixture, final):
   header["ButterStop"] = 1
   header["ButterStopFinal"] = int(final)
   loop = FinalStopLoop(header, FixtureProfile(fixture), fitted=car.lower(), full_run=True)
+  # FarLeadLoop builds every fixture on the Palisade CP (classic CAN), K5 rows
+  # included, so the per-car capability has to be set from here. ButterStopFinal
+  # then resolves to the early hand-off on classic CAN and to the window on the
+  # rest, exactly as on the car.
+  loop.long_control._early_req_capable = car in CLASSIC_CAN_CARS
+  loop.long_control._refresh_butter_stop()
   run = loop.run()
   run["entries"] = loop.entries
   run["exits"] = loop.exits
+  run["window"] = loop.window
+  run["plan_guard_ticks"] = loop.plan_guard_ticks
+  run["probe"] = dict(loop.probe)
+  run["final_window"] = bool(loop.long_control.final_window)
+  run["early_req"] = bool(loop.long_control.early_req)
   return run
 
 
@@ -246,6 +326,26 @@ def _write(path, row):
 
 G2_ROWS = []
 G3_ROWS = []
+NOENTRY_ROWS = []
+
+
+def _fmt(value, spec="{:.3f}"):
+  return "nan" if value is None else spec.format(float(value))
+
+
+def _print_noentry(car, eid, probe):
+  """Why an event whose car mode is the window opened none, in one line."""
+  first = probe.get("first_le_0_6")
+  if first is None:
+    first_shown = "none"
+  else:
+    state, a_ego, v_ego = first
+    first_shown = f"{state}/a={_fmt(a_ego)}/v={_fmt(v_ego)}"
+  print(
+    f"NOENTRY {car} {eid} v_ho={_fmt(probe.get('v_ho'))} a_ho={_fmt(probe.get('a_ho'))} "
+    + f"sacc={_fmt(probe.get('sacc'))} v_min_pid={_fmt(probe.get('v_min_pid'))} "
+    + f"first_le_0.6={first_shown}",
+    flush=True)
 
 
 @pytest.mark.parametrize("car,eid", EVENTS, ids=[f"{c}-{e}" for c, e in EVENTS])
@@ -281,11 +381,19 @@ def test_final_stop_gate(car, eid):
   g3_note = ("window" if g3_applies
              else ("no_window" if not entries else f"exit_{exits[-1]['reason']}"))
 
+  # Which behaviour ButterStopFinal resolved to on this car, and whether the
+  # window opened at all. Both feed the census rows and the no-entry probe.
+  mode = "early" if on_run["early_req"] else ("window" if on_run["final_window"] else "off")
   G2_ROWS.append({"car": car, "eid": eid, "entry_t": entry_t, "entry_v": entry_v,
                   "on_time": on_time, "off_time": off_time,
-                  "n_entries": len(entries), "exits": exits})
+                  "n_entries": len(entries), "exits": exits,
+                  "final_window": on_run["final_window"], "early_req": on_run["early_req"],
+                  "plan_guard_ticks": int(on_run["plan_guard_ticks"]),
+                  "window_ticks": int(sum(1 for x in on_run["window"]["final_t"] if x is not None))})
   G3_ROWS.append({"car": car, "eid": eid, "on_cmd": on_cmd, "off_cmd": off_cmd,
                   "g3_note": g3_note, "g3_ok": g3_ok})
+  if mode == "window" and not entries:
+    NOENTRY_ROWS.append({"car": car, "eid": eid, **on_run["probe"]})
 
   gap_ok = on["gap_stop"] >= off["gap_stop"] - G1_GAP_SLACK
 
@@ -302,6 +410,10 @@ def test_final_stop_gate(car, eid):
     "entry_t": entry_t,
     "entry_v": entry_v,
     "exits": exits,
+    "final_window": on_run["final_window"],
+    "early_req": on_run["early_req"],
+    "plan_guard_ticks": int(on_run["plan_guard_ticks"]),
+    "window_ticks": int(sum(1 for x in on_run["window"]["final_t"] if x is not None)),
     "g1_gap_ok": bool(gap_ok),
     "g3_applies": g3_applies,
     "g3_ok": g3_ok,
@@ -317,9 +429,14 @@ def test_final_stop_gate(car, eid):
     f"on t_stop={on['t_stop']:6.2f} dt={on['dt_real']:5.2f} gap={on['gap_stop']:6.3f} "
     + f"end={on['end_decel']:6.4f} cmd={on_cmd:7.4f} min_gap={on['min_gap_g1']:6.3f}"
   )
+  guard_ticks = int(on_run["plan_guard_ticks"])
+  window_ticks = int(sum(1 for x in on_run["window"]["final_t"] if x is not None))
+  if mode == "window" and not entries:
+    _print_noentry(car, eid, on_run["probe"])
   print(
     f"FSTOP {car} {eid:34s} real_t={ref['t_sim']:6.2f} | {off_part} | {on_part} "
-    + f"entry_v={entry_shown:>6s} | dgap={on['gap_stop'] - off['gap_stop']:+.3f}",
+    + f"entry_v={entry_shown:>6s} | dgap={on['gap_stop'] - off['gap_stop']:+.3f} "
+    + f"| mode={mode} plan_guard={guard_ticks}/{window_ticks}",
     flush=True)
 
   assert gap_ok, (
@@ -332,7 +449,7 @@ def test_final_stop_gate(car, eid):
 
 
 def test_final_stop_g2_report():
-  """G2 per car, plus the entry / exit census."""
+  """G2 per car, plus the entry / exit census and the no-entry probe rows."""
   assert G2_ROWS, "the per-event gate produced no rows"
   rows = [r for r in G2_ROWS if np.isfinite(r["entry_t"])]
   assert rows, "FAIL_g2: no event entered the window"
@@ -348,6 +465,14 @@ def test_final_stop_g2_report():
     print(f"G2 {car:9s} n={len(car_rows):2d} on={on_t:.3f} s off={off_t:.3f} s "
           + f"d={on_t - off_t:+.3f} {verdict}", flush=True)
   _write("g2.json", summary)
+
+  for car in sorted({r["car"] for r in rows}):
+    car_rows = [r for r in rows if r["car"] == car]
+    guards = sum(r["plan_guard_ticks"] for r in car_rows)
+    ticks = sum(r["window_ticks"] for r in car_rows)
+    frac = (guards / ticks) if ticks else float("nan")
+    print(f"GUARD {car:9s} events={len(car_rows):2d} plan_guard_ticks={guards} "
+          + f"window_ticks={ticks} frac={frac:.3f}", flush=True)
 
   entry_v = [r["entry_v"] for r in rows if np.isfinite(r["entry_v"])]
   exit_reasons = {}
@@ -388,13 +513,20 @@ def test_final_stop_g2_report():
       print(f"  G3 {name:10s} {r['car']:9s} {r['eid']:34s} on_cmd={r['on_cmd']:+.4f} "
             + f"off_cmd={r['off_cmd']:+.4f} {verdict}", flush=True)
   _write("g3.json", G3_ROWS)
+  _write("noentry.json", NOENTRY_ROWS)
+  for row in NOENTRY_ROWS:
+    _print_noentry(row["car"], row["eid"], row)
 
   bad = {car: s for car, s in summary.items() if not s["ok"]}
   assert not bad, f"FAIL_g2: {bad}"
 
 
 def test_butter_stop_maneuvers_with_final_stop():
-  """G4: ButterStopLoop takes no header dict; set the key then refresh."""
+  """G4: ButterStopLoop takes no header dict; set the key then refresh.
+
+  ButterStopLoop builds the Palisade CP, so ButterStopFinal resolves to the
+  early hand-off there; the maneuvers record it unchanged.
+  """
   from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
     _CASES, ButterStopLoop, compute_metrics,
   )
