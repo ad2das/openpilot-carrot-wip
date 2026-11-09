@@ -1,6 +1,7 @@
 import math
 import numpy as np
 from openpilot.cereal import car
+from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
@@ -12,11 +13,11 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 )
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
+  CREEP_ACCEL, CREEP_V, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
   FINAL_KV, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX, FINAL_U_MIN,
   FINAL_V_MAX, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS, STANDSTILL_T, STANDSTILL_V,
-  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, final_profile, final_roll_limit,
-  plan_stop_distance, rest_ramp_floor,
+  STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, early_req_gap_ok, final_profile,
+  final_roll_limit, plan_stop_distance, rest_ramp_floor,
 )
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
@@ -44,7 +45,7 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 
 def long_control_state_trans(CP, active, long_control_state, v_ego,
                              should_stop, brake_pressed, cruise_standstill, a_ego, stopping_accel, radarState,
-                             final_hold=False):
+                             final_hold=False, early_handoff=False):
   stopping_condition = should_stop
   stopping_accel = stopping_accel if stopping_accel < 0.0 else -0.5
   starting_condition = (not should_stop and
@@ -75,7 +76,7 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
       if stopping_condition:
         leadOne = radarState.leadOne
         fcw_stop = leadOne.status and leadOne.dRel < 4.0
-        if (fcw_stop and not final_hold) or (a_ego > stopping_accel and not final_hold):
+        if (fcw_stop and not final_hold) or (a_ego > stopping_accel and not final_hold) or early_handoff:
           long_control_state = LongCtrlState.stopping
         elif long_control_state == LongCtrlState.starting:
           long_control_state = LongCtrlState.stopping
@@ -130,6 +131,14 @@ class LongControl:
     self._final_a0 = 0.0
     self._final_done = False
 
+    # ButterStopEarlyReq log latch: one event per stop, cleared above 1 m/s.
+    self._early_logged = False
+    # The probe is for the classic-CAN Palisade ESC, which flags standstill while
+    # the wheels still roll. A CAN-FD car (K5, ...) flags it only after the
+    # physical stop (d_ass median +0.92 s), so handing off early there is a
+    # plain early StopReq with no upside.
+    self._early_req_capable = CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CANFD)
+
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
     if self.hyundai_fixed_longitudinal_tuning:
       self._apply_hyundai_longitudinal_tuning()
@@ -157,6 +166,7 @@ class LongControl:
       value = 0.0
     self.butter_stop = math.isfinite(value) and value != 0.0
     self.final_stop = False
+    self.early_req = False
     if not self.butter_stop:
       return
     try:
@@ -164,6 +174,11 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       final_value = 0.0
     self.final_stop = math.isfinite(final_value) and final_value > 0.0
+    try:
+      early_value = float(self.params.get_int("ButterStopEarlyReq"))
+    except (TypeError, ValueError, AttributeError):
+      early_value = 0.0
+    self.early_req = math.isfinite(early_value) and early_value > 0.0
     try:
       dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
     except (TypeError, ValueError, AttributeError):
@@ -383,11 +398,25 @@ class LongControl:
       self._final_done = False
     final_hold = self._final_t is not None
 
+    # ButterStopEarlyReq: hand the stop to the car before its ESC standstill
+    # timer runs out. Off by default; only on classic-CAN Hyundai/Kia, only with
+    # a lead whose gap survives weak braking. final_hold wins, so a final-stop
+    # window is never cut short.
+    early_handoff = (self.early_req and self._early_req_capable and active and should_stop
+                     and self.long_control_state == LongCtrlState.pid
+                     and not final_hold and float(CS.vEgo) <= EARLY_V
+                     and early_req_gap_ok(float(CS.vEgo), _lead_on, _d_rel))
+    if early_handoff and not self._early_logged:
+      cloudlog.event("butterStopEarlyReq", vEgo=float(CS.vEgo), dRel=float(_d_rel), aEgo=float(CS.aEgo))
+      self._early_logged = True
+    if CS.vEgo > 1.0:
+      self._early_logged = False
+
     prev_long_control_state = self.long_control_state
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
                                                        CS.cruiseState.standstill, CS.aEgo, self.stopping_accel, radarState,
-                                                       final_hold=final_hold)
+                                                       final_hold=final_hold, early_handoff=early_handoff)
     if active and soft_hold_active:
       self.long_control_state = LongCtrlState.stopping
 

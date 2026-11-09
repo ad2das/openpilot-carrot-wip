@@ -40,6 +40,15 @@ LEAD_RAW_ALLOW = 0.5   # d_eff may never exceed raw dRel by more than this (m)
 TAU_LEAD = 0.3         # lead-position filter time constant (s)
 FLOOR_RELAX_JERK = 0.8  # max floor relaxation rate (m/s^3); tightening is instant
 MIN_FINAL_GAP_ABS = 3.0
+# Early hand-off (ButterStopEarlyReq, experimental field probe). The Palisade
+# ESC raises StandStill about 0.51 s after vEgo crosses about 0.79 m/s, then
+# releases its braking within ~1 s whatever we command; the ordinary hand-off
+# at 0.395 m/s always arrives after that, which is the pre-stop crawl. This
+# toggle hands the stop to the car as soon as v_ego is at or below EARLY_V, so
+# the field drive can show whether the ESC keeps braking with StopReq already
+# set.
+EARLY_V = 0.80        # ButterStopEarlyReq: hand off at or below this (m/s); the Palisade ESC timer starts ~0.79 m/s
+EARLY_A_WEAK = 0.25   # weakest decel assumed once the car owns the stop (m/s^2)
 STANDSTILL_V = 0.05
 STANDSTILL_T = 0.2
 HOLD_RAMP = 2.0
@@ -116,6 +125,14 @@ def final_roll_limit(v_ego, d_eff, s_ego):
   """
   stock = v_ego * v_ego / (2.0 * STOCK_ROLL_DECEL)
   return s_ego + min(stock + FINAL_ROLL_M, d_eff - MIN_FINAL_GAP_ABS)
+
+
+def early_req_gap_ok(v_ego, lead_status, d_rel):
+  """True only with a lead whose gap still clears MIN_FINAL_GAP_ABS if the car stops at EARLY_A_WEAK."""
+  if not lead_status or not math.isfinite(d_rel):
+    return False
+  need = max(v_ego, 0.0) ** 2 / (2.0 * EARLY_A_WEAK)
+  return d_rel - need >= MIN_FINAL_GAP_ABS
 
 
 def plan_stop_distance(plan_t, plan_speeds):

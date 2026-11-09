@@ -107,6 +107,7 @@ Tune the speed band containing the symptom instead of changing the whole table. 
 | `VEgoStopping` | `50` → 0.50 m/s | Higher values enter stopping state at a higher planned speed |
 | `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s for a gentler stop |
 | `ButterStopFinal` | `1` → on, `0` → off | Drives the last stop itself below about 0.6 m/s so deceleration reaches almost zero at standstill |
+| `ButterStopEarlyReq` | `1` → on, `0` → off | Hands the stop to the car at about 0.8 m/s, before the ESC standstill timer releases braking |
 | `AChangeCostStarting` | MPC acceleration-change cost | Higher values smooth initial acceleration changes |
 
 ### `StopDistanceCarrot`
@@ -150,6 +151,20 @@ Default `0` (off) is identical to the previous behavior; turn it on to test it. 
 
 > [!NOTE]
 > Not tested on a vehicle. The fitted-plant replay is the only check made so far, and it cannot judge the jolt itself; the field test is the only way to confirm the improvement.
+
+### `ButterStopEarlyReq` · Early stop request (experimental, Palisade)
+
+Default `0` (off) is identical to the previous behavior. This is a field probe, not a finished feature: it exists to measure one specific behavior of the car.
+
+On a Palisade the ESC raises `TCS13.StandStill` about `0.51 s` after the reported speed crosses about `0.79 m/s`, while the wheels are still rolling, and it then releases braking within about a second whatever openpilot requests. Because the ordinary hand-off to the stopping state happens at a median `0.395 m/s`, it always arrives after that flag, which is the slow crawl at the end of every Palisade stop. With this setting on, the stop is handed to the car as soon as the reported speed is at or below `0.80 m/s` and the stop has been requested, so the field drive can show whether the ESC keeps braking when the stop request is already set.
+
+- It applies only while `ButterStop` is on, only in the `pid` state, and only with a lead. The hand-off happens only when at least `3 m` to that lead would remain even if the car finished the stop at a weak `0.25 m/s²`; without that margin the ordinary hand-off applies.
+- Hyundai/Kia classic-CAN cars only, such as the Palisade. On a CAN-FD car (K5 and similar) the ESC flags standstill only after the physical stop, so this setting does nothing there.
+- `ButterStopFinal` wins: while its window is open this setting does nothing.
+- One `butterStopEarlyReq` message is logged per stop, with the reported speed, lead distance and acceleration at the moment of hand-off.
+
+> [!NOTE]
+> Not tested on a vehicle. Nothing in simulation can model the ESC standstill timer, so the field drive is the only way to learn whether the trick works. Set it back to `0` afterwards.
 
 The description above concerns upstream control. The final CANFD request override is described below.
 
