@@ -13,7 +13,7 @@ from openpilot.selfdrive.controls.lib.cruise_coasting import (
 )
 from openpilot.selfdrive.controls.lib import butter_stop as butter_stop_module
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  CREEP_ACCEL, CREEP_V, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
+  CREEP_ACCEL, CREEP_V, EARLY_REQ_ENABLED, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_FB_V, FINAL_HOLD_T,
   FINAL_KV, FINAL_PLAN_GUARD_MAX, FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX,
   FINAL_U_MIN, FINAL_V_MAX, FINAL_WINDOW_ENABLED, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS,
   STANDSTILL_T, STANDSTILL_V,
@@ -36,6 +36,40 @@ DEPART_WINDOW_T = 4.0      # s
 DEPART_P_FLOOR = -0.2      # m/s^2 below aTarget
 DEPART_MIN_DREL = 4.0      # m
 DEPART_RELEASE_JERK = 1.0  # m/s^3, floor relax when the window ends or the plan stops accelerating
+
+# ButterStopFinal firm finish (classic-CAN Hyundai/Kia): hold at least FIRM_A of
+# braking through the last metres of a planned stop so the car is nearly stopped
+# when the Palisade ESC standstill timer (0.51 s after 0.794 m/s) releases the
+# brakes. Off unless ButterStop and ButterStopFinal are both on.
+FIRM_V_HI = 2.0            # m/s, band top (car responds ~0.6 s late)
+FIRM_V_LO = 0.3            # m/s, band bottom
+FIRM_ATGT = -0.3           # m/s^2, plan must command real braking (P7)
+FIRM_VPLAN_END = 0.3       # m/s, plan must end at a stop (P7)
+FIRM_JERK = 2.0            # m/s^3, cap build rate
+FIRM_RELEASE_JERK = 2.0    # m/s^3, cap relax rate on a soft exit
+FIRM_A = 0.8               # m/s^2, ButterStopFinal firm-finish decel on classic-CAN Hyundai/Kia
+
+
+def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+  if firm_a <= 0.0 or gas or brake or cruise_standstill:
+    return False
+  if not (0.0 <= t_since_plan <= MAX_PLAN_AGE) or len(plan_speeds) == 0:
+    return False
+  v_end = float(plan_speeds[-1])
+  if not (math.isfinite(v_ego) and math.isfinite(a_target) and math.isfinite(v_end)):
+    return False
+  return a_target < FIRM_ATGT and v_end < FIRM_VPLAN_END and FIRM_V_LO <= v_ego <= FIRM_V_HI
+
+
+def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
+  if gate:
+    base = last_output if cap is None else cap
+    return max(-firm_a, min(float(base), 0.0) - FIRM_JERK * DT_CTRL)
+  if cap is None or hard_exit:
+    return None
+  cap += FIRM_RELEASE_JERK * DT_CTRL
+  return None if cap >= 0.0 else cap
+
 
 STOPPING_ACCEL_DEFAULT = -50  # Params use hundredths of m/s^2
 STOPPING_ACCEL_MIN = -100
@@ -109,6 +143,8 @@ class LongControl:
     self._early_req_capable = CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CANFD)
     self._refresh_stopping_accel()
     self._refresh_butter_stop()
+    self._firm_cap = None
+    self._firm_logged = False
     self.j_lead = 0.0
 
     # ButterStop stop-episode state. The standstill hold/release decision itself
@@ -175,6 +211,7 @@ class LongControl:
     self.final_stop = False
     self.final_window = False
     self.early_req = False
+    self.firm_a = 0.0
     if not self.butter_stop:
       return
     try:
@@ -182,11 +219,15 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       final_value = 0.0
     self.final_stop = math.isfinite(final_value) and final_value > 0.0
-    # One switch, two behaviours: classic-CAN Hyundai/Kia hand the stop to the
-    # car early and never open the window; CAN-FD and every other brand would
-    # drive the window, but FINAL_WINDOW_ENABLED holds the window off for every
-    # car until a version passes the sim gap gate.
-    self.early_req = self.final_stop and self._early_req_capable
+    # One switch, two behaviours. Classic-CAN Hyundai/Kia get the firm finish:
+    # at least FIRM_A of braking through the last 2.0 -> 0.3 m/s, so the car is
+    # nearly stopped when the ESC standstill timer releases the brakes. The
+    # early StopReq hand-off is held off by EARLY_REQ_ENABLED (W-SS1: a StopReq
+    # sent before the flag did not stop the release). CAN-FD and every other
+    # brand would drive the final window, which FINAL_WINDOW_ENABLED holds off
+    # for every car until a version passes the sim gap gate.
+    self.early_req = self.final_stop and self._early_req_capable and EARLY_REQ_ENABLED
+    self.firm_a = FIRM_A if (self.final_stop and self._early_req_capable) else 0.0
     self.final_window = self.final_stop and not self._early_req_capable and FINAL_WINDOW_ENABLED
     try:
       dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
@@ -630,11 +671,35 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
         output_accel = min(0.0, max(output_accel, butter_floor_value))
+      # Off-identity: with the param off and no cap in flight the block is not
+      # entered at all, so it cannot even read CS. The _firm_cap half keeps the
+      # soft release alive when the param is switched off mid-stop.
+      if self.firm_a > 0.0 or self._firm_cap is not None:
+        hard_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
+        # getattr, not attribute access: several callers hand update() a partial plan
+        # (no .speeds) and a bare read raises on every tick before the gate is even
+        # entered. An absent plan is "no plan", which the gate rejects.
+        plan_speeds = getattr(long_plan, "speeds", ())
+        gate = firm_gate(self.firm_a, float(CS.vEgo), float(a_target_ff), plan_speeds, t_since_plan,
+                         bool(CS.gasPressed), bool(CS.brakePressed), bool(CS.cruiseState.standstill))
+        was_capped = self._firm_cap is not None
+        self._firm_cap = firm_cap_step(self._firm_cap, self.last_output_accel, self.firm_a, gate, hard_exit)
+        if gate and not was_capped and not self._firm_logged:
+          cloudlog.event("butterStopFirm", vEgo=float(CS.vEgo), aTarget=float(a_target_ff), firmA=self.firm_a)
+          self._firm_logged = True
+        if float(CS.vEgo) > FIRM_V_HI + 1.0:
+          self._firm_logged = False
+        if self._firm_cap is not None and output_accel > self._firm_cap:
+          # Do not integrate the speed error the cap is overriding.
+          self.pid.i = previous_integral
+          output_accel = self._firm_cap
       guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
       if guarded > output_accel:
         # Do not integrate the speed error the guard is overriding.
         self.pid.i = previous_integral
         output_accel = guarded
 
+    if self.long_control_state != LongCtrlState.pid:
+      self._firm_cap = None
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     return self.last_output_accel, a_target_ff, j_target_now

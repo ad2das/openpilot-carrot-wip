@@ -344,12 +344,13 @@ def test_v2e_butter_stop_final_picks_the_mode_per_car(monkeypatch):
   monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
 
   classic = _control_for(monkeypatch, "hyundai", 0, on)
-  assert classic.final_stop and classic.early_req
-  assert not classic.final_window, "classic-CAN Hyundai hands off early, never opens the window"
+  assert classic.final_stop and not classic.early_req and classic.firm_a == lc.FIRM_A
+  assert not classic.final_window, "classic-CAN Hyundai gets the firm finish, never the window"
 
   canfd = _control_for(monkeypatch, "hyundai", HyundaiFlags.CANFD, on)
   assert canfd.final_stop and canfd.final_window
   assert not canfd.early_req, "CAN-FD drives the window, never hands off early"
+  assert canfd.firm_a == 0.0
 
   toyota = _control_for(monkeypatch, "toyota", 0, on)
   assert toyota.final_stop and toyota.final_window
@@ -362,7 +363,12 @@ def test_v2e_butter_stop_final_picks_the_mode_per_car(monkeypatch):
 
 
 def test_v2e_classic_can_hyundai_never_opens_the_window(monkeypatch):
-  """The early hand-off owns the stop on those cars: the window stays shut."""
+  """The early hand-off owns the stop on those cars: the window stays shut.
+
+  EARLY_REQ_ENABLED ships False (W-SS1), so this test turns it back on: it pins
+  the hand-off contract that the constant can re-enable, as test_early_req.py does.
+  """
+  monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
   events = []
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: events.append(name)))
   control = _control_for(monkeypatch, "hyundai", 0, {"ButterStop": 1, "ButterStopFinal": 1})
@@ -831,7 +837,8 @@ def test_m1_canfd_final_stop_is_a_no_op_while_the_window_is_disabled(monkeypatch
 
 
 def test_m2_classic_can_early_hand_off_survives_the_window_switch(monkeypatch):
-  """The early hand-off is the shipped behaviour and does not depend on the constant."""
+  """The early hand-off does not depend on a module constant staying enabled."""
+  monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
   for window in (False, True):
     monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", window)
     control = _control_for(monkeypatch, "hyundai", 0, {"ButterStop": 1, "ButterStopFinal": 1})
