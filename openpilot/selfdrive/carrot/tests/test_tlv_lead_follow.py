@@ -466,7 +466,7 @@ def test_no_fire_while_ego_moving():
     tick(planner, lead(d_rel=5.0, v_lead=0.0), 0.5)  # not standstill
   assert planner.lead_follow_arm_frames == 0
   for step in range(1, 40):
-    tick(planner, lead(d_rel=5.0 + 0.2 * step, v_lead=1.5), 0.5)
+    tick(planner, lead(d_rel=5.0 + 0.2 * step, v_lead=1.4), 0.5)  # dv 0.9 < LEAD_FOLLOW_ROLL_DV: the rolling arm must not fire either
   assert planner.lead_follow_active is False
 
 

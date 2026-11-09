@@ -90,6 +90,11 @@ LEAD_FOLLOW_GO_VLEAD = 1.0
 LEAD_FOLLOW_GO_GAIN_M = 0.5
 LEAD_FOLLOW_MAX_DIST_M = 40.0
 LEAD_FOLLOW_JUMP_M = 5.0
+# Rolling-queue arm: the ego is still rolling slowly (not stopped) behind a lead
+# that pulls away (20:18:22 bus restart, W-DEP2). Same latch, same exits.
+LEAD_FOLLOW_ROLL_V_MAX = 3.0
+LEAD_FOLLOW_ROLL_DV = 1.0
+LEAD_FOLLOW_ROLL_FRAMES = int(0.5 / DT_MDL)
 TLV_LOG_MIN_INTERVAL_S = 2.0
 TLV_ROUTE_LEFT_NEAR_M = 150.0
 TLV_BLINKER_STOP_GAP_S = 0.5
@@ -299,6 +304,8 @@ class CarrotPlanner:
     self.lead_follow_arm_frames = 0
     self.lead_follow_d_stop = None
     self.lead_follow_d_prev = 0.0
+    self.lead_follow_roll_frames = 0
+    self.lead_follow_roll_d0 = None
     # W74D follow-up: moving-timeout and veto instrumentation state.
     self.tlv_coast_moving_frames = 0
     self.tlv_coast_stop_sign_seen = False
@@ -1179,7 +1186,7 @@ class CarrotPlanner:
       self.trafficState = TrafficState.red
 
   def _update_lead_follow(self, lead, v_ego: float) -> None:
-    """WLF2: latch a stopped lead's departure; see the LEAD_FOLLOW_* constants."""
+    """WLF2: latch a lead's departure, from standstill or a slow rolling queue; see the LEAD_FOLLOW_* constants."""
     status = bool(getattr(lead, 'status', False))
     d = float(getattr(lead, 'dRel', 0.0))
     vl = float(getattr(lead, 'vLead', 0.0))
@@ -1189,8 +1196,25 @@ class CarrotPlanner:
         self.lead_follow_active = False
         self.lead_follow_arm_frames = 0
         self.lead_follow_d_stop = None
+        self.lead_follow_roll_frames = 0
+        self.lead_follow_roll_d0 = None
       else:
         self.lead_follow_d_prev = d
+      return
+    if (status and TLV_STANDSTILL_MPS <= v_ego < LEAD_FOLLOW_ROLL_V_MAX
+        and d <= LEAD_FOLLOW_ARM_DIST_M and vl - v_ego >= LEAD_FOLLOW_ROLL_DV):
+      if self.lead_follow_roll_frames == 0:
+        self.lead_follow_roll_d0 = d
+      self.lead_follow_roll_frames += 1
+    else:
+      self.lead_follow_roll_frames = 0
+      self.lead_follow_roll_d0 = None
+    if (self.lead_follow_roll_frames >= LEAD_FOLLOW_ROLL_FRAMES and self.tlv_red_active
+        and d >= self.lead_follow_roll_d0 + LEAD_FOLLOW_GO_GAIN_M):
+      self.lead_follow_active = True
+      self.lead_follow_d_prev = d
+      self.lead_follow_roll_frames = 0
+      self.lead_follow_roll_d0 = None
       return
     if not status or v_ego >= TLV_STANDSTILL_MPS:
       self.lead_follow_arm_frames = 0
