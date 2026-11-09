@@ -386,14 +386,21 @@ class LongitudinalPlanner:
     elapsed = now-getattr(self, '_signal_prepare_time', now-self.dt)
     self._signal_prepare_time = now
     cs = sm['carState']
-    active = (getattr(getattr(carrot, 'prepare_decision', None), 'active', False)
+    # W-TLT9/11: tier 1 of CarrotTlvStopGo drives the same final cap and, unlike the
+    # prepare experiment, never lets it sit above the plan's own target (a start while
+    # still accelerating would otherwise take seconds to come down). tlv_soft_active
+    # is only ever set with that toggle on.
+    tier1 = getattr(carrot, 'tlv_soft_active', False)
+    requested = getattr(getattr(carrot, 'prepare_decision', None), 'active', False) or tier1
+    active = (requested
               and not reset_state and not cs.gasPressed and not cs.brakePressed
               and 0 < elapsed <= .2
               and not self.output_should_stop and self.mpc.mode == 'acc'
               and not sm['radarState'].leadOne.status and not sm['radarState'].leadTwo.status)
     previous = getattr(self, '_signal_prepare_previous', cs.aEgo)
     uncapped = self.output_a_target
-    self.output_a_target = self._signal_prepare_accel.apply(self.output_a_target, previous, elapsed, active)
+    self.output_a_target = self._signal_prepare_accel.apply(self.output_a_target, previous, elapsed, active,
+                                                           follow_target=tier1)
     self._signal_prepare_previous = self.output_a_target
     if active:
       # Coasting must not cancel the requested gentle deceleration downstream.

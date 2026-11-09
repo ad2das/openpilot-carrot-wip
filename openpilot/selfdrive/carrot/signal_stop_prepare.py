@@ -198,11 +198,14 @@ class PrepareAccel:
   def __init__(self):
     self.cap = None
 
-  def apply(self, target, previous, dt, active):
+  def apply(self, target, previous, dt, active, follow_target=False):
     if not active or not all(math.isfinite(x) for x in (target, previous, dt)) or not 0 < dt <= .2:
       self.cap = None
       return target
     if self.cap is None:
       self.cap = max(SignalStopPrepare.TARGET_ACCEL, previous)
+    if follow_target:
+      # Never above the plan's own target: the ramp starts from where the plan already is.
+      self.cap = min(self.cap, target)
     self.cap = max(SignalStopPrepare.TARGET_ACCEL, self.cap-SignalStopPrepare.RAMP*dt)
     return min(target, self.cap)
