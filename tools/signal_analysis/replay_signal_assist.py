@@ -61,10 +61,10 @@ def planner_class(source):
             deque=collections.deque, cloudlog=NS(event=lambda *a, **k: None), CARROT_MAN_TIMEOUT=1.0)
   ns.update({n: getattr(helpers, n) for n in dir(helpers) if not n.startswith('_')})
   tree = ast.parse(source)
-  # keep the W74D TLV_* module constants alive: only class/function nodes are
+  # keep the W74D TLV_* and WLF2 LEAD_FOLLOW_* module constants alive: only class/function nodes are
   # re-executed below, so their module-level assignments must run too
   tlv_constants = [n for n in tree.body if isinstance(n, (ast.Assign, ast.AnnAssign))
-                   and all(isinstance(t, ast.Name) and t.id.startswith('TLV_')
+                   and all(isinstance(t, ast.Name) and t.id.startswith(('TLV_', 'LEAD_FOLLOW_'))
                            for t in (n.targets if isinstance(n, ast.Assign) else [n.target]))]
   nodes = tlv_constants + [n for n in tree.body if isinstance(n, (ast.ClassDef, ast.FunctionDef))]
   exec(compile(ast.Module(nodes, type_ignores=[]), 'carrot_source_replay', 'exec'), ns)
