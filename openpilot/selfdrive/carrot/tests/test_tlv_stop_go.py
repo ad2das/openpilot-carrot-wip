@@ -371,10 +371,16 @@ def test_gas_releases_and_holds_off_for_the_rest_of_that_red():
 
 
 def test_lead_appearance_releases():
+  # A lead releases the commit only once seen LEAD_SOLID_S = 0.5 s (tlv_stop_tiers v5):
+  # one- or two-tick radar blips (000004ad) keep the stop.
   p, calls = planner(2, toggle=1)
   step(p, inputs_at(10., 100.))
   assert p.tlv_stop_committed is True
-  step(p, inputs_at(10., 100., lead=True))
+  lead = inputs_at(10., 100., lead=True)
+  steps(p, lead, 9)
+  assert p.tlv_stop_committed is True
+  assert ('release', 'lead') not in calls
+  steps(p, lead, 3)
   assert p.tlv_stop_committed is False
   assert calls[-1] == ('release', 'lead')
 

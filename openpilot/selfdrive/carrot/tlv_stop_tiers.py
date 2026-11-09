@@ -30,6 +30,7 @@ CUE_MIN_S = 0.5
 CUE_BRAKE_HOLD_S = 2.0
 LEAD_CLEAR_S = 0.3           # a stop commit needs the lead gone this long (no commit inside a lead dropout)
 LEAD_REARM_S = 1.0           # after a lead release, a new stop commit waits this long
+LEAD_SOLID_S = 0.5           # a lead releases either tier only once seen this long (gaps <= LEAD_CLEAR_S bridged)
 
 
 @dataclass
@@ -75,6 +76,7 @@ class TlvStopTiers:
     self.last_gated_t = None
     self.last_lead_t = None
     self.last_lead_rel_t = None
+    self.lead_run_t0 = None
     self.gas_ep = False
     self.soft_latched = False
     self.soft_stop_seen = False
@@ -126,7 +128,11 @@ class TlvStopTiers:
     elif i.gas and conf_recent:
       self.gas_ep = True
     if i.lead:
+      if self.last_lead_t is None or i.t - self.last_lead_t > LEAD_CLEAR_S:
+        self.lead_run_t0 = i.t
       self.last_lead_t = i.t
+    # one- or two-tick radar blips (000004ad 20:14:56-15:01) must not drop a tier
+    lead_solid = i.lead and self.lead_run_t0 is not None and i.t - self.lead_run_t0 >= LEAD_SOLID_S
     lead_clear = ((self.last_lead_t is None or i.t - self.last_lead_t > LEAD_CLEAR_S)
                   and (self.last_lead_rel_t is None or i.t - self.last_lead_rel_t > LEAD_REARM_S))
 
@@ -136,7 +142,7 @@ class TlvStopTiers:
         self.soft_stop_seen = True
       self.soft_moving_s = 0.0 if self.soft_stop_seen else self.soft_moving_s + dt
       r = ('disabled' if not i.enabled else 'go' if i.go else 'red_end' if not gated_held else
-           'gas' if (i.gas or i.cooldown) else 'lead' if i.lead else
+           'gas' if (i.gas or i.cooldown) else 'lead' if lead_solid else
            'timeout' if self.soft_moving_s > SOFT_MAX_MOVING_S else
            'slow' if i.v_ego < SOFT_MIN_MPS else None)
       if r:
@@ -154,7 +160,7 @@ class TlvStopTiers:
     # tier 2
     if self.committed:
       r = ('disabled' if not i.enabled else 'go' if i.go else 'red_end' if not held_raw else
-           'gas' if (i.gas or i.cooldown) else 'lead' if i.lead else None)
+           'gas' if (i.gas or i.cooldown) else 'lead' if lead_solid else None)
       if r:
         self.committed = False
         if r == 'lead':

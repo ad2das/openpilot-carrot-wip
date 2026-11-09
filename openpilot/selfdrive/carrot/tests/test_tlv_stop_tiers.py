@@ -9,6 +9,7 @@ import pytest
 from openpilot.selfdrive.carrot.tlv_stop_tiers import (
   CUE_BRAKE_HOLD_S,
   LEAD_CLEAR_S,
+  LEAD_SOLID_S,
   SOFT_DECEL,
   SOFT_MAX_MOVING_S,
   STOP_MAX_MPS,
@@ -131,13 +132,18 @@ def test_one_model_stop_tick_resets_the_moving_clock():
 
 
 def test_gas_lead_and_speed_each_release_soft_and_the_blinker_only_blocks_the_start():
-  for reason, kwargs in (('gas', dict(gas=True)), ('lead', dict(lead=True))):
-    state = TlvStopTiers()
-    state.update(tier_in(0.0))
-    assert state.soft_active
-    state.update(tier_in(DT, **kwargs))
-    assert not state.soft_active
-    assert state.events == [('soft', 'release', reason)]
+  state = TlvStopTiers()
+  state.update(tier_in(0.0))
+  assert state.soft_active
+  state.update(tier_in(DT, gas=True))
+  assert not state.soft_active
+  assert state.events == [('soft', 'release', 'gas')]
+
+  # a lead releases soft only once it has been seen LEAD_SOLID_S
+  state = TlvStopTiers()
+  rows = walk(state, 0.0, 1.0, lambda t: tier_in(t, lead=(t >= DT)))
+  releases = [(r[0], e) for r in rows for e in r[3] if e[0] == 'soft' and e[1] == 'release']
+  assert releases == [(round(DT + LEAD_SOLID_S, 2), ('soft', 'release', 'lead'))]
 
   state = TlvStopTiers()
   state.update(tier_in(0.0))
@@ -276,13 +282,42 @@ def test_gas_through_a_held_red_blocks_both_tiers_until_that_red_ends():
 
 def test_a_lead_release_holds_the_recommit_for_one_second():
   state = TlvStopTiers()
-  rows = walk(state, 0.0, 3.0, lambda t: tier_in(t, v=10.0, x_end=100.0, stop_x=60.0, lead=(t == 1.0)))
+  rows = walk(state, 0.0, 3.5, lambda t: tier_in(t, v=10.0, x_end=100.0, stop_x=60.0, lead=(1.0 <= t <= 1.6)))
   commits = [(r[0], e) for r in rows for e in r[3] if e[0] == 'stop' and e[1] == 'commit']
-  assert [c[0] for c in commits] == pytest.approx([0.0, 2.05])
+  # released at 1.0 + LEAD_SOLID_S; re-commit once the lead is gone > LEAD_CLEAR_S and > LEAD_REARM_S after the release
+  assert [c[0] for c in commits] == pytest.approx([0.0, 2.55])
   assert [c[1][2] for c in commits] == ['slow_no_veto', 'slow_no_veto']
   releases = [(r[0], e[2]) for r in rows for e in r[3] if e[0] == 'stop' and e[1] == 'release']
-  assert releases == [(1.0, 'lead')]  # one lead tick, one release, then the calm gap
+  assert releases == [(1.5, 'lead')]
   assert state.committed
+
+
+def test_one_or_two_tick_lead_blips_keep_both_tiers_and_a_solid_lead_releases_them():
+  state = TlvStopTiers()
+
+  def make(t):  # 000004ad 20:14:56-15:01 shape: blips at 1.0, 2.0-2.05, 3.0, then a solid lead from 4.0
+    blip = t in (1.0, 2.0, 2.05, 3.0)
+    return tier_in(t, v=18.0, x_end=100.0, stop_x=120.0, lead=blip or t >= 4.0)
+
+  rows = walk(state, 0.0, 6.0, make)
+  stop = [(r[0], e) for r in rows for e in r[3] if e[0] == 'stop']
+  soft = [(r[0], e) for r in rows for e in r[3] if e[0] == 'soft']
+  assert stop == [(0.5, ('stop', 'commit', 'cue')), (4.5, ('stop', 'release', 'lead'))]
+  assert soft == [(0.0, ('soft', 'start', 'confirmed_red')), (4.5, ('soft', 'release', 'lead'))]
+
+
+def test_short_lead_gaps_are_bridged_and_a_long_gap_restarts_the_run():
+  state = TlvStopTiers()
+  rows = walk(state, 0.0, 3.0, lambda t: tier_in(
+    t, v=10.0, x_end=100.0, stop_x=60.0, lead=(t >= 1.0 and int(round(t / DT)) % 2 == 0)))
+  releases = [(r[0], e[2]) for r in rows for e in r[3] if e[0] == 'stop' and e[1] == 'release']
+  assert releases == [(1.5, 'lead')]  # every other tick: 0.05 s gaps never break the run
+
+  state = TlvStopTiers()
+  rows = walk(state, 0.0, 3.0, lambda t: tier_in(
+    t, v=10.0, x_end=100.0, stop_x=60.0, lead=(1.0 <= t <= 1.3 or 1.65 <= t <= 2.2)))
+  releases = [(r[0], e[2]) for r in rows for e in r[3] if e[0] == 'stop' and e[1] == 'release']
+  assert releases == [(2.15, 'lead')]  # the 0.35 s gap (> LEAD_CLEAR_S) restarts the run at 1.65
 
 
 def test_a_stray_lead_tick_only_delays_the_first_commit_by_the_clear_time():
