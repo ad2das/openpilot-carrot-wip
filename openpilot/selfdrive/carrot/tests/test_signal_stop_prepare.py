@@ -183,15 +183,15 @@ def test_acceleration_ramp_cancellation_and_stronger_brake():
 
 
 def test_follow_target_never_sits_above_the_plan():
-  # TLV tier 1 (W-TLT11): the cap follows the plan down, then still ramps 0.25 m/s^3 below it.
+  # TLV tier 1 (W-TLT11/14): the cap follows the plan down, then still ramps 0.25 m/s^3 below it, to -1.0.
   p=PrepareAccel()
   assert p.apply(.9,.95,.05,True,follow_target=True)==pytest.approx(.8875)
   assert p.apply(.5,.8875,.05,True,follow_target=True)==pytest.approx(.4875)
   assert p.apply(.6,.4875,.05,True,follow_target=True)==pytest.approx(.475)
   q=PrepareAccel()
   assert q.apply(.9,.95,.05,True)==.9 and q.cap==pytest.approx(.9375)
-  r=PrepareAccel();out=[r.apply(-.2,0.,.05,True,follow_target=True) for _ in range(40)]
-  assert out[0]==pytest.approx(-.2125) and out[-1]==pytest.approx(-.5)
+  r=PrepareAccel();out=[r.apply(-.2,0.,.05,True,follow_target=True) for _ in range(80)]
+  assert out[0]==pytest.approx(-.2125) and out[39]==pytest.approx(-.7) and out[-1]==pytest.approx(-1.) and min(out)>=-1.
   assert r.apply(-2.,-.5,.05,True,follow_target=True)==-2.
 
 

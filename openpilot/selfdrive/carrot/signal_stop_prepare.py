@@ -113,6 +113,7 @@ class SignalStopPrepare:
   CONFIRM = .6
   TARGET_ACCEL = -.5
   RAMP = .25  # m/s^3; zero to -0.5 takes two seconds
+  TLV_TIER1_ACCEL = -1.  # CarrotTlvStopGo tier 1 floor (W-TLT14 4ab replay: peak -2.66 -> -2.41, +1.4 m margin)
 
   def __init__(self):
     self.key = None
@@ -202,10 +203,11 @@ class PrepareAccel:
     if not active or not all(math.isfinite(x) for x in (target, previous, dt)) or not 0 < dt <= .2:
       self.cap = None
       return target
+    floor = SignalStopPrepare.TLV_TIER1_ACCEL if follow_target else SignalStopPrepare.TARGET_ACCEL
     if self.cap is None:
-      self.cap = max(SignalStopPrepare.TARGET_ACCEL, previous)
+      self.cap = max(floor, previous)
     if follow_target:
       # Never above the plan's own target: the ramp starts from where the plan already is.
       self.cap = min(self.cap, target)
-    self.cap = max(SignalStopPrepare.TARGET_ACCEL, self.cap-SignalStopPrepare.RAMP*dt)
+    self.cap = max(floor, self.cap-SignalStopPrepare.RAMP*dt)
     return min(target, self.cap)

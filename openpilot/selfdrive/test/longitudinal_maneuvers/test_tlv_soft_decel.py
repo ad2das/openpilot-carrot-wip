@@ -151,7 +151,7 @@ def test_tier1_reaches_the_soft_decel_within_2s_from_cruise():
   a = _tier1_plan(18.33, 19.44)
   t, low = _t040(a), float(a[TIER1_LO:TIER1_HI].min())
   assert t is not None and t <= 2.0, f"-0.40 reached at {t} s (entry {a[TIER1_LO - 1]:.3f})"
-  assert low >= -0.60, f"tier 1 dipped to {low:.3f}"
+  assert -1.10 <= low <= -0.95, f"tier 1 low {low:.3f}, expected the -1.0 floor"
   back = np.flatnonzero(a[TIER1_HI:] >= -0.05)
   assert back.size and back[0] * PLAN_DT <= 2.5, "plan did not come back after the release"
 
@@ -161,4 +161,4 @@ def test_tier1_entered_while_accelerating_still_slows_within_2_5s():
   assert a[TIER1_LO - 1] >= 0.3, f"not accelerating at entry ({a[TIER1_LO - 1]:.3f})"
   t, low = _t040(a), float(a[TIER1_LO:TIER1_HI].min())
   assert t is not None and t <= 2.5, f"-0.40 reached at {t} s (entry {a[TIER1_LO - 1]:.3f})"
-  assert low >= -0.60, f"tier 1 dipped to {low:.3f}"
+  assert low >= -1.10, f"tier 1 dipped to {low:.3f}"
