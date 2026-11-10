@@ -96,7 +96,7 @@ import openpilot.selfdrive.controls.lib.longcontrol as lc
 from openpilot.common.realtime import DT_CTRL
 from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
-from openpilot.selfdrive.controls.lib.butter_stop import EARLY_REQ_ENABLED
+from openpilot.selfdrive.controls.lib.butter_stop import EARLY_REQ_ENABLED, PROBE_V_MAX
 from openpilot.selfdrive.controls.lib.longcontrol import (
   FIRM_A, FIRM_JERK, FIRM_V_HI, FIRM_V_LO, LongCtrlState,
   firm_cap_step, firm_gate,
@@ -248,17 +248,21 @@ def test_f6c_butter_stop_off_is_zero(monkeypatch):
   assert control.early_req is False
 
 
-def test_f6d_canfd_stays_off(monkeypatch):
+def test_f6d_canfd_gets_the_probe_instead_of_the_firm_finish(monkeypatch):
+  """CAN-FD Hyundai/Kia now drive the K5 measurement window, not the firm finish."""
   control, _ = _control_with_cp(monkeypatch, ON, _canfd_cp())
   assert control._early_req_capable is False
+  assert control._final_window_capable is True
   assert control.firm_a == 0.0
-  assert control.final_window is False, "FINAL_WINDOW_ENABLED holds the window off"
+  assert control.final_window is True, "CAN-FD Hyundai/Kia run the probe"
 
 
 def test_f6e_other_brand_stays_off(monkeypatch):
   control, _ = make_control(monkeypatch, values=ON, brand="toyota")
   assert control._early_req_capable is False
+  assert control._final_window_capable is False
   assert control.firm_a == 0.0
+  assert control.final_window is False
 
 
 def test_firm_a_is_the_module_constant(monkeypatch):
@@ -402,11 +406,35 @@ def test_switch_off_matches_a_controller_that_never_had_it(monkeypatch):
   _assert_identical(off_rows, base_rows, "off_vs_base")
 
 
-def test_canfd_with_the_switch_on_is_identical_to_off(monkeypatch):
+def test_canfd_with_the_switch_on_does_not_enter_the_firm_block(monkeypatch):
+  """The firm finish belongs to classic CAN: on CAN-FD the switch selects the probe.
+
+  The probe owns the command below PROBE_V_MAX, so the arm-1 stream is no longer
+  identical to arm 0 there. What this pins is that the firm block itself stays
+  out of it: no gate call, no cap, and every tick above the probe's speed range
+  is unchanged.
+  """
+  calls = {"gate": 0, "step": 0}
+  real_gate, real_step = lc.firm_gate, lc.firm_cap_step
+
+  def spy_gate(*args, **kwargs):
+    calls["gate"] += 1
+    return real_gate(*args, **kwargs)
+
+  def spy_step(*args, **kwargs):
+    calls["step"] += 1
+    return real_step(*args, **kwargs)
+
+  monkeypatch.setattr(lc, "firm_gate", spy_gate)
+  monkeypatch.setattr(lc, "firm_cap_step", spy_step)
   stream = _build_stream()
   _, on_rows, _ = _run_stream_with_cp(monkeypatch, ON, stream, _canfd_cp())
   _, off_rows, _ = _run_stream_with_cp(monkeypatch, OFF, stream, _canfd_cp())
-  _assert_identical(on_rows, off_rows, "canfd")
+  assert calls == {"gate": 0, "step": 0}, calls
+  above = [(a, b) for a, b in zip(on_rows, off_rows, strict=True) if a["v"] > PROBE_V_MAX]
+  assert above, "the stream must spend ticks above the probe's speed range"
+  for a, b in above:
+    assert a["output"] == b["output"], (a["tick"], a["v"], a["output"], b["output"])
 
 
 # ---------------------------------------------------------------------------

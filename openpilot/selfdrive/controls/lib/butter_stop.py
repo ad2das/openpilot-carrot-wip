@@ -12,13 +12,13 @@ is instant). All standstill hold/release logic lives unchanged in the
 LongControl stopping state machine; this module provides the floor and the
 creep guard constants used there.
 
-ButterStopFinal (experimental, off by default) adds the opposite tool at the
-very end of the stop: instead of handing the last part to the car's own stop,
-LongControl keeps pid and follows final_profile -- a constant-jerk decel whose
-magnitude reaches FINAL_A_END exactly at standstill, so the car stops with
-almost no residual deceleration. The profile is time-based because vEgo
-over-reads near zero. The constants and the profile live here; the window
-state machine lives in LongControl.
+ButterStopFinal (experimental) adds the opposite tool at the very end of the
+stop: instead of handing the last part to the car's own stop, LongControl
+keeps pid through a measurement window. On CAN-FD Hyundai/Kia that window
+commands the decel the car's own stopping state delivers at each speed, and an
+under-response guard hands the stop back to the car when the car brakes weaker
+than the weakest decile of its stock stops. The constants, the profile and the
+probe tables live here; the window state machine lives in LongControl.
 """
 import math
 
@@ -78,23 +78,36 @@ STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling dista
 
 # Final-stop window (ButterStopFinal, experimental). The car physically stops
 # while still decelerating ~0.3 m/s^2, and that residual decel is the jolt, so
-# behind this toggle the last part of a stop stays in pid and is driven by a
-# constant-jerk profile whose decel magnitude falls from the entry decel to
-# FINAL_A_END exactly at the planned standstill. The window is time-based:
-# vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s after the
-# physical stop, and is ~0.08 m/s at it), so speed cannot drive the profile.
-FINAL_WINDOW_ENABLED = False  # the final-stop window failed the K5 sim gap gate (W-FINAL2/3); off for every car until a version passes
+# behind this toggle the last part of a stop stays in pid. The window is
+# time-based: vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s
+# after the physical stop, and is ~0.08 m/s at it), so speed cannot drive it.
+FINAL_WINDOW_ENABLED = True  # CAN-FD Hyundai/Kia: the K5 measurement probe (stock stopping decel in pid, under-response guard)
 EARLY_REQ_ENABLED = False  # W-SS1: StopReq before the ESC flag did not stop its release; ButterStopFinal drives the firm finish instead
-FINAL_V_MAX = 0.6     # window may start only at v_ego <= this (m/s)
 FINAL_A_END = 0.10    # decel magnitude at the planned standstill (m/s^2)
 FINAL_A0_MIN = 0.25   # entry decel magnitude clip (m/s^2)
 FINAL_A0_MAX = 0.8
-FINAL_KV = 0.5        # speed feedback gain (1/s), only while v_ref >= FINAL_FB_V and v_ego >= FINAL_FB_V
-FINAL_FB_V = 0.2
-FINAL_HOLD_T = 1.5    # after T, keep -FINAL_A_END at most this long before handing off (s)
 FINAL_U_MAX = -0.05   # the window never commands less braking than this
 FINAL_U_MIN = -1.5
-FINAL_PLAN_GUARD_MAX = STOCK_ROLL_DECEL   # the plan guard never brakes harder than stock stopping (m/s^2)
+# K5 measurement probe (ButterStopFinal on CAN-FD Hyundai/Kia). From where the
+# K5 hands off to stopping today, stay in pid and command the decel its own
+# stopping delivers today (44 K5 stops, W-PLANT1 npz), so the drive records how
+# the K5 answers pid below 0.3 m/s at today's strength. If the car brakes weaker
+# than the weakest decile of those stops for PROBE_GUARD_T, hand back to stock.
+PROBE_V_MAX = 0.45
+PROBE_BP_V = [0.10, 0.20, 0.30, 0.40]
+PROBE_A = [-0.14, -0.23, -0.30, -0.39]
+PROBE_WEAK_A = [-0.099, -0.150, -0.211, -0.235]
+PROBE_GUARD_T = 0.3
+PROBE_GUARD_V = 0.10
+PROBE_MAX_T = 3.0
+
+
+def probe_accel(v_ego):
+  return float(np.interp(v_ego, PROBE_BP_V, PROBE_A))
+
+
+def probe_weak(v_ego):
+  return float(np.interp(v_ego, PROBE_BP_V, PROBE_WEAK_A))
 
 
 def final_a0_dist(a_end=None, a_stock=STOCK_ROLL_DECEL):

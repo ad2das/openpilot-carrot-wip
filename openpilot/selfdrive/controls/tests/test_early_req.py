@@ -99,7 +99,7 @@ sys.modules.setdefault("openpilot.selfdrive.controls.lib.longitudinal_mpc_lib.c_
 import openpilot.selfdrive.controls.lib.longcontrol as lc
 from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  EARLY_A_WEAK, EARLY_V, FINAL_V_MAX, MIN_FINAL_GAP_ABS, early_req_gap_ok,
+  EARLY_A_WEAK, EARLY_V, MIN_FINAL_GAP_ABS, PROBE_V_MAX, early_req_gap_ok,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState, long_control_state_trans
 from openpilot.selfdrive.controls.tests.test_butter_stop import (
@@ -467,7 +467,6 @@ def test_canfd_never_hands_off_early_and_opens_the_window_instead(monkeypatch):
   """T6: a CAN-FD car (K5) drives the window; the early hand-off never fires."""
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
-  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
   control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
@@ -480,7 +479,9 @@ def test_canfd_never_hands_off_early_and_opens_the_window_instead(monkeypatch):
   control.long_control_state = LongCtrlState.pid
   states = []
   open_ticks = []
-  for v, a_ego in _stop_stream(ticks=200, relax_at=0.55):
+  # aEgo relaxes only below the probe's entry speed, so the stock hand-off
+  # cannot take pid before the window opens.
+  for v, a_ego in _stop_stream(ticks=200, relax_at=PROBE_V_MAX - 0.05):
     cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=np.maximum(0.0, v - 0.6 * PLAN_T),
                                       lead_status=True, d_rel=9.0)
     cs.aEgo = a_ego
@@ -492,7 +493,7 @@ def test_canfd_never_hands_off_early_and_opens_the_window_instead(monkeypatch):
   assert events.names("butterStopEarlyReq") == []
   assert open_ticks, "the window must open on a CAN-FD car"
   entry_v = control._final_v0
-  assert entry_v <= FINAL_V_MAX + 1e-9, entry_v
+  assert entry_v <= PROBE_V_MAX + 1e-9, entry_v
   assert len(events.names("butterStopFinal")) == 1
 
 
@@ -501,11 +502,10 @@ def test_non_hyundai_brands_never_hand_off_early(monkeypatch):
   for brand in ("toyota", "gm", "tesla", "ford"):
     events = _EventLog()
     monkeypatch.setattr(lc, "cloudlog", events)
-    monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
     control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1}, brand=brand)
     assert control.final_stop is True, brand
     assert control.early_req is False, brand
-    assert control.final_window is True, brand
+    assert control.final_window is False, brand
     assert control._early_req_capable is False, brand
 
     control.long_control_state = LongCtrlState.pid
@@ -626,7 +626,6 @@ def test_t5_canfd_opens_the_window_and_never_hands_off_early(monkeypatch):
   """T5 control: the other half of the switch, on a CAN-FD car."""
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
-  monkeypatch.setattr(lc, "FINAL_WINDOW_ENABLED", True)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
   control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
@@ -635,7 +634,8 @@ def test_t5_canfd_opens_the_window_and_never_hands_off_early(monkeypatch):
 
   control.long_control_state = LongCtrlState.pid
   open_ticks = []
-  for tick, (v, a_ego) in enumerate(_stop_stream(ticks=260, relax_at=0.55)):
+  # Same reason as T6: aEgo relaxes only below the probe's entry speed.
+  for tick, (v, a_ego) in enumerate(_stop_stream(ticks=260, relax_at=PROBE_V_MAX - 0.05)):
     cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=np.maximum(0.0, v - 0.6 * PLAN_T),
                                       lead_status=True, d_rel=9.0)
     cs.aEgo = a_ego
