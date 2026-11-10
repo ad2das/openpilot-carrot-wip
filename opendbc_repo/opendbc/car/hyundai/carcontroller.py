@@ -862,6 +862,8 @@ class CarController(CarControllerBase):
 class HyundaiJerk:
   def __init__(self):
     self.params = Params()
+    self.butter_final = False
+    self._butter_final_count = 0
     self.jerk = 0.0
     self.jerk_u = self.jerk_l = 0.0
     self.cb_upper = self.cb_lower = 0.0
@@ -870,6 +872,16 @@ class HyundaiJerk:
     self.carrot_cruise_accel = 0.0
     self.accel_request_history = deque(maxlen=max(1, round(CANFD_JERK_ERROR_DELAY / DT_CTRL)))
     self.jerk_error_filter = MyMovingAverage(max(1, round(CANFD_JERK_ERROR_FILTER_TIME / DT_CTRL)), 0.0)
+
+  def _refresh_butter_final(self):
+    # ButterStopFinal (with ButterStop on) restores the pre-10-24 classic-CAN comfort band:
+    # with the band the Palisade ESC keeps braking through its standstill flag far more often
+    # (W-REAP2: 58 % vs 11 % of stops), which shortens the crawl and softens the final jolt.
+    try:
+      self.butter_final = (self.params.get_int("ButterStop") != 0
+                           and self.params.get_int("ButterStopFinal") > 0)
+    except (TypeError, ValueError, AttributeError):
+      self.butter_final = False
 
   def check_carrot_cruise(self, CC, CS, hud_control, stopping, accel, a_target):
     carrot_cruise_decel = self.params.get_float("CarrotCruiseDecel")
@@ -892,6 +904,9 @@ class HyundaiJerk:
       self.carrot_cruise_accel = CS.out.aEgo
 
   def make_jerk(self, CP, CS, accel, actuators, hud_control):
+    if self._butter_final_count % 100 == 0:
+      self._refresh_butter_final()
+    self._butter_final_count += 1
     canfd = bool(CP.flags & HyundaiFlags.CANFD)
     jerk_u_min = CANFD_JERK_UPPER_MIN if canfd else self.jerk_u_min
     if actuators.longControlState == LongCtrlState.stopping:
@@ -940,7 +955,7 @@ class HyundaiJerk:
       else:
         self.jerk_u = min(max(self.jerk_u_min, self.jerk * 2.0), jerk_max_u)
         self.jerk_l = min(max(1.0, -self.jerk * 4.0), jerk_max_l)
-        cb_scale = classic_cb_scale(actuators.longControlState, CS.out.vEgo, accel)
+        cb_scale = 1.0 if self.butter_final else classic_cb_scale(actuators.longControlState, CS.out.vEgo, accel)
         self.cb_upper = np.clip(0.9 + accel * 0.2, 0, 1.2) * cb_scale
         self.cb_lower = np.clip(0.8 + accel * 0.2, 0, 1.2) * cb_scale
 

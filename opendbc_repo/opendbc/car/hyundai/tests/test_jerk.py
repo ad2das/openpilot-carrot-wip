@@ -65,6 +65,9 @@ def test_canfd_hold_interlock_blocks_all_automatic_button_paths(brake_hold_activ
 
 def build_jerk_controller():
   controller = HyundaiJerk.__new__(HyundaiJerk)
+  controller.params = SimpleNamespace(get_int=lambda key: 0)
+  controller.butter_final = False
+  controller._butter_final_count = 0
   controller.jerk = 0.0
   controller.jerk_u = controller.jerk_l = 0.0
   controller.cb_upper = controller.cb_lower = 0.0
@@ -441,3 +444,86 @@ def test_canfd_comfort_band_still_zero():
 
   assert controller.cb_upper == 0.0
   assert controller.cb_lower == 0.0
+
+
+def _butter_stub(values):
+  return SimpleNamespace(get_int=lambda key: values[key])
+
+
+def _run_classic_stop(controller, accel=-0.3, canfd=False):
+  CP = SimpleNamespace(flags=HyundaiFlags.CANFD if canfd else 0)
+  CS = SimpleNamespace(out=SimpleNamespace(aEgo=accel, vEgo=0.5, brakePressed=False, gasPressed=False))
+  actuators = SimpleNamespace(longControlState=LongCtrlState.stopping, jerk=0.0)
+  controller.make_jerk(CP, CS, accel=accel, actuators=actuators, hud_control=None)
+  return controller.cb_upper, controller.cb_lower
+
+
+def test_butter_final_restores_classic_comfort_band():
+  controller = build_jerk_controller()
+  controller.params = _butter_stub({"ButterStop": 1, "ButterStopFinal": 1})
+
+  cb_upper, cb_lower = _run_classic_stop(controller)
+
+  assert cb_upper == pytest.approx(0.84, abs=1e-9)
+  assert cb_lower == pytest.approx(0.74, abs=1e-9)
+
+
+def test_butter_final_off_keeps_band_zero_while_stopping():
+  controller = build_jerk_controller()
+  controller.params = _butter_stub({"ButterStop": 1, "ButterStopFinal": 0})
+
+  cb_upper, cb_lower = _run_classic_stop(controller)
+
+  assert cb_upper == 0.0
+  assert cb_lower == 0.0
+
+
+def test_butter_final_requires_butter_stop():
+  controller = build_jerk_controller()
+  controller.params = _butter_stub({"ButterStop": 0, "ButterStopFinal": 1})
+
+  cb_upper, cb_lower = _run_classic_stop(controller)
+
+  assert cb_upper == 0.0
+  assert cb_lower == 0.0
+
+
+def test_butter_final_ignored_on_canfd():
+  controller = build_jerk_controller()
+  controller.params = _butter_stub({"ButterStop": 1, "ButterStopFinal": 1})
+
+  cb_upper, cb_lower = _run_classic_stop(controller, canfd=True)
+
+  assert cb_upper == 0.0
+  assert cb_lower == 0.0
+
+
+def test_butter_final_param_error_disables_band():
+  controller = build_jerk_controller()
+
+  def raising(key):
+    raise ValueError(key)
+
+  controller.params = SimpleNamespace(get_int=raising)
+
+  cb_upper, cb_lower = _run_classic_stop(controller)
+
+  assert controller.butter_final is False
+  assert cb_upper == 0.0
+  assert cb_lower == 0.0
+
+
+def test_butter_final_refresh_cadence():
+  values = {"ButterStop": 1, "ButterStopFinal": 1}
+  controller = build_jerk_controller()
+  controller.params = _butter_stub(values)
+
+  for _ in range(99):
+    _run_classic_stop(controller)
+  cb_upper, _ = _run_classic_stop(controller)
+  assert cb_upper == pytest.approx(0.84, abs=1e-9)
+
+  values["ButterStopFinal"] = 0
+  cb_upper, cb_lower = _run_classic_stop(controller)
+  assert cb_upper == 0.0
+  assert cb_lower == 0.0
