@@ -42,6 +42,7 @@ DEPART_RELEASE_JERK = 1.0  # m/s^3, floor relax when the window ends or the plan
 # braking through the last metres of a planned stop so the car is nearly stopped
 # when the Palisade ESC standstill timer (0.51 s after 0.794 m/s) releases the
 # brakes. Off unless ButterStop and ButterStopFinal are both on.
+# Inside the band the cap tracks the car's decel (firm_track_step below).
 FIRM_V_HI = 2.0            # m/s, band top (car responds ~0.6 s late)
 FIRM_V_LO = 0.3            # m/s, band bottom
 FIRM_ATGT = -0.3           # m/s^2, plan must command real braking (P7)
@@ -70,6 +71,33 @@ def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
     return None
   cap += FIRM_RELEASE_JERK * DT_CTRL
   return None if cap >= 0.0 else cap
+
+
+# Firm-finish decel tracker. Inside the firm band the cap follows the car's own
+# decel toward FIRM_A instead of only flooring the command. With no lead, no fcw
+# and a plan no harder than FIRM_TRACK_ATGT it may also ease a command that brakes
+# harder than FIRM_A, so the car does not reach the Palisade ESC standstill flag
+# still decelerating hard (field 4b5 seg 11: -0.87 at the flag, J ~10). With a
+# lead, or any doubt, it only ever adds braking.
+FIRM_TRACK_KP = 1.0        # m/s^2 of command per m/s^2 the car is off FIRM_A
+FIRM_TRACK_MAX = 1.2       # m/s^2, most braking the tracker asks for
+FIRM_TRACK_MIN = 0.55      # m/s^2, least braking it asks for (no lead only)
+FIRM_TRACK_ATGT = -1.2     # m/s^2, a plan harder than this is a real need: never ease
+
+
+def firm_track_target(firm_a, a_ego):
+  u = -firm_a + FIRM_TRACK_KP * (-firm_a - a_ego)
+  return max(-FIRM_TRACK_MAX, min(-FIRM_TRACK_MIN, u))
+
+
+def firm_track_step(cap, last_output, firm_a, a_ego, ease_ok):
+  if not math.isfinite(a_ego):
+    a_ego = -firm_a
+  base = min(float(last_output if cap is None else cap), 0.0)
+  target = firm_track_target(firm_a, a_ego)
+  if not ease_ok:
+    target = min(target, -firm_a)
+  return base + max(-FIRM_JERK * DT_CTRL, min(FIRM_RELEASE_JERK * DT_CTRL, target - base))
 
 
 STOPPING_ACCEL_DEFAULT = -50  # Params use hundredths of m/s^2
@@ -697,13 +725,24 @@ class LongControl:
         gate = firm_gate(self.firm_a, float(CS.vEgo), float(a_target_ff), plan_speeds, t_since_plan,
                          bool(CS.gasPressed), bool(CS.brakePressed), bool(CS.cruiseState.standstill))
         was_capped = self._firm_cap is not None
-        self._firm_cap = firm_cap_step(self._firm_cap, self.last_output_accel, self.firm_a, gate, hard_exit)
+        ease_ok = False
+        if gate:
+          # A missing lead object counts as a lead: never ease without proof there is none.
+          lead_one = getattr(radarState, "leadOne", None) if radarState is not None else None
+          no_lead = lead_one is not None and not bool(getattr(lead_one, "status", True))
+          ease_ok = (no_lead and not bool(getattr(long_plan, "fcw", False))
+                     and float(a_target_ff) >= FIRM_TRACK_ATGT)
+          self._firm_cap = firm_track_step(self._firm_cap, self.last_output_accel, self.firm_a,
+                                           float(CS.aEgo), ease_ok)
+        else:
+          self._firm_cap = firm_cap_step(self._firm_cap, self.last_output_accel, self.firm_a, gate, hard_exit)
         if gate and not was_capped and not self._firm_logged:
-          cloudlog.event("butterStopFirm", vEgo=float(CS.vEgo), aTarget=float(a_target_ff), firmA=self.firm_a)
+          cloudlog.event("butterStopFirm", vEgo=float(CS.vEgo), aTarget=float(a_target_ff), firmA=self.firm_a,
+                         ease=bool(ease_ok))
           self._firm_logged = True
         if float(CS.vEgo) > FIRM_V_HI + 1.0:
           self._firm_logged = False
-        if self._firm_cap is not None and output_accel > self._firm_cap:
+        if self._firm_cap is not None and (ease_ok or output_accel > self._firm_cap):
           # Do not integrate the speed error the cap is overriding.
           self.pid.i = previous_integral
           output_accel = self._firm_cap
