@@ -79,9 +79,12 @@ def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
 # harder than FIRM_A, so the car does not reach the Palisade ESC standstill flag
 # still decelerating hard (field 4b5 seg 11: -0.87 at the flag, J ~10). With a
 # lead, or any doubt, it only ever adds braking.
+# The ease stops at FIRM_TRACK_MIN: below ~2 m/s the Palisade ESC follows a release
+# but does not build braking back (field 4ba seg 5: eased to -0.55, the ESC held
+# -0.56..-0.66 under a -1.0 request, flagged at 0.49 m/s and crawled 0.97 m).
 FIRM_TRACK_KP = 1.0        # m/s^2 of command per m/s^2 the car is off FIRM_A
 FIRM_TRACK_MAX = 1.2       # m/s^2, most braking the tracker asks for
-FIRM_TRACK_MIN = 0.55      # m/s^2, least braking it asks for (no lead only)
+FIRM_TRACK_MIN = 0.70      # m/s^2, least braking it asks for (no lead only)
 FIRM_TRACK_ATGT = -1.2     # m/s^2, a plan harder than this is a real need: never ease
 
 

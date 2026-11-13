@@ -519,7 +519,7 @@ def test_gas_press_drops_the_cap(monkeypatch):
 
 def test_t1_track_target_units():
   """The target is -FIRM_A when the car decelerates at FIRM_A, and saturates."""
-  cases = {(-2.0): -0.55, (-1.1): -0.55, (-1.0): -0.60, (-0.8): -0.80,
+  cases = {(-2.0): -0.70, (-1.1): -0.70, (-1.0): -0.70, (-0.8): -0.80,
            (-0.6): -1.00, (-0.55): -1.05, (-0.4): -1.20, 0.0: -1.20, 0.5: -1.20}
   for a_ego, expected in cases.items():
     assert firm_track_target(0.8, a_ego) == pytest.approx(expected, abs=1e-9), a_ego
@@ -537,14 +537,14 @@ def test_t2_track_step_one_call(cap, last, a_ego, ease, expected):
   assert firm_track_step(cap, last, 0.8, a_ego, ease) == pytest.approx(expected, abs=1e-9)
 
 
-def test_t3a_ease_ramp_reaches_firm_track_min_at_38_calls():
+def test_t3a_ease_ramp_reaches_firm_track_min_at_30_calls():
   cap, calls = None, 0
   while True:
     cap = firm_track_step(cap, -1.3, 0.8, -1.1, True)
     calls += 1
     if cap >= -FIRM_TRACK_MIN - 1e-12 or calls > 1000:
       break
-  assert calls == 38, calls
+  assert calls == 30, calls
   assert cap == pytest.approx(-FIRM_TRACK_MIN, abs=1e-9)
   for _ in range(20):
     cap = firm_track_step(cap, -1.3, 0.8, -1.1, True)
@@ -602,16 +602,16 @@ SCENARIOS = [("4b5 no lead", _table(P4B5), 3.54, -0.85, False),
 # extra min, extra max, new u min, new u max).
 SPEC_EXPECTED = {
   "4b5 no lead": {
-    "fitted": [(0.8, 0.7, 0.5, -0.832, -0.631, -0.983, -0.776, 6.011, 6.165),
-               (0.85, 0.8, 0.3, -0.855, -0.708, -0.984, -0.762, 5.880, 6.060),
+    "fitted": [(0.8, 0.7, 0.5, -0.832, -0.682, -0.983, -0.824, 6.011, 6.124),
+               (0.85, 0.8, 0.3, -0.855, -0.727, -0.984, -0.825, 5.880, 6.017),
                (0.6, 1.1, 0.3, -0.590, -0.603, -0.675, -0.619, 7.491, 7.630)],
-    "grid": (-1.172, -0.505, -0.988, -0.586, 0.043, 0.232, -1.283, -0.550),
+    "grid": (-1.172, -0.505, -1.043, -0.586, 0.033, 0.199, -1.283, -0.700),
   },
   "4b1 no lead": {
-    "fitted": [(0.8, 0.7, 0.5, -0.679, -0.695, -0.727, -0.657, 4.583, 4.679),
-               (0.85, 0.8, 0.3, -0.725, -0.731, -0.770, -0.715, 4.445, 4.558),
+    "fitted": [(0.8, 0.7, 0.5, -0.679, -0.691, -0.727, -0.667, 4.583, 4.661),
+               (0.85, 0.8, 0.3, -0.725, -0.728, -0.770, -0.720, 4.445, 4.532),
                (0.6, 1.1, 0.3, -0.528, -0.601, -0.574, -0.607, 5.280, 5.249)],
-    "grid": (-0.938, -0.483, -0.803, -0.594, -0.274, 0.171, -1.023, -0.550),
+    "grid": (-0.938, -0.483, -0.864, -0.594, -0.274, 0.118, -1.023, -0.700),
   },
   "4b1 lead": {
     "fitted": [(0.8, 0.7, 0.5, -0.679, -0.689, -0.727, -0.727, 4.583, 4.580),
@@ -733,7 +733,7 @@ def test_t4_closed_loop_matches_the_spec(name):
 
 def test_t5_band_hit_counts():
   """Plants whose arrival decel lands in the W-PJU0 best bin [-0.85, -0.65]."""
-  expected = {"4b5 no lead": (16, 30), "4b1 no lead": (24, 36)}
+  expected = {"4b5 no lead": (16, 26), "4b1 no lead": (24, 35)}
   for name, (want_old, want_new) in expected.items():
     pid, v0, a0, lead = next((p, v, a, l) for n, p, v, a, l in SCENARIOS if n == name)
     old = sum(1 for p in GRID if -0.85 <= _closed_loop(False, pid, v0, a0, *p, lead)["a0.4"] <= -0.65)
