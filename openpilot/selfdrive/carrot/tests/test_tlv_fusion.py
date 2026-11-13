@@ -421,10 +421,13 @@ def test_tlv_detect_mode_is_cached_and_refreshed_at_most_once_per_second(monkeyp
   sm = FakeSM(carrotTlv=tlv_message("green"))
   serv._update_tlv_fusion(sm)
   serv._update_tlv_fusion(sm)
-  assert calls == ["TrafficLightDetectMode"]
+  # W-FGO2 (E2d) polls CarrotTlvStopGo in the same 1 s block, right after
+  # TrafficLightDetectMode, so the cached list holds both keys and neither
+  # is re-read inside the second.
+  assert calls == ["TrafficLightDetectMode", "CarrotTlvStopGo"]
   clock[0] += 2.0
   serv._update_tlv_fusion(sm)
-  assert calls == ["TrafficLightDetectMode", "TrafficLightDetectMode"]
+  assert calls == ["TrafficLightDetectMode", "CarrotTlvStopGo"] * 2
 
 
 def test_mode2_ignores_bad_or_inactive_tlv_messages():

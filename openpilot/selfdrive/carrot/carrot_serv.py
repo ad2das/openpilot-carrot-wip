@@ -125,6 +125,12 @@ TLV_GREEN_FAMILY_STATES = (3, 4, 6)     # green, left, greenLeft
 # and carrotTlv gaps on route 450 are median 0.062 s, p95 0.40 s, max 0.58 s.
 # Hold a src-1 TLV state for this long since the last accepted message.
 TLV_HOLD_S = 0.8
+# W-FGO2 (CarrotTlvStopGo only): a cue-gated W150 release at standstill publishes a
+# TLV go at once instead of only clearing the red, so the planner's WTOP1 veto and
+# the committed stop end without waiting for the W143 green confirm (route 4ba
+# 08:50: the release came 1.13 s before it). Straight green only.
+TLV_FAST_GO_MAX_MPS = 0.3
+TLV_FAST_GO_VOTE_CLASSES = (2, 4)  # LampClass GREEN, GREEN_LEFT (tracker.py)
 # WHOLE1: the two holes where a confirmed TLV red vanished although the light was
 # still red. (a) tlvd suspends itself under CPU contention (status 2) and publishes
 # status=suspended (no detections) for 1.1-1.2 s while the red is still there;
@@ -178,6 +184,8 @@ class CarrotServ:
   tlv_release_latched = False
   tlv_release_track_id = -1
   tlv_release_clears = 0
+  tlv_stop_go = 0
+  tlv_fast_go_count = 0
   tlv_last_red_top = None
   tlv_top_exit = None
   tlv_last_stopped = None
@@ -305,6 +313,8 @@ class CarrotServ:
     self.tlv_release_track_id = -1
     self.tlv_detect_mode = 0    # TrafficLightDetectMode cached; refreshed at most 1/s
     self.tlv_detect_mode_poll = 0.0
+    self.tlv_stop_go = 0        # W-FGO2: CarrotTlvStopGo, polled with TrafficLightDetectMode
+    self.tlv_fast_go_count = 0
     # W148: expressway gate, fed only by the carrotNavi roadCategory.
     self.tlv_navi_road_category = None
     self.tlv_navi_road_category_t = -1e9
@@ -559,6 +569,10 @@ class CarrotServ:
         self.tlv_detect_mode = self.params.get_int("TrafficLightDetectMode")
       except Exception:
         self.tlv_detect_mode = 0
+      try:
+        self.tlv_stop_go = self.params.get_int("CarrotTlvStopGo")
+      except Exception:
+        self.tlv_stop_go = 0
     if self.tlv_detect_mode < 1:
       return
     # W148: on an expressway the TLV feeds nothing. Clear a held src-1 state so
@@ -621,11 +635,23 @@ class CarrotServ:
     # accepted exactly as before.
     if released_flag and self._tlv_model_start_cue(sm):
       keep_latch = self.tlv_release_latched and track_id == self.tlv_release_track_id
+      was_fast_go = keep_latch and (self.traffic_state, self.traffic_state_src) == (2, 1)
       self._clear_tlv_red()
       self.tlv_release_latched = True
       self.tlv_release_track_id = track_id
       if not keep_latch:
         self.tlv_release_clears += 1
+      # W-FGO2: publish the release as a TLV go (see TLV_FAST_GO_*).
+      if self._tlv_fast_go_ok(sm, msg):
+        self.traffic_state = 2
+        self.traffic_state_src = 1
+        self.tlv_hold_until = now + TLV_HOLD_S
+        self.traffic_light_count = int(0.5 / 0.1)
+        if not was_fast_go:
+          self.tlv_fast_go_count += 1
+          cloudlog.event("tlv_fast_go", track_id=int(track_id),
+                         vote_cls=int(getattr(msg, "relevantVoteCls", -1)),
+                         vote_prob=float(getattr(msg, "relevantVoteProb", 0.0)))
     # W150(b): while latched, a still-releasing track may not re-arm the red it
     # just lifted. The published state stays red (tlvd keeps the machine red),
     # so without this the very same publish would put traffic_state back to 1.
@@ -798,6 +824,19 @@ class CarrotServ:
     self.traffic_state_src = 0
     self.tlv_hold_until = 0.0
     self.tlv_det_support = 0
+
+  def _tlv_fast_go_ok(self, sm, msg) -> bool:
+    """W-FGO2: may a cue-gated W150 release publish a TLV go (not only clear the red)?"""
+    if int(getattr(self, "tlv_stop_go", 0)) != 1:
+      return False
+    if int(getattr(msg, "relevantVoteCls", -1)) not in TLV_FAST_GO_VOTE_CLASSES:
+      return False
+    if self._tlv_left_intent(sm):
+      return False
+    try:
+      return float(sm['carState'].vEgo) < TLV_FAST_GO_MAX_MPS
+    except Exception:
+      return False
 
   def _release_unlatch(self) -> None:
     """W150: end a cue-gated release; the red is accepted again as today."""

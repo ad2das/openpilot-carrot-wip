@@ -1182,7 +1182,12 @@ class CarrotPlanner:
           and v_ego > self._tlv_stop_min_mps and not self.last_model_stop_sign):
         self.xState = XState.e2eCruise
       self._log_tlv_stop_go(action, reason, v_ego, stop_x)
-    if self.tlv_stop_committed:
+    # W-FGO2: stopped (e2eStopped) behind a live WTOP1 veto, the committed red no
+    # longer hides the model's own green. The veto still holds the car until a TLV
+    # go, and carrotServ needs this plan green as the start cue for its W150 fast go.
+    show_model_green = (v_ego < TLV_STANDSTILL_MPS and self.xState == XState.e2eStopped
+                        and self.tlv_red_veto and self.trafficState == TrafficState.green)
+    if self.tlv_stop_committed and not show_model_green:
       self.trafficState = TrafficState.red
 
   def _update_lead_follow(self, lead, v_ego: float) -> None:

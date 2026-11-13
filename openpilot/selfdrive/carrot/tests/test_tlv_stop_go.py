@@ -28,7 +28,7 @@ assertion runs a couple of ticks past it.
 import ast
 import time
 
-from test_tlv_fusion import carrot_man_message, gate_sm, planner_for_gate
+from test_tlv_fusion import FakeSM, carrot_man_message, gate_sm, planner_for_gate
 
 from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.carrot.tlv_green_override import GreenHold, override_ok
@@ -463,3 +463,168 @@ def test_existing_tlv_green_start_still_leaves_e2e_stopped_in_mode_two():
   sm.recv_time['carrotMan'] = time.monotonic()
   p._update_carrot_man(sm, 0.0, 60.0)
   assert p.xState.name == 'e2eCruise'
+
+# ---------------------------------------------------------------------------
+# W-FGO2: at standstill in e2eStopped behind a live WTOP1 veto the commit no
+# longer hides the model's own green (E1). The veto still holds the car, so the
+# car cannot start off it; only a TLV go (2/1, the carrotServ fast go) does.
+#
+# The replay namespace stubs get_carrot_man -> None, so the veto would never be
+# computed here; install the real reader (same gates, replay clock) once.
+# ---------------------------------------------------------------------------
+
+_CM_TIMEOUT = 1.0
+
+
+def _replay_get_carrot_man(sm):
+  """carrot_man_input.get_carrot_man on the replay clock.
+
+  Defensive about the plain dicts and SimpleNamespaces the older tests pass:
+  those have no seen/alive/valid, so they keep the stub's None.
+  """
+  try:
+    carrot_man = sm['carrotMan']
+  except Exception:
+    return None
+  seen, alive, valid = (getattr(sm, name, {}) for name in ('seen', 'alive', 'valid'))
+  if not all(d.get('carrotMan', False) for d in (seen, alive, valid)):
+    return None
+  age = replay()['clock'].monotonic() - getattr(sm, 'recv_time', {}).get('carrotMan', 0.0)
+  if not 0.0 <= age <= _CM_TIMEOUT:
+    return None
+  return carrot_man if 0 < carrot_man.desiredSpeed <= 250 else None
+
+
+def _install_carrot_man(monkeypatch):
+  # monkeypatch.setitem restores the stub afterwards: the replay namespace is
+  # module-cached and runA runs without -p no:randomly.
+  monkeypatch.setitem(replay()['cls']._update_carrot_man.__globals__,
+                      'get_carrot_man', _replay_get_carrot_man)
+
+
+def _cm_sm(speed=0.0, stop_x=100.0):
+  """`inputs_at` as a FakeSM with the services the planner reads."""
+  base = inputs_at(speed, stop_x)
+  sm = FakeSM(**base)
+  sm['selfdriveState'].enabled = True
+  for name in ('seen', 'alive', 'valid', 'updated'):
+    getattr(sm, name)['carrotMan'] = True
+  sm.recv_time['carrotMan'] = replay()['clock'].monotonic()
+  sm['carrotMan'] = carrot_man_message(state=1, src=1)
+  return sm
+
+
+def _set_carrot_man(sm, state, src=1):
+  sm['carrotMan'] = carrot_man_message(state=state, src=src)
+  for name in ('seen', 'alive', 'valid', 'updated'):
+    getattr(sm, name)['carrotMan'] = True
+  sm.recv_time['carrotMan'] = replay()['clock'].monotonic()
+  return sm
+
+
+def _standstill(sm):
+  """The model's own green at a standstill: no stop cue, a start cue."""
+  sm['carState'].vEgo = 0.0
+  sm['carState'].vEgoCluster = 0.0
+  sm['modelV2'].velocity.x = [0.0] + [15.] * 32
+  return sm
+
+
+def test_commit_at_standstill_shows_the_model_green_behind_the_veto(monkeypatch):
+  XState, TrafficState = replay()['XState'], replay()['TrafficState']
+  _install_carrot_man(monkeypatch)
+  p, calls = planner(2, toggle=1)
+  sm = _cm_sm(10., 100.)
+  step(p, sm)
+  assert p.tlv_stop_committed is True
+
+  _standstill(sm)
+  seen = []
+  for _ in range(40):
+    # carrotMan republishes at 20 Hz; without this refresh it would age out of
+    # CARROT_MAN_TIMEOUT and the veto would clear on its own.
+    _set_carrot_man(sm, 1)
+    step(p, sm)
+    seen.append((p.xState, p.trafficState, p.tlv_red_veto, p.tlv_stop_committed))
+  assert all(row[0] == XState.e2eStopped for row in seen)
+  assert all(row[2] and row[3] for row in seen)
+  # The commit no longer forces red: the model's green reaches the plan, which
+  # is the start cue carrotServ needs. The veto is what keeps the car stopped.
+  assert seen[-1][1] == TrafficState.green
+  assert p.tlv_stop_committed is True
+  # The standstill hold adds no event: the single entry is the original commit.
+  assert [action for action, _ in calls] == ['commit']
+
+
+def test_the_veto_still_ends_with_a_tlv_go_and_the_car_pulls_away(monkeypatch):
+  XState = replay()['XState']
+  _install_carrot_man(monkeypatch)
+  p, calls = planner(2, toggle=1)
+  sm = _cm_sm(10., 100.)
+  step(p, sm)
+  _standstill(sm)
+  for _ in range(40):
+    _set_carrot_man(sm, 1)
+    step(p, sm)
+  assert p.xState == XState.e2eStopped
+  # carrotServ's fast go publishes 2/1: the tier releases and the veto ends.
+  _set_carrot_man(sm, 2)
+  for _ in range(3):
+    step(p, sm, go=True)
+  assert calls[-1] == ('release', 'go')
+  assert p.tlv_red_veto is False
+  assert p.xState == XState.e2eCruise
+
+
+def test_without_the_veto_the_commit_still_forces_red_at_standstill(monkeypatch):
+  XState, TrafficState = replay()['XState'], replay()['TrafficState']
+  _install_carrot_man(monkeypatch)
+  p, calls = planner(2, toggle=1)
+  sm = _cm_sm(10., 100.)
+  step(p, sm)
+  assert p.tlv_stop_committed is True
+  # carrotMan absent: no veto source at all.
+  del sm['carrotMan']
+  for name in ('seen', 'alive', 'valid', 'updated'):
+    getattr(sm, name)['carrotMan'] = False
+  _standstill(sm)
+  for _ in range(40):
+    step(p, sm)
+    assert p.tlv_red_veto is False
+    assert p.trafficState == TrafficState.red
+  # The car does not start: the same e2eStop->e2eStopped transition as today
+  # (the first ticks still finish the stop).
+  assert p.xState == XState.e2eStopped
+
+
+def test_moving_car_keeps_the_committed_red(monkeypatch):
+  TrafficState = replay()['TrafficState']
+  _install_carrot_man(monkeypatch)
+  p, calls = planner(2, toggle=1)
+  sm = _cm_sm(10., 100.)
+  step(p, sm)
+  assert p.tlv_stop_committed is True
+  # 2 m/s is above the 0.3 m/s standstill bound, so E1 does not apply.
+  sm['carState'].vEgo = 2.0
+  sm['carState'].vEgoCluster = 2.0
+  sm['modelV2'].velocity.x = [2.0] + [15.] * 32
+  for _ in range(10):
+    step(p, sm)
+    assert p.trafficState == TrafficState.red
+
+
+def test_toggle_off_never_commits_and_the_model_green_is_untouched(monkeypatch):
+  XState, TrafficState = replay()['XState'], replay()['TrafficState']
+  _install_carrot_man(monkeypatch)
+  p, calls = planner(2, toggle=0)
+  sm = _cm_sm(10., 100.)
+  step(p, sm)
+  assert p.tlv_stop_committed is False
+  _standstill(sm)
+  for _ in range(40):
+    _set_carrot_man(sm, 1)
+    step(p, sm)
+    assert p.tlv_stop_committed is False
+    assert p.trafficState != TrafficState.red  # the model's own cue stays in charge
+    assert p.xState == XState.e2eCruise        # the toggle-off planner never stops for the lamp
+  assert calls == []

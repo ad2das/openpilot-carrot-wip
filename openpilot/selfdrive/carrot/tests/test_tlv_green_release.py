@@ -587,3 +587,164 @@ def test_no_cue_never_latches(monkeypatch):
   assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
   assert serv.tlv_release_clears == 0
   assert serv.tlv_hold_until > clock[0]
+
+
+# ---------------------------------------------------------------------------
+# W-FGO2: a cue-gated W150 release at standstill publishes a TLV go (2/1), so
+# the planner's WTOP1 veto and the committed stop end before the W143 confirm
+# (route 4ba 08:50: the release came 1.13 s before it). CarrotTlvStopGo only.
+# ---------------------------------------------------------------------------
+
+def _voted(msg, cls, prob=0.86):
+  """Release vote telemetry as tlvd publishes it (relevantVoteCls/Prob)."""
+  msg.relevantVoteCls = int(cls)
+  msg.relevantVoteProb = float(prob)
+  return msg
+
+
+def _fast_serv(detect: int = 2, toggle: int = 1) -> CarrotServ:
+  """make_serv whose params also carry the CarrotTlvStopGo toggle."""
+  serv = make_serv(detect)
+  serv.params = SimpleNamespace(
+    get_int=lambda key: detect if key == "TrafficLightDetectMode" else toggle if key == "CarrotTlvStopGo" else 0)
+  serv.tlv_stop_go = toggle
+  return serv
+
+
+def _fast_sm(msg, ts=2, v=0.0, left=False, atc=""):
+  return FakeSM(carrotTlv=msg,
+                longitudinalPlan=SimpleNamespace(trafficState=ts, xState=SimpleNamespace(raw=5)),
+                carState=SimpleNamespace(vEgo=v, leftBlinker=left, gasPressed=False),
+                carrotMan=SimpleNamespace(atcType=atc))
+
+
+def _fast_publish(serv, clock, msg, ts=2, v=0.0, left=False, atc="", dt=0.05):
+  clock[0] += dt
+  serv._update_tlv_fusion(_fast_sm(msg, ts=ts, v=v, left=left, atc=atc))
+
+
+def _events(monkeypatch):
+  seen = []
+  monkeypatch.setattr(carrot_serv.cloudlog, "event", lambda name, **kw: seen.append((name, kw)))
+  return seen
+
+
+def _armed(serv, clock):
+  """Two plain red publishes arm the 1/1 state (the second latches through the queue)."""
+  for _ in range(2):
+    _fast_publish(serv, clock, tlv_message("red", conf=0.9), ts=1)
+  return serv
+
+
+def test_fast_go_publishes_a_tlv_go_on_the_release(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  events = _events(monkeypatch)
+  serv = _armed(_fast_serv(), clock)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  assert serv.tlv_fast_go_count == 1
+  assert [name for name, _ in events] == ["tlv_fast_go"]
+  # relevantVoteProb is a capnp Float32, so compare within its precision.
+  assert events[0][1]["vote_cls"] == 2
+  assert abs(events[0][1]["vote_prob"] - 0.86) < 1e-6
+  # The same publish again: still a go, but no second count and no second event.
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  assert serv.tlv_fast_go_count == 1
+  assert [name for name, _ in events] == ["tlv_fast_go"]
+
+
+def test_fast_go_toggle_off_keeps_todays_w150_clear(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = _armed(_fast_serv(toggle=0), clock)
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (0, 0)
+  assert serv.tlv_fast_go_count == 0
+
+
+def test_fast_go_needs_a_straight_green_vote(monkeypatch):
+  for cls in (6, 1, 7, 0):  # LEFT, YELLOW, OFF, RED
+    clock = [100.0]
+    monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+    serv = _armed(_fast_serv(), clock)
+    _fast_publish(serv, clock, _voted(_released("red"), cls, 0.86), ts=2, v=0.0)
+    assert (serv.traffic_state, serv.traffic_state_src) == (0, 0), cls
+    assert serv.tlv_fast_go_count == 0, cls
+
+
+def test_fast_go_needs_no_left_intent(monkeypatch):
+  cases = ({"left": True}, {"atc": "turn left"}, {"atc": "atc left"})
+  for kw in cases:
+    clock = [100.0]
+    monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+    serv = _armed(_fast_serv(), clock)
+    _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0, **kw)
+    assert (serv.traffic_state, serv.traffic_state_src) == (0, 0), kw
+    assert serv.tlv_fast_go_count == 0, kw
+
+
+def test_fast_go_needs_standstill(monkeypatch):
+  for v, expected in ((0.5, (0, 0)), (0.29, (2, 1))):
+    clock = [100.0]
+    monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+    serv = _armed(_fast_serv(), clock)
+    _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=v)
+    assert (serv.traffic_state, serv.traffic_state_src) == expected, v
+
+
+def test_fast_go_still_needs_the_model_cue(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = _armed(_fast_serv(), clock)
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=1, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+  assert not serv.tlv_release_latched
+  assert serv.tlv_fast_go_count == 0
+
+
+def test_fast_go_unlatches_on_a_new_red_vote(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = _armed(_fast_serv(), clock)
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  _fast_publish(serv, clock, tlv_message("red", conf=0.9), ts=2, v=0.0)
+  assert not serv.tlv_release_latched
+  assert (serv.traffic_state, serv.traffic_state_src) == (1, 1)
+
+
+def test_fast_go_is_followed_by_the_w143_green_path(monkeypatch):
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = _armed(_fast_serv(), clock)
+  _fast_publish(serv, clock, _voted(_released("red"), 2, 0.86), ts=2, v=0.0)
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+  _fast_publish(serv, clock, tlv_message("green", conf=0.9, go_after_red=True), ts=2, v=0.0)
+  assert not serv.tlv_release_latched
+  assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+
+
+def test_fast_go_fires_on_the_4ba_release_not_the_green_confirm(monkeypatch):
+  """Route 4ba 08:50 replay: model green from -1.6 s, release from -1.13 s.
+
+  The logged W143 green confirm is the reference 0; the first (2, 1) must land
+  on the -1.13 s publish, i.e. 1.13 s before it.
+  """
+  clock = [100.0]
+  monkeypatch.setattr(carrot_serv.time, "monotonic", lambda: clock[0])
+  serv = _fast_serv()
+  first_go = None
+  # 20 Hz publishes on a grid that contains the -1.13 s release tick exactly
+  # (-2.53 + 0.05 * 28); the model green switches on 0.45 s earlier.
+  for k in range(52):
+    t = round(-2.53 + 0.05 * k, 6)
+    ts = 2 if t >= -1.58 else 1
+    msg = _voted(_released("red"), 2, 0.86) if t >= -1.13 else tlv_message("red", conf=0.9)
+    _fast_publish(serv, clock, msg, ts=ts, v=0.0)
+    if first_go is None and (serv.traffic_state, serv.traffic_state_src) == (2, 1):
+      first_go = t
+  assert first_go == -1.13
+  assert serv.tlv_fast_go_count == 1
