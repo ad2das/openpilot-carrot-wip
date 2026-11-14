@@ -45,8 +45,8 @@ DEPART_RELEASE_JERK = 1.0  # m/s^3, floor relax when the window ends or the plan
 # Inside the band the cap tracks the car's decel (firm_track_step below).
 FIRM_V_HI = 2.0            # m/s, band top (car responds ~0.6 s late)
 FIRM_V_LO = 0.3            # m/s, band bottom
-FIRM_ATGT = -0.2           # m/s^2, plan must command braking (P7); -0.3 shut 19/63 lead stops whose plan creeps at -0.25..-0.36 (W-FGATE1/2)
-FIRM_VPLAN_END = 0.5       # m/s, plan must end near a stop (P7); with -0.2 opens 98.8 % of stops by 1.0 m/s, 0.95 extra-brake episodes/h (W-FGATE2)
+FIRM_ATGT = -0.3           # m/s^2, plan must command real braking (P7)
+FIRM_VPLAN_END = 0.3       # m/s, plan must end at a stop (P7)
 FIRM_JERK = 2.0            # m/s^3, cap build rate
 FIRM_RELEASE_JERK = 2.0    # m/s^3, cap relax rate on a soft exit
 FIRM_A = 0.8               # m/s^2, ButterStopFinal firm-finish decel on classic-CAN Hyundai/Kia

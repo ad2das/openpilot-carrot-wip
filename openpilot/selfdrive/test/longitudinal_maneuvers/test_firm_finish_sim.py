@@ -51,7 +51,7 @@ from openpilot.selfdrive.controls.lib import longcontrol as longcontrol_module
 _SCRATCH = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-08-perf"
 FIX = f"{_SCRATCH}/W-PLANT3B/fixtures"
 POP = f"{_SCRATCH}/W-PLANTE/raw/sim/head"
-OUT = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-13-field/W-FGATE3/raw/sim"
+OUT = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-13-field/W-TRACK2/raw/sim"
 # test_final_stop_sim's own output dir. It must be REGENERATED on the current base
 # before this gate runs: the 2026-11-09 files predate later commits. Run order is
 # run 4 on firm-base (copied aside to raw/run4_base_sim), then run 4 on firm-finish,

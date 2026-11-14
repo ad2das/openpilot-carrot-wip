@@ -159,8 +159,8 @@ def test_gate_passes_on_the_base_inputs():
   ("brake", True),
   ("v_ego", 2.01),
   ("v_ego", 0.29),
-  ("a_target", -0.2),
-  ("plan_speeds", [1.0, 0.5, 0.5]),
+  ("a_target", -0.3),
+  ("plan_speeds", [1.0, 0.5, 0.3]),
   ("a_target", float("nan")),
   ("t_since_plan", -0.01),
   ("t_since_plan", MAX_PLAN_AGE + 0.01),
@@ -178,13 +178,6 @@ def test_gate_band_edges_are_inclusive(v_ego):
 
 def test_gate_rejects_a_non_finite_plan_end():
   assert _gate(plan_speeds=[1.0, float("nan")]) is False
-
-
-def test_gate_opens_on_a_creeping_lead_stop_plan():
-  # Field 4b7 s1: behind a stopped lead the plan creeps (aTarget -0.27, plan end 0.45 m/s
-  # at v 1.0); the old -0.3 / 0.3 gate never opened and the stop crawled.
-  assert _gate(a_target=-0.27, plan_speeds=[1.0, 0.7, 0.45]) is True
-  assert _gate(a_target=-0.21, plan_speeds=[1.0, 0.49]) is True
 
 
 # ---------------------------------------------------------------------------
@@ -399,7 +392,7 @@ def test_switch_off_never_enters_the_block(monkeypatch):
   monkeypatch.setattr(lc, "firm_cap_step", spy_step)
   monkeypatch.setattr(lc, "firm_track_step", spy_track)
 
-  # Full-length stream: the gate needs plan_speeds[-1] < 0.5, i.e. v < ~1.75, so a
+  # Full-length stream: the gate needs plan_speeds[-1] < 0.3, i.e. v < ~1.55, so a
   # short high-speed slice would prove only the off arm and never enter the block.
   stream = _build_stream()
   _, rows_off, _ = _run_stream(monkeypatch, OFF, stream)
