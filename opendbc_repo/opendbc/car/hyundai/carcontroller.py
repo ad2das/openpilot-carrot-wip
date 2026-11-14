@@ -52,6 +52,8 @@ CANFD_JERK_LOWER_ACCEL_BP = [0.0, 0.8, 1.2, 1.5, 2.0, 2.5, 3.2]
 CANFD_JERK_LOWER_LIMIT_V = [1.2, 1.2, 1.2, 1.7, 3.0, 3.3, 3.7]
 
 CLASSIC_CB_FADE_V = (1.0, 3.0)  # m/s: classic-CAN comfort band off below 1.0 m/s and full above 3.0 m/s while braking
+# ButterStop restores the pre-10-24 classic-CAN comfort band; tests patch this to get the plain-ButterStop arm
+BUTTER_FINAL_BAND = True
 
 
 def classic_cb_scale(long_control_state, v_ego, accel):
@@ -874,12 +876,11 @@ class HyundaiJerk:
     self.jerk_error_filter = MyMovingAverage(max(1, round(CANFD_JERK_ERROR_FILTER_TIME / DT_CTRL)), 0.0)
 
   def _refresh_butter_final(self):
-    # ButterStopFinal (with ButterStop on) restores the pre-10-24 classic-CAN comfort band:
+    # The ButterStop final stop restores the pre-10-24 classic-CAN comfort band:
     # with the band the Palisade ESC keeps braking through its standstill flag far more often
     # (W-REAP2: 58 % vs 11 % of stops), which shortens the crawl and softens the final jolt.
     try:
-      self.butter_final = (self.params.get_int("ButterStop") != 0
-                           and self.params.get_int("ButterStopFinal") > 0)
+      self.butter_final = (self.params.get_int("ButterStop") != 0 and BUTTER_FINAL_BAND)
     except (TypeError, ValueError, AttributeError):
       self.butter_final = False
 

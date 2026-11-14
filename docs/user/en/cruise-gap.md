@@ -105,8 +105,7 @@ Tune the speed band containing the symptom instead of changing the whole table. 
 |---|---|---|
 | `StopDistanceCarrot` | `600` → 6.00 m | Increases fixed clearance to a stopped lead |
 | `VEgoStopping` | `50` → 0.50 m/s | Higher values enter stopping state at a higher planned speed |
-| `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s for a gentler stop |
-| `ButterStopFinal` | `1` → on, `0` → off | Hands the stop to the car at about 0.8 m/s on classic-CAN Hyundai/Kia; does nothing yet on CAN-FD and other cars |
+| `ButterStop` | `1` → on, `0` → off | Tapers the braking ceiling below about 3 m/s and runs the final-stop control for a gentler stop |
 | `AChangeCostStarting` | MPC acceleration-change cost | Higher values smooth initial acceleration changes |
 
 ### `StopDistanceCarrot`
@@ -139,21 +138,12 @@ Default `1` (on); set `0` to carefully disable. While enabled, control tapers th
 > [!NOTE]
 > In simulation with the real MPC solver there were no collisions, the standstill gap was 0.2–0.8 m longer than before, and the mean deceleration over the last 0.5 s fell from about 0.5~0.51 to 0.3 m/s². Not tested on a vehicle.
 
-### `ButterStopFinal` · Final stop (experimental)
+**Final stop (part of `ButterStop`)** — no separate switch; it runs whenever `ButterStop` is on.
 
-Default `0` (off) is identical to the previous behavior; turn it on to test it.
-
-**Classic-CAN Hyundai/Kia, such as the Palisade** — the stop is handed to the car early. On a Palisade the ESC raises `TCS13.StandStill` about `0.51 s` after the reported speed crosses about `0.79 m/s`, while the wheels are still rolling, and it then releases braking within about a second whatever openpilot requests. Because the ordinary hand-off to the stopping state happens at a median `0.395 m/s`, it always arrives after that flag, which is the slow crawl at the end of every Palisade stop. With this setting on, the stop is handed to the car as soon as the reported speed is at or below `0.80 m/s` and the stop has been requested, so the field drive can show whether the ESC keeps braking when the stop request is already present.
-
-- It applies only in the `pid` state and only with a lead. The hand-off happens only when at least `3 m` to that lead would remain even if the car finished the stop at a weak `0.25 m/s²`; without that margin the ordinary hand-off applies.
-- One `butterStopEarlyReq` message is logged per stop, with the reported speed, lead distance and acceleration at the moment of hand-off.
-
-**CAN-FD cars (K5 and similar) and every other brand** — nothing happens yet. The final-stop window that openpilot used to drive on those cars failed the K5 simulated gap gate (a stop ended at `2.978 m` to the lead, under the `3 m` floor), so it is switched off by a module constant (`FINAL_WINDOW_ENABLED = False`) and this setting does nothing on those cars. The window code stays in the tree for later work.
-
-- It works only while `ButterStop` is on; with `ButterStop` at `0` this setting does nothing.
-
-> [!NOTE]
-> Not tested on a vehicle. The fitted-plant replay is the only check made so far, and it cannot judge the jolt itself; the field test is the only way to confirm the improvement.
+- **Classic-CAN Hyundai/Kia such as the Palisade:** holds at least `-0.8 m/s²` of braking through the last `2.0→0.3 m/s` of a stop and sends the comfort band through standstill as before 10/24, so the ESC keeps the brakes applied until the car stops (less creep and jolt). The early StopReq hand-off stays off.
+- **CAN-FD Hyundai/Kia such as the K5:** keeps pid below `0.45 m/s` and commands the same decel the car's own stopping delivers, recording how the car answers, and hands the stop straight back to the stock stopping state as soon as the car brakes weaker than that (measurement build).
+- **Other brands:** no final-stop action.
+- `ButterStop` `0` turns the final stop off together with the taper and is identical to before.
 
 The description above concerns upstream control. The final CANFD request override is described below.
 
@@ -275,7 +265,6 @@ The catalog and initial Params default are both `100`. Invalid values, including
 Relief requires measured lateral movement, continuous observations of the same lead, predicted body clearance, and sufficient selected leadTwo spacing. It starts only after predicted clearance plus 0.35 seconds. The cap is the smallest of 20% of base TF, 0.25 seconds, and 4 metres. Current leadOne/leadTwo retain normal TF.
 
 A blind-spot warning, cancellation, changed or missing tracks, missing pose data, or a missing normally selected second lead blocks additional relief. A lane that appears empty does not authorize earlier acceleration without sufficient observations. This setting does not replace lane-change permission checks or checking rear traffic.
-
 
 The normally selected leadOne/leadTwo at lane-change entry form the reference pair. If either selected lead changes or disappears, additional acceleration relief stops for the rest of that maneuver. Braking uses only the currently selected leads; side radar candidates and stored entry vehicles never become additional braking obstacles.
 

@@ -1,13 +1,13 @@
-"""ButterStopFinal on classic-CAN Hyundai/Kia: the early hand-off gate, its
+"""The ButterStop final stop on classic-CAN Hyundai/Kia: the early hand-off gate, its
 off-identity against the pre-change state machine, and the LongControl wiring
 behind the log event.
 
 The shipped module constant EARLY_REQ_ENABLED is False (W-SS1: a StopReq sent
 before the ESC flag did not stop the release), so on the car this half of the
-switch is silent and ButterStopFinal drives the firm finish instead. The tests
+switch is silent and the ButterStop final stop drives the firm finish instead. The tests
 below are the early hand-off's own contract: they turn the constant back on and
 pin its behaviour, so re-enabling it is a one-line change with coverage.
-ButterStopFinal=0 must still be identical to the previous controller: T1
+With the final stop off the controller must still be identical to the previous one: T1
 compares long_control_state_trans against the pre-change machine over a full
 grid, and T4 compares every tick of a replayed stop against it as well. T5/T6
 pin that the other half of the switch (the final window) is the complement:
@@ -318,7 +318,7 @@ def test_update_hands_off_at_early_v_and_logs_once(monkeypatch):
   stream = _stop_stream()
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
   control, states, fire_tick, events, _ = _run_stop(
-    monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, stream)
+    monkeypatch, {"ButterStop": 1}, stream)
 
   expected_tick = next(i for i, (v, _) in enumerate(stream) if v <= EARLY_V)
   assert fire_tick == expected_tick, (fire_tick, expected_tick)
@@ -335,10 +335,12 @@ def test_update_hands_off_at_early_v_and_logs_once(monkeypatch):
 
 def test_update_with_the_toggle_off_follows_the_stock_path_every_tick(monkeypatch):
   """Constant -0.6 m/s^2 never satisfies a_ego > stopping_accel: stock stays pid."""
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", False)
   stream = _stop_stream(decel=0.6, ticks=180)
   control, states, fire_tick, events, ticks = _run_stop(
     monkeypatch, {"ButterStop": 1}, stream)
 
+  assert control.final_stop is False, "the off arm must resolve the final stop off"
   assert control.early_req is False
   assert fire_tick is None, fire_tick
   assert set(states) == {LongCtrlState.pid}
@@ -351,10 +353,12 @@ def test_update_with_the_toggle_off_follows_the_stock_path_every_tick(monkeypatc
 
 def test_update_with_the_toggle_off_fires_on_the_stock_accel_rule(monkeypatch):
   """Once aEgo relaxes above stopping_accel the stock hand-off runs, later than 0.8 m/s."""
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", False)
   stream = _stop_stream(decel=0.6, ticks=260, relax_at=0.3)
   control, states, fire_tick, events, ticks = _run_stop(
     monkeypatch, {"ButterStop": 1}, stream)
 
+  assert control.final_stop is False, "the off arm must resolve the final stop off"
   expected_tick = next(i for i, (v, a) in enumerate(stream) if a > control.stopping_accel)
   assert fire_tick == expected_tick, (fire_tick, expected_tick)
   assert stream[fire_tick][0] < EARLY_V
@@ -369,7 +373,7 @@ def test_update_does_not_fire_without_a_lead(monkeypatch):
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
   control.long_control_state = LongCtrlState.pid
   states = []
   for v, a_ego in _stop_stream(ticks=180):
@@ -395,7 +399,7 @@ def test_update_waits_in_the_weak_braking_gap_until_the_need_shrinks(monkeypatch
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
   control.long_control_state = LongCtrlState.pid
 
   states = []
@@ -419,20 +423,21 @@ def test_update_waits_in_the_weak_braking_gap_until_the_need_shrinks(monkeypatch
 
 
 def test_update_requires_butter_stop_on(monkeypatch):
-  control, _ = make_control(monkeypatch, values={"ButterStop": 0, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 0})
   assert control.early_req is False
 
 
 def test_early_req_defaults_off(monkeypatch):
   control, _ = make_control(monkeypatch, values={"ButterStop": 1})
-  assert control.early_req is False
+  assert control.final_stop, "the final stop itself is on with ButterStop"
+  assert control.early_req is False, "the early hand-off stays off by constant"
 
 
 def test_update_relatches_the_log_above_walking_speed(monkeypatch):
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
 
   def frame(v, a_ego):
     cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=np.maximum(0.0, v - 0.6 * PLAN_T),
@@ -469,7 +474,7 @@ def test_canfd_never_hands_off_early_and_opens_the_window_instead(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", events)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
-  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
+  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1}, cp)
 
   assert control.final_stop is True, "the switch itself is on"
   assert control.final_window is True, "CAN-FD drives the final window"
@@ -502,7 +507,7 @@ def test_non_hyundai_brands_never_hand_off_early(monkeypatch):
   for brand in ("toyota", "gm", "tesla", "ford"):
     events = _EventLog()
     monkeypatch.setattr(lc, "cloudlog", events)
-    control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1}, brand=brand)
+    control, _ = make_control(monkeypatch, values={"ButterStop": 1}, brand=brand)
     assert control.final_stop is True, brand
     assert control.early_req is False, brand
     assert control.final_window is False, brand
@@ -527,7 +532,7 @@ def test_classic_can_hyundai_is_capable(monkeypatch):
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
   cp = make_cp()
   cp.flags = 0
-  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
+  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1}, cp)
   assert control._early_req_capable is True
 
   control.long_control_state = LongCtrlState.pid
@@ -543,11 +548,11 @@ def test_other_hyundai_flags_do_not_block_the_probe(monkeypatch):
   """Only the CANFD bit matters; a different Hyundai flag leaves the probe live."""
   cp = make_cp()
   cp.flags = int(HyundaiFlags.MANDO_RADAR)
-  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
+  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1}, cp)
   assert control._early_req_capable is True
 
   cp.flags = int(HyundaiFlags.MANDO_RADAR | HyundaiFlags.CANFD)
-  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
+  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1}, cp)
   assert control._early_req_capable is False
 
 
@@ -557,11 +562,11 @@ def test_other_hyundai_flags_do_not_block_the_probe(monkeypatch):
 # ---------------------------------------------------------------------------
 
 def test_shipped_constant_never_hands_off(monkeypatch):
-  """ButterStopFinal 1 on a classic-CAN car, constant at its shipped False."""
+  """The final stop on a classic-CAN car, constant at its shipped False."""
   assert lc.EARLY_REQ_ENABLED is False, "the module constant is the shipped value"
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
-  control, _ = make_control(monkeypatch, values={"ButterStop": 1, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 1})
   assert control.final_stop is True, "the switch is on"
   assert control.early_req is False, "the hand-off is held off by the constant"
   assert control.firm_a == pytest.approx(0.8), "the firm finish takes its place"
@@ -612,7 +617,7 @@ def test_t5_classic_can_hyundai_never_opens_the_window(monkeypatch):
   """
   monkeypatch.setattr(lc, "EARLY_REQ_ENABLED", True)
   control, events, state, open_ticks = _run_final_stop(
-    monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1})
+    monkeypatch, {"ButterStop": 1})
   assert control.final_stop and control.early_req
   assert not control.final_window, "classic CAN must not open the window"
   assert state == LongCtrlState.stopping
@@ -628,7 +633,7 @@ def test_t5_canfd_opens_the_window_and_never_hands_off_early(monkeypatch):
   monkeypatch.setattr(lc, "cloudlog", events)
   cp = make_cp()
   cp.flags = int(HyundaiFlags.CANFD)
-  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 1}, cp)
+  control, _ = _control_with_cp(monkeypatch, {"ButterStop": 1}, cp)
   assert control.final_stop and control.final_window
   assert not control.early_req
 

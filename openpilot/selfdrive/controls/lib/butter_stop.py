@@ -12,7 +12,7 @@ is instant). All standstill hold/release logic lives unchanged in the
 LongControl stopping state machine; this module provides the floor and the
 creep guard constants used there.
 
-ButterStopFinal (experimental) adds the opposite tool at the very end of the
+The ButterStop final stop adds the opposite tool at the very end of the
 stop: instead of handing the last part to the car's own stop, LongControl
 keeps pid through a measurement window. On CAN-FD Hyundai/Kia that window
 commands the decel the car's own stopping state delivers at each speed, and an
@@ -40,14 +40,14 @@ LEAD_RAW_ALLOW = 0.5   # d_eff may never exceed raw dRel by more than this (m)
 TAU_LEAD = 0.3         # lead-position filter time constant (s)
 FLOOR_RELAX_JERK = 0.8  # max floor relaxation rate (m/s^3); tightening is instant
 MIN_FINAL_GAP_ABS = 3.0
-# Early hand-off (ButterStopFinal on classic-CAN Hyundai, experimental field
+# Early hand-off (ButterStop final stop on classic-CAN Hyundai, experimental field
 # probe). The Palisade ESC raises StandStill about 0.51 s after vEgo crosses
 # about 0.79 m/s, then releases its braking within ~1 s whatever we command;
 # the ordinary hand-off at 0.395 m/s always arrives after that, which is the
-# pre-stop crawl. On those cars ButterStopFinal hands the stop to the car as
+# pre-stop crawl. On those cars the ButterStop final stop hands the stop to the car as
 # soon as v_ego is at or below EARLY_V, so the field drive can show whether the
 # ESC keeps braking with StopReq already set.
-EARLY_V = 0.80        # ButterStopFinal on classic-CAN Hyundai: hand off at or below this (m/s); the Palisade ESC timer starts ~0.79 m/s
+EARLY_V = 0.80        # ButterStop final stop on classic-CAN Hyundai: hand off at or below this (m/s); the Palisade ESC timer starts ~0.79 m/s
 EARLY_A_WEAK = 0.25   # weakest decel assumed once the car owns the stop (m/s^2)
 STANDSTILL_V = 0.05
 STANDSTILL_T = 0.2
@@ -76,19 +76,19 @@ FINAL_ROLL_RESET_V = 1.0 # a latch above this speed is stale, drop it (m/s)
 FINAL_ROLL_VLEAD = 0.3   # lead must be slower than this to latch (m/s)
 STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling distance
 
-# Final-stop window (ButterStopFinal, experimental). The car physically stops
+# Final-stop window (part of ButterStop). The car physically stops
 # while still decelerating ~0.3 m/s^2, and that residual decel is the jolt, so
 # behind this toggle the last part of a stop stays in pid. The window is
 # time-based: vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s
 # after the physical stop, and is ~0.08 m/s at it), so speed cannot drive it.
 FINAL_WINDOW_ENABLED = True  # CAN-FD Hyundai/Kia: the K5 measurement probe (stock stopping decel in pid, under-response guard)
-EARLY_REQ_ENABLED = False  # W-SS1: StopReq before the ESC flag did not stop its release; ButterStopFinal drives the firm finish instead
+EARLY_REQ_ENABLED = False  # W-SS1: StopReq before the ESC flag did not stop its release; the ButterStop final stop drives the firm finish instead
 FINAL_A_END = 0.10    # decel magnitude at the planned standstill (m/s^2)
 FINAL_A0_MIN = 0.25   # entry decel magnitude clip (m/s^2)
 FINAL_A0_MAX = 0.8
 FINAL_U_MAX = -0.05   # the window never commands less braking than this
 FINAL_U_MIN = -1.5
-# K5 measurement probe (ButterStopFinal on CAN-FD Hyundai/Kia). From where the
+# K5 measurement probe (ButterStop final stop on CAN-FD Hyundai/Kia). From where the
 # K5 hands off to stopping today, stay in pid and command the decel its own
 # stopping delivers today (44 K5 stops, W-PLANT1 npz), so the drive records how
 # the K5 answers pid below 0.3 m/s at today's strength. If the car brakes weaker

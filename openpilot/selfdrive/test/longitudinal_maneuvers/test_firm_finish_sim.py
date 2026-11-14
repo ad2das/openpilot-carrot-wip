@@ -1,12 +1,12 @@
-"""W-FIRM1 sim gate: the ButterStopFinal firm finish (arm 1) vs off (arm 0).
+"""W-FIRM1 sim gate: the ButterStop final-stop firm finish (arm 1) vs off (arm 0).
 
 Per event in the W-PLANTE gate population restricted to the Palisade (the only
 classic-CAN car with a fitted plant here), it runs the real LongitudinalPlanner
 + real LongControl + fitted plant three times on the same fixture header:
 
-  arm 0  = ButterStopFinal 0 (the switch off);
-  arm 1  = ButterStopFinal 1 (the firm finish at FIRM_A, gated);
-  report = ButterStopFinal 1 with FIRM_A patched to 1.2, report-only.
+  arm 0  = the final stop off (FINAL_STOP_ENABLED False);
+  arm 1  = the final stop on (the firm finish at FIRM_A, gated);
+  report = the final stop on with FIRM_A patched to 1.2, report-only.
 
 and checks:
 
@@ -216,24 +216,27 @@ def _run(fixture, final, firm_a=None):
   """One arm. firm_a patches the module constant for the report-only depth."""
   header = dict(fixture["params"])
   header["ButterStop"] = 1
-  header["ButterStopFinal"] = int(final)
   loop = FirmLoop(header, FixtureProfile(fixture), fitted="palisade", full_run=True)
   # FarLeadLoop builds every fixture on the Palisade CP already; set the
   # capability explicitly so the gate cannot depend on that coincidence, then
   # re-resolve the switch exactly as the car does once per second. The switch
   # resolution is what decides firm_a, so it must run after the CP patch.
   saved_firm_a = longcontrol_module.FIRM_A
+  saved_final = longcontrol_module.FINAL_STOP_ENABLED
   if firm_a is not None:
     longcontrol_module.FIRM_A = float(firm_a)
   try:
+    longcontrol_module.FINAL_STOP_ENABLED = bool(final)
     loop.long_control._early_req_capable = True
     loop.long_control._refresh_butter_stop()
     run = loop.run()
   finally:
     longcontrol_module.FIRM_A = saved_firm_a
+    longcontrol_module.FINAL_STOP_ENABLED = saved_final
   run["rows"] = loop.rows
   run["firm_a"] = float(loop.long_control.firm_a)
   run["early_req"] = bool(loop.long_control.early_req)
+  run["final_stop"] = bool(loop.long_control.final_stop)
   return run
 
 
@@ -295,7 +298,9 @@ def test_firm_finish_gate(car, eid):
   ref = real_stop(fixture)
 
   off_run = _run(fixture, FINAL_OFF)
+  assert off_run["final_stop"] is False, "the off arm must resolve the final stop off"
   on_run = _run(fixture, FINAL_ON)
+  assert on_run["final_stop"] is True, "the on arm must resolve the final stop on"
   rep_run = _run(fixture, FINAL_ON, firm_a=FIRM_A_REPORT)
 
   off = _metrics(off_run, ref)

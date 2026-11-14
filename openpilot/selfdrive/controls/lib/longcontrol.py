@@ -38,10 +38,10 @@ DEPART_P_FLOOR = -0.2      # m/s^2 below aTarget
 DEPART_MIN_DREL = 4.0      # m
 DEPART_RELEASE_JERK = 1.0  # m/s^3, floor relax when the window ends or the plan stops accelerating
 
-# ButterStopFinal firm finish (classic-CAN Hyundai/Kia): hold at least FIRM_A of
+# ButterStop final stop (classic-CAN Hyundai/Kia): hold at least FIRM_A of
 # braking through the last metres of a planned stop so the car is nearly stopped
 # when the Palisade ESC standstill timer (0.51 s after 0.794 m/s) releases the
-# brakes. Off unless ButterStop and ButterStopFinal are both on.
+# brakes. Part of ButterStop, so it is off whenever ButterStop is off.
 # Inside the band the cap tracks the car's decel (firm_track_step below).
 FIRM_V_HI = 2.0            # m/s, band top (car responds ~0.6 s late)
 FIRM_V_LO = 0.3            # m/s, band bottom
@@ -49,7 +49,8 @@ FIRM_ATGT = -0.3           # m/s^2, plan must command real braking (P7)
 FIRM_VPLAN_END = 0.3       # m/s, plan must end at a stop (P7)
 FIRM_JERK = 2.0            # m/s^3, cap build rate
 FIRM_RELEASE_JERK = 2.0    # m/s^3, cap relax rate on a soft exit
-FIRM_A = 0.8               # m/s^2, ButterStopFinal firm-finish decel on classic-CAN Hyundai/Kia
+FIRM_A = 0.8               # m/s^2, ButterStop final-stop firm-finish decel on classic-CAN Hyundai/Kia
+FINAL_STOP_ENABLED = True  # ButterStop's final stop (firm finish / K5 probe); tests patch this to get the plain-ButterStop arm
 
 
 def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
@@ -166,7 +167,7 @@ class LongControl:
     self.readParamCount = 0
     self.final_stop = False
     self.final_window = False
-    # Which final-stop behaviour ButterStopFinal selects. The early hand-off is
+    # Which final-stop behaviour the ButterStop final stop selects. The early hand-off is
     # for the classic-CAN Palisade ESC, which flags standstill while the wheels
     # still roll. A CAN-FD car (K5, ...) flags it only after the physical stop
     # (d_ass median +0.92 s), so an early hand-off there is a plain early StopReq
@@ -203,7 +204,7 @@ class LongControl:
     self._butter_lead_filter = LeadPosFilter()
     self._butter_roll_limit = None
     self._butter_diag = {}
-    # ButterStopFinal window state. One window per stop: _final_t is the
+    # ButterStop final-stop window state. One window per stop: _final_t is the
     # elapsed profile time (None = no window), _final_done blocks a second
     # window in the same stop and clears once the car is moving again.
     self._final_t = None
@@ -213,7 +214,7 @@ class LongControl:
     self._final_s_trav = 0.0
     self._final_done = False
 
-    # ButterStopFinal early hand-off log latch: one event per stop, cleared
+    # ButterStop final-stop early hand-off log latch: one event per stop, cleared
     # above 1 m/s.
     self._early_logged = False
 
@@ -249,11 +250,7 @@ class LongControl:
     self.firm_a = 0.0
     if not self.butter_stop:
       return
-    try:
-      final_value = float(self.params.get_int("ButterStopFinal"))
-    except (TypeError, ValueError, AttributeError):
-      final_value = 0.0
-    self.final_stop = math.isfinite(final_value) and final_value > 0.0
+    self.final_stop = FINAL_STOP_ENABLED
     # One switch, two behaviours. Classic-CAN Hyundai/Kia get the firm finish:
     # at least FIRM_A of braking through the last 2.0 -> 0.3 m/s, so the car is
     # nearly stopped when the ESC standstill timer releases the brakes. The
@@ -468,7 +465,7 @@ class LongControl:
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-    # ButterStopFinal window, resolved before the state machine so final_hold
+    # ButterStop final-stop window, resolved before the state machine so final_hold
     # can suppress the ordinary hand-off this tick. The window keeps its own
     # lead threshold: the 4 m fcw radius would end it while the distance guard
     # is still able to stop the car inside the lead gap, and the ordinary
@@ -515,7 +512,7 @@ class LongControl:
       self._final_done = False
     final_hold = self._final_t is not None
 
-    # ButterStopFinal on classic-CAN Hyundai/Kia: hand the stop to the car
+    # ButterStop final stop on classic-CAN Hyundai/Kia: hand the stop to the car
     # before its ESC standstill timer runs out. Only with a lead whose gap
     # survives weak braking. final_hold wins, so a final-stop window is never
     # cut short; on those cars the window never opens at all.
@@ -676,7 +673,7 @@ class LongControl:
 
     else:  # LongCtrlState.pid
       if self._final_t is not None:
-        # ButterStopFinal owns the command for the whole window: no coasting
+        # The ButterStop final stop owns the command for the whole window: no coasting
         # relief, no butter floor and no depart guard inside it.
         self.coasting.reset()
         output_accel = self._final_window_accel(CS, long_plan, radarState)

@@ -1,8 +1,8 @@
-"""ButterStopFinal firm finish: the band gate, the cap ramp/release math, the
+"""The ButterStop final stop, firm finish half: the band gate, the cap ramp/release math, the
 switch resolution, and the LongControl wiring (off-identity, the on-stream
 floor, and the gas exit).
 
-The firm finish is the classic-CAN Hyundai/Kia half of ButterStopFinal. F6 pins
+The firm finish is the classic-CAN Hyundai/Kia half of the ButterStop final stop. F6 pins
 which cars resolve it: Palisade with the switch on gets FIRM_A, CAN-FD and other
 brands get 0. F7 pins off-identity: with the switch off the cap block is not
 entered at all, and the stop stream is tick-for-tick the same as before. F8 pins
@@ -222,11 +222,10 @@ def test_cap_release_reaches_none_at_40_calls():
 
 
 # ---------------------------------------------------------------------------
-# F6: which cars resolve the firm finish from the ButterStopFinal switch
+# F6: which cars resolve the firm finish from the ButterStop final stop
 # ---------------------------------------------------------------------------
 
-ON = {"ButterStop": 1, "ButterStopFinal": 1}
-OFF = {"ButterStop": 1, "ButterStopFinal": 0}
+ON = {"ButterStop": 1}  # the final stop is part of ButterStop; arms turn it off via FINAL_STOP_ENABLED
 
 
 def test_f6a_palisade_with_the_switch_on_gets_the_firm_finish(monkeypatch):
@@ -237,14 +236,16 @@ def test_f6a_palisade_with_the_switch_on_gets_the_firm_finish(monkeypatch):
 
 
 def test_f6b_switch_off_is_zero(monkeypatch):
-  control, _ = make_control(monkeypatch, values=OFF)
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", False)
+  control, _ = make_control(monkeypatch, values=ON)
+  assert control.final_stop is False, "the off arm must resolve the final stop off"
   assert control.firm_a == 0.0
   assert control.early_req is False
 
 
 def test_f6c_butter_stop_off_is_zero(monkeypatch):
   """final_stop is only computed when ButterStop is on (the early return)."""
-  control, _ = make_control(monkeypatch, values={"ButterStop": 0, "ButterStopFinal": 1})
+  control, _ = make_control(monkeypatch, values={"ButterStop": 0})
   assert control.final_stop is False
   assert control.firm_a == 0.0
   assert control.early_req is False
@@ -316,9 +317,10 @@ def _probe_pid(control):
   return calls
 
 
-def _run_stream(monkeypatch, values, stream, gas_from=None):
+def _run_stream(monkeypatch, values, stream, gas_from=None, final_stop=True):
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", bool(final_stop))
   control, _ = make_control(monkeypatch, values=values)
   control.long_control_state = LongCtrlState.pid
   pid_calls = _probe_pid(control)
@@ -342,10 +344,11 @@ def _run_stream(monkeypatch, values, stream, gas_from=None):
   return control, rows, events
 
 
-def _run_stream_with_cp(monkeypatch, values, stream, cp):
+def _run_stream_with_cp(monkeypatch, values, stream, cp, final_stop=True):
   """Same stream, but with an explicit CP so the capability gate is exercised."""
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", bool(final_stop))
   control, _ = _control_with_cp(monkeypatch, values, cp)
   control.long_control_state = LongCtrlState.pid
   rows = []
@@ -362,14 +365,6 @@ def _run_stream_with_cp(monkeypatch, values, stream, cp):
 # ---------------------------------------------------------------------------
 # F7: the switch off is invisible
 # ---------------------------------------------------------------------------
-
-def _assert_identical(left, right, label):
-  assert len(left) == len(right)
-  for a, b in zip(left, right, strict=True):
-    assert a["output"] == b["output"], (label, a["tick"], a["output"], b["output"])
-    assert a["state"] == b["state"], (label, a["tick"], a["state"], b["state"])
-    assert a["integral_after"] == b["integral_after"], (label, a["tick"])
-
 
 def test_switch_off_never_enters_the_block(monkeypatch):
   """With the switch off the block is not entered: neither helper is called."""
@@ -395,7 +390,8 @@ def test_switch_off_never_enters_the_block(monkeypatch):
   # Full-length stream: the gate needs plan_speeds[-1] < 0.3, i.e. v < ~1.55, so a
   # short high-speed slice would prove only the off arm and never enter the block.
   stream = _build_stream()
-  _, rows_off, _ = _run_stream(monkeypatch, OFF, stream)
+  off_control, rows_off, _ = _run_stream(monkeypatch, ON, stream, final_stop=False)
+  assert off_control.final_stop is False, "the off arm must resolve the final stop off"
   assert rows_off, "no ticks ran"
   assert calls == {"gate": 0, "step": 0, "track": 0}, calls
 
@@ -403,14 +399,6 @@ def test_switch_off_never_enters_the_block(monkeypatch):
   _, rows_on, _ = _run_stream(monkeypatch, ON, stream)
   assert calls["gate"] > 0 and calls["track"] > 0, calls
   assert any(r["cap"] is not None for r in rows_on)
-
-
-def test_switch_off_matches_a_controller_that_never_had_it(monkeypatch):
-  """Off identity: a full stop is the same as ButterStop 1 with Final 0 on base."""
-  stream = _build_stream()
-  _, off_rows, _ = _run_stream(monkeypatch, OFF, stream)
-  _, base_rows, _ = _run_stream(monkeypatch, {"ButterStop": 1, "ButterStopFinal": 0}, stream)
-  _assert_identical(off_rows, base_rows, "off_vs_base")
 
 
 def test_canfd_with_the_switch_on_does_not_enter_the_firm_block(monkeypatch):
@@ -441,7 +429,8 @@ def test_canfd_with_the_switch_on_does_not_enter_the_firm_block(monkeypatch):
   monkeypatch.setattr(lc, "firm_track_step", spy_track)
   stream = _build_stream()
   _, on_rows, _ = _run_stream_with_cp(monkeypatch, ON, stream, _canfd_cp())
-  _, off_rows, _ = _run_stream_with_cp(monkeypatch, OFF, stream, _canfd_cp())
+  off_control, off_rows, _ = _run_stream_with_cp(monkeypatch, ON, stream, _canfd_cp(), final_stop=False)
+  assert off_control.final_stop is False, "the off arm must resolve the final stop off"
   assert calls == {"gate": 0, "step": 0, "track": 0}, calls
   above = [(a, b) for a, b in zip(on_rows, off_rows, strict=True) if a["v"] > PROBE_V_MAX]
   assert above, "the stream must spend ticks above the probe's speed range"
@@ -484,7 +473,8 @@ def test_switch_on_holds_the_floor_through_the_band(monkeypatch):
 
 def test_before_the_band_top_the_output_matches_the_switch_off(monkeypatch):
   stream = _build_stream()
-  _, off_rows, _ = _run_stream(monkeypatch, OFF, stream)
+  off_control, off_rows, _ = _run_stream(monkeypatch, ON, stream, final_stop=False)
+  assert off_control.final_stop is False, "the off arm must resolve the final stop off"
   _, on_rows, _ = _run_stream(monkeypatch, ON, stream)
   above = [(a, b) for a, b in zip(on_rows, off_rows, strict=True) if a["v"] > FIRM_V_HI]
   assert above, "the stream never runs above the band top"

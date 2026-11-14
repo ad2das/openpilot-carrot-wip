@@ -226,7 +226,7 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 |---|---|---|
 | [가속 성향·드라이브 모드](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | 연비, 안전, 일반, 고속 모드와 자동 전환 |
 | [가속 성향·속도별 가속값](cruise-gap.md#acceleration-table) | `CruiseMaxVals0`, `CruiseMaxVals1`, `CruiseMaxVals2`, `CruiseMaxVals3`, `CruiseMaxVals4`, `CruiseMaxVals5`, `CruiseMaxVals6` | 속도 구간별 최대 가속 성향 |
-| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `ButterStopFinal`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입, 부드러운 정차, 마지막 정지 제어와 재출발 특성 |
+| [정차·재출발](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `ButterStop`, `VEgoStopping`, `AChangeCostStarting` | 정지 위치, 정지 진입, 부드러운 정차, 마지막 정지 제어와 재출발 특성 |
 | [가감속 튜닝](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | 현기차 `100/0/100`, 토요타·렉서스 `0/0/100` 고정·숨김; VW MEB(ID.4 포함)는 저장 게인 적용 |
 | [차간거리](cruise-gap.md#following-gap) | `TFollowGap1`, `TFollowGap2`, `TFollowGap3`, `TFollowGap4`, `DynamicTFollowLC`, `SpeedTFFactor`, `TFollowDecelBoost` | 차간 단계별 시간, 정상 선택 앞차 기준 차로 변경 완화와 감속 여유(기본 0%) |
 | [추종응답성](cruise-gap.md#lead-response) | `LeadAccelResponse`, `LeadAccelResponseTF1`–`LeadAccelResponseTF4` | 모든 차간 단계의 앞차 출발·가속 추종과 접근 반응 |
@@ -244,14 +244,13 @@ VW MEB(ID.4 포함)에도 수동 조향비와 학습 비율이 적용됩니다. 
 
 `SpeedTFFactor`는 선택한 기본 TF에 속도별 선형 배율을 적용합니다. 10은 변화 없음, 20은 100km/h에서 2배입니다. 단계별 `LeadAccelResponseTF1`~`TF4`는 -1이면 공통값, 0~5이면 해당 반응을 사용합니다. 반응 4~5도 속도 배율을 유지합니다. 주행 화면의 거리 바는 동적 보정이 반영된 추종 목표거리를 m로 표시합니다.
 
-
 감속 미리보기는 반응 단계와 별도로 동작합니다. 상대 가속도가 줄거나 앞차가 레이더·비전 사이에서 전환되거나 사라져도, 제어 중에는 남은 보정을 점진적으로 해제합니다. 가속·브레이크 페달 개입이나 종방향 제어 종료 시에는 초기화합니다.
 
 `LongTuning*`, `LongActuatorDelay`는 openpilot이 가감속을 제어하는 차량에서 직접적인 영향을 줄 수 있는 고급 항목입니다. 현대·기아·제네시스에서는 `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`가 안전값 `100/0/100`으로 고정되어 설정 화면에 나오지 않으며, 토요타·렉서스는 전용 보정기 앞의 중복 보정을 막기 위해 공통 게인을 `0/0/100`으로 고정·숨깁니다. 순정 ACC 차량에서는 관련 없는 항목도 있습니다.
 
 `StoppingAccel`(정지시작가속도)은 기본 `-50`, 범위 `-100~-50`, 변경 단위 `10`으로 다시 조정할 수 있습니다. 저장값에 0.01을 곱한 가속도를 사용하며, 제어에서도 범위를 제한합니다. 기존 정지 진입·감속 방식과 차종별 소프트홀드를 사용하고 변경은 약 1초 안에 반영됩니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
 
-`ButterStop`(버터스톱, 기본 켜짐)은 약 3m/s 이하 정지 마지막 구간의 감속 상한을 낮춰 더 부드럽게 정차하고, 정차 확인 후 밀림을 즉시 잡습니다. `0`으로 끄면 기존 동작과 완전히 동일합니다. `ButterStopFinal`(기본 `0`, 끔, 실험)을 켜면 팰리세이드 등 일반 CAN 현대·기아에서 정차 마지막 `2.0→0.3m/s` 구간에 `-0.8m/s²` 이상 제동을 유지하고, 정차 중 컴포트 밴드를 10/24 이전처럼 보내, 차량 ESC가 브레이크를 풀지 않고 멈추게 합니다(기어감·덜컹임 줄이기). K5 등 CAN-FD 현대·기아에서는 0.45m/s 이하에서도 pid를 유지하며 차량 순정 정차와 같은 세기로 정지까지 직접 제어해 반응을 기록하고, 차가 그보다 약하게 감속하면 즉시 순정 정차로 넘깁니다. 그 외 차종에서는 아무 동작도 하지 않습니다. `ButterStop`이 켜져 있을 때만 동작합니다. `0`이면 기존과 동일합니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
+`ButterStop`(버터스톱, 기본 켜짐)은 약 3m/s 이하 정지 마지막 구간의 감속 상한을 낮춰 더 부드럽게 정차하고, 정차 확인 후 밀림을 즉시 잡으며, 마지막 정차 제어도 함께 켭니다. 팰리세이드 등 일반 CAN 현대·기아에서는 정차 마지막 `2.0→0.3m/s` 구간에 `-0.8m/s²` 이상 제동을 유지하고, 정차 중 컴포트 밴드를 10/24 이전처럼 보내, 차량 ESC가 브레이크를 풀지 않고 멈추게 합니다(기어감·덜컹임 줄이기). K5 등 CAN-FD 현대·기아에서는 0.45m/s 이하에서도 pid를 유지하며 차량 순정 정차와 같은 세기로 정지까지 직접 제어해 반응을 기록하고, 차가 그보다 약하게 감속하면 즉시 순정 정차로 넘깁니다. 그 외 차종에서는 마지막 정차 동작이 없습니다. `0`으로 끄면 기존 동작과 완전히 동일합니다. [정차·재출발](cruise-gap.md#stop-resume)을 참고하세요.
 
 `VEgoStopping`(정지출발민감도)은 범위 `10~100`, 기본 `50`이며, `10`은 `0.10m/s`입니다. 기존의 `10` 미만 저장값은 자동으로 `10`으로 올리고, 주행 중에도 같은 최저값을 적용합니다.
 

@@ -1,8 +1,8 @@
-"""W-FSTOP1 sim gate: ButterStopFinal 1 vs 0 on the fitted plant.
+"""W-FSTOP1 sim gate: the ButterStop final stop on vs off on the fitted plant.
 
 Per event in the W-PLANTE gate population (lead_jump is False), it runs the
 real LongitudinalPlanner + real LongControl + fitted plant twice on the same
-fixture header -- once with ButterStopFinal 0 and once with 1 -- and checks:
+fixture header -- once with the final stop off and once with it on -- and checks:
 
   G1 per event:  both arms come to rest (standstill onset within +-8 s of the
                  real stop); gap_stop(1) >= gap_stop(0) - 0.05 m;
@@ -11,7 +11,7 @@ fixture header -- once with ButterStopFinal 0 and once with 1 -- and checks:
                  <= arm 0's time from the same instant (report both).
   G3 per event:  arm 1 mean commanded accel over the last 0.3 s before its sim
                  standstill >= -0.15 (report arm 0's value too).
-  G4:            the ButterStopLoop maneuvers run with ButterStopFinal 1.
+  G4:            the ButterStopLoop maneuvers run with the final stop on.
 
 Report-only: window entries / events, entry-v distribution, exits by reason.
 
@@ -32,13 +32,13 @@ import os
 import numpy as np
 import pytest
 
-from openpilot.common.params import Params
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_far_lead_replay import (
   FarLeadLoop,
   FixtureProfile,
 )
 from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _kf_end_decel
+from openpilot.selfdrive.controls.lib import longcontrol as longcontrol_module
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_U_MAX, FINAL_U_MIN, MIN_FINAL_GAP_ABS, PROBE_GUARD_T, PROBE_MAX_T, PROBE_V_MAX, probe_accel,
@@ -60,7 +60,7 @@ G1_BACK, G1_FWD = 15.0, 2.0  # G1 gap window in sim time around the real stop
 G1_GAP_SLACK = 0.05          # m, gap_stop(1) may come this much closer
 G3_WINDOW = 0.3              # s, mean command before standstill
 G3_MAX_DECEL = -0.15         # m/s^2, arm-1 mean command floor
-CLASSIC_CAN_CARS = ("Palisade",)  # ButterStopFinal hands off early on these; the rest open the window
+CLASSIC_CAN_CARS = ("Palisade",)  # the final stop hands off early on these; the rest open the window
 
 
 def _gate_events():
@@ -184,7 +184,7 @@ def _command_mean_before(run, t_stop, window=G3_WINDOW):
 
 
 class FinalStopLoop(FarLeadLoop):
-  """FarLeadLoop that records LongControl's ButterStopFinal window state.
+  """FarLeadLoop that records LongControl's final-stop window state.
 
   The base loop exposes only its own logs, so the window clock is read from the
   live controller after every update(): entry tick and speed, and the reason
@@ -303,18 +303,23 @@ class FinalStopLoop(FarLeadLoop):
 
 
 def _run(car, fixture, final):
+  """One arm. The final stop is part of ButterStop, so the arm is the module constant."""
   header = dict(fixture["params"])
   header["ButterStop"] = 1
-  header["ButterStopFinal"] = int(final)
+  saved = longcontrol_module.FINAL_STOP_ENABLED
   loop = FinalStopLoop(header, FixtureProfile(fixture), fitted=car.lower(), full_run=True)
   # FarLeadLoop builds every fixture on the Palisade CP (classic CAN), K5 rows
-  # included, so the per-car capability has to be set from here. ButterStopFinal
+  # included, so the per-car capability has to be set from here. The final stop
   # then resolves to the early hand-off on classic CAN, to the K5 measurement
   # window on CAN-FD, and to nothing on any other brand.
   loop.long_control._early_req_capable = car in CLASSIC_CAN_CARS
   loop.long_control._final_window_capable = car not in CLASSIC_CAN_CARS
-  loop.long_control._refresh_butter_stop()
-  run = loop.run()
+  try:
+    longcontrol_module.FINAL_STOP_ENABLED = bool(final)
+    loop.long_control._refresh_butter_stop()
+    run = loop.run()
+  finally:
+    longcontrol_module.FINAL_STOP_ENABLED = saved
   run["entries"] = loop.entries
   run["exits"] = loop.exits
   run["window"] = loop.window
@@ -325,6 +330,7 @@ def _run(car, fixture, final):
   run["probe"] = dict(loop.probe)
   run["final_window"] = bool(loop.long_control.final_window)
   run["early_req"] = bool(loop.long_control.early_req)
+  run["final_stop"] = bool(loop.long_control.final_stop)
   return run
 
 
@@ -366,7 +372,9 @@ def test_final_stop_gate(car, eid):
   ref = real_stop(fixture)
 
   off_run = _run(car, fixture, FINAL_OFF)
+  assert off_run["final_stop"] is False, "the off arm must resolve the final stop off"
   on_run = _run(car, fixture, FINAL_ON)
+  assert on_run["final_stop"] is True, "the on arm must resolve the final stop on"
   off = _metrics(off_run, ref)
   on = _metrics(on_run, ref)
 
@@ -392,7 +400,7 @@ def test_final_stop_gate(car, eid):
   g3_note = ("window" if g3_applies
              else ("no_window" if not entries else f"exit_{exits[-1]['reason']}"))
 
-  # Which behaviour ButterStopFinal resolved to on this car, and whether the
+  # Which behaviour the final stop resolved to on this car, and whether the
   # window opened at all. Both feed the census rows and the no-entry probe.
   mode = "early" if on_run["early_req"] else ("window" if on_run["final_window"] else "off")
   G2_ROWS.append({"car": car, "eid": eid, "entry_t": entry_t, "entry_v": entry_v,
@@ -556,41 +564,45 @@ def test_final_stop_g2_report():
 
 
 def test_butter_stop_maneuvers_with_final_stop():
-  """G4: ButterStopLoop takes no header dict; set the key then refresh.
+  """G4: ButterStopLoop takes no header dict; set the constant then refresh.
 
-  ButterStopLoop builds the Palisade CP, so ButterStopFinal resolves to the
+  ButterStopLoop builds the Palisade CP, so the final stop resolves to the
   early hand-off there; the maneuvers record it unchanged.
   """
   from openpilot.selfdrive.test.longitudinal_maneuvers.test_butter_stop_maneuvers import (
     _CASES, ButterStopLoop, compute_metrics,
   )
 
-  params = Params()
   rows = []
-  for _, maneuver in _CASES:
-    runs = {}
-    for final in (FINAL_OFF, FINAL_ON):
-      loop = ButterStopLoop(maneuver, butter=1)
-      params.put_int("ButterStopFinal", final)
-      loop.long_control._refresh_butter_stop()
-      runs[final] = loop.run()
-    off = compute_metrics(runs[FINAL_OFF], maneuver.title + " final0", 1)
-    on = compute_metrics(runs[FINAL_ON], maneuver.title + " final1", 1)
-    rows.append({
-      "title": maneuver.title,
-      "final0": {k: v for k, v in off.items() if isinstance(v, (int, float, bool))},
-      "final1": {k: v for k, v in on.items() if isinstance(v, (int, float, bool))},
-    })
-    zero = (
-      f"final0 stopped={off.get('stopped')} min_gap={off.get('min_gap_m', float('nan')):.3f} "
-      + f"final_gap={off.get('final_gap_m', float('nan')):.3f} "
-      + f"accel_last={off.get('accel_last_0.5s_mean_abs')}"
-    )
-    one = (
-      f"final1 stopped={on.get('stopped')} min_gap={on.get('min_gap_m', float('nan')):.3f} "
-      + f"final_gap={on.get('final_gap_m', float('nan')):.3f} "
-      + f"accel_last={on.get('accel_last_0.5s_mean_abs')}"
-    )
-    print(f"MANEUVER {maneuver.title:28s} {zero} | {one}", flush=True)
+  saved = longcontrol_module.FINAL_STOP_ENABLED
+  try:
+    for _, maneuver in _CASES:
+      runs = {}
+      for final in (FINAL_OFF, FINAL_ON):
+        loop = ButterStopLoop(maneuver, butter=1)
+        longcontrol_module.FINAL_STOP_ENABLED = bool(final)
+        loop.long_control._refresh_butter_stop()
+        assert loop.long_control.final_stop is bool(final), "the arm must resolve the final stop"
+        runs[final] = loop.run()
+      off = compute_metrics(runs[FINAL_OFF], maneuver.title + " final0", 1)
+      on = compute_metrics(runs[FINAL_ON], maneuver.title + " final1", 1)
+      rows.append({
+        "title": maneuver.title,
+        "final0": {k: v for k, v in off.items() if isinstance(v, (int, float, bool))},
+        "final1": {k: v for k, v in on.items() if isinstance(v, (int, float, bool))},
+      })
+      zero = (
+        f"final0 stopped={off.get('stopped')} min_gap={off.get('min_gap_m', float('nan')):.3f} "
+        + f"final_gap={off.get('final_gap_m', float('nan')):.3f} "
+        + f"accel_last={off.get('accel_last_0.5s_mean_abs')}"
+      )
+      one = (
+        f"final1 stopped={on.get('stopped')} min_gap={on.get('min_gap_m', float('nan')):.3f} "
+        + f"final_gap={on.get('final_gap_m', float('nan')):.3f} "
+        + f"accel_last={on.get('accel_last_0.5s_mean_abs')}"
+      )
+      print(f"MANEUVER {maneuver.title:28s} {zero} | {one}", flush=True)
+  finally:
+    longcontrol_module.FINAL_STOP_ENABLED = saved
 
   _write("maneuvers.json", rows)
