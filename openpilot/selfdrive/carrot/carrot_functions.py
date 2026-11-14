@@ -137,6 +137,25 @@ TLV_HI_STOP_MODEL_S = 0.3            # model expression continuously true
 # for ~0.1-0.2 s inside one episode, which must not restart the 0.5 s clock.
 TLV_HI_STOP_RED_GAP_FRAMES = int(TLV_FAST_GATE_RESET_S / DT_MDL)
 
+STOP_REARM_MAX = 10.0  # m; e2eStop re-arms the stop distance from the model only above this
+
+
+def e2e_stop_rearm(actual_stop_distance: float, stop_dist: float, near: bool) -> tuple[float, bool]:
+  """e2eStop stop-distance update from the model reading stop_dist.
+
+  Above STOP_REARM_MAX the model reading replaces the dead-reckoned distance, as before.
+  Once the dead-reckoned distance is inside STOP_REARM_MAX it only shrinks (by travel):
+  a later model reading above STOP_REARM_MAX would move the stop line metres forward while
+  the car is nearly stopped (field 4bc: 2.6 -> 10.4 m, the plan turned to cruise and the car
+  rolled again). `near` latches for the rest of the e2eStop episode.
+  """
+  if 0.0 < actual_stop_distance <= STOP_REARM_MAX:
+    near = True
+  if stop_dist > STOP_REARM_MAX and not near:
+    actual_stop_distance = stop_dist
+  return actual_stop_distance, near
+
+
 # W-TSG1 (user 2026-11-03, experimental CarrotTlvStopGo): a confirmed TLV red commits the
 # existing e2eStop at the model's stop distance. Never derives a distance from the lamp.
 # W-TLT1 moved its constants into openpilot/selfdrive/carrot/tlv_stop_tiers.py.
@@ -187,6 +206,7 @@ class CarrotPlanner:
     self.xState = XState.cruise
     self.xStop = 0.0
     self.actual_stop_distance = 0.0
+    self._stop_near = False
     #self.debugLongText = ""
     self.stopping_count = 0
     self.traffic_starting_count = 0
@@ -1496,8 +1516,8 @@ class CarrotPlanner:
           self.trafficStopAdjustRatio = np.interp(v_ego_kph, [0, 100], [1.0, 0.7])
           # 속도가 높을수록 먼 정지거리 추정값을 줄여 보정함.
           stop_dist = stop_model_x_rl * np.interp(stop_model_x_rl, [0, 50], [1.0, self.trafficStopAdjustRatio])
-          if stop_dist > 10.0:  # 10m 이상일 때만 실제 정지거리를 갱신함.
-            self.actual_stop_distance = stop_dist
+          # 10m 이상일 때만 실제 정지거리를 갱신함 (10m 안에 들어온 뒤에는 줄어들기만 함).
+          self.actual_stop_distance, self._stop_near = e2e_stop_rearm(self.actual_stop_distance, stop_dist, self._stop_near)
           stop_model_x = 0
           self.fakeCruiseDistance = 0 if self.actual_stop_distance > 10.0 else 10.0
           if v_ego < 0.3:
@@ -1524,6 +1544,9 @@ class CarrotPlanner:
         self.actual_stop_distance = stop_model_x_rl
       else:
         self.xState = XState.e2eCruise
+
+    if self.xState != XState.e2eStop:
+      self._stop_near = False
 
     if self.trafficState in [TrafficState.off, TrafficState.green] or self.xState not in [XState.e2eStop, XState.e2eStopped]:
       stop_model_x = 1000.0
