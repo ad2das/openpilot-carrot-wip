@@ -615,7 +615,10 @@ def _case_failures(group, off_metrics, on_metrics):
 
 
 @pytest.mark.parametrize("group,maneuver", _CASES, ids=_CASE_IDS)
-def test_butter_stop_maneuver(group, maneuver):
+def test_butter_stop_maneuver(group, maneuver, monkeypatch):
+  # The v3.1 criteria judge the ButterStop smoothing layer alone; the final stop
+  # is recorded by test_final_stop_sim G4 and gated by its own sims.
+  monkeypatch.setattr(longcontrol, "FINAL_STOP_ENABLED", False)
   off = ButterStopLoop(maneuver, butter=0).run()
   on = ButterStopLoop(maneuver, butter=1).run()
   off_metrics = compute_metrics(off, maneuver.title, 0)
@@ -713,6 +716,9 @@ def test_butter_stop_tuning_sweep(monkeypatch):
   TAU_LEAD. When no combo passes, the closest three are reported by (failure
   count, mean soft_on) with the failing criteria and nothing is shipped.
   """
+  # The v3.1 criteria judge the ButterStop smoothing layer alone; the final stop
+  # is recorded by test_final_stop_sim G4 and gated by its own sims.
+  monkeypatch.setattr(longcontrol, "FINAL_STOP_ENABLED", False)
   off_cache = {m.title: compute_metrics(ButterStopLoop(m, butter=0).run(), m.title, 0) for _, m in _CASES}
   rows = []
   for d_extra in _SWEEP_D_EXTRA:
