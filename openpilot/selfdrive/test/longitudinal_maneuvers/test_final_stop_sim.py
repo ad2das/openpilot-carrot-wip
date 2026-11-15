@@ -41,7 +41,8 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _k
 from openpilot.selfdrive.controls.lib import longcontrol as longcontrol_module
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  FINAL_U_MAX, FINAL_U_MIN, MIN_FINAL_GAP_ABS, PROBE_GUARD_T, PROBE_MAX_T, PROBE_V_MAX, probe_accel,
+  FINAL_U_MAX, FINAL_U_MIN, MIN_FINAL_GAP_ABS, PROBE_MAX_T, PROBE_V_MAX, probe_accel,
+  probe_firm_scale,
 )
 
 _SCRATCH = "/mnt/c/Users/Administrator/Downloads/carrot-wip/carrot-openpilot/.analysis/scratch/2026-11-08-perf"
@@ -197,7 +198,8 @@ class FinalStopLoop(FarLeadLoop):
     self.window = {"t": [], "final_t": [], "v": [], "accel": [], "lc_state": [], "fcw": []}
     self.entries = []
     self.exits = []
-    self.guard_exits = 0
+    self.firm_windows = 0     # windows where the firm-up engaged (the old guard now firms, not exits)
+    self._firm_counted = False
     self.window_ticks = 0
     self.cmd_mismatches = 0
     # The plan guard no longer exists inside the window (the command is the
@@ -211,12 +213,14 @@ class FinalStopLoop(FarLeadLoop):
     self.long_control.update = self._update
 
   def _command_mismatch(self, CS, radarState, logged):
-    """True when the window's logged command is not the probe/lead minimum.
+    """True when the window's logged command is not the probe/lead minimum plus the firm-up.
 
-    The probe command is a pure function of vEgo, so the whole window command
-    is clip(min(probe_accel(v), lead term), FINAL_U_MIN, FINAL_U_MAX). This
-    recomputes it from the tick's inputs and compares; a mismatch means the
-    controller and this report disagree about the wiring.
+    The probe command is a pure function of vEgo plus the window's own firm-up extra, so the
+    whole window command is clip(min(probe_accel(v) + extra*probe_firm_scale(v), lead term),
+    FINAL_U_MIN, FINAL_U_MAX). The extra is advanced before the command is built, so the
+    controller's live value after update() is the one this tick used. This recomputes it from
+    the tick's inputs and compares; a mismatch means the controller and this report disagree
+    about the wiring.
     """
     try:
       v_ego = float(CS.vEgo)
@@ -224,7 +228,7 @@ class FinalStopLoop(FarLeadLoop):
       return True
     if not math.isfinite(v_ego):
       return True
-    u = probe_accel(v_ego)
+    u = probe_accel(v_ego) + float(self.long_control._probe_extra) * probe_firm_scale(v_ego)
     lead = getattr(radarState, "leadOne", None)
     if lead is not None and bool(getattr(lead, "status", False)):
       gap = float(lead.dRel) - MIN_FINAL_GAP_ABS
@@ -278,26 +282,29 @@ class FinalStopLoop(FarLeadLoop):
       self.window_ticks = getattr(self, "window_ticks", 0) + 1
       if self._command_mismatch(CS, radarState, out[0]):
         self.cmd_mismatches = getattr(self, "cmd_mismatches", 0) + 1
+      if float(self.long_control._probe_extra) < 0.0 and not self._firm_counted:
+        self._firm_counted = True
+        self.firm_windows += 1
     if not was_open and now is not None:
+      self._firm_counted = False
       self.entries.append({"t": tick_t, "v": float(CS.vEgo),
                            "a0": float(self.long_control._final_a0)})
     elif was_open and now is None:
       # Same order as the exit terms in update(), so the reason names the term
-      # that actually fired. The guard is last, so it only owns the tick when
-      # no earlier term did.
+      # that actually fired. The under-response guard no longer ends the window
+      # (it firms the stop up), so only the non-finite sensor case sits last.
       if not (active and long_plan.shouldStop and self.long_control.final_stop):
         reason = "inactive_or_should_stop_cleared"
+      elif pre_state != int(LongCtrlState.pid):
+        reason = "left_pid"
       elif lead_close:
         reason = "lead_close"
       elif float(CS.vEgo) < STANDSTILL:
         reason = "standstill"
       elif pre_final_t >= PROBE_MAX_T:
         reason = "probe_timeout"
-      elif self.long_control._probe_weak_t >= PROBE_GUARD_T - 1e-9:
-        reason = "probe_guard"
-        self.guard_exits += 1
       else:
-        reason = "timeout"
+        reason = "sensor_invalid"
       self.exits.append({"t": tick_t, "reason": reason, "v": float(CS.vEgo)})
     return out
 
@@ -324,7 +331,7 @@ def _run(car, fixture, final):
   run["exits"] = loop.exits
   run["window"] = loop.window
   run["plan_guard_ticks"] = loop.plan_guard_ticks
-  run["guard_exits"] = loop.guard_exits
+  run["firm_windows"] = loop.firm_windows
   run["window_ticks"] = loop.window_ticks
   run["cmd_mismatches"] = loop.cmd_mismatches
   run["probe"] = dict(loop.probe)
@@ -395,7 +402,7 @@ def test_final_stop_gate(car, eid):
   # reaching standstill or by timing out. Events with no window, or whose
   # window ended on a closing lead and handed off early, measure the base
   # stopping state and are reported separately.
-  g3_applies = bool(entries) and bool(exits) and exits[-1]["reason"] in ("standstill", "timeout")
+  g3_applies = bool(entries) and bool(exits) and exits[-1]["reason"] in ("standstill", "left_pid")
   g3_ok = (on_cmd >= G3_MAX_DECEL) if g3_applies else None
   g3_note = ("window" if g3_applies
              else ("no_window" if not entries else f"exit_{exits[-1]['reason']}"))
@@ -408,7 +415,7 @@ def test_final_stop_gate(car, eid):
                   "n_entries": len(entries), "exits": exits,
                   "final_window": on_run["final_window"], "early_req": on_run["early_req"],
                   "plan_guard_ticks": int(on_run["plan_guard_ticks"]),
-                  "guard_exits": int(on_run["guard_exits"]),
+                  "firm_windows": int(on_run["firm_windows"]),
                   "cmd_mismatches": int(on_run["cmd_mismatches"]),
                   "window_ticks": int(sum(1 for x in on_run["window"]["final_t"] if x is not None))})
   G3_ROWS.append({"car": car, "eid": eid, "on_cmd": on_cmd, "off_cmd": off_cmd,
@@ -434,7 +441,7 @@ def test_final_stop_gate(car, eid):
     "final_window": on_run["final_window"],
     "early_req": on_run["early_req"],
     "plan_guard_ticks": int(on_run["plan_guard_ticks"]),
-    "guard_exits": int(on_run["guard_exits"]),
+    "firm_windows": int(on_run["firm_windows"]),
     "cmd_mismatches": int(on_run["cmd_mismatches"]),
     "window_ticks": int(sum(1 for x in on_run["window"]["final_t"] if x is not None)),
     "g1_gap_ok": bool(gap_ok),
@@ -453,7 +460,7 @@ def test_final_stop_gate(car, eid):
     + f"end={on['end_decel']:6.4f} cmd={on_cmd:7.4f} min_gap={on['min_gap_g1']:6.3f}"
   )
   guard_ticks = int(on_run["plan_guard_ticks"])
-  guard_exits = int(on_run["guard_exits"])
+  firm_windows = int(on_run["firm_windows"])
   cmd_mismatches = int(on_run["cmd_mismatches"])
   window_ticks = int(sum(1 for x in on_run["window"]["final_t"] if x is not None))
   if mode == "window" and not entries:
@@ -461,7 +468,7 @@ def test_final_stop_gate(car, eid):
   print(
     f"FSTOP {car} {eid:34s} real_t={ref['t_sim']:6.2f} | {off_part} | {on_part} "
     + f"entry_v={entry_shown:>6s} | dgap={on['gap_stop'] - off['gap_stop']:+.3f} "
-    + f"| mode={mode} plan_guard={guard_ticks}/{window_ticks} guard={guard_exits} "
+    + f"| mode={mode} plan_guard={guard_ticks}/{window_ticks} firm={firm_windows} "
     + f"cmd_mismatch={cmd_mismatches}",
     flush=True)
 
@@ -478,10 +485,9 @@ def test_final_stop_g2_report():
   """G2 per car, plus the entry / exit census and the no-entry probe rows.
 
   No event entering the window is a legitimate outcome here, not a failure:
-  PROBE_V_MAX is the real car's hand-off speed (median 0.400 m/s), and the
-  fitted plant hands off later in aEgo at 0.476-0.751 m/s, so the stock path
-  takes pid before the probe's speed gate can open. The census and the
-  no-entry probe rows are the result in that case.
+  the fitted plant hands off later in aEgo than the real car (aEgo 0.476-0.751
+  m/s), so the stock path can take pid before the window's speed gate opens.
+  The census and the no-entry probe rows are the result in that case.
   """
   assert G2_ROWS, "the per-event gate produced no rows"
   rows = [r for r in G2_ROWS if np.isfinite(r["entry_t"])]
@@ -509,12 +515,12 @@ def test_final_stop_g2_report():
 
   for car in sorted({r["car"] for r in rows}):
     car_rows = [r for r in rows if r["car"] == car]
-    guards = sum(r["guard_exits"] for r in car_rows)
+    guards = sum(r["firm_windows"] for r in car_rows)
     ticks = sum(r["window_ticks"] for r in car_rows)
     mismatches = sum(r["cmd_mismatches"] for r in car_rows)
     frac = (guards / len(car_rows)) if car_rows else float("nan")
-    print(f"GUARD {car:9s} events={len(car_rows):2d} guard_exits={guards} "
-          + f"frac_events={frac:.3f} window_ticks={ticks} cmd_mismatch={mismatches}", flush=True)
+    print(f"FIRM  {car:9s} events={len(car_rows):2d} firm_windows={guards} "
+          + f"firm_frac={frac:.3f} window_ticks={ticks} cmd_mismatch={mismatches}", flush=True)
 
   entry_v = [r["entry_v"] for r in rows if np.isfinite(r["entry_v"])]
   exit_reasons = {}

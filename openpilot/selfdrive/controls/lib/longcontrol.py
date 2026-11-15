@@ -16,9 +16,10 @@ from openpilot.selfdrive.controls.lib.butter_stop import (
   CREEP_ACCEL, CREEP_V, EARLY_REQ_ENABLED, EARLY_V, FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN,
   FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX,
   FINAL_U_MIN, FINAL_WINDOW_ENABLED, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS,
+  PROBE_FIRM_JERK, PROBE_FIRM_MAX,
   PROBE_GUARD_T, PROBE_GUARD_V, PROBE_MAX_T, PROBE_V_MAX, STANDSTILL_T, STANDSTILL_V,
   STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, early_req_gap_ok,
-  final_profile_travel, final_roll_limit, plan_stop_distance, probe_accel, probe_weak,
+  final_profile_travel, final_roll_limit, plan_stop_distance, probe_accel, probe_firm_scale, probe_weak,
   rest_ramp_floor,
 )
 from openpilot.selfdrive.controls.lib.stop_law import StopCtl
@@ -193,6 +194,7 @@ class LongControl:
     self.stop_law_last = False
     self._probe_weak_t = 0.0
     self._probe_guard_logged = False
+    self._probe_extra = 0.0
     self._refresh_stopping_accel()
     self._refresh_butter_stop()
     self._firm_cap = None
@@ -273,11 +275,11 @@ class LongControl:
     # at least FIRM_A of braking through the last 2.0 -> 0.3 m/s, so the car is
     # nearly stopped when the ESC standstill timer releases the brakes. The
     # early StopReq hand-off is held off by EARLY_REQ_ENABLED (W-SS1: a StopReq
-    # sent before the flag did not stop the release). CAN-FD Hyundai/Kia drive
-    # the K5 measurement probe (W-K5B1): the final window holds pid below
-    # PROBE_V_MAX and commands the decel the car's own stopping delivers there,
-    # with an under-response guard that hands back to stock. Every other brand
-    # gets nothing from this switch.
+    # sent before the flag did not stop the release). CAN-FD Hyundai/Kia
+    # get the K5 final stop: the window holds pid below PROBE_V_MAX down to rest
+    # and commands the decel the car's own stopping delivers there, adding
+    # braking when the car answers weaker than that. Every other brand gets
+    # nothing from this switch.
     self.early_req = self.final_stop and self._early_req_capable and EARLY_REQ_ENABLED
     self.firm_a = FIRM_A if (self.final_stop and self._early_req_capable) else 0.0
     self.stop_law = self.final_stop and self._early_req_capable and self._stop_law_car and STOP_LAW_ENABLED
@@ -415,33 +417,37 @@ class LongControl:
     self.depart_guard_last = True
     return self._depart_floor
 
-  def _probe_guard_tripped(self, CS):
-    # Under-response guard: the car must brake at least as hard as the weakest
-    # tenth of today's stock K5 stops; PROBE_GUARD_T weaker than that hands back.
+  def _probe_firm_step(self, CS):
+    """Advance the under-response counter; return False only on non-finite sensors (the window then ends).
+
+    A car that brakes weaker than the weakest tenth of the stock K5 stops for PROBE_GUARD_T gets
+    PROBE_FIRM_JERK more braking per second up to PROBE_FIRM_MAX. The extra is never given back
+    inside the window; probe_firm_scale fades it out over the last 0.20 m/s.
+    """
     try:
       v = float(CS.vEgo)
       a = float(CS.aEgo)
     except (TypeError, ValueError, AttributeError):
-      return True
+      return False
     if not (math.isfinite(v) and math.isfinite(a)):
-      return True
+      return False
     if v >= PROBE_GUARD_V and a > probe_weak(v):
       self._probe_weak_t += DT_CTRL
     else:
       self._probe_weak_t = 0.0
-    if self._probe_weak_t < PROBE_GUARD_T - 1e-9:
-      return False
-    if not self._probe_guard_logged:
-      cloudlog.event("butterStopProbeGuard", vEgo=v, aEgo=a, t=float(self._final_t))
-      self._probe_guard_logged = True
+    if self._probe_weak_t >= PROBE_GUARD_T - 1e-9:
+      self._probe_extra = max(self._probe_extra - PROBE_FIRM_JERK * DT_CTRL, -PROBE_FIRM_MAX)
+      if not self._probe_guard_logged:
+        cloudlog.event("butterStopProbeGuard", vEgo=v, aEgo=a, t=float(self._final_t), firm=True)
+        self._probe_guard_logged = True
     return True
 
   def _final_window_accel(self, CS, long_plan, radarState):
-    """One tick of the K5 measurement window, then advance its clock.
+    """One tick of the K5 final-stop window, then advance its clock.
 
     Commands the decel the K5's own stopping state delivers at this speed
-    (probe_accel over the 44-stop table), so the drive records how the car
-    answers our pid below 0.3 m/s at that strength. The lead guard stays at
+    (probe_accel over the 44-stop table), plus the firm-up extra while the car
+    answers weaker than the weakest decile. The lead guard stays at
     full strength against the remaining gap: the gap is a hard safety budget
     and may brake harder than the probe. long_plan is no longer read. The PID
     integrator is reset because nothing in this window is a PID decision.
@@ -451,6 +457,8 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       v_ego = float("nan")
     u = probe_accel(v_ego) if math.isfinite(v_ego) else probe_accel(PROBE_V_MAX)
+    if math.isfinite(v_ego):
+      u += self._probe_extra * probe_firm_scale(v_ego)
     # Lead guard: unchanged and at full strength. The gap is a hard safety
     # budget, so it is allowed to brake harder than the probe table.
     lead = getattr(radarState, "leadOne", None) if radarState is not None else None
@@ -533,7 +541,7 @@ class LongControl:
                      or final_close
                      or CS.vEgo < STANDSTILL_V
                      or self._final_t >= PROBE_MAX_T
-                     or self._probe_guard_tripped(CS))
+                     or not self._probe_firm_step(CS))
       if exit_window:
         self._final_t = None
         self._final_done = True
@@ -546,6 +554,7 @@ class LongControl:
       self._final_a0 = min(FINAL_A0_MAX, max(FINAL_A0_DIST, FINAL_A0_MIN, -float(self.last_output_accel)))
       self._probe_weak_t = 0.0
       self._probe_guard_logged = False
+      self._probe_extra = 0.0
       # Freeze the plan target at entry. Once the plan's speeds reach zero the
       # live plan_stop_distance collapses to ~0; the frozen target stays
       # meaningful for the whole window, and the profile's own travel is the

@@ -95,9 +95,9 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.selfdrive.controls.lib import longcontrol as lc
 from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_A_END, FINAL_U_MAX, FINAL_U_MIN,
-  MIN_FINAL_GAP_ABS, PROBE_A, PROBE_BP_V, PROBE_GUARD_V, PROBE_MAX_T,
-  PROBE_V_MAX, PROBE_WEAK_A, STANDSTILL_V, STOCK_ROLL_DECEL, final_a0_dist, final_profile,
-  final_profile_travel, probe_accel, probe_weak,
+  MIN_FINAL_GAP_ABS, PROBE_A, PROBE_BP_V, PROBE_FIRM_JERK, PROBE_FIRM_MAX, PROBE_GUARD_V,
+  PROBE_MAX_T, PROBE_V_MAX, PROBE_WEAK_A, STANDSTILL_V, STOCK_ROLL_DECEL, final_a0_dist,
+  final_profile, final_profile_travel, probe_accel, probe_firm_scale, probe_weak,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongCtrlState, long_control_state_trans,
@@ -581,8 +581,14 @@ def test_p2_window_opens_at_probe_v_max_and_stays_pid(monkeypatch):
   assert control._final_s_target > 0.0
 
 
-def test_p3_guard_exits_on_tick_30_and_hands_the_stop_to_the_car(monkeypatch):
-  """30 weak ticks (0.30 s) trip the guard; the same tick becomes stopping."""
+def test_p3_guard_firms_the_stop_instead_of_handing_it_back(monkeypatch):
+  """30 weak ticks (0.30 s) no longer hand the stop back: the window keeps pid and adds braking.
+
+  On tick 30 the extra starts at -PROBE_FIRM_JERK*DT_CTRL and grows -0.01 per weak tick until
+  it floors at -PROBE_FIRM_MAX on tick 69, and the command is the probe table plus the extra.
+  The car then stays in pid, which is the whole point of the change: a hand-back at this speed
+  is what made the K5 crawl (-0.02..-0.10 m/s^2 under StopReq 1 while rolling).
+  """
   events = []
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: events.append(name)))
   control, _ = _probe_control(monkeypatch)
@@ -590,19 +596,35 @@ def test_p3_guard_exits_on_tick_30_and_hands_the_stop_to_the_car(monkeypatch):
   _stop_frame(control, 0.44, a_ego=-0.30, speeds=_decaying_speeds(0.44))
   assert control._final_t is not None
   assert control._probe_weak_t == pytest.approx(0.0)
+  assert control._probe_extra == pytest.approx(0.0)
 
-  outs = []
   for tick in range(1, 31):
-    outs.append(_stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))[0])
-    if tick < 30:
-      assert control._final_t is not None, tick
-  assert control._final_t is None, "the guard must have exited the window on tick 30"
-  assert control._final_done
-  assert control.long_control_state == LongCtrlState.stopping
-  assert outs[-1] <= 0.0, outs[-1]
+    out = _stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))[0]
+    assert control._final_t is not None, tick
+    assert control.long_control_state == LongCtrlState.pid, tick
+    expected = float(np.clip(probe_accel(0.30) + control._probe_extra * 1.0,
+                             FINAL_U_MIN, FINAL_U_MAX))
+    assert out == pytest.approx(expected, abs=1e-9), (tick, out, expected)
+  assert not control._final_done, "the window must not end on the guard any more"
+  assert control._probe_extra == pytest.approx(-PROBE_FIRM_JERK * DT_CTRL, abs=1e-12)
   assert events.count("butterStopProbeGuard") == 1, events
 
-  # A weak spell shorter than PROBE_GUARD_T is not a trip: 25 ticks, then the car
+  # Every further weak tick is one more 0.01 of braking until the -PROBE_FIRM_MAX floor.
+  for tick in range(31, 70):
+    out = _stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))[0]
+    if tick < 69:
+      assert control._probe_extra == pytest.approx(-PROBE_FIRM_JERK * DT_CTRL * (tick - 29), abs=1e-12), tick
+    expected = float(np.clip(probe_accel(0.30) + control._probe_extra * 1.0,
+                             FINAL_U_MIN, FINAL_U_MAX))
+    assert out == pytest.approx(expected, abs=1e-9), (tick, out, expected)
+  assert control._probe_extra == pytest.approx(-PROBE_FIRM_MAX, abs=1e-12), control._probe_extra
+  for _ in range(20):
+    _stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))
+  assert control._probe_extra == pytest.approx(-PROBE_FIRM_MAX, abs=1e-12), "the floor holds"
+  assert control.long_control_state == LongCtrlState.pid
+  assert events.count("butterStopProbeGuard") == 1, "the guard logs once per window"
+
+  # A weak spell shorter than PROBE_GUARD_T adds nothing: 25 ticks, then the car
   # answers (-0.30, weaker than the weakest decile of the band) and the window stays.
   control2, _ = _probe_control(monkeypatch)
   control2.long_control_state = LongCtrlState.pid
@@ -611,9 +633,11 @@ def test_p3_guard_exits_on_tick_30_and_hands_the_stop_to_the_car(monkeypatch):
     _stop_frame(control2, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))
   assert control2._final_t is not None
   assert control2._probe_weak_t == pytest.approx(25 * DT_CTRL, abs=1e-9)
+  assert control2._probe_extra == pytest.approx(0.0)
   _stop_frame(control2, 0.30, a_ego=-0.30, speeds=_decaying_speeds(0.30))
   assert control2._final_t is not None, "recovering above the weak decile keeps the window"
   assert control2._probe_weak_t == pytest.approx(0.0)
+  assert control2._probe_extra == pytest.approx(0.0), "a 0.25 s weak spell adds nothing"
 
 
 def test_p4_guard_never_trips_below_probe_guard_v(monkeypatch):
@@ -628,6 +652,93 @@ def test_p4_guard_never_trips_below_probe_guard_v(monkeypatch):
   assert control._probe_weak_t == pytest.approx(0.0)
   assert control._final_t is not None, "no guard exit at 0.08 m/s"
   assert PROBE_GUARD_V == pytest.approx(0.10)
+
+
+def test_p8_firm_scale():
+  """probe_firm_scale fades the extra in between 0.05 and 0.20 m/s, flat outside."""
+  assert probe_firm_scale(0.05) == pytest.approx(0.0)
+  assert probe_firm_scale(0.125) == pytest.approx(0.5)
+  assert probe_firm_scale(0.20) == pytest.approx(1.0)
+  assert probe_firm_scale(0.5) == pytest.approx(1.0)
+  assert probe_firm_scale(0.0) == pytest.approx(0.0)
+
+
+def test_p9_extra_is_held_when_the_car_recovers(monkeypatch):
+  """The extra is never given back inside the window: recovery only stops it growing."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: None))
+  control, _ = _probe_control(monkeypatch)
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, a_ego=-0.30, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+  for _ in range(49):
+    _stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))
+  assert control._probe_extra == pytest.approx(-0.2, abs=1e-9), control._probe_extra
+
+  for _ in range(20):
+    _stop_frame(control, 0.30, a_ego=-0.40, speeds=_decaying_speeds(0.30))
+  assert control._probe_extra == pytest.approx(-0.2, abs=1e-12), "recovery does not release it"
+  assert control._final_t is not None
+  assert control.long_control_state == LongCtrlState.pid
+
+
+def test_p10_extra_resets_on_the_next_window(monkeypatch):
+  """A new stop starts with no extra and no guard log, even after a firm one."""
+  events = []
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: events.append(name)))
+  control, _ = _probe_control(monkeypatch)
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, a_ego=-0.30, speeds=_decaying_speeds(0.44))
+  for _ in range(60):
+    _stop_frame(control, 0.30, a_ego=-0.05, speeds=_decaying_speeds(0.30))
+  assert control._probe_extra < 0.0
+  assert events.count("butterStopProbeGuard") == 1
+
+  # End this stop: below STANDSTILL_V the window closes for good.
+  _stop_frame(control, STANDSTILL_V - 0.01, a_ego=-0.05, speeds=np.zeros(len(PLAN_T)))
+  assert control._final_t is None
+  assert control._final_done
+
+  # Rolling above 1.0 m/s clears the latch for the next stop.
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 1.5, a_ego=-0.20, speeds=np.full(len(PLAN_T), 1.0))
+  assert not control._final_done
+
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.50, a_ego=-0.30, speeds=_decaying_speeds(0.50))
+  assert control._final_t is not None, "the second stop opens its own window"
+  assert control._probe_extra == pytest.approx(0.0), control._probe_extra
+  assert control._probe_weak_t == pytest.approx(0.0)
+  for _ in range(10):
+    _stop_frame(control, 0.50, a_ego=-0.30, speeds=_decaying_speeds(0.50))
+  assert control._probe_extra == pytest.approx(0.0), "a strong second answer gets nothing"
+
+
+def test_p11_non_finite_sensor_ends_the_window(monkeypatch):
+  """A nan speed inside the window ends it the same tick instead of freezing the clock."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: None))
+  control, _ = _probe_control(monkeypatch)
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, a_ego=-0.30, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  cs, plan, radar = stopping_inputs(v_ego=0.30, plan_speeds=_decaying_speeds(0.30))
+  cs.vEgo = float("nan")
+  cs.aEgo = -0.05
+  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._final_t is None, "a non-finite vEgo ends the window"
+  assert control._final_done
+
+
+def test_p12_window_opens_at_0_50(monkeypatch):
+  """0.50 m/s is above the old ceiling and inside the new one: the window opens and stays pid."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: None))
+  control, _ = _probe_control(monkeypatch)
+  control.long_control_state = LongCtrlState.pid
+  out = _stop_frame(control, 0.50, a_ego=-0.30, speeds=_decaying_speeds(0.50))[0]
+  assert control._final_t is not None, "the window must open at 0.50 m/s"
+  assert control.long_control_state == LongCtrlState.pid
+  assert control._probe_extra == pytest.approx(0.0)
+  assert out == pytest.approx(-0.39, abs=1e-9), out
 
 
 def test_p5_capability_split(monkeypatch):
@@ -693,7 +804,11 @@ def test_p6_lead_guard_still_binds_inside_the_probe(monkeypatch):
 
 
 def test_p7_window_exits_at_probe_max_t(monkeypatch):
-  """PROBE_MAX_T: the window cannot outlive 3 s once v stays above standstill."""
+  """PROBE_MAX_T: the window cannot outlive 8 s once v stays above standstill.
+
+  The timeout is only a fallback now: a real stop ends at STANDSTILL_V. This pins that the
+  fallback still ends the window, and that it is the term that did it.
+  """
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: None))
   control, _ = _probe_control(monkeypatch)
   control.long_control_state = LongCtrlState.pid
@@ -707,12 +822,13 @@ def test_p7_window_exits_at_probe_max_t(monkeypatch):
     assert control._final_t <= PROBE_MAX_T + DT_CTRL + 1e-6, control._final_t
     _stop_frame(control, 0.30, a_ego=-0.30, speeds=_decaying_speeds(0.30))
     ticks += 1
-    if ticks > 400:
+    if ticks > int(PROBE_MAX_T / DT_CTRL) + 50:
       break
   assert control._final_t is None
   # Float accumulation of DT_CTRL puts the exit one tick either side of the exact
   # quotient; what matters is that PROBE_MAX_T is the term that ended it.
   assert abs(ticks * DT_CTRL - PROBE_MAX_T) <= 2 * DT_CTRL, ticks
+  assert control._probe_extra == pytest.approx(0.0), "not a weak stream: the timeout ended it"
 
 
 # ---------------------------------------------------------------------------

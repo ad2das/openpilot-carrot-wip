@@ -81,25 +81,30 @@ STOCK_ROLL_DECEL = 0.5   # stock stopping decel used for the stock rolling dista
 # behind this toggle the last part of a stop stays in pid. The window is
 # time-based: vEgo over-reads near zero (wheel speed latches to 0 about 1.1 s
 # after the physical stop, and is ~0.08 m/s at it), so speed cannot drive it.
-FINAL_WINDOW_ENABLED = True  # CAN-FD Hyundai/Kia: the K5 measurement probe (stock stopping decel in pid, under-response guard)
+FINAL_WINDOW_ENABLED = True  # CAN-FD Hyundai/Kia: the K5 final stop (pid to rest, firm-up on a weak response)
 EARLY_REQ_ENABLED = False  # W-SS1: StopReq before the ESC flag did not stop its release; the ButterStop final stop drives the firm finish instead
 FINAL_A_END = 0.10    # decel magnitude at the planned standstill (m/s^2)
 FINAL_A0_MIN = 0.25   # entry decel magnitude clip (m/s^2)
 FINAL_A0_MAX = 0.8
 FINAL_U_MAX = -0.05   # the window never commands less braking than this
 FINAL_U_MIN = -1.5
-# K5 measurement probe (ButterStop final stop on CAN-FD Hyundai/Kia). From where the
-# K5 hands off to stopping today, stay in pid and command the decel its own
-# stopping delivers today (44 K5 stops, W-PLANT1 npz), so the drive records how
-# the K5 answers pid below 0.3 m/s at today's strength. If the car brakes weaker
-# than the weakest decile of those stops for PROBE_GUARD_T, hand back to stock.
-PROBE_V_MAX = 0.45
+# K5 final stop (ButterStop final stop on CAN-FD Hyundai/Kia). From where the K5 hands off to
+# stopping, stay in pid down to STANDSTILL_V and command the decel the K5's own stopping
+# delivers (44 K5 stops, W-PLANT1 npz). StopReq 1 while still rolling gives the K5 only
+# -0.02..-0.10 m/s^2 (W-K5R1: 12-16 s crawls, every re-stop began that way), while the
+# windows that ran to rest never rolled again. So the window opens up to PROBE_V_MAX, and
+# a car that brakes weaker than the weakest decile for PROBE_GUARD_T gets more braking
+# (PROBE_FIRM_*) instead of a hand-back to the stock stopping state.
+PROBE_V_MAX = 1.0
 PROBE_BP_V = [0.10, 0.20, 0.30, 0.40]
 PROBE_A = [-0.14, -0.23, -0.30, -0.39]
 PROBE_WEAK_A = [-0.099, -0.150, -0.211, -0.235]
 PROBE_GUARD_T = 0.3
 PROBE_GUARD_V = 0.10
-PROBE_MAX_T = 3.0
+PROBE_MAX_T = 8.0                  # s; fallback only, the window ends at STANDSTILL_V
+PROBE_FIRM_JERK = 1.0              # m/s^3; extra braking build rate while the car stays weak
+PROBE_FIRM_MAX = 0.4               # m/s^2; most extra braking
+PROBE_FIRM_FADE_V = (0.05, 0.20)   # m/s; the extra fades out between these speeds so the end stays soft
 
 
 def probe_accel(v_ego):
@@ -108,6 +113,11 @@ def probe_accel(v_ego):
 
 def probe_weak(v_ego):
   return float(np.interp(v_ego, PROBE_BP_V, PROBE_WEAK_A))
+
+
+def probe_firm_scale(v_ego):
+  lo, hi = PROBE_FIRM_FADE_V
+  return float(np.clip((v_ego - lo) / (hi - lo), 0.0, 1.0))
 
 
 def final_a0_dist(a_end=None, a_stock=STOCK_ROLL_DECEL):
