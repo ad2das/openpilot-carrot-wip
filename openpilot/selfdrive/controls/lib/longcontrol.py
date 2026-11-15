@@ -1,7 +1,7 @@
 import math
 import numpy as np
 from openpilot.cereal import car
-from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.hyundai.values import CAR as HYUNDAI_CAR, HyundaiFlags
 from openpilot.common.realtime import DT_CTRL
 from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
@@ -21,6 +21,7 @@ from openpilot.selfdrive.controls.lib.butter_stop import (
   final_profile_travel, final_roll_limit, plan_stop_distance, probe_accel, probe_weak,
   rest_ramp_floor,
 )
+from openpilot.selfdrive.controls.lib.stop_law import StopCtl
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
@@ -51,6 +52,14 @@ FIRM_JERK = 2.0            # m/s^3, cap build rate
 FIRM_RELEASE_JERK = 2.0    # m/s^3, cap relax rate on a soft exit
 FIRM_A = 0.8               # m/s^2, ButterStop final-stop firm-finish decel on classic-CAN Hyundai/Kia
 FINAL_STOP_ENABLED = True  # ButterStop's final stop (firm finish / K5 probe); tests patch this to get the plain-ButterStop arm
+
+# ButterStop stop law (stop_law.py), Palisade only: owns the pid command for a stop behind a stopped
+# or nearly stopped lead from 3.5 m/s down to the ESC standstill flag and steers one continuous decel
+# to it. The taper floor and the firm finish stand aside while it runs. Fitted on the Palisade twin.
+STOP_LAW_ENABLED = True                         # tests patch this to get the pre-law ButterStop arm
+STOP_LAW_CARS = (HYUNDAI_CAR.HYUNDAI_PALISADE,)
+STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the ordinary command after the law lets go
+STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events
 
 
 def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
@@ -175,6 +184,13 @@ class LongControl:
     # Assigned before the first _refresh_butter_stop() call, which reads it.
     self._early_req_capable = CP.brand == "hyundai" and not (CP.flags & HyundaiFlags.CANFD)
     self._final_window_capable = CP.brand == "hyundai" and bool(CP.flags & HyundaiFlags.CANFD)
+    self._stop_law_car = getattr(CP, "carFingerprint", None) in STOP_LAW_CARS
+    self._stop_ctl = None
+    self._stop_release = None
+    self._stop_logged = False
+    self._stop_drop_logged = False
+    self.stop_law = False
+    self.stop_law_last = False
     self._probe_weak_t = 0.0
     self._probe_guard_logged = False
     self._refresh_stopping_accel()
@@ -248,7 +264,9 @@ class LongControl:
     self.final_window = False
     self.early_req = False
     self.firm_a = 0.0
+    self.stop_law = False
     if not self.butter_stop:
+      self._stop_ctl = None
       return
     self.final_stop = FINAL_STOP_ENABLED
     # One switch, two behaviours. Classic-CAN Hyundai/Kia get the firm finish:
@@ -262,6 +280,11 @@ class LongControl:
     # gets nothing from this switch.
     self.early_req = self.final_stop and self._early_req_capable and EARLY_REQ_ENABLED
     self.firm_a = FIRM_A if (self.final_stop and self._early_req_capable) else 0.0
+    self.stop_law = self.final_stop and self._early_req_capable and self._stop_law_car and STOP_LAW_ENABLED
+    if not self.stop_law:
+      self._stop_ctl = None
+    elif self._stop_ctl is None:
+      self._stop_ctl = StopCtl()
     self.final_window = self.final_stop and self._final_window_capable and FINAL_WINDOW_ENABLED
     try:
       dist = float(self.params.get_float("StopDistanceCarrot")) * 0.01
@@ -444,6 +467,35 @@ class LongControl:
     self._final_t += DT_CTRL
     return float(np.clip(u, FINAL_U_MIN, FINAL_U_MAX))
 
+  def _stop_law_accel(self, active, CS, long_plan, t_since_plan, radarState, u_plan):
+    """ButterStop stop-law command for this pid tick, or None when the ordinary path keeps the command."""
+    ctl = self._stop_ctl
+    was_on = ctl.law is not None
+    try:
+      v_ego = float(CS.vEgo)
+      allow = (bool(active) and not bool(CS.gasPressed) and not bool(CS.brakePressed)
+               and not bool(CS.cruiseState.standstill) and not bool(getattr(long_plan, "fcw", False))
+               and 0.0 <= float(t_since_plan) <= MAX_PLAN_AGE)
+      lead = getattr(radarState, "leadOne", None) if radarState is not None else None
+      lead_status = bool(getattr(lead, "status", False))
+      d_rel = float(lead.dRel) if lead_status else None
+      v_lead = float(lead.vLead) if lead_status else float("nan")
+      u = ctl.update(allow, v_ego, float(CS.aEgo), lead_status, d_rel, v_lead,
+                     float(long_plan.aTarget), float(u_plan))
+    except (TypeError, ValueError, AttributeError):
+      ctl.idle()
+      return None
+    if v_ego > STOP_LAW_LOG_RESET_V:
+      self._stop_logged = False
+      self._stop_drop_logged = False
+    if u is not None and not was_on and not self._stop_logged:
+      cloudlog.event("butterStopLaw", vEgo=v_ego, dStop=float(ctl.d_stop), q=float(ctl.q))
+      self._stop_logged = True
+    elif u is None and was_on and not self._stop_drop_logged:
+      cloudlog.event("butterStopLawDrop", why=str(ctl.why), vEgo=v_ego)
+      self._stop_drop_logged = True
+    return u
+
   def update(self, active, CS, long_plan, accel_limits, t_since_plan, radarState):
 
     soft_hold_active = CS.softHoldActive > 0
@@ -544,6 +596,12 @@ class LongControl:
     else:
       self._depart_t = None
       self._depart_floor = None
+
+    if self._stop_ctl is not None and self.long_control_state != LongCtrlState.pid:
+      if self._stop_ctl.law is not None and not self._stop_drop_logged:
+        cloudlog.event("butterStopLawDrop", why="state", vEgo=float(CS.vEgo))
+        self._stop_drop_logged = True
+      self._stop_ctl.idle()
 
     # ButterStop episode bookkeeping. This only decides how much braking the
     # taper may remove while still rolling and how fast the confirmed hold
@@ -707,7 +765,18 @@ class LongControl:
         output_accel = self.coasting.apply(output_accel, relief, DT_CTRL)
       else:
         self.coasting.reset()
-      if butter_floor_value is not None and output_accel < butter_floor_value:
+      stop_u = None
+      if self._stop_ctl is not None:
+        stop_u = self._stop_law_accel(active, CS, long_plan, t_since_plan, radarState, output_accel)
+      self.stop_law_last = stop_u is not None
+      if stop_u is not None:
+        # The stop law owns the command: no taper floor, no firm finish. Do not integrate the speed
+        # error it overrides.
+        self.pid.i = previous_integral
+        output_accel = stop_u
+        self._firm_cap = None
+        self._stop_release = stop_u
+      if stop_u is None and butter_floor_value is not None and output_accel < butter_floor_value:
         # ButterStop taper: only remove braking above the floor, never add any.
         # Freeze the integrator while limited, like the coasting relief.
         self.pid.i = previous_integral
@@ -716,7 +785,7 @@ class LongControl:
       # Off-identity: with the param off and no cap in flight the block is not
       # entered at all, so it cannot even read CS. The _firm_cap half keeps the
       # soft release alive when the param is switched off mid-stop.
-      if self.firm_a > 0.0 or self._firm_cap is not None:
+      if stop_u is None and (self.firm_a > 0.0 or self._firm_cap is not None):
         hard_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
         # getattr, not attribute access: several callers hand update() a partial plan
         # (no .speeds) and a bare read raises on every tick before the gate is even
@@ -746,6 +815,16 @@ class LongControl:
           # Do not integrate the speed error the cap is overriding.
           self.pid.i = previous_integral
           output_accel = self._firm_cap
+      if stop_u is None and self._stop_release is not None:
+        # Soft hand-back after the law lets go: relax at STOP_LAW_RELEASE_JERK; a harder ordinary
+        # command passes at once; pedals or cruise standstill end it at once.
+        self._stop_release += STOP_LAW_RELEASE_JERK * DT_CTRL
+        release_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
+        if self._stop_release >= 0.0 or output_accel <= self._stop_release or release_exit:
+          self._stop_release = None
+        else:
+          self.pid.i = previous_integral
+          output_accel = self._stop_release
       guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
       if guarded > output_accel:
         # Do not integrate the speed error the guard is overriding.
@@ -754,5 +833,9 @@ class LongControl:
 
     if self.long_control_state != LongCtrlState.pid:
       self._firm_cap = None
+      self._stop_release = None
+      self.stop_law_last = False
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
+    if self._stop_ctl is not None:
+      self._stop_ctl.commit(float(self.last_output_accel))
     return self.last_output_accel, a_target_ff, j_target_now
