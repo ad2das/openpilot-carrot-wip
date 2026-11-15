@@ -327,6 +327,9 @@ def test_restop_during_the_wait_keeps_requesting_the_restart(camera):
   assert controller.isg_mode == "depart"
 
   cs.isgAutoStop = False
+  values = send(camera, controller, cs)
+  assert values["StopReq"] == 1
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
   for _ in range(ISG_POST_FRAMES - 1):
     values = send(camera, controller, cs)
     assert values["StopReq"] == 1
