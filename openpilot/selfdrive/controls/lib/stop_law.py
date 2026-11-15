@@ -57,12 +57,14 @@ def dw(v):
 
 
 class StopLaw:
-  def __init__(self, a0, u_hist):
-    """a0: measured accel at entry. u_hist: the last applied commands, oldest first, len >= ND + 1."""
+  def __init__(self, a0, u_hist, tol_lock=0.0):
+    """a0: measured accel at entry. u_hist: the last applied commands, oldest first, len >= ND + 1.
+    tol_lock: metres the locked hold may run past the stop point before it brakes firmer than A_H."""
     uh = [float(x) for x in u_hist]
     if len(uh) < ND + 1:
       raise ValueError("u_hist needs at least ND + 1 samples")
     self.uh = uh
+    self.tol_lock = float(tol_lock)
     self.u_prev = uh[-1]
     self.r_prev = float(a0)
     self.locked = False
@@ -117,6 +119,11 @@ class StopLaw:
         r_t = -A_MIN
     else:
       self.locked = True
+      if self.tol_lock > 0.0:
+        den_l = d_stop + self.tol_lock - X_CORR
+        if den_l < DEN_FLOOR:
+          den_l = DEN_FLOOR
+        a_kin = -v * v / (2.0 * den_l)
       r_t = a_kin if a_kin < A_H else A_H      # never softer than a_kin once a_kin is firmer than A_H
     dr = r_t - self.r_prev
     if dr < 0.0:
@@ -178,6 +185,7 @@ CFG = dict(
   LEAD_JUMP_M=1.5,     # m (butter_stop.LEAD_JUMP_M)
   LEAD_RAW_ALLOW=0.5,  # m (butter_stop.LEAD_RAW_ALLOW)
   JUMP_VERIFY_S=0.5,   # s (butter_stop.LeadPosFilter.JUMP_VERIFY_S)
+  TOL_LOCK=0.3,        # m, once locked the hold may run this far past the stop point before braking firmer than A_H
 )
 UH_KEEP = 64           # applied-command history kept for seeding the law (>= ND + 1)
 
@@ -277,7 +285,7 @@ class StopCtl:
               and q >= c["Q_ENTER"] and (a_target < 0.0 or not c["NEED_PLAN_BRAKE"])
               and len(self.uh) >= ND + 1):
         return None
-      self.law = StopLaw(a, self.uh[-UH_KEEP:])
+      self.law = StopLaw(a, self.uh[-UH_KEEP:], c["TOL_LOCK"])
       self.t_flag = 0.0
       self.frozen = False
       self.n_enter += 1

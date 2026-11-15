@@ -446,7 +446,7 @@ _STOPCTL_N = int(np.load(os.path.join(FIX, "stopctl_fixture.npz"), allow_pickle=
 @pytest.mark.parametrize("i", range(_STOPCTL_N))
 def test_t11_stopctl_fixture(i):
   z = np.load(os.path.join(FIX, "stopctl_fixture.npz"), allow_pickle=False)
-  ctl = SL.StopCtl(**json.loads(str(z["c%d_cfg" % i])))
+  ctl = SL.StopCtl(**dict(json.loads(str(z["c%d_cfg" % i])), TOL_LOCK=0.0))  # recorded with the D7 law at TOL_LOCK 0
   for u0 in z["c%d_warm" % i]:
     ctl.commit(float(u0))
   mism = 0
@@ -463,6 +463,56 @@ def test_t11_stopctl_fixture(i):
     ctl.commit(u_app)
   assert mism == 0
   assert worst <= 1e-9
+
+
+_STOPCTL_TOL_N = int(np.load(os.path.join(FIX, "stopctl_tol_fixture.npz"), allow_pickle=False)["n"])
+
+
+def _replay_ctl(path, i, extra):
+  z = np.load(path, allow_pickle=False)
+  ctl = SL.StopCtl(**dict(json.loads(str(z["c%d_cfg" % i])), **extra))
+  for u0 in z["c%d_warm" % i]:
+    ctl.commit(float(u0))
+  mism = 0
+  worst = 0.0
+  for row in z["c%d_io" % i]:
+    allow, v, a, ls, d_rel, v_lead, a_tgt, u_plan, u_exp, u_app = (float(x) for x in row)
+    u = ctl.update(bool(allow), v, a, bool(ls), d_rel, v_lead, a_tgt, u_plan)
+    if math.isnan(u_exp):
+      mism += u is not None
+    elif u is None:
+      mism += 1
+    else:
+      worst = max(worst, abs(u - u_exp))
+    ctl.commit(u_app)
+  return mism, worst
+
+
+@pytest.mark.parametrize("i", range(_STOPCTL_TOL_N))
+def test_t13a_stopctl_tol_fixture_at_default(i):
+  # recorded with TWIN/PORT2/stop_law2.py at TOL_LOCK 0.3 (the law the sweep ran); stored cfg omits TOL_LOCK
+  mism, worst = _replay_ctl(os.path.join(FIX, "stopctl_tol_fixture.npz"), i, {})
+  assert mism == 0
+  assert worst <= 1e-9
+
+
+def test_t13b_tol_lock_default_and_teeth():
+  assert SL.CFG["TOL_LOCK"] == 0.3
+  worst = max(_replay_ctl(os.path.join(FIX, "stopctl_tol_fixture.npz"), i, {"TOL_LOCK": 0.0})[1] for i in range(_STOPCTL_TOL_N))
+  assert worst > 1e-3
+
+
+def test_t13c_locked_hold_is_softer_with_tol():
+  law0 = SL.StopLaw(-0.7, [-0.7] * 64, 0.0)
+  law3 = SL.StopLaw(-0.7, [-0.7] * 64, 0.3)
+  for _ in range(40):
+    u0 = law0.step(0.6, -0.7, 0.15)
+    u3 = law3.step(0.6, -0.7, 0.15)
+    assert law3.r >= law0.r - 1e-12
+    law0.commit(u0)
+    law3.commit(u3)
+  assert law0.locked and law3.locked
+  assert law3.r - law0.r > 0.5
 
 
 def test_t12a_dt_matches_controls_tick():

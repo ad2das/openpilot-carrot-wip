@@ -223,16 +223,19 @@ def _run(fixture, final, firm_a=None):
   # resolution is what decides firm_a, so it must run after the CP patch.
   saved_firm_a = longcontrol_module.FIRM_A
   saved_final = longcontrol_module.FINAL_STOP_ENABLED
+  saved_law = longcontrol_module.STOP_LAW_ENABLED
   if firm_a is not None:
     longcontrol_module.FIRM_A = float(firm_a)
   try:
     longcontrol_module.FINAL_STOP_ENABLED = bool(final)
+    longcontrol_module.STOP_LAW_ENABLED = False  # gate the pre-law firm arm; the stop law has its own gates
     loop.long_control._early_req_capable = True
     loop.long_control._refresh_butter_stop()
     run = loop.run()
   finally:
     longcontrol_module.FIRM_A = saved_firm_a
     longcontrol_module.FINAL_STOP_ENABLED = saved_final
+    longcontrol_module.STOP_LAW_ENABLED = saved_law
   run["rows"] = loop.rows
   run["firm_a"] = float(loop.long_control.firm_a)
   run["early_req"] = bool(loop.long_control.early_req)
