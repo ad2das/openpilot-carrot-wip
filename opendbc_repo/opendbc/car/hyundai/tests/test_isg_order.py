@@ -307,9 +307,10 @@ def test_gas_pedal_hands_back_but_keeps_the_request(camera):
   base_values = decode(payload(camera, b, reference, stopping=False, accel=0.5, override=True))
   assert a.isg_mode == "post"
   assert live_values["CRUSE_INFO_SET_2"] == CIS2_RESTART
-  # Everything but the request byte is openpilot's own packet.
-  live_values.pop("CRUSE_INFO_SET_2")
-  base_values.pop("CRUSE_INFO_SET_2")
+  # Everything but the request byte (and the checksum it feeds) is openpilot's own packet.
+  for key in ("CRUSE_INFO_SET_2", "CHECKSUM"):
+    live_values.pop(key)
+    base_values.pop(key)
   assert live_values == base_values
 
   at_rest(live, 0.2)
