@@ -59,6 +59,16 @@ def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, 
     values.update(StopReq=command.stop_req, aReqRaw=command.raw, aReqValue=command.value,
                   AccelLimitBandUpper=0.0, AccelLimitBandLower=command.lower)
 
+  isg_event = controller.isg_restart_order(
+    values, isg_auto_stop=bool(getattr(CS, "isgAutoStop", False)), speed=speed,
+    ok=finite and CS.out.canValid and not CS.out.parkingBrake, gas=CS.out.gasPressed, brake=CS.out.brakePressed,
+    drive=str(CS.out.gearShifter) == "drive", releasing=controller.release_frames > 0)
+  if isg_event:
+    carlog.warning({"event": "carrot_isg", "isg": isg_event, "mode": controller.isg_mode, "speed": speed,
+                    "brake": CS.out.brakePressed, "isgState": getattr(CS, "isgState", -1),
+                    "ACCMode": values["ACCMode"], "StopReq": values["StopReq"],
+                    "CIS2": values.get("CRUSE_INFO_SET_2")})
+
   # Apply only to the final packet, after approach and interlocks select StopReq.
   # The first StopReq frame already carries zero Raw/Value; Upper may rise next.
   values["JerkUpperLimit"] = controller.limit_scc_jerk_upper(values["StopReq"], values["JerkUpperLimit"])

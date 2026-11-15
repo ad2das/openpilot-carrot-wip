@@ -9,6 +9,7 @@ from opendbc.car import Bus, create_button_events, structs, DT_CTRL
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
+from opendbc.car.hyundai.stopping import read_isg
 from opendbc.car.hyundai.steering_touch import HyundaiSteeringTouch
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
                                        EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
@@ -186,6 +187,9 @@ class CarState(CarStateBase):
     # for CANFD parsing
     self.scc_control = None
     self.canfdSccHoldActive = False
+    self.isg_status = None
+    self.isgState = -1
+    self.isgAutoStop = False
     self.lfa = None
     self.lfa_alt = None
     self.lfahda_cluster = None
@@ -462,6 +466,7 @@ class CarState(CarStateBase):
         elif self.controls_ready_count == 126:
           add_and_cache(self.cp, "CRUISE_BUTTONS_ALT2", "cruise_buttons_alt2", ignore_counter = True)
           add_and_cache(self.cp, "TRAILER_STATUS", "trailer_status", ignore_counter = True)
+          add_and_cache(self.cp, "ISG_STATUS", "isg_status", ignore_counter = True)
 
     if canfd and self.CP.flags & HyundaiFlags.CANFD:
       self._discover_canfd_camera_tx_messages(can_parsers[Bus.cam])
@@ -1235,6 +1240,7 @@ class CarState(CarStateBase):
 
     avh_state = cp.vl["ESP_STATUS"]["AVH_Sta"]
     self.canfdSccHoldActive = avh_state == 1
+    self.isgState, self.isgAutoStop = read_isg(cp, self.isg_status)
     avh_lamp = cp.vl["ESP_STATUS"]["AVH_LAMP"]
     ret.brakeHoldActive, self.canfdAvhReleaseGraceFrames = update_canfd_auto_hold_interlock_state(
       avh_state, avh_lamp, self.canfdOemBrakeHoldLatched, self.canfdAvhReleaseGraceFrames,

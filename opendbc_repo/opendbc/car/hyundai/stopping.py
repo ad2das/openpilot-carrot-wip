@@ -3,6 +3,7 @@
 Thresholds below are experimental, not OEM acceptance conditions. This controller
 cannot guarantee stopping; ECU response must be measured on the vehicle.
 """
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -46,6 +47,33 @@ STALL_T = 1.0         # s at ZERO_SPEED < speed <= MOVING_SPEED without AVH afte
 STALL_ZERO_FRAMES = 10      # 0.2 s at <= ZERO_SPEED ends a stall rescue
 STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back to StopReq 1
 
+# K5 ISG restart order (routes 6d1 10-24 18:35, 734 11-15 19:11): with the engine ISG auto-stopped under an openpilot
+# standstill hold, a release (departure StopReq 1->0, or a driver brake) while CRUSE_INFO_SET_2 was still 1 and before a
+# crank made the ISG give up ~0.65 s later and demand a manual restart. The stock SCC requests the restart
+# (CRUSE_INFO_SET_2 = 2) while it still holds and lets go when the engine leaves auto-stop (W-ISG4 census, 60 K5 routes).
+ISG_STATE_AUTO_STOP = 8       # ISG_STATUS (0x0B5) byte 15 while the engine is auto-stopped (16 = restarting)
+ISG_STALE_NS = 500_000_000    # ISG_STATUS older than this reads as unknown
+CIS2_RESTART = 2              # SCC_CONTROL CRUSE_INFO_SET_2: stock engine restart request
+ISG_BRAKE_WAIT_FRAMES = 50    # 1.0 s: a driver-brake release waits at most this long for the restart
+ISG_DEPART_LOG_FRAMES = 150   # 3.0 s: log once when a departure still waits for the engine
+ISG_POST_FRAMES = 100         # 2.0 s: keep the restart request after the restart until the car moves
+
+
+def parse_isg_state(state, fresh: bool = True) -> tuple[int, bool]:
+  """ISG_STATUS.ISG_STATE -> (state, auto-stopped). (-1, False) when missing, stale or not finite."""
+  if state is None or not fresh or not math.isfinite(state):
+    return -1, False
+  state = int(state)
+  return state, state == ISG_STATE_AUTO_STOP
+
+
+def read_isg(cp, isg_status) -> tuple[int, bool]:
+  """ISG state from the pt parser; isg_status is the parser.vl["ISG_STATUS"] dict or None when never seen."""
+  if isg_status is None:
+    return -1, False
+  fresh = cp.last_nonempty_nanos - cp.ts_nanos["ISG_STATUS"]["ISG_STATE"] <= ISG_STALE_NS
+  return parse_isg_state(isg_status["ISG_STATE"], fresh)
+
 
 class StopPhase(StrEnum):
   idle = "idle"
@@ -72,6 +100,10 @@ class CanfdStopping:
     # ButterStop on: keep sending the openpilot request through approach/request
     # so the soft taper reaches the ESC.
     self.pass_accel = False
+    # ISG restart order: survives episode resets and follows the final packet.
+    self.isg_mode = ""          # "", "depart", "brake", "expired", "post"
+    self.isg_frames = 0
+    self.isg_out_stop_req = 0
     self.reset()
 
   def limit_scc_jerk_upper(self, stop_req: int, jerk_upper: float) -> float:
@@ -198,3 +230,57 @@ class CanfdStopping:
     raw = min(accel, 0.0) if soft else min(accel, APPROACH_ACCEL)
     value = min(0.0, max(previous_value - jerk_l * DT, min(raw, previous_value + jerk_u * DT)))
     return StopCommand(0, raw, value, 0.0)
+
+  def isg_restart_order(self, values: dict, *, isg_auto_stop: bool, speed: float, ok: bool,
+                        gas: bool, brake: bool, drive: bool, releasing: bool) -> str:
+    """Hold a standstill release until the ISG-stopped engine restarts, like the stock SCC.
+
+    values: the final SCC_CONTROL signals, changed in place. ok: finite sensors, CAN valid, no parking brake.
+    releasing: the stop controller is debouncing a release. Returns a log event name, or "".
+    """
+    event = ""
+    leaving = brake or values["ACCMode"] != 1
+    at_rest = ok and drive and not gas and speed <= MOVING_SPEED
+    released = self.isg_out_stop_req == 1 and values["StopReq"] == 0
+
+    # 1) end a wait when the engine left auto-stop or the driver / sensors took over
+    if self.isg_mode in ("depart", "brake") and not (isg_auto_stop and at_rest):
+      restarted = not isg_auto_stop
+      event = "isg_restarted" if restarted else "isg_released"
+      self.isg_mode = "post" if (restarted and at_rest and not leaving and self.isg_mode == "depart") else ""
+      self.isg_frames = 0
+    elif self.isg_mode == "expired" and (not (isg_auto_stop and at_rest) or (values["StopReq"] == 1 and not leaving)):
+      self.isg_mode = ""          # a new hold after a brake timeout is protected again
+      self.isg_frames = 0
+    elif self.isg_mode == "post" and (not at_rest or leaving or self.isg_frames >= ISG_POST_FRAMES):
+      self.isg_mode = ""
+      self.isg_frames = 0
+
+    # 2) start or switch a wait
+    if isg_auto_stop and at_rest:
+      if self.isg_mode in ("", "post") and (released or (releasing and values["StopReq"] == 1)):
+        self.isg_mode = "brake" if leaving else "depart"
+        self.isg_frames = 0
+        event = "isg_wait_" + self.isg_mode
+      elif self.isg_mode == "depart" and leaving:
+        self.isg_mode = "brake"
+        self.isg_frames = 0
+        event = "isg_wait_brake"
+
+    # 3) apply
+    if self.isg_mode in ("depart", "brake"):
+      self.isg_frames += 1
+      if self.isg_mode == "brake" and self.isg_frames > ISG_BRAKE_WAIT_FRAMES:
+        self.isg_mode = "expired"
+        event = "isg_brake_timeout"
+      else:
+        if self.isg_mode == "depart" and self.isg_frames == ISG_DEPART_LOG_FRAMES:
+          event = "isg_depart_slow"
+        values.update(ACCMode=1, StopReq=1, aReqRaw=0.0, aReqValue=0.0, AccelLimitBandUpper=0.0,
+                      AccelLimitBandLower=STOP_LOWER_BAND, CRUSE_INFO_SET_2=CIS2_RESTART)
+    elif self.isg_mode == "post":
+      self.isg_frames += 1
+      values["CRUSE_INFO_SET_2"] = CIS2_RESTART
+
+    self.isg_out_stop_req = values["StopReq"]
+    return event
