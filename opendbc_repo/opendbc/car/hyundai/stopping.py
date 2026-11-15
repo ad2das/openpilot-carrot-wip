@@ -51,12 +51,15 @@ STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back
 # standstill hold, a release (departure StopReq 1->0, or a driver brake) while CRUSE_INFO_SET_2 was still 1 and before a
 # crank made the ISG give up ~0.65 s later and demand a manual restart. The stock SCC requests the restart
 # (CRUSE_INFO_SET_2 = 2) while it still holds and lets go when the engine leaves auto-stop (W-ISG4 census, 60 K5 routes).
+# Under the driver's brake the engine stays off even with CRUSE_INFO_SET_2 = 2 and restarts at the brake release
+# (route 722 392-399 s, 6.7 s held, outcome normal), so a brake wait has no time limit. After any wait ends (restart,
+# gas, gear change) the restart request stays 2 while the engine is still auto-stopped: a release with the request
+# already 2 is accepted (722 393.174, 21/21 ordered releases).
 ISG_STATE_AUTO_STOP = 8       # ISG_STATUS (0x0B5) byte 15 while the engine is auto-stopped (16 = restarting)
 ISG_STALE_NS = 500_000_000    # ISG_STATUS older than this reads as unknown
 CIS2_RESTART = 2              # SCC_CONTROL CRUSE_INFO_SET_2: stock engine restart request
-ISG_BRAKE_WAIT_FRAMES = 50    # 1.0 s: a driver-brake release waits at most this long for the restart
-ISG_DEPART_LOG_FRAMES = 150   # 3.0 s: log once when a departure still waits for the engine
-ISG_POST_FRAMES = 100         # 2.0 s: keep the restart request after the restart until the car moves
+ISG_WAIT_LOG_FRAMES = 150     # 3.0 s: log once when a wait still holds
+ISG_POST_FRAMES = 100         # 2.0 s: keep the restart request this long after the engine runs, unless the car moves first
 
 
 def parse_isg_state(state, fresh: bool = True) -> tuple[int, bool]:
@@ -101,7 +104,7 @@ class CanfdStopping:
     # so the soft taper reaches the ESC.
     self.pass_accel = False
     # ISG restart order: survives episode resets and follows the final packet.
-    self.isg_mode = ""          # "", "depart", "brake", "expired", "post"
+    self.isg_mode = ""          # "", "depart", "brake", "post"
     self.isg_frames = 0
     self.isg_out_stop_req = 0
     self.reset()
@@ -243,16 +246,13 @@ class CanfdStopping:
     at_rest = ok and drive and not gas and speed <= MOVING_SPEED
     released = self.isg_out_stop_req == 1 and values["StopReq"] == 0
 
-    # 1) end a wait when the engine left auto-stop or the driver / sensors took over
+    # 1) end a wait when the engine left auto-stop or the driver / sensors took over; keep the request in "post"
     if self.isg_mode in ("depart", "brake") and not (isg_auto_stop and at_rest):
-      restarted = not isg_auto_stop
-      event = "isg_restarted" if restarted else "isg_released"
-      self.isg_mode = "post" if (restarted and at_rest and not leaving and self.isg_mode == "depart") else ""
+      event = "isg_restarted" if not isg_auto_stop else "isg_released"
+      self.isg_mode = "post" if ok else ""
       self.isg_frames = 0
-    elif self.isg_mode == "expired" and (not (isg_auto_stop and at_rest) or (values["StopReq"] == 1 and not leaving)):
-      self.isg_mode = ""          # a new hold after a brake timeout is protected again
-      self.isg_frames = 0
-    elif self.isg_mode == "post" and (not at_rest or leaving or self.isg_frames >= ISG_POST_FRAMES):
+    elif self.isg_mode == "post" and (not ok or speed > MOVING_SPEED
+                                      or (not isg_auto_stop and self.isg_frames >= ISG_POST_FRAMES)):
       self.isg_mode = ""
       self.isg_frames = 0
 
@@ -264,22 +264,18 @@ class CanfdStopping:
         event = "isg_wait_" + self.isg_mode
       elif self.isg_mode == "depart" and leaving:
         self.isg_mode = "brake"
-        self.isg_frames = 0
         event = "isg_wait_brake"
 
     # 3) apply
     if self.isg_mode in ("depart", "brake"):
       self.isg_frames += 1
-      if self.isg_mode == "brake" and self.isg_frames > ISG_BRAKE_WAIT_FRAMES:
-        self.isg_mode = "expired"
-        event = "isg_brake_timeout"
-      else:
-        if self.isg_mode == "depart" and self.isg_frames == ISG_DEPART_LOG_FRAMES:
-          event = "isg_depart_slow"
-        values.update(ACCMode=1, StopReq=1, aReqRaw=0.0, aReqValue=0.0, AccelLimitBandUpper=0.0,
-                      AccelLimitBandLower=STOP_LOWER_BAND, CRUSE_INFO_SET_2=CIS2_RESTART)
+      if self.isg_frames == ISG_WAIT_LOG_FRAMES:
+        event = "isg_wait_slow"
+      values.update(ACCMode=1, StopReq=1, aReqRaw=0.0, aReqValue=0.0, AccelLimitBandUpper=0.0,
+                    AccelLimitBandLower=STOP_LOWER_BAND, CRUSE_INFO_SET_2=CIS2_RESTART)
     elif self.isg_mode == "post":
-      self.isg_frames += 1
+      if not isg_auto_stop:
+        self.isg_frames += 1    # the 2 s count starts once the engine runs
       values["CRUSE_INFO_SET_2"] = CIS2_RESTART
 
     self.isg_out_stop_req = values["StopReq"]

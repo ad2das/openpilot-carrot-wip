@@ -14,8 +14,8 @@ import pytest
 from opendbc.can.packer import CANPacker
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai import hyundaicanfd
-from opendbc.car.hyundai.stopping import (CIS2_RESTART, ISG_BRAKE_WAIT_FRAMES, ISG_POST_FRAMES, STOP_LOWER_BAND,
-                                          CanfdStopping, parse_isg_state, read_isg)
+from opendbc.car.hyundai.stopping import (CIS2_RESTART, ISG_POST_FRAMES, STOP_LOWER_BAND, CanfdStopping,
+                                          parse_isg_state, read_isg)
 from opendbc.car.hyundai.tests.test_stopping import make_cs, send
 
 CIS2_OFF = 1
@@ -73,6 +73,15 @@ def payload(camera, controller, cs, *, enabled=True, override=False, stopping=Tr
     msg, _ = hyundaicanfd.create_acc_control(packer, can, enabled, previous_value, accel, stopping, override, 30.0,
                                              hud, 2.0, 1.0, cs, controller, accel_value_last=previous_value)
   return None if msg is None else msg[1]
+
+
+def decode(packet):
+  """Decode packed SCC_CONTROL bytes through a CANParser round-trip."""
+  if packet is None:
+    return None
+  parser = CANParser("hyundai_canfd_generated", [("SCC_CONTROL", 50)], 0)
+  parser.update([1_000_000_000, [(416, packet, 0)]])
+  return parser.vl["SCC_CONTROL"]
 
 
 def held(camera, cs):
@@ -198,55 +207,67 @@ def test_packets_match_the_controller_without_the_isg_order(camera, auto_stop):
       assert left != right, f"frame {frame}: the ISG order never fired"
 
 
-# --- T3: a driver brake waits at most 1.0 s -------------------------------
+# --- T3: a driver brake holds until the engine restarts (no time limit) ----
 
 @pytest.mark.parametrize("camera", [True, False])
-def test_brake_release_waits_one_second_then_lets_go(camera, monkeypatch):
-  events = []
-  monkeypatch.setattr(hyundaicanfd.carlog, "warning", lambda message: events.append(message))
+def test_brake_wait_holds_until_the_engine_restarts(camera):
   cs = isg_cs()
   controller, _ = held(camera, cs)
   cs.out.brakePressed = True
 
-  for frame in range(1, ISG_BRAKE_WAIT_FRAMES + 1):
-    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} released during the brake wait"
+  # Route 722 held 6.7 s under the brake; 500 frames is 10 s and must all hold.
+  for frame in range(1, 501):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} released while the engine was off"
 
-  values = send(camera, controller, cs, enabled=False)
-  assert values["StopReq"] == 0
-  assert values["ACCMode"] == 0
-  assert values["CRUSE_INFO_SET_2"] == base_cis2(camera), "a brake release gets no post phase"
-  assert controller.isg_mode == "expired"
-
-  for _ in range(10):
-    assert send(camera, controller, cs, enabled=False)["StopReq"] == 0
-  timeouts = isg_events(events, "isg_brake_timeout")
-  assert len(timeouts) == 1, timeouts
-  assert timeouts[0]["mode"] == "expired"
-
-
-@pytest.mark.parametrize("camera", [True, False])
-def test_brake_wait_ends_when_the_engine_restarts(camera):
-  cs = isg_cs()
-  controller, _ = held(camera, cs)
-  cs.out.brakePressed = True
-  for _ in range(10):
-    assert_hold(send(camera, controller, cs, enabled=False))
+  cs.out.brakePressed = False
+  for frame in range(10):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"brake-release frame {frame}"
+  assert controller.isg_mode == "brake"
 
   cs.isgAutoStop = False
   values = send(camera, controller, cs, enabled=False)
+  assert values["ACCMode"] == 0, "the wait must hand the packet back"
   assert values["StopReq"] == 0
-  assert values["ACCMode"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART, "the request must outlive the release"
+  assert controller.isg_mode == "post"
+
+  for _ in range(ISG_POST_FRAMES - 1):
+    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  values = send(camera, controller, cs, enabled=False)
   assert values["CRUSE_INFO_SET_2"] == base_cis2(camera)
   assert controller.isg_mode == ""
-  for _ in range(5):
-    assert send(camera, controller, cs, enabled=False)["StopReq"] == 0
-  assert controller.isg_mode == "", "a brake release must not open a post phase"
 
-
-# --- T4: a brake during a departure wait restarts the clock ----------------
 
 @pytest.mark.parametrize("camera", [True, False])
-def test_brake_during_a_departure_wait_restarts_the_clock(camera):
+def test_gear_change_during_a_brake_wait_keeps_the_request(camera):
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  for _ in range(20):
+    assert_hold(send(camera, controller, cs, enabled=False))
+
+  cs.out.gearShifter = "neutral"
+  values = send(camera, controller, cs, enabled=False)
+  assert values["ACCMode"] == 0, "a gear change hands the packet back"
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+  for frame in range(300):
+    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"frame {frame}"
+
+  cs.isgAutoStop = False
+  for frame in range(ISG_POST_FRAMES):
+    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"post frame {frame}"
+  assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == base_cis2(camera)
+
+
+# --- T4: a brake during a departure wait switches to the brake wait ---------
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_brake_during_a_departure_wait_switches_and_keeps_holding(camera, monkeypatch):
+  events = []
+  monkeypatch.setattr(hyundaicanfd.carlog, "warning", lambda message: events.append(message))
   cs = isg_cs()
   controller, _ = held(camera, cs)
   for _ in range(20):
@@ -254,31 +275,46 @@ def test_brake_during_a_departure_wait_restarts_the_clock(camera):
   assert controller.isg_mode == "depart"
 
   cs.out.brakePressed = True
-  for frame in range(1, ISG_BRAKE_WAIT_FRAMES + 1):
+  for frame in range(1, 201):
     assert_hold(send(camera, controller, cs, stopping=False, accel=0.5)), f"frame {frame}"
-  values = send(camera, controller, cs, stopping=False, accel=0.5)
-  assert values["StopReq"] == 0
-  assert values["CRUSE_INFO_SET_2"] == base_cis2(camera)
-  assert controller.isg_mode == "expired"
+  assert controller.isg_mode == "brake"
+  switches = isg_events(events, "isg_wait_brake")
+  assert len(switches) == 1, switches
 
 
-# --- T5: the gas pedal keeps the plain release -----------------------------
+# --- T5: the gas pedal hands the packet back but keeps the request ---------
 
 @pytest.mark.parametrize("camera", [True, False])
-def test_gas_pedal_keeps_the_plain_release(camera):
+def test_gas_pedal_hands_back_but_keeps_the_request(camera):
   live, reference = isg_cs(), isg_cs()
   a, b = CanfdStopping(), isg_off(CanfdStopping())
   for cs in (live, reference):
     cs.canfdSccHoldActive = True
 
+  # Hold, then a departure wait, so gas interrupts a running wait.
   for _ in range(3):
     assert payload(camera, a, live, stopping=True, accel=-0.5) == \
            payload(camera, b, reference, stopping=True, accel=-0.5)
+  for _ in range(3):
+    assert payload(camera, a, live, stopping=False, accel=0.5) != \
+           payload(camera, b, reference, stopping=False, accel=0.5)
+  assert a.isg_mode == "depart"
+
   for cs in (live, reference):
     cs.out.gasPressed = True
-  for frame in range(5):
-    assert payload(camera, a, live, stopping=False, accel=0.5, override=True) == \
-           payload(camera, b, reference, stopping=False, accel=0.5, override=True), f"frame {frame}"
+
+  live_values = decode(payload(camera, a, live, stopping=False, accel=0.5, override=True))
+  base_values = decode(payload(camera, b, reference, stopping=False, accel=0.5, override=True))
+  assert a.isg_mode == "post"
+  assert live_values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  # Everything but the request byte is openpilot's own packet.
+  live_values.pop("CRUSE_INFO_SET_2")
+  base_values.pop("CRUSE_INFO_SET_2")
+  assert live_values == base_values
+
+  at_rest(live, 0.2)
+  at_rest(reference, 0.2)
+  assert decode(payload(camera, a, live, stopping=False, accel=0.5, override=True))["CRUSE_INFO_SET_2"] == base_cis2(camera)
   assert a.isg_mode == ""
 
 
@@ -299,7 +335,7 @@ def test_untouched_sequences_are_byte_identical(camera, case):
   assert a.isg_mode == "", case
 
 
-# --- T7: a long departure wait keeps holding ------------------------------
+# --- T7: a long wait keeps holding and logs once ---------------------------
 
 @pytest.mark.parametrize("camera", [True, False])
 def test_long_departure_wait_holds_and_logs_once(camera, monkeypatch):
@@ -309,7 +345,20 @@ def test_long_departure_wait_holds_and_logs_once(camera, monkeypatch):
   controller, _ = held(camera, cs)
   for frame in range(1, 401):
     assert_hold(send(camera, controller, cs, stopping=False, accel=0.5)), f"frame {frame}"
-  slow = isg_events(events, "isg_depart_slow")
+  slow = isg_events(events, "isg_wait_slow")
+  assert len(slow) == 1, slow
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_long_brake_wait_holds_and_logs_once(camera, monkeypatch):
+  events = []
+  monkeypatch.setattr(hyundaicanfd.carlog, "warning", lambda message: events.append(message))
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  for frame in range(1, 401):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame}"
+  slow = isg_events(events, "isg_wait_slow")
   assert len(slow) == 1, slow
 
 
@@ -340,56 +389,51 @@ def test_restop_during_the_wait_keeps_requesting_the_restart(camera):
 
 # --- T9: guards block the ISG override --------------------------------------
 
-GUARDS = {
-  "nan_speed": dict(speed=float("nan")),
-  "can_invalid": dict(canValid=False),
-  "parking_brake": dict(parkingBrake=True),
-  "reverse": dict(gearShifter="reverse"),
-}
+DOES_NOT_BLOCK = ("nan_speed", "can_invalid", "parking_brake")
+
+
+def guarded_cs(**out):
+  cs = isg_cs()
+  for name, value in out.items():
+    if name == "speed":
+      at_rest(cs, value)
+    else:
+      setattr(cs.out, name, value)
+  return cs
 
 
 @pytest.mark.parametrize("camera", [True, False])
-@pytest.mark.parametrize("guard", list(GUARDS))
-def test_guards_block_the_isg_override(camera, guard):
-  def sequence(with_guard):
-    cs = isg_cs(**GUARDS[guard]) if with_guard else isg_cs()
-    if "speed" in GUARDS[guard] and with_guard:
-      at_rest(cs, GUARDS[guard]["speed"])
+@pytest.mark.parametrize("guard", DOES_NOT_BLOCK)
+def test_guards_give_no_hold_and_no_post(camera, guard):
+  """A sensor/CAN/parking-brake fault must not hold the car, and must not leave a post request behind."""
+  out = {"nan_speed": dict(speed=float("nan")), "can_invalid": dict(canValid=False),
+         "parking_brake": dict(parkingBrake=True)}[guard]
+
+  for with_guard in (False, True):
+    cs = guarded_cs(**out) if with_guard else isg_cs()
     a, b = CanfdStopping(), isg_off(CanfdStopping())
     ticks = [dict(stopping=True, accel=-0.5)] * 2 + [dict(stopping=False, accel=0.5)] * 6
     left = [payload(camera, a, cs, **tick) for tick in ticks]
     right = [payload(camera, b, cs, **tick) for tick in ticks]
-    return left, right, a.isg_mode
+    if not with_guard:
+      assert left != right, f"{guard}: the control sequence never fired"
+      assert a.isg_mode == "depart", guard
+    else:
+      assert left == right, f"{guard}: the ISG order overrode a guarded frame"
+      assert a.isg_mode == "", guard
 
-  live, off, mode = sequence(True)
-  assert live == off, f"{guard}: the ISG order overrode a guarded frame"
-  assert mode == "", guard
-
-  live, off, mode = sequence(False)
-  assert live != off, f"{guard}: the control sequence never fired"
-  assert mode == "depart", guard
-
-
-# --- T10: a brake timeout does not disarm the next stop --------------------
 
 @pytest.mark.parametrize("camera", [True, False])
-def test_expired_brake_wait_protects_a_new_hold(camera):
-  cs = isg_cs()
-  controller, _ = held(camera, cs)
-  cs.out.brakePressed = True
-  for _ in range(ISG_BRAKE_WAIT_FRAMES + 1):
-    send(camera, controller, cs, enabled=False)
-  assert controller.isg_mode == "expired"
-  assert send(camera, controller, cs, enabled=False)["StopReq"] == 0
-
-  cs.out.brakePressed = False
-  for _ in range(12):
-    assert send(camera, controller, cs)["StopReq"] == 1
-  assert controller.isg_mode == "", "a new hold must clear the expired wait"
-
-  for _ in range(10):
-    assert_hold(send(camera, controller, cs, stopping=False, accel=0.5))
-  assert controller.isg_mode == "depart"
+def test_reverse_without_a_wait_is_untouched(camera):
+  live, reference = isg_cs(), isg_cs()
+  for cs in (live, reference):
+    cs.out.gearShifter = "reverse"
+    cs.canfdSccHoldActive = True
+  a, b = CanfdStopping(), isg_off(CanfdStopping())
+  for frame in range(12):
+    assert payload(camera, a, live, stopping=False, accel=0.5) == \
+           payload(camera, b, reference, stopping=False, accel=0.5), f"frame {frame}"
+  assert a.isg_mode == ""
 
 
 # --- T11: the state parser --------------------------------------------------
