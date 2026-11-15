@@ -62,6 +62,12 @@ G1_GAP_SLACK = 0.05          # m, gap_stop(1) may come this much closer
 G3_WINDOW = 0.3              # s, mean command before standstill
 G3_MAX_DECEL = -0.15         # m/s^2, arm-1 mean command floor
 CLASSIC_CAN_CARS = ("Palisade",)  # the final stop hands off early on these; the rest open the window
+# K5 gates are report-only since the K5 final stop runs pid to rest (W-K5F1, 2026-11-16): this fitted
+# plant's K5 stopping branch brakes -1.0 m/s^2 above 0.40 m/s (fitted_plant.py a_stop / v0 / dv_stop),
+# while the real K5 under StopReq 1 while rolling decelerates only -0.02..-0.10 (W-K5R1 Q4), so the
+# stock arm here stops shorter than the car does, and the plant's scope note says it misses per-event
+# stop distance. K5 rows still print in full; the field drive judges them. Other cars keep asserting.
+GATE_REPORT_ONLY_CARS = ("K5",)
 
 
 def _gate_events():
@@ -472,6 +478,9 @@ def test_final_stop_gate(car, eid):
     + f"cmd_mismatch={cmd_mismatches}",
     flush=True)
 
+  if car in GATE_REPORT_ONLY_CARS:
+    print(f"REPORT_ONLY {car} {eid}: g1_gap_ok={gap_ok} g3_applies={g3_applies} g3_ok={g3_ok}", flush=True)
+    return
   assert gap_ok, (
     f"FAIL_g1_gap {car} {eid}: gap_stop(1)={on['gap_stop']:.3f} < "
     + f"gap_stop(0)-{G1_GAP_SLACK:.2f}={off['gap_stop'] - G1_GAP_SLACK:.3f}")
@@ -565,7 +574,10 @@ def test_final_stop_g2_report():
   for row in NOENTRY_ROWS:
     _print_noentry(row["car"], row["eid"], row)
 
-  bad = {car: s for car, s in summary.items() if not s["ok"]}
+  bad = {car: s for car, s in summary.items() if not s["ok"] and car not in GATE_REPORT_ONLY_CARS}
+  for car in GATE_REPORT_ONLY_CARS:
+    if car in summary and not summary[car]["ok"]:
+      print(f"REPORT_ONLY G2 {car}: {summary[car]}", flush=True)
   assert not bad, f"FAIL_g2: {bad}"
 
 
