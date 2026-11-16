@@ -219,14 +219,14 @@ class FinalStopLoop(FarLeadLoop):
     self.long_control.update = self._update
 
   def _command_mismatch(self, CS, radarState, logged):
-    """True when the window's logged command is not the probe/lead minimum plus the firm-up.
+    """True when the window's logged command is not the probe/lead minimum plus the extras.
 
-    The probe command is a pure function of vEgo plus the window's own firm-up extra, so the
-    whole window command is clip(min(probe_accel(v) + extra*probe_firm_scale(v), lead term),
-    FINAL_U_MIN, FINAL_U_MAX). The extra is advanced before the command is built, so the
-    controller's live value after update() is the one this tick used. This recomputes it from
-    the tick's inputs and compares; a mismatch means the controller and this report disagree
-    about the wiring.
+    The probe command is a pure function of vEgo plus the window's own two extras (the firm-up
+    and the near-rest one), so the whole window command is clip(min(probe_accel(v) +
+    extra*probe_firm_scale(v) + low, lead term), FINAL_U_MIN, FINAL_U_MAX). Both extras are
+    advanced before the command is built, so the controller's live values after update() are the
+    ones this tick used. This recomputes it from the tick's inputs and compares; a mismatch means
+    the controller and this report disagree about the wiring.
     """
     try:
       v_ego = float(CS.vEgo)
@@ -234,7 +234,8 @@ class FinalStopLoop(FarLeadLoop):
       return True
     if not math.isfinite(v_ego):
       return True
-    u = probe_accel(v_ego) + float(self.long_control._probe_extra) * probe_firm_scale(v_ego)
+    u = (probe_accel(v_ego) + float(self.long_control._probe_extra) * probe_firm_scale(v_ego)
+         + float(self.long_control._probe_low_extra))
     lead = getattr(radarState, "leadOne", None)
     if lead is not None and bool(getattr(lead, "status", False)):
       gap = float(lead.dRel) - MIN_FINAL_GAP_ABS
