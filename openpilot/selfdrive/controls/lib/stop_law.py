@@ -189,6 +189,22 @@ CFG = dict(
 )
 UH_KEEP = 64           # applied-command history kept for seeding the law (>= ND + 1)
 
+GAP_OFFSET = 0.7      # m, law rest gap = StopDistanceCarrot - GAP_OFFSET; 550 cm keeps the field-tuned 4.8 m
+SETTING_MIN_M = 4.0   # StopDistanceCarrot menu range 400-1000 cm (carrot_settings.json)
+SETTING_MAX_M = 10.0
+
+
+def stop_law_gap(stop_distance_m):
+  """Law rest gap for StopDistanceCarrot in metres. Outside the menu range (unset Params read as 0, NaN, direct
+  writes) -> CFG GAP, the old fixed value."""
+  try:
+    d = float(stop_distance_m)
+  except (TypeError, ValueError):
+    return CFG["GAP"]
+  if not (math.isfinite(d) and SETTING_MIN_M <= d <= SETTING_MAX_M):
+    return CFG["GAP"]
+  return round(d - GAP_OFFSET, 3)
+
 
 class LeadPos:
   """butter_stop.LeadPosFilter, verbatim logic: smoothed lead position in the ego-odometry frame."""

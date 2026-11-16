@@ -23,7 +23,7 @@ from openpilot.selfdrive.controls.lib.butter_stop import (
   final_profile_travel, final_roll_limit, plan_stop_distance, probe_accel, probe_firm_scale, probe_weak,
   rest_ramp_floor, rest_speed,
 )
-from openpilot.selfdrive.controls.lib.stop_law import StopCtl
+from openpilot.selfdrive.controls.lib.stop_law import StopCtl, stop_law_gap
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
@@ -296,6 +296,9 @@ class LongControl:
     except (TypeError, ValueError, AttributeError):
       dist = float("nan")
     self.stop_distance_orig = dist if math.isfinite(dist) and dist >= 0.0 else STOP_DISTANCE_DEFAULT
+    # The law's rest gap follows the setting; a change waits until no stop is running.
+    if self._stop_ctl is not None and self._stop_ctl.law is None:
+      self._stop_ctl.c["GAP"] = stop_law_gap(self.stop_distance_orig)
 
   def _butter_floor(self, active, CS, long_plan, t_since_plan, radarState):
     if not self.butter_stop:

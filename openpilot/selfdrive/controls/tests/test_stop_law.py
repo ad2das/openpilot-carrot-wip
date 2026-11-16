@@ -128,8 +128,8 @@ def make_cp(fingerprint="HYUNDAI_PALISADE", flags=0):
                          startingState=False, vEgoStarting=0.5, stopAccel=-2.0, stoppingDecelRate=0.8, startAccel=1.0)
 
 
-def make_control(monkeypatch, butter=1, **cp_kw):
-  stored = {"StoppingAccel": -50, "StopDistanceCarrot": 550, "ButterStop": butter,
+def make_control(monkeypatch, butter=1, stop_cm=550, **cp_kw):
+  stored = {"StoppingAccel": -50, "StopDistanceCarrot": stop_cm, "ButterStop": butter,
             "LongTuningKpV": 100, "LongTuningKiV": 200, "LongTuningKf": 100}
   params = DictParams(stored)
   monkeypatch.setattr(lc, "Params", lambda: params)
@@ -680,3 +680,65 @@ def test_p8_first_command_is_continuous():
 def test_p9_unknown_keyword_raises():
   with pytest.raises(KeyError):
     K.StopCtl(NOPE=1)
+
+
+def test_gap_setting_map():
+  assert SL.stop_law_gap(5.5) == 4.8 == SL.CFG["GAP"]
+  assert SL.stop_law_gap(4.0) == 3.3
+  assert SL.stop_law_gap(4.5) == 3.8
+  assert SL.stop_law_gap(5.0) == 4.3
+  assert SL.stop_law_gap(7.0) == 6.3
+  assert SL.stop_law_gap(10.0) == 9.3
+  for bad in (0.0, 3.99, 10.01, float("nan"), None, "x"):
+    assert SL.stop_law_gap(bad) == SL.CFG["GAP"]
+  assert SL.stop_law_gap(butter_stop.STOP_DISTANCE_DEFAULT) == SL.CFG["GAP"]
+
+
+@pytest.mark.parametrize("stop_cm,expected", [(450, 3.8), (500, 4.3), (550, 4.8), (700, 6.3), (0, 4.8)])
+def test_gap_wired_from_setting(monkeypatch, stop_cm, expected):
+  control, _ = make_control(monkeypatch, stop_cm=stop_cm)
+  assert control._stop_ctl.c["GAP"] == expected
+
+
+def test_gap_change_waits_for_idle(monkeypatch):
+  control, params = make_control(monkeypatch)
+  ctl = control._stop_ctl
+  sentinel = object()
+  ctl.law = sentinel
+  params.values["StopDistanceCarrot"] = 700
+  control._refresh_butter_stop()
+  assert control._stop_ctl is ctl
+  assert ctl.law is sentinel
+  assert ctl.c["GAP"] == 4.8
+  ctl.law = None
+  control._refresh_butter_stop()
+  assert ctl.c["GAP"] == 6.3
+
+
+@pytest.mark.parametrize("stop_cm", [450, 550, 700])
+def test_t1_gap_tracks_setting(monkeypatch, stop_cm):
+  events = silence_cloudlog(monkeypatch)
+  control, params = make_control(monkeypatch, stop_cm=stop_cm)
+  gap = SL.stop_law_gap(stop_cm * 0.01)
+  ref = SL.StopCtl(GAP=gap)
+  trace, plant = run_stop(control, gap0=gap + 12.0, ref=ref)
+
+  for row in trace:
+    if row["u_ref"] is not None:
+      assert row["law"] is True
+      assert row["out"] == float(np.clip(row["u_ref"], *LIMITS))
+    else:
+      assert row["law"] is False
+  assert all(r["uh_ok"] for r in trace)
+  n_law = sum(r["law"] for r in trace)
+  assert n_law >= 100
+  assert control._stop_ctl.n_enter >= 1
+  assert len([e for e in events if e[0] == "butterStopLaw"]) == 1
+  min_gap = min(r["gap"] for r in trace)
+  assert min_gap >= 3.0
+  assert plant.v == 0.0
+  first_law_v = next((r["v"] for r in trace if r["law"]), float("nan"))
+  msg = "T1 cm=%d final_gap=%.3f law_ticks=%d n_enter=%d min_gap=%.3f first_law_v=%.3f" % (
+    stop_cm, trace[-1]["gap"], n_law, control._stop_ctl.n_enter, min_gap, first_law_v)
+  print(msg)
+  assert gap - 0.5 <= trace[-1]["gap"] <= gap + 0.7, msg
