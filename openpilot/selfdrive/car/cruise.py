@@ -29,6 +29,9 @@ CRUISE_LONG_PRESS = 50
 AUTO_CRUISE_MAX_STEERING_ANGLE = 70.0
 GAS_DECEL_CANCEL_ACCEL = -1.0  # m/s^2
 GAS_DECEL_CANCEL_TIME = 0.5    # s of continuous deceleration with the gas held
+RESUME_PENDING_AFTER_BLINKER_S = 10.0  # drop a blocked release resume 10 s (blinker-off time) after release
+RESUME_PENDING_MAX_S = 30.0            # hard cap from the release
+RESUME_STANDSTILL_MAX_STEER = 20.0     # the standstill engage gate on steering angle
 CRUISE_NEAREST_FUNC = {
   ButtonType.accelCruise: math.ceil,
   ButtonType.decelCruise: math.floor,
@@ -206,6 +209,9 @@ class VCruiseCarrot:
     self._cruise_available = False
     self._hold_interlock_active = False
     self._steering_interlock_active = False
+    self._resume_pending = None   # None | 'gas' | 'brake'
+    self._resume_pending_frames = 0
+    self._resume_blinker_off_frames = 0
     self._lat_enabled = self.params.get_int("AutoEngage") > 0
     self._v_cruise_kph_at_brake = 0
     self.cruise_state_available_last = False
@@ -852,7 +858,96 @@ class VCruiseCarrot:
       self._gas_decel_count = 0
     return self._gas_decel_count >= int(GAS_DECEL_CANCEL_TIME / 0.01)
 
+  def _set_resume_pending(self, kind, why):
+    self._resume_pending = kind
+    self._resume_pending_frames = 0
+    self._resume_blinker_off_frames = 0
+    self._add_log(f"Resume pending ({kind}, {why})")
+
+  def _clear_resume_pending(self):
+    self._resume_pending = None
+    self._resume_pending_frames = 0
+    self._resume_blinker_off_frames = 0
+
+  def _update_resume_pending(self, CS, CC):
+    if self._resume_pending is None:
+      return
+    drop = None
+    if CC.enabled:
+      drop = "engaged"
+    elif CS.gasPressed or CS.brakePressed:
+      drop = "pedal"
+    elif not self._cruise_available or self._hold_interlock_active:
+      drop = "interlock"
+    elif CS.gearShifter != GearShifter.drive or self.autoCruiseControl_cancel_timer > 0:
+      drop = "gear"
+    elif self._cruise_cancel_state:
+      drop = "cancel"
+    elif self._soft_hold_active > 0:
+      drop = "soft hold"
+    else:
+      self._resume_pending_frames += 1
+      if not (CS.leftBlinker or CS.rightBlinker):
+        self._resume_blinker_off_frames += 1
+      if (self._resume_blinker_off_frames > int(RESUME_PENDING_AFTER_BLINKER_S / 0.01) or
+          self._resume_pending_frames > int(RESUME_PENDING_MAX_S / 0.01)):
+        drop = "timeout"
+    if drop is not None:
+      self._clear_resume_pending()
+      self._add_log(f"Resume pending dropped ({drop})")
+
+  def _resume_gate_clear(self, CS):
+    if CS.leftBlinker or CS.rightBlinker or self._steering_interlock_active:
+      return False
+    if self._resume_pending == 'brake' and self.v_ego_kph_set <= self.autoGasTokSpeed:
+      return abs(CS.steeringAngleDeg) < RESUME_STANDSTILL_MAX_STEER
+    return True
+
+  def _gas_release(self, CS, CC, v_cruise_kph, latch):
+    if 0 < self.d_rel < CS.vEgo * 0.8:
+      if CS.vEgo < 1.0:
+        self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (safe speed)")
+      else:
+        self._cruise_control(-1, 0, "Cruise off (lead car too close)")
+    elif self.v_ego_kph_set < self.autoGasCancelSpeed:
+      self._cruise_control(-1, 0, "Cruise off (gas speed)")
+    elif self.xState == 3:
+      v_cruise_kph = min(self.v_ego_kph_set, v_cruise_kph)
+      self._cruise_control(-1, 3, "Cruise off (traffic sign)")
+    elif CS.leftBlinker or CS.rightBlinker:
+      if latch and not CC.enabled and not self.disengage_on_accelerator:
+        self._set_resume_pending('gas', 'blinker')
+    elif not self.disengage_on_accelerator and self.v_ego_kph_set >= self.autoGasTokSpeed and not CC.enabled:
+      v_cruise_kph = min(self.v_ego_kph_set, v_cruise_kph)
+      self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (gas pressed)")
+      if latch and self._steering_interlock_active:
+        self._set_resume_pending('gas', 'steering')
+    return v_cruise_kph
+
+  def _brake_release(self, CS, CC, v_cruise_kph, latch):
+    if CS.leftBlinker or CS.rightBlinker:
+      if latch and not CC.enabled:
+        self._set_resume_pending('brake', 'blinker')
+    elif self.v_ego_kph_set > self.autoGasTokSpeed:
+      v_cruise_kph = self.v_ego_kph_set
+      self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (speed)")
+      if latch and not CC.enabled and self._steering_interlock_active:
+        self._set_resume_pending('brake', 'steering')
+    elif abs(CS.steeringAngleDeg) < RESUME_STANDSTILL_MAX_STEER:
+      if self.xState in [3, 5]:
+        if self.xState == 3:  # 감속중
+          v_cruise_kph = self.v_ego_kph_set
+        self._cruise_control(1, 0, "Cruise on (traffic sign)")
+      elif 0 < self.d_rel < 20:
+        # v_cruise_kph = self.v_ego_kph_set # 전방에 차가 가까이 있을때, 기존속도 유지
+        self._cruise_control(1, -1 if self.v_ego_kph_set < 1 else 0, "Cruise on (lead car)")
+    else:
+      if latch and not CC.enabled:
+        self._set_resume_pending('brake', 'steering')
+    return v_cruise_kph
+
   def _update_cruise_state(self, CS, CC, v_cruise_kph):
+    self._update_resume_pending(CS, CC)
     if not CC.enabled:
       #self._pause_auto_speed_up = False
       if self._brake_pressed_count == -1 and self._soft_hold_active > 0:
@@ -879,38 +974,16 @@ class VCruiseCarrot:
       else:
         v_cruise_kph = self._v_cruise_desired(CS, v_cruise_kph)
     elif self._gas_pressed_count == -1:
-      if 0 < self.d_rel < CS.vEgo * 0.8:
-        if CS.vEgo < 1.0:
-          self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (safe speed)")
-        else:
-          self._cruise_control(-1, 0, "Cruise off (lead car too close)")
-      elif self.v_ego_kph_set < self.autoGasCancelSpeed:
-        self._cruise_control(-1, 0, "Cruise off (gas speed)")
-      elif self.xState == 3:
-        v_cruise_kph = min(self.v_ego_kph_set, v_cruise_kph)
-        self._cruise_control(-1, 3, "Cruise off (traffic sign)")
-      elif CS.leftBlinker or CS.rightBlinker:
-        pass
-      elif not self.disengage_on_accelerator and self.v_ego_kph_set >= self.autoGasTokSpeed and not CC.enabled:
-        v_cruise_kph = min(self.v_ego_kph_set, v_cruise_kph)
-        self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (gas pressed)")
+      v_cruise_kph = self._gas_release(CS, CC, v_cruise_kph, latch=True)
     elif self._brake_pressed_count == -1 and self._soft_hold_active == 0:
-      if CS.leftBlinker or CS.rightBlinker:
-        pass
-      elif self.v_ego_kph_set > self.autoGasTokSpeed:
-        v_cruise_kph = self.v_ego_kph_set
-        self._cruise_control(1, -1 if self.aTarget > 0.0 else 0, "Cruise on (speed)")
-      elif abs(CS.steeringAngleDeg) < 20:
-        if self.xState in [3, 5]:
-          if self.xState == 3:  # 감속중
-            v_cruise_kph = self.v_ego_kph_set
-          self._cruise_control(1, 0, "Cruise on (traffic sign)")
-        elif 0 < self.d_rel < 20: 
-          # v_cruise_kph = self.v_ego_kph_set # 전방에 차가 가까이 있을때, 기존속도 유지
-          self._cruise_control(1, -1 if self.v_ego_kph_set < 1 else 0, "Cruise on (lead car)")
-
+      v_cruise_kph = self._brake_release(CS, CC, v_cruise_kph, latch=True)
     elif self._brake_pressed_count < 0 and self._gas_pressed_count < 0:
-      if not CC.enabled:
+      if self._resume_pending is not None and not CC.enabled and self._resume_gate_clear(CS):
+        kind = self._resume_pending
+        self._clear_resume_pending()
+        release = self._gas_release if kind == 'gas' else self._brake_release
+        v_cruise_kph = release(CS, CC, v_cruise_kph, latch=False)
+      elif not CC.enabled:
         if self.d_rel > 0 and CS.vEgo > 0.02:
           safe_state, safe_dist = self._check_safe_stop(CS, 4)
           if abs(CS.steeringAngleDeg) > 70:
