@@ -96,8 +96,9 @@ from openpilot.selfdrive.controls.lib import longcontrol as lc
 from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_A0_DIST, FINAL_A0_MAX, FINAL_A0_MIN, FINAL_A_END, FINAL_U_MAX, FINAL_U_MIN,
   MIN_FINAL_GAP_ABS, PROBE_A, PROBE_BP_V, PROBE_FIRM_JERK, PROBE_FIRM_MAX, PROBE_GUARD_V,
-  PROBE_MAX_T, PROBE_V_MAX, PROBE_WEAK_A, STANDSTILL_V, STOCK_ROLL_DECEL, final_a0_dist,
-  final_profile, final_profile_travel, probe_accel, probe_firm_scale, probe_weak,
+  PROBE_LOW_JERK, PROBE_LOW_MAX, PROBE_MAX_T, PROBE_V_MAX, PROBE_WEAK_A, PROBE_ZERO_T, PROBE_ZERO_V,
+  STANDSTILL_V, STOCK_ROLL_DECEL, final_a0_dist,
+  final_profile, final_profile_travel, probe_accel, probe_firm_scale, probe_weak, rest_speed,
 )
 from openpilot.selfdrive.controls.lib.longcontrol import (
   CONTROL_N_T_IDX, LongCtrlState, long_control_state_trans,
@@ -286,11 +287,26 @@ def test_final_hold_never_delays_a_starting_exit():
 # LongControl integration
 # ---------------------------------------------------------------------------
 
-def _stop_frame(control, v, a_ego=-0.35, speeds=None, lead_status=False, d_rel=30.0):
+def _stop_frame(control, v, a_ego=-0.35, speeds=None, lead_status=False, d_rel=30.0,
+                vraw=None, wheels=None):
   cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=speeds)
   cs.aEgo = a_ego
+  if vraw is not None:
+    cs.vEgoRaw = vraw
+  if wheels is not None:
+    cs.wheelSpeeds = SimpleNamespace(fl=wheels[0], fr=wheels[1], rl=wheels[2], rr=wheels[3])
   radar.leadOne = SimpleNamespace(status=lead_status, dRel=d_rel, aLeadK=0.0, vLead=0.0)
   return control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+
+
+def _rest_frame(control, v=0.0, a_ego=-0.1, speeds=None, **kwargs):
+  """One frame at rest: vEgo, vEgoRaw and all four wheels at `v` unless a kwarg overrides it."""
+  vraw = kwargs.pop("vraw", v)
+  wheels = kwargs.pop("wheels", None)
+  if wheels is None:
+    wheels = (v, v, v, v)
+  return _stop_frame(control, v, a_ego=a_ego, speeds=speeds,
+                     vraw=vraw, wheels=wheels, **kwargs)
 
 
 def _decaying_speeds(v):
@@ -448,16 +464,236 @@ def test_window_output_stays_inside_final_clip(monkeypatch):
   assert control._final_t is not None or control._final_done
 
 
-def test_window_exits_at_standstill_speed(monkeypatch):
+def test_z1_window_stays_open_below_standstill_v(monkeypatch):
+  """50 ticks at STANDSTILL_V - 0.01 keep the window open in pid: the old exit is gone.
+
+  The window used to end at vEgo < STANDSTILL_V while every wheel still turned; on route 737
+  that handed a rolling car to StopReq 1, which barely brakes. Only a wheels-stopped run ends it.
+  """
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
   control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
   control.long_control_state = LongCtrlState.pid
 
+  v = STANDSTILL_V - 0.01
+  assert PROBE_ZERO_V < v, "the test only means something below STANDSTILL_V but above zero"
+  rolling, _, _ = stopping_inputs(v_ego=v, plan_speeds=_decaying_speeds(v))
+  rolling.vEgoRaw = v
+  rolling.wheelSpeeds = SimpleNamespace(fl=v, fr=v, rl=v, rr=v)
+  assert rest_speed(rolling) == pytest.approx(v), "every speed source still reads rolling"
   _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
   assert control._final_t is not None
-  _stop_frame(control, STANDSTILL_V - 0.01, speeds=np.zeros(len(PLAN_T)))
+  for tick in range(50):
+    _stop_frame(control, v, a_ego=-0.10, speeds=_decaying_speeds(v), vraw=v, wheels=(v, v, v, v))
+    assert control._final_t is not None, tick
+    assert control.long_control_state == LongCtrlState.pid, tick
+  assert not control._final_done
+  assert control._probe_zero_t == pytest.approx(0.0), "a rolling wheel never advances the zero clock"
+
+
+def test_z2_window_exits_after_zero_t(monkeypatch):
+  """10 zero ticks (round(PROBE_ZERO_T / DT_CTRL)) close the window with reason wheels_stopped."""
+  events = []
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(
+    event=lambda name, **k: events.append((name, k))))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  ticks = int(round(PROBE_ZERO_T / DT_CTRL))
+  for tick in range(1, ticks + 1):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+    if tick < ticks:
+      assert control._final_t is not None, tick
+      assert control.long_control_state == LongCtrlState.pid, tick
+  assert control._final_t is None, "the 10th zero tick closes the window"
+  assert control._probe_zero_t >= PROBE_ZERO_T - 1e-9
+  assert control.long_control_state == LongCtrlState.stopping
+  ends = [k for n, k in events if n == "butterStopFinalEnd"]
+  assert len(ends) == 1, ends
+  assert ends[0]["reason"] == "wheels_stopped", ends[0]
+  assert float(ends[0]["vEgo"]) == pytest.approx(0.0)
+
+
+def test_z3_one_turning_wheel_resets_the_zero_clock(monkeypatch):
+  """A single wheel at 0.02 m/s on tick 5 restarts the clock: the window closes 10 ticks later."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  for tick in range(1, 6):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+    assert control._final_t is not None, tick
+  assert control._probe_zero_t == pytest.approx(5 * DT_CTRL, abs=1e-9)
+
+  _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)), wheels=(0.0, 0.0, 0.0, 0.02))
+  assert control._final_t is not None
+  assert control._probe_zero_t == pytest.approx(0.0), "one turning wheel clears the clock"
+
+  for tick in range(10):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+    if tick < 9:
+      assert control._final_t is not None, tick
+  assert control._final_t is None, "the window closes on the 10th zero tick after the reset"
+  assert control._final_done
+
+
+def test_z4_near_rest_extra_builds_and_floors(monkeypatch):
+  """At 0.08 m/s the extra grows -PROBE_LOW_JERK * DT_CTRL per tick and floors on tick 54."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  v = 0.08
+  floor_tick = int(round(PROBE_LOW_MAX / (PROBE_LOW_JERK * DT_CTRL)))
+  assert floor_tick == 54, floor_tick
+  for tick in range(1, 120):
+    out = _stop_frame(control, v, a_ego=-0.10, speeds=_decaying_speeds(v),
+                      vraw=v, wheels=(v, v, v, v))[0]
+    expected_extra = -min(PROBE_LOW_JERK * DT_CTRL * tick, PROBE_LOW_MAX)
+    assert control._probe_low_extra == pytest.approx(expected_extra, abs=1e-12), tick
+    expected = float(np.clip(probe_accel(v) + control._probe_extra * probe_firm_scale(v)
+                             + control._probe_low_extra, FINAL_U_MIN, FINAL_U_MAX))
+    assert out == pytest.approx(expected, abs=1e-9), (tick, out, expected)
+    assert control._final_t is not None, tick
+  assert control._probe_low_extra == pytest.approx(-PROBE_LOW_MAX, abs=1e-12)
+
+
+def test_z5_near_rest_extra_never_builds_at_or_above_guard_v_or_at_zero(monkeypatch):
+  """At 0.10 m/s (the guard) and at 0.0 m/s (already stopped) the extra stays 0."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  for _ in range(30):
+    _stop_frame(control, PROBE_GUARD_V, a_ego=-0.10, speeds=_decaying_speeds(PROBE_GUARD_V),
+                vraw=PROBE_GUARD_V, wheels=(PROBE_GUARD_V,) * 4)
+    assert control._probe_low_extra == pytest.approx(0.0), control._probe_low_extra
+  assert control._final_t is not None
+
+  # At zero the clock runs instead: 5 ticks only, so the window stays open and the extra stays 0.
+  for _ in range(5):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+    assert control._probe_low_extra == pytest.approx(0.0)
+  assert control._final_t is not None
+  assert control._probe_zero_t == pytest.approx(5 * DT_CTRL, abs=1e-9)
+
+
+def test_z6_near_rest_extra_is_held_and_reset(monkeypatch):
+  """Built to -0.06 at 0.08, it is held through 20 ticks at 0.12 and cleared by the next window."""
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda *a, **k: None))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  for _ in range(20):
+    _stop_frame(control, 0.08, a_ego=-0.10, speeds=_decaying_speeds(0.08),
+                vraw=0.08, wheels=(0.08,) * 4)
+  built = control._probe_low_extra
+  assert built == pytest.approx(-0.06, abs=1e-9), built
+
+  for _ in range(20):
+    _stop_frame(control, 0.12, a_ego=-0.10, speeds=_decaying_speeds(0.12),
+                vraw=0.12, wheels=(0.12,) * 4)
+  assert control._probe_low_extra == pytest.approx(built), "held, never given back"
+  assert control._final_t is not None
+
+  # End the stop with zero ticks, roll away above 1 m/s, and open a fresh window.
+  for _ in range(int(round(PROBE_ZERO_T / DT_CTRL))):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+  assert control._final_t is None and control._final_done
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 1.5, a_ego=-0.20, speeds=np.full(len(PLAN_T), 1.0))
+  assert not control._final_done
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.50, a_ego=-0.30, speeds=_decaying_speeds(0.50))
+  assert control._final_t is not None, "the second stop opens its own window"
+  assert control._probe_low_extra == pytest.approx(0.0)
+  assert control._probe_zero_t == pytest.approx(0.0)
+
+
+def test_z7_non_finite_wheel_ends_the_window(monkeypatch):
+  """A nan wheel speed is a sensor failure: the window ends the same tick, not at zero."""
+  events = []
+  monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(
+    event=lambda name, **k: events.append((name, k))))
+  control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+  control.long_control_state = LongCtrlState.pid
+  _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+  assert control._final_t is not None
+
+  _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)), wheels=(0.0, 0.0, 0.0, float("nan")))
   assert control._final_t is None
   assert control._final_done
+  ends = [k for n, k in events if n == "butterStopFinalEnd"]
+  assert len(ends) == 1 and ends[0]["reason"] == "sensor_invalid", ends
+
+
+def test_z8_every_exit_logs_its_reason(monkeypatch):
+  """One butterStopFinalEnd per window, and its reason names the term that closed it."""
+  def _open(monkeypatch):
+    events = []
+    monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(
+      event=lambda name, **k: events.append((name, k))))
+    control, _ = _window_control(monkeypatch, values={"ButterStop": 1})
+    control.long_control_state = LongCtrlState.pid
+    _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
+    assert control._final_t is not None
+    return control, events
+
+  def _reason(events):
+    ends = [k for n, k in events if n == "butterStopFinalEnd"]
+    assert len(ends) == 1, ends
+    return ends[0]["reason"]
+
+  # inactive: shouldStop clears.
+  control, events = _open(monkeypatch)
+  cs, plan, radar = stopping_inputs(v_ego=0.44, plan_speeds=_decaying_speeds(0.44))
+  plan.shouldStop = False
+  control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)
+  assert control._final_t is None and _reason(events) == "inactive"
+
+  # left_pid: the state machine leaves pid.
+  control, events = _open(monkeypatch)
+  control.long_control_state = LongCtrlState.stopping
+  _stop_frame(control, 0.30, speeds=_decaying_speeds(0.30))
+  assert control._final_t is None and _reason(events) == "left_pid"
+
+  # lead_close: the lead is inside MIN_FINAL_GAP_ABS.
+  control, events = _open(monkeypatch)
+  _stop_frame(control, 0.30, speeds=_decaying_speeds(0.30), lead_status=True,
+              d_rel=MIN_FINAL_GAP_ABS - 0.1)
+  assert control._final_t is None and _reason(events) == "lead_close"
+
+  # sensor_invalid: a non-finite wheel.
+  control, events = _open(monkeypatch)
+  _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)), wheels=(0.0, 0.0, 0.0, float("nan")))
+  assert control._final_t is None and _reason(events) == "sensor_invalid"
+
+  # wheels_stopped: 10 zero ticks.
+  control, events = _open(monkeypatch)
+  for _ in range(int(round(PROBE_ZERO_T / DT_CTRL))):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+  assert control._final_t is None and _reason(events) == "wheels_stopped"
+
+  # timeout: PROBE_MAX_T with the wheels still rolling above the guard.
+  control, events = _open(monkeypatch)
+  v = 0.30
+  ticks = 0
+  while control._final_t is not None:
+    _stop_frame(control, v, a_ego=-0.30, speeds=_decaying_speeds(v),
+                vraw=v, wheels=(v, v, v, v))
+    ticks += 1
+    if ticks > int(PROBE_MAX_T / DT_CTRL) + 50:
+      pytest.fail("the window never timed out")
+  assert _reason(events) == "timeout"
 
 
 def test_window_exits_on_timeout(monkeypatch):
@@ -527,7 +763,9 @@ def test_window_never_reopens_in_the_same_stop(monkeypatch):
 
   _stop_frame(control, 0.44, speeds=_decaying_speeds(0.44))
   assert control._final_t is not None
-  _stop_frame(control, STANDSTILL_V - 0.01, speeds=np.zeros(len(PLAN_T)))
+  for _ in range(int(round(PROBE_ZERO_T / DT_CTRL))):
+    _rest_frame(control, 0.0, speeds=np.zeros(len(PLAN_T)))
+  assert control._final_t is None
   assert control._final_done
 
   # Back to the same stop: no second window until the car is rolling again.
@@ -693,8 +931,9 @@ def test_p10_extra_resets_on_the_next_window(monkeypatch):
   assert control._probe_extra < 0.0
   assert events.count("butterStopProbeGuard") == 1
 
-  # End this stop: below STANDSTILL_V the window closes for good.
-  _stop_frame(control, STANDSTILL_V - 0.01, a_ego=-0.05, speeds=np.zeros(len(PLAN_T)))
+  # End this stop: the wheels read zero for PROBE_ZERO_T and the window closes for good.
+  for _ in range(int(round(PROBE_ZERO_T / DT_CTRL))):
+    _rest_frame(control, 0.0, a_ego=-0.05, speeds=np.zeros(len(PLAN_T)))
   assert control._final_t is None
   assert control._final_done
 
@@ -806,7 +1045,7 @@ def test_p6_lead_guard_still_binds_inside_the_probe(monkeypatch):
 def test_p7_window_exits_at_probe_max_t(monkeypatch):
   """PROBE_MAX_T: the window cannot outlive 8 s once v stays above standstill.
 
-  The timeout is only a fallback now: a real stop ends at STANDSTILL_V. This pins that the
+  The timeout is only a fallback now: a real stop ends when the wheels read zero. This pins that the
   fallback still ends the window, and that it is the term that did it.
   """
   monkeypatch.setattr(lc, "cloudlog", SimpleNamespace(event=lambda name, **k: None))

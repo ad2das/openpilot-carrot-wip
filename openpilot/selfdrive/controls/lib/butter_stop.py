@@ -101,10 +101,36 @@ PROBE_A = [-0.14, -0.23, -0.30, -0.39]
 PROBE_WEAK_A = [-0.099, -0.150, -0.211, -0.235]
 PROBE_GUARD_T = 0.3
 PROBE_GUARD_V = 0.10
-PROBE_MAX_T = 8.0                  # s; fallback only, the window ends at STANDSTILL_V
+PROBE_MAX_T = 8.0                  # s; fallback only, the window ends when the wheels read zero
 PROBE_FIRM_JERK = 1.0              # m/s^3; extra braking build rate while the car stays weak
 PROBE_FIRM_MAX = 0.4               # m/s^2; most extra braking
 PROBE_FIRM_FADE_V = (0.05, 0.20)   # m/s; the extra fades out between these speeds so the end stays soft
+# The window ends only with the wheels stopped (K5 route 737, 2026-11-16): it used to end at vEgo < STANDSTILL_V
+# while every wheel still turned at 0.04-0.05 m/s; under StopReq 1 the K5 barely brakes a rolling car, so it crept
+# 3.5 s and rolled back to 0.18 m/s before a -2.5 rescue. Below PROBE_GUARD_V the window also adds braking over
+# time so the car reaches zero instead of fading out.
+PROBE_ZERO_V = 0.01      # m/s; vEgo, vEgoRaw and every wheel at or below this = wheels stopped (stopping.py ZERO_SPEED)
+PROBE_ZERO_T = 0.10      # s of continuous zero before the window hands the stop to the car
+PROBE_LOW_JERK = 0.3     # m/s^3; extra braking per second while below PROBE_GUARD_V and not yet at zero
+PROBE_LOW_MAX = 0.16     # m/s^2; most of that extra (probe -0.14 - 0.16 = -0.30 near rest)
+
+
+def rest_speed(CS) -> float:
+  """max(|vEgo|, |vEgoRaw|, |fl|, |fr|, |rl|, |rr|); fields a CarState stand-in lacks are skipped (vEgo is required).
+  nan when any present value is not finite."""
+  vals = [CS.vEgo]
+  if hasattr(CS, "vEgoRaw"):
+    vals.append(CS.vEgoRaw)
+  ws = getattr(CS, "wheelSpeeds", None)
+  if ws is not None:
+    vals += [getattr(ws, k) for k in ("fl", "fr", "rl", "rr") if hasattr(ws, k)]
+  out = 0.0
+  for x in vals:
+    x = float(x)
+    if not math.isfinite(x):
+      return float("nan")
+    out = max(out, abs(x))
+  return out
 
 
 def probe_accel(v_ego):

@@ -17,10 +17,11 @@ from openpilot.selfdrive.controls.lib.butter_stop import (
   FINAL_ROLL_RESET_V, FINAL_ROLL_V, FINAL_ROLL_VLEAD, FINAL_U_MAX,
   FINAL_U_MIN, FINAL_WINDOW_ENABLED, HOLD_RAMP, LeadPosFilter, MIN_FINAL_GAP_ABS,
   PROBE_FIRM_JERK, PROBE_FIRM_MAX,
-  PROBE_GUARD_T, PROBE_GUARD_V, PROBE_MAX_T, PROBE_V_MAX, STANDSTILL_T, STANDSTILL_V,
+  PROBE_GUARD_T, PROBE_GUARD_V, PROBE_LOW_JERK, PROBE_LOW_MAX, PROBE_MAX_T, PROBE_V_MAX,
+  PROBE_ZERO_T, PROBE_ZERO_V, STANDSTILL_T, STANDSTILL_V,
   STOP_DISTANCE_DEFAULT, butter_eligible, butter_floor, early_req_gap_ok,
   final_profile_travel, final_roll_limit, plan_stop_distance, probe_accel, probe_firm_scale, probe_weak,
-  rest_ramp_floor,
+  rest_ramp_floor, rest_speed,
 )
 from openpilot.selfdrive.controls.lib.stop_law import StopCtl
 
@@ -195,6 +196,8 @@ class LongControl:
     self._probe_weak_t = 0.0
     self._probe_guard_logged = False
     self._probe_extra = 0.0
+    self._probe_zero_t = 0.0
+    self._probe_low_extra = 0.0
     self._refresh_stopping_accel()
     self._refresh_butter_stop()
     self._firm_cap = None
@@ -442,12 +445,29 @@ class LongControl:
         self._probe_guard_logged = True
     return True
 
+  def _probe_rest_step(self, CS):
+    """Advance the wheels-stopped clock and the near-rest extra; return False on a non-finite speed (the window then ends)."""
+    try:
+      s = rest_speed(CS)
+    except (TypeError, ValueError, AttributeError):
+      return False
+    if not math.isfinite(s):
+      return False
+    if s <= PROBE_ZERO_V:
+      self._probe_zero_t += DT_CTRL
+    else:
+      self._probe_zero_t = 0.0
+      if s < PROBE_GUARD_V:
+        self._probe_low_extra = max(self._probe_low_extra - PROBE_LOW_JERK * DT_CTRL, -PROBE_LOW_MAX)
+    return True
+
   def _final_window_accel(self, CS, long_plan, radarState):
     """One tick of the K5 final-stop window, then advance its clock.
 
     Commands the decel the K5's own stopping state delivers at this speed
     (probe_accel over the 44-stop table), plus the firm-up extra while the car
-    answers weaker than the weakest decile. The lead guard stays at
+    answers weaker than the weakest decile. Below PROBE_GUARD_V the near-rest
+    extra adds braking until the wheels read zero. The lead guard stays at
     full strength against the remaining gap: the gap is a hard safety budget
     and may brake harder than the probe. long_plan is no longer read. The PID
     integrator is reset because nothing in this window is a PID decision.
@@ -459,6 +479,7 @@ class LongControl:
     u = probe_accel(v_ego) if math.isfinite(v_ego) else probe_accel(PROBE_V_MAX)
     if math.isfinite(v_ego):
       u += self._probe_extra * probe_firm_scale(v_ego)
+      u += self._probe_low_extra
     # Lead guard: unchanged and at full strength. The gap is a hard safety
     # budget, so it is allowed to brake harder than the probe table.
     lead = getattr(radarState, "leadOne", None) if radarState is not None else None
@@ -536,13 +557,28 @@ class LongControl:
     _lead_on = bool(getattr(_lead, "status", False))
     final_close = _lead_on and _d_rel < MIN_FINAL_GAP_ABS
     if self._final_t is not None:
-      exit_window = (not (active and should_stop and self.final_window)
-                     or self.long_control_state != LongCtrlState.pid
-                     or final_close
-                     or CS.vEgo < STANDSTILL_V
-                     or self._final_t >= PROBE_MAX_T
-                     or not self._probe_firm_step(CS))
-      if exit_window:
+      sensors_ok = self._probe_firm_step(CS) and self._probe_rest_step(CS)
+      if not (active and should_stop and self.final_window):
+        exit_reason = "inactive"
+      elif self.long_control_state != LongCtrlState.pid:
+        exit_reason = "left_pid"
+      elif final_close:
+        exit_reason = "lead_close"
+      elif not sensors_ok:
+        exit_reason = "sensor_invalid"
+      elif self._probe_zero_t >= PROBE_ZERO_T - 1e-9:
+        exit_reason = "wheels_stopped"
+      elif self._final_t >= PROBE_MAX_T:
+        exit_reason = "timeout"
+      else:
+        exit_reason = ""
+      if exit_reason:
+        try:
+          v_log = float(CS.vEgo)
+        except (TypeError, ValueError, AttributeError):
+          v_log = float("nan")
+        cloudlog.event("butterStopFinalEnd", reason=exit_reason, vEgo=v_log, t=float(self._final_t),
+                       extra=float(self._probe_extra), low=float(self._probe_low_extra))
         self._final_t = None
         self._final_done = True
     elif (not self._final_done and self.final_window and active and should_stop
@@ -555,6 +591,8 @@ class LongControl:
       self._probe_weak_t = 0.0
       self._probe_guard_logged = False
       self._probe_extra = 0.0
+      self._probe_zero_t = 0.0
+      self._probe_low_extra = 0.0
       # Freeze the plan target at entry. Once the plan's speeds reach zero the
       # live plan_stop_distance collapses to ~0; the frozen target stays
       # meaningful for the whole window, and the profile's own travel is the

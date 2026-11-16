@@ -41,7 +41,7 @@ from openpilot.selfdrive.test.longitudinal_maneuvers.test_fitted_plant import _k
 from openpilot.selfdrive.controls.lib import longcontrol as longcontrol_module
 from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
 from openpilot.selfdrive.controls.lib.butter_stop import (
-  FINAL_U_MAX, FINAL_U_MIN, MIN_FINAL_GAP_ABS, PROBE_MAX_T, PROBE_V_MAX, probe_accel,
+  FINAL_U_MAX, FINAL_U_MIN, MIN_FINAL_GAP_ABS, PROBE_MAX_T, PROBE_V_MAX, PROBE_ZERO_T, probe_accel,
   probe_firm_scale,
 )
 
@@ -299,14 +299,17 @@ class FinalStopLoop(FarLeadLoop):
       # Same order as the exit terms in update(), so the reason names the term
       # that actually fired. The under-response guard no longer ends the window
       # (it firms the stop up), so only the non-finite sensor case sits last.
+      # _probe_zero_t is only cleared at a window open, and update() resolves the
+      # exit before it can open one in the same tick, so reading it here after
+      # update() on the closing tick still carries the value that closed it.
       if not (active and long_plan.shouldStop and self.long_control.final_stop):
         reason = "inactive_or_should_stop_cleared"
       elif pre_state != int(LongCtrlState.pid):
         reason = "left_pid"
       elif lead_close:
         reason = "lead_close"
-      elif float(CS.vEgo) < STANDSTILL:
-        reason = "standstill"
+      elif float(self.long_control._probe_zero_t) >= PROBE_ZERO_T - 1e-9:
+        reason = "wheels_stopped"
       elif pre_final_t >= PROBE_MAX_T:
         reason = "probe_timeout"
       else:
@@ -408,7 +411,7 @@ def test_final_stop_gate(car, eid):
   # reaching standstill or by timing out. Events with no window, or whose
   # window ended on a closing lead and handed off early, measure the base
   # stopping state and are reported separately.
-  g3_applies = bool(entries) and bool(exits) and exits[-1]["reason"] in ("standstill", "left_pid")
+  g3_applies = bool(entries) and bool(exits) and exits[-1]["reason"] in ("wheels_stopped", "left_pid")
   g3_ok = (on_cmd >= G3_MAX_DECEL) if g3_applies else None
   g3_note = ("window" if g3_applies
              else ("no_window" if not entries else f"exit_{exits[-1]['reason']}"))
