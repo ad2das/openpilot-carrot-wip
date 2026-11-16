@@ -35,6 +35,7 @@ import os
 import sys
 from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 
 # Same Windows import shims as test_final_stop.py: these tests never construct the
@@ -252,6 +253,7 @@ def _replay(monkeypatch, name):
     trace.append({"t": row["t"], "v": row["v"], "out": float(out),
                   "open": control._final_t is not None, "done": bool(control._final_done),
                   "extra": float(control._probe_extra), "weak_t": float(control._probe_weak_t),
+                  "low": float(control._probe_low_extra),
                   "state": int(control.long_control_state),
                   "logged_u": row["u_logged"]})
   return control, trace, events

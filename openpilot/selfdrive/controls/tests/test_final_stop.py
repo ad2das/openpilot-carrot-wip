@@ -549,7 +549,9 @@ def test_z4_near_rest_extra_builds_and_floors(monkeypatch):
   assert control._final_t is not None
 
   v = 0.08
-  floor_tick = int(round(PROBE_LOW_MAX / (PROBE_LOW_JERK * DT_CTRL)))
+  # 0.16 / (0.3 * 0.01) = 53.3 ticks of ramp, so the extra is still ramping at tick 53 and
+  # saturates on tick 54.
+  floor_tick = int(np.ceil(PROBE_LOW_MAX / (PROBE_LOW_JERK * DT_CTRL)))
   assert floor_tick == 54, floor_tick
   for tick in range(1, 120):
     out = _stop_frame(control, v, a_ego=-0.10, speeds=_decaying_speeds(v),
