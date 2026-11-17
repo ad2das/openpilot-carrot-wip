@@ -41,6 +41,7 @@ from openpilot.selfdrive.carrot.radar_motion.primary import (
   VISION_LEAD_MIN_PROB,
   VisionLead,
   VisionRadarMatcher,
+  VisionRadarMatch,
   lead_from_vision,
   lead_from_radar_point,
   match_dpath_primary_lead,
@@ -57,6 +58,8 @@ from openpilot.selfdrive.carrot.radar_motion.trajectory_cutin import (
   TrajectoryCutInDetector,
 )
 from openpilot.selfdrive.carrot.radar_motion.trajectory_cutout import TrajectoryCutOutTracker
+from openpilot.selfdrive.carrot.radar_motion.stationary_lane import StoppingLaneCornerTracker
+from openpilot.selfdrive.carrot.radar_motion.in_lane import InLaneCornerTracker
 
 
 # modelV2 is polled at 20 Hz while liveTracks may arrive just before or after
@@ -96,6 +99,7 @@ MOVING_FRONT_RANGE_MAX_GAP_S = 0.15
 MOVING_FRONT_RANGE_MAX_POSITION_ERROR_M = 2.5
 MOVING_FRONT_RANGE_MAX_LATERAL_ERROR_M = 0.75
 MOVING_FRONT_RANGE_MAX_SPEED_JUMP_MPS = 3.0
+VISION_TRANSITION_CONFIRM_S = 0.20
 CORROBORATED_STATIONARY_VISION_RANGE_MISMATCH_HOLD_S = 0.15
 SCC_PRIMARY_DUPLICATE_MAX_VLEAD_DELTA_MPS = 3.0
 SCC_PRIMARY_CLOSER_MARGIN_M = 1.0
@@ -103,10 +107,68 @@ CROSS_SENSOR_CLOSE_CUTIN_MIN_DREL_M = 2.0
 CROSS_SENSOR_CLOSE_CUTIN_MAX_DREL_M = 12.0
 CROSS_SENSOR_CLOSE_CUTIN_MAX_ABS_DPATH_M = 3.0
 CROSS_SENSOR_CLOSE_CUTIN_MIN_VLEAD_MPS = 0.5
+# EnableRadarTracks 3 adopts the OEM SCC object with its lateral position zeroed. When the
+# front/corner radar tracks of that same body put it clearly beside the path, it is an
+# adjacent-lane car (2026-09-24 queue, 2026-10-06 lane change phantoms): do not adopt it.
+# Close-range radar lateral can read 1.3-2.0 m for a car straight ahead, so "near" is 2.0 m.
+FORCED_SCC_NEAR_PATH_M = 2.0
+FORCED_SCC_BESIDE_PATH_M = 2.5
+FORCED_SCC_VISION_MIN_PROB = 0.5
+# During a lane change the old lane can still hold a stopped car the path has already left.
+FORCED_SCC_LANE_CHANGE_KEEP_VLEAD_MPS = 5.0
+FORCED_SCC_REJECT_HOLD_S = 1.0
+LANE_CHANGE_ACTIVE_STATES = frozenset(("preLaneChange", "laneChangeStarting", "laneChangeFinishing"))
 
 
 def _is_corner(point: RadarPointSnapshot) -> bool:
   return point.source.startswith("corner")
+
+
+def _lane_change_active(model: Any) -> bool:
+  meta = getattr(model, "meta", None)
+  return str(getattr(meta, "laneChangeState", "off")) in LANE_CHANGE_ACTIVE_STATES
+
+
+def _forced_scc_lateral_evidence(
+  scc: RadarPointSnapshot,
+  points: tuple[RadarPointSnapshot, ...],
+  path: tuple[tuple[float, float], ...],
+  vision: VisionLead | None,
+  model: Any,
+) -> tuple[bool, bool]:
+  """(beside_path, in_lane) for the SCC body that mode 3 would adopt unconditionally."""
+  if _lane_change_active(model) and scc.v_lead < FORCED_SCC_LANE_CHANGE_KEEP_VLEAD_MPS:
+    return False, True
+  if (
+    vision is not None
+    and vision.probability >= FORCED_SCC_VISION_MIN_PROB
+    and abs(vision.d_rel - scc.d_rel) <= max(
+      SCC_PHYSICAL_MATCH_MIN_DREL_M, scc.d_rel * SCC_PHYSICAL_MATCH_DREL_FRACTION,
+    )
+    and abs(vision.y_rel) <= FORCED_SCC_NEAR_PATH_M
+  ):
+    return False, True
+  supports = [
+    support for support in (
+      _scc_physical_support(
+        scc, (point for point in points if point.source == "frontRadar"), path, require_path=False,
+      ),
+      _scc_physical_support(
+        scc, (point for point in points if _is_corner(point)), path, require_path=False,
+      ),
+    )
+    if support is not None
+  ]
+  if not supports:
+    return False, False  # no physical match: SCC may be the only sensor on this car
+  d_paths = [abs(project_to_model_path(path, point.d_rel, point.y_rel).d_path) for point in supports]
+  # A noisy model path alone must not push a car out: the raw lateral has to agree.
+  if min(d_paths) < FORCED_SCC_NEAR_PATH_M or min(abs(point.y_rel) for point in supports) < FORCED_SCC_NEAR_PATH_M:
+    return False, True
+  # Front and corner on different bodies: reject only if both are clearly beside the path.
+  agree = len(supports) < 2 or abs(supports[0].y_rel - supports[1].y_rel) <= SCC_CORNER_MATCH_MAX_YREL_DELTA_M
+  beside = max(d_paths) >= FORCED_SCC_BESIDE_PATH_M and (agree or min(d_paths) >= FORCED_SCC_BESIDE_PATH_M)
+  return beside, False
 
 
 def _model_path(model: Any) -> tuple[tuple[float, float], ...]:
@@ -467,6 +529,8 @@ class DPathRadarController:
   ) -> None:
     self.primary_matcher = VisionRadarMatcher()
     self.scc_primary_fallback_matcher = VisionRadarMatcher()
+    self.forced_scc_rejected_s: float | None = None  # last frame mode 3 refused a beside-path SCC body
+    self._forced_scc_previous: tuple[float, RadarPointSnapshot] | None = None
     self.enable_radar_tracks = int(enable_radar_tracks)
     self.front_radar_measurement_delay_s = max(
       0.0, float(front_radar_measurement_delay_s),
@@ -483,6 +547,8 @@ class DPathRadarController:
     self.front_kinematic_associator = FrontRadarKinematicAssociator()
     self.lead_two_tracker = DPathLeadTwoTracker()
     self.stationary_shadow_tracker = DPathStationaryShadowTracker()
+    self.stopping_lane_corner_tracker = StoppingLaneCornerTracker()
+    self.in_lane_corner_tracker = InLaneCornerTracker()
     self.stationary_primary_handoff_tracker = (
       DPathStationaryPrimaryHandoffTracker()
     )
@@ -497,6 +563,88 @@ class DPathRadarController:
     self._stationary_range_last_point: RadarPointSnapshot | None = None
     self._stationary_range_last_time_s: float | None = None
     self._stationary_range_anchor_time_s: float | None = None
+    self._vision_transition_radar: tuple[float, RadarPointSnapshot] | None = None
+    self._vision_transition_previous: tuple[float, dict[str, Any]] | None = None
+    self._vision_transition_since_s = 0.0
+
+  def _confirm_vision_transition(
+    self,
+    match: VisionRadarMatch | None,
+    vision_lead: dict[str, Any] | None,
+    points: tuple[RadarPointSnapshot, ...],
+    path: tuple[tuple[float, float], ...],
+    time_s: float,
+  ) -> VisionRadarMatch | None:
+    """Retain a measured front lead until its visual replacement is coherent."""
+    # Count camera time even while the ordinary matcher still accepts radar.
+    # This avoids adding another wait after existing confirmation/hold paths.
+    # Use published visual velocity, including the model ego-speed correction.
+    if vision_lead is None:
+      self._vision_transition_previous = None
+      self._vision_transition_since_s = 0.0
+    else:
+      previous_vision = self._vision_transition_previous
+      continuous = False
+      if previous_vision is not None:
+        previous_s, lead = previous_vision
+        dt = time_s - previous_s
+        continuous = (
+          0.0 <= dt <= RADAR_MOTION_MAX_TIME_SKEW_S
+          and abs(vision_lead["dRel"] - (lead["dRel"] + lead["vRel"] * dt)) <= MOVING_FRONT_RANGE_MAX_POSITION_ERROR_M
+          and abs(vision_lead["yRel"] - lead["yRel"]) <= MOVING_FRONT_RANGE_MAX_LATERAL_ERROR_M
+          and abs(vision_lead["vLead"] - lead["vLead"]) <= MOVING_FRONT_RANGE_MAX_SPEED_JUMP_MPS
+        )
+      if not continuous:
+        self._vision_transition_since_s = time_s
+      self._vision_transition_previous = (time_s, vision_lead)
+    previous = self._vision_transition_radar
+    self._vision_transition_radar = None
+    point = None
+    if previous is not None:
+      previous_s, previous_point = previous
+      point = next((
+        candidate for candidate in points
+        if (candidate.source, candidate.track_id) == (previous_point.source, previous_point.track_id)
+      ), None)
+      dt = time_s - previous_s
+      if not (
+        point is not None and point.measured
+        and 0.0 <= dt <= RADAR_MOTION_MAX_TIME_SKEW_S
+        and 0.5 < point.d_rel < 180.0
+        and abs(point.d_rel - (previous_point.d_rel + previous_point.v_rel * dt)) <= MOVING_FRONT_RANGE_MAX_POSITION_ERROR_M
+        and abs(point.y_rel - (previous_point.y_rel + previous_point.yv_rel * dt)) <= MOVING_FRONT_RANGE_MAX_LATERAL_ERROR_M
+        and abs(point.v_lead - previous_point.v_lead) <= (
+          STATIONARY_FRONT_ANCHOR_MAX_SPEED_JUMP_MPS
+          if abs(previous_point.v_lead) <= STATIONARY_MAX_ABS_VLEAD_MPS
+          else MOVING_FRONT_RANGE_MAX_SPEED_JUMP_MPS
+        )
+        and (
+          point.v_lead > STATIONARY_MAX_ABS_VLEAD_MPS
+          or self.primary_matcher.stationary_identity == (point.source, point.track_id)
+        )
+        and abs(project_to_model_path(path, point.d_rel, point.y_rel).d_path) <= RADAR_VISION_FALLBACK_MAX_ABS_DPATH_M
+      ):
+        point = None
+    if match is not None or vision_lead is None or point is None or self.enable_radar_tracks <= 0:
+      if (
+        match is not None and self.enable_radar_tracks > 0
+        and match.point.source == "frontRadar" and match.point.measured
+        and abs(match.d_path) <= RADAR_VISION_FALLBACK_MAX_ABS_DPATH_M
+      ):
+        self._vision_transition_radar = (time_s, match.point)
+      return match
+
+    # Both histories are current. A visual jump restarts confirmation while
+    # the retained radar supplies its latest measured distance and kinematics.
+    if time_s - self._vision_transition_since_s >= VISION_TRANSITION_CONFIRM_S - 1e-6:
+      self._vision_transition_previous = None
+      self._vision_transition_since_s = 0.0
+      return None
+    self._vision_transition_radar = (time_s, point)
+    return VisionRadarMatch(
+      point=point, probability=0.0, score=0.0,
+      d_path=project_to_model_path(path, point.d_rel, point.y_rel).d_path,
+    )
 
   def _reset_stationary_range_history(self) -> None:
     self._stationary_range_last_point = None
@@ -644,6 +792,44 @@ class DPathRadarController:
       >= CORROBORATED_STATIONARY_VISION_RANGE_MISMATCH_HOLD_S
     )
 
+  def _reject_forced_scc(
+    self,
+    scc: RadarPointSnapshot,
+    points: tuple[RadarPointSnapshot, ...],
+    path: tuple[tuple[float, float], ...],
+    vision: VisionLead | None,
+    model: Any,
+    time_s: float,
+  ) -> bool:
+    """Mode 3: refuse a beside-path SCC body; hold the refusal briefly through support dropouts."""
+    # SCC commonly reuses track ID 0 for different cars. A distance/speed jump
+    # must not transfer a previous adjacent car's refusal to the new lead.
+    previous = self._forced_scc_previous
+    continuous = False
+    if previous is not None:
+      previous_s, point = previous
+      dt = time_s - previous_s
+      continuous = (
+        0.0 <= dt <= FORCED_SCC_REJECT_HOLD_S
+        and (scc.source, scc.track_id) == (point.source, point.track_id)
+        and abs(scc.d_rel - (point.d_rel + point.v_rel * dt)) <= 2.0
+        and abs(scc.v_rel - point.v_rel) <= 3.0
+      )
+    if not continuous:
+      self.forced_scc_rejected_s = None
+    self._forced_scc_previous = (time_s, scc)
+    beside, in_lane = _forced_scc_lateral_evidence(scc, points, path, vision, model)
+    if in_lane:
+      self.forced_scc_rejected_s = None
+      return False
+    if beside:
+      self.forced_scc_rejected_s = time_s
+      return True
+    return (
+      self.forced_scc_rejected_s is not None
+      and 0.0 <= time_s - self.forced_scc_rejected_s <= FORCED_SCC_REJECT_HOLD_S
+    )
+
   def _points_at_model_time(
     self,
     radar_points: Any,
@@ -706,6 +892,8 @@ class DPathRadarController:
       self._reset_motion_pipeline()
       self.lead_two_tracker.reset()
       self.stationary_shadow_tracker.reset()
+      self.stopping_lane_corner_tracker.reset()
+      self.in_lane_corner_tracker.reset()
       self.stationary_primary_handoff_tracker.reset()
       self.scc_lead_two_tracker.reset()
     if self.motion_sensor == "corner":
@@ -813,6 +1001,10 @@ class DPathRadarController:
   ) -> DPathRadarOutput:
     path = _model_path(model)
     if len(path) < 2:
+      self.stopping_lane_corner_tracker.reset()
+      self.in_lane_corner_tracker.reset()
+      self.forced_scc_rejected_s = None
+      self._forced_scc_previous = None
       self.primary_matcher.reset()
       self.scc_primary_fallback_matcher.reset()
       self.lead_two_tracker.reset()
@@ -827,6 +1019,9 @@ class DPathRadarController:
       self._moving_range_last_point = None
       self._moving_range_last_time_s = None
       self._reset_stationary_range_history()
+      self._vision_transition_radar = None
+      self._vision_transition_previous = None
+      self._vision_transition_since_s = 0.0
       return DPathRadarOutput(
         None, None, None, None, (), (), (), (), (), (), None,
       )
@@ -865,10 +1060,17 @@ class DPathRadarController:
       # A farther permissive match must not hide a strongly visible nearer car.
       primary_match = None
     if primary_match is None and self.enable_radar_tracks == 3:
-      # 3 uses front-radar/vision matching first, then always trusts the SCC
-      # longitudinal object if matching fails. Vision is the final fallback
-      # only when no SCC object exists.
+      # Mode 3 tries front-radar/vision first, then SCC unless physical lateral
+      # evidence identifies an adjacent car. Vision remains the final fallback.
       primary_match = unconditional_scc_match(points)
+      if primary_match is not None and self._reject_forced_scc(primary_match.point, points, path, vision, model, time_s):
+        primary_match = None
+      elif primary_match is None:
+        self.forced_scc_rejected_s = None
+        self._forced_scc_previous = None
+    else:
+      self.forced_scc_rejected_s = None
+      self._forced_scc_previous = None
     if primary_match is not None:
       self.scc_primary_fallback_matcher.reset()
     elif self.enable_radar_tracks == 2:
@@ -892,7 +1094,16 @@ class DPathRadarController:
       )
     else:
       self.scc_primary_fallback_matcher.reset()
-    lead_one = None
+    vision_candidate = None
+    if vision is not None and (
+      vision_only_lead_allowed(self.enable_radar_tracks)
+      or _central_vision_fallback_allowed(vision, path)
+    ):
+      vision_candidate = lead_from_vision(
+        vision, path, v_ego, model_v_ego=_model_ego_speed(model, v_ego),
+      )
+    primary_match = self._confirm_vision_transition(primary_match, vision_candidate, points, path, time_s)
+    lead_one = vision_candidate
     if primary_match is not None:
       lead_one = self._lead_from_radar_point(
         primary_match.point,
@@ -900,20 +1111,21 @@ class DPathRadarController:
         primary_match.probability,
         primary_match.score,
       )
+    if self.enable_radar_tracks > 0 and self.motion_sensor == "corner" and lead_one is None:
+      stopping_corner = self.stopping_lane_corner_tracker.update(
+        time_s, v_ego, model, points, vision_lead_from_model(model),
+      )
     else:
-      if (
-        vision is not None
-        and (
-          vision_only_lead_allowed(self.enable_radar_tracks)
-          or _central_vision_fallback_allowed(vision, path)
-        )
-      ):
-        lead_one = lead_from_vision(
-          vision,
-          path,
-          v_ego,
-          model_v_ego=_model_ego_speed(model, v_ego),
-        )
+      self.stopping_lane_corner_tracker.reset()
+      stopping_corner = None
+    if self.enable_radar_tracks > 0 and self.motion_sensor == "corner":
+      in_lane_corner = self.in_lane_corner_tracker.update(
+        time_s, v_ego, model, points, vision_lead_from_model(model),
+        measurement_time_s=time_s - radar_to_model_time_s,
+      )
+    else:
+      self.in_lane_corner_tracker.reset()
+      in_lane_corner = None
     cutout_point = primary_match.point if primary_match is not None and self.enable_radar_tracks > 0 else None
     paired_corners = tuple(
       point for point in points
@@ -1273,6 +1485,20 @@ class DPathRadarController:
       if not _scc_lead_two_can_compete(scc_lead_two, lead_one):
         scc_lead_two = None
     lead_two = selection.lead_two
+    # A visual lead can be corroborated by a corner born inside the lane;
+    # it need not invent a CUT-IN to supply measured longitudinal kinematics.
+    if in_lane_corner is not None and (lead_one is None or not lead_one.get("radar", False)):
+      point, lane_offset = in_lane_corner
+      if lead_two is None or point.d_rel < float(lead_two["dRel"]):
+        lead_two = self._lead_from_radar_point(
+          point, lane_offset, vision_lead_from_model(model).probability, 1.0,
+        )
+    if stopping_corner is not None:
+      point, lane_offset = stopping_corner
+      if lead_two is None or point.d_rel < float(lead_two["dRel"]):
+        lead_two = self._lead_from_radar_point(
+          point, lane_offset, vision_lead_from_model(model).probability, 1.0,
+        )
     if (
       scc_lead_two is not None
       and (
