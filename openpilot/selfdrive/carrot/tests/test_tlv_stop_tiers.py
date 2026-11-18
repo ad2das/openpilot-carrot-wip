@@ -60,7 +60,7 @@ def test_cue_commit_needs_the_half_second_and_reports_cue():
   assert not any(r[2] for r in rows if r[0] <= 0.45)
   commit = next(r for r in rows if r[2])
   assert commit[0] == 0.50
-  assert commit[3] == (('stop', 'commit', 'cue'),)
+  assert commit[3] == (('soft', 'firm', 'cue'), ('stop', 'commit', 'cue'))
 
 
 @pytest.mark.parametrize("v_ego,expected", [(8.3, False), (27.8, False), (8.34, True), (27.7, True)])
@@ -231,7 +231,7 @@ def test_the_cue_waits_out_the_brake_hold():
   # brake ends at 0.5, the hold clears at 2.5, the first valid tick is 2.55 and
   # the 0.5 s cue clock then lands the commit at 3.05.
   assert commit[0] == pytest.approx(3.05)
-  assert commit[3] == (('stop', 'commit', 'cue'),)
+  assert commit[3] == (('soft', 'firm', 'cue'), ('stop', 'commit', 'cue'))
 
 
 def test_distance_window_tracks_speed_and_the_220_metre_floor():
@@ -303,7 +303,7 @@ def test_one_or_two_tick_lead_blips_keep_both_tiers_and_a_solid_lead_releases_th
   stop = [(r[0], e) for r in rows for e in r[3] if e[0] == 'stop']
   soft = [(r[0], e) for r in rows for e in r[3] if e[0] == 'soft']
   assert stop == [(0.5, ('stop', 'commit', 'cue')), (4.5, ('stop', 'release', 'lead'))]
-  assert soft == [(0.0, ('soft', 'start', 'confirmed_red')), (4.5, ('soft', 'release', 'lead'))]
+  assert soft == [(0.0, ('soft', 'start', 'confirmed_red')), (0.5, ('soft', 'firm', 'cue')), (4.5, ('soft', 'release', 'lead'))]
 
 
 def test_short_lead_gaps_are_bridged_and_a_long_gap_restarts_the_run():

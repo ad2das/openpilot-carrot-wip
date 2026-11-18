@@ -400,7 +400,8 @@ class LongitudinalPlanner:
     previous = getattr(self, '_signal_prepare_previous', cs.aEgo)
     uncapped = self.output_a_target
     self.output_a_target = self._signal_prepare_accel.apply(self.output_a_target, previous, elapsed, active,
-                                                           follow_target=tier1)
+                                                           follow_target=tier1,
+                                                           firm=getattr(carrot, 'tlv_soft_firm', True))
     self._signal_prepare_previous = self.output_a_target
     if active:
       # Coasting must not cancel the requested gentle deceleration downstream.

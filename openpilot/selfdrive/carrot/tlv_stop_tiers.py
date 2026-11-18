@@ -81,6 +81,7 @@ class TlvStopTiers:
     self.soft_latched = False
     self.soft_stop_seen = False
     self.soft_moving_s = 0.0
+    self.soft_firm = False
 
   def accel_cap(self):
     """Acceleration upper limit this tick, or None when tier 1 is off."""
@@ -136,11 +137,16 @@ class TlvStopTiers:
     lead_clear = ((self.last_lead_t is None or i.t - self.last_lead_t > LEAD_CLEAR_S)
                   and (self.last_lead_rel_t is None or i.t - self.last_lead_rel_t > LEAD_REARM_S))
 
+    # tier 1 floors at -0.5 until the model's own cue, then -1.0 (see PrepareAccel firm)
     # tier 1
     if self.soft_active:
       if i.model_stop:
         self.soft_stop_seen = True
       self.soft_moving_s = 0.0 if self.soft_stop_seen else self.soft_moving_s + dt
+      if not self.soft_firm and cue:
+        self.soft_firm = True
+        self.soft_moving_s = 0.0
+        self.events.append(('soft', 'firm', 'cue'))
       r = ('disabled' if not i.enabled else 'go' if i.go else 'red_end' if not gated_held else
            'gas' if (i.gas or i.cooldown) else 'lead' if lead_solid else
            'timeout' if self.soft_moving_s > SOFT_MAX_MOVING_S else
@@ -148,6 +154,7 @@ class TlvStopTiers:
       if r:
         self.soft_active = False
         self.soft_latched = True
+        self.soft_firm = False
         self.events.append(('soft', 'release', r))
     elif (i.enabled and not self.soft_latched and not self.gas_ep and i.conf and i.gated_red
           and SOFT_MIN_MPS <= i.v_ego < SOFT_MAX_MPS
@@ -155,6 +162,7 @@ class TlvStopTiers:
       self.soft_active = True
       self.soft_stop_seen = i.model_stop
       self.soft_moving_s = 0.0
+      self.soft_firm = cue
       self.events.append(('soft', 'start', 'confirmed_red'))
 
     # tier 2

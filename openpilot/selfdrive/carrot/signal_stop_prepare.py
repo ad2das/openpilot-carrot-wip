@@ -199,11 +199,11 @@ class PrepareAccel:
   def __init__(self):
     self.cap = None
 
-  def apply(self, target, previous, dt, active, follow_target=False):
+  def apply(self, target, previous, dt, active, follow_target=False, firm=True):
     if not active or not all(math.isfinite(x) for x in (target, previous, dt)) or not 0 < dt <= .2:
       self.cap = None
       return target
-    floor = SignalStopPrepare.TLV_TIER1_ACCEL if follow_target else SignalStopPrepare.TARGET_ACCEL
+    floor = (SignalStopPrepare.TLV_TIER1_ACCEL if firm else SignalStopPrepare.TARGET_ACCEL) if follow_target else SignalStopPrepare.TARGET_ACCEL
     if self.cap is None:
       self.cap = max(floor, previous)
     if follow_target:

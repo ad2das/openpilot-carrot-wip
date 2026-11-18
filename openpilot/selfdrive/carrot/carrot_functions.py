@@ -320,6 +320,7 @@ class CarrotPlanner:
     self.tlvStopGo = 0
     self.tlv_stop_committed = False
     self.tlv_soft_active = False
+    self.tlv_soft_firm = True    # unknown = firm (today); tiers.soft_firm overwrites it every tier tick
     self.tlv_tiers = TlvStopTiers()
     self.lead_follow_arm_frames = 0
     self.lead_follow_d_stop = None
@@ -1149,10 +1150,12 @@ class CarrotPlanner:
     except Exception:
       pass
 
-  def _log_tlv_soft(self, action: str, reason: str, v_ego: float, x_end: float, v0: float) -> None:
+  def _log_tlv_soft(self, action: str, reason: str, v_ego: float, x_end: float, v0: float,
+                    firm: bool = True) -> None:
     try:
       cloudlog.event('tlvSoftDecel', action=action, reason=reason, v_ego=float(v_ego),
                      rx=float(x_end / (10.0 * max(v0, 1.0))),
+                     firm=bool(firm),
                      mode=int(self.trafficLightDetectMode))
     except Exception:
       pass
@@ -1194,9 +1197,10 @@ class CarrotPlanner:
     ))
     self.tlv_stop_committed = tiers.committed
     self.tlv_soft_active = tiers.soft_active
+    self.tlv_soft_firm = tiers.soft_firm
     for kind, action, reason in tiers.events:
       if kind == 'soft':
-        self._log_tlv_soft(action, reason, v_ego, float(x[-1]), float(v[0]))
+        self._log_tlv_soft(action, reason, v_ego, float(x[-1]), float(v[0]), tiers.soft_firm)
         continue
       if (action == 'release' and self.xState == XState.e2eStop
           and v_ego > self._tlv_stop_min_mps and not self.last_model_stop_sign):
