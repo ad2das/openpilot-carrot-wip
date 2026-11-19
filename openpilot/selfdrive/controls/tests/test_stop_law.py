@@ -742,3 +742,27 @@ def test_t1_gap_tracks_setting(monkeypatch, stop_cm):
     stop_cm, trace[-1]["gap"], n_law, control._stop_ctl.n_enter, min_gap, first_law_v)
   print(msg)
   assert gap - 0.5 <= trace[-1]["gap"] <= gap + 0.7, msg
+
+
+def test_release_ramp_ends_at_zero_before_handover(monkeypatch):
+  # The hand-back ramp owns the tick on which it reaches 0.0; the ordinary command takes over on the next tick.
+  # Law off (no StopCtl), so only the hand-back block acts; the ordinary command here asks for +0.5 m/s^2.
+  silence_cloudlog(monkeypatch)
+  control, params = make_control(monkeypatch)
+  control._stop_ctl = None
+  plant = NominalPlant(1.0, a0=0.0)
+  for _ in range(30):
+    cs, plan, radar = tick_inputs(plant, 80.0, lead_status=False, a_target=0.0, v_target_now=plant.v, should_stop=False)
+    control.update(True, cs, plan, LIMITS, AGE, radar)
+  assert control.long_control_state == LongCtrlState.pid
+  control._stop_release = -0.0197
+  outs = []
+  for _ in range(2):
+    cs, plan, radar = tick_inputs(plant, 80.0, lead_status=False, a_target=0.5, v_target_now=plant.v + 0.5,
+                                  should_stop=False)
+    outs.append(float(control.update(True, cs, plan, LIMITS, AGE, radar)[0]))
+    if len(outs) == 1:
+      assert control._stop_release is None
+  assert outs[0] == 0.0
+  assert outs[0] - (-0.0197) <= lc.STOP_LAW_RELEASE_JERK * DT_CTRL + 1e-12
+  assert outs[1] > 0.0

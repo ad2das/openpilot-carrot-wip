@@ -868,13 +868,17 @@ class LongControl:
       if stop_u is None and self._stop_release is not None:
         # Soft hand-back after the law lets go: relax at STOP_LAW_RELEASE_JERK; a harder ordinary
         # command passes at once; pedals or cruise standstill end it at once.
-        self._stop_release += STOP_LAW_RELEASE_JERK * DT_CTRL
+        self._stop_release = min(0.0, self._stop_release + STOP_LAW_RELEASE_JERK * DT_CTRL)
         release_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
-        if self._stop_release >= 0.0 or output_accel <= self._stop_release or release_exit:
+        if release_exit or output_accel <= self._stop_release:
           self._stop_release = None
         else:
+          # The ramp owns this tick even at its 0.0 endpoint: handing the ordinary command control
+          # there lets one tick step past STOP_LAW_RELEASE_JERK. It is released one tick later.
           self.pid.i = previous_integral
           output_accel = self._stop_release
+          if self._stop_release >= 0.0:
+            self._stop_release = None
       guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
       if guarded > output_accel:
         # Do not integrate the speed error the guard is overriding.
