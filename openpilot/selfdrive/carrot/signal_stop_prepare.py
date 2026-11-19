@@ -196,18 +196,29 @@ class SignalStopPrepare:
 
 class PrepareAccel:
   """Final upper acceleration cap; stronger existing braking always wins."""
+  RAMP_UP = .5  # m/s^3; smooth upward release when continuous floor eases off
+
   def __init__(self):
     self.cap = None
 
-  def apply(self, target, previous, dt, active, follow_target=False, firm=True):
+  def apply(self, target, previous, dt, active, follow_target=False, firm=True, floor_override=None):
     if not active or not all(math.isfinite(x) for x in (target, previous, dt)) or not 0 < dt <= .2:
       self.cap = None
       return target
-    floor = (SignalStopPrepare.TLV_TIER1_ACCEL if firm else SignalStopPrepare.TARGET_ACCEL) if follow_target else SignalStopPrepare.TARGET_ACCEL
+    if follow_target and floor_override is not None and math.isfinite(floor_override):
+      floor = min(0., max(SignalStopPrepare.TLV_TIER1_ACCEL, float(floor_override)))
+    else:
+      floor = (SignalStopPrepare.TLV_TIER1_ACCEL if firm else SignalStopPrepare.TARGET_ACCEL) if follow_target else SignalStopPrepare.TARGET_ACCEL
     if self.cap is None:
       self.cap = max(floor, previous)
     if follow_target:
-      # Never above the plan's own target: the ramp starts from where the plan already is.
-      self.cap = min(self.cap, target)
-    self.cap = max(floor, self.cap-SignalStopPrepare.RAMP*dt)
+      if self.cap < floor:
+        # Floor eased upward (e.g. range grew): release smoothly instead of stepping.
+        self.cap = min(floor, self.cap+self.RAMP_UP*dt)
+      else:
+        # Never above the plan's own target: the ramp starts from where the plan already is.
+        self.cap = min(self.cap, target)
+        self.cap = max(floor, self.cap-SignalStopPrepare.RAMP*dt)
+    else:
+      self.cap = max(floor, self.cap-SignalStopPrepare.RAMP*dt)
     return min(target, self.cap)

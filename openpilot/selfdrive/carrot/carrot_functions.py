@@ -1,3 +1,4 @@
+import math
 import time
 from collections import deque
 from enum import Enum
@@ -321,6 +322,7 @@ class CarrotPlanner:
     self.tlv_stop_committed = False
     self.tlv_soft_active = False
     self.tlv_soft_firm = True    # unknown = firm (today); tiers.soft_firm overwrites it every tier tick
+    self.tlv_soft_cap = None     # single-source-of-truth tier-1 accel cap in [-1.0, 0.0], or None
     self.tlv_tiers = TlvStopTiers()
     self.lead_follow_arm_frames = 0
     self.lead_follow_d_stop = None
@@ -421,9 +423,12 @@ class CarrotPlanner:
       # Graded redLikely (mode 2, model not signalling a go): coast only, never brake.
       accel = min(accel, 0.0)
     if getattr(self, 'tlv_soft_active', False):
-      # W-TLT1 tier 1: a confirmed red far out trims the plan before the model
-      # has decided anything, so a phantom costs a few km/h, not a stop.
-      accel = min(accel, -self._tlv_soft_decel)
+      # W-TLT1 tier 1: range-scaled deceleration cap (0.0 while far, down to
+      # -SOFT_DECEL here; PrepareAccel applies the full ramp down to -1.0).
+      soft_cap = getattr(self, 'tlv_soft_cap', None)
+      if soft_cap is None:
+        soft_cap = -self._tlv_soft_decel
+      accel = min(accel, max(float(soft_cap), -self._tlv_soft_decel))
     return accel
 
   def _get_base_t_follow(self, personality, v_ego):
@@ -1043,6 +1048,22 @@ class CarrotPlanner:
     except Exception:
       return False
 
+  def _read_tlv_range_m(self, sm) -> float:
+    """Fresh carrotMan.tlvRangeM (m) for a src-1 TLV light; 0.0 when unknown."""
+    try:
+      service = 'carrotMan'
+      if not (sm.seen[service] and sm.alive[service] and sm.valid[service]):
+        return 0.0
+      if time.monotonic() - sm.recv_time[service] > CARROT_MAN_TIMEOUT:
+        return 0.0
+      carrot_man = sm[service]
+      if int(getattr(carrot_man, 'trafficStateSrc', 0)) != 1:
+        return 0.0
+      val = float(getattr(carrot_man, 'tlvRangeM', 0.0))
+      return val if math.isfinite(val) and val > 0.0 else 0.0
+    except Exception:
+      return 0.0
+
   def _apply_fast_gate(self, raw_red: bool, sm, v_ego: float) -> bool:
     """W139c fast-road phantom gate: G-det OR G-model, only at >= 22.2 m/s.
 
@@ -1151,11 +1172,13 @@ class CarrotPlanner:
       pass
 
   def _log_tlv_soft(self, action: str, reason: str, v_ego: float, x_end: float, v0: float,
-                    firm: bool = True) -> None:
+                    firm: bool = True, cap: float | None = None, range_m: float | None = None) -> None:
     try:
       cloudlog.event('tlvSoftDecel', action=action, reason=reason, v_ego=float(v_ego),
                      rx=float(x_end / (10.0 * max(v0, 1.0))),
                      firm=bool(firm),
+                     cap=(None if cap is None else round(float(cap), 3)),
+                     range_m=(None if range_m is None else round(float(range_m), 1)),
                      mode=int(self.trafficLightDetectMode))
     except Exception:
       pass
@@ -1165,8 +1188,9 @@ class CarrotPlanner:
     """W-TSG1/W-TLT1 (experimental CarrotTlvStopGo): a confirmed TLV red gets two
     tiers, both decided by the pure tlv_stop_tiers state machine.
 
-    Tier 1 (soft) caps the planned acceleration at -0.5 m/s^2 from 30-100 km/h,
-    so a far red trims speed gently and a phantom costs a few km/h. Tier 2
+    Tier 1 (soft) scales the acceleration cap continuously (0 to -1.0 m/s^2)
+    from the fused monocular range to the red light and ego speed, so far reds
+    coast without braking while near/fast reds brake immediately. Tier 2
     (stop) commits the existing e2eStop path; the distance is always the
     model's (stop_model_x_rl), never derived from the lamp colour, and at
     40 km/h and above it needs the model's own slowdown cue.
@@ -1194,13 +1218,16 @@ class CarrotPlanner:
       cooldown=self.tlv_gas_cooldown_frames > 0,
       starting=self.traffic_starting_count != 0,
       enabled=enabled,
+      range_m=self._read_tlv_range_m(sm),
     ))
     self.tlv_stop_committed = tiers.committed
     self.tlv_soft_active = tiers.soft_active
     self.tlv_soft_firm = tiers.soft_firm
+    self.tlv_soft_cap = tiers.accel_cap()
     for kind, action, reason in tiers.events:
       if kind == 'soft':
-        self._log_tlv_soft(action, reason, v_ego, float(x[-1]), float(v[0]), tiers.soft_firm)
+        self._log_tlv_soft(action, reason, v_ego, float(x[-1]), float(v[0]),
+                           tiers.soft_firm, tiers.accel_cap(), tiers.soft_range_m)
         continue
       if (action == 'release' and self.xState == XState.e2eStop
           and v_ego > self._tlv_stop_min_mps and not self.last_model_stop_sign):

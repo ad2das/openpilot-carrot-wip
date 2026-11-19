@@ -298,6 +298,7 @@ class CarrotServ:
     self.traffic_state = 0
     self.traffic_state_src = 0  # 0 = navi DETECT, 1 = carrotTlv device detector
     self.tlv_det_support = 0    # W139c: carrotTlv.relevantDetSupport passed through
+    self.tlv_range_m = 0.0      # fused monocular range (m) of the accepted src-1 light
     self.tlv_hold_until = 0.0   # W143: src-1 TLV state held until this monotonic time
     self.tlv_last_red_top = None  # (monotonic, relevantBox.y1) of the last accepted red
     self.tlv_top_exit = None      # WTOP1 hold state
@@ -432,6 +433,7 @@ class CarrotServ:
         self.traffic_state = 0
         self.traffic_state_src = 0
         self.tlv_det_support = 0
+        self.tlv_range_m = 0.0
 
   def _handle_detect_command(self, xArg):
     elements = [e.strip() for e in xArg.split(',')]
@@ -583,6 +585,7 @@ class CarrotServ:
       if self.traffic_state_src == 1:
         self.traffic_state = 0
         self.traffic_state_src = 0
+        self.tlv_range_m = 0.0
         self.tlv_hold_until = 0.0
         self.traffic_light_count = -1
       return
@@ -610,11 +613,13 @@ class CarrotServ:
     # W138: require the relevant track and a non-degenerate relevantBox; dets[0]
     # is no longer a fallback (it may be an unrelated light).
     if int(msg.relevantTrackId) < 0:
+      self.tlv_range_m = 0.0
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
       return
     rb = msg.relevantBox
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
+      self.tlv_range_m = 0.0
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
       return
@@ -662,6 +667,7 @@ class CarrotServ:
       self.traffic_state = TLV_GRADED_TRAFFIC_STATE
       self.traffic_state_src = 1
       self.tlv_det_support = int(msg.relevantDetSupport)
+      self.tlv_range_m = max(0.0, float(getattr(msg, 'relevantRangeM', 0.0)))
       self.tlv_hold_until = now + TLV_HOLD_S
       self.traffic_light_count = int(0.5 / 0.1)
       return
@@ -687,6 +693,7 @@ class CarrotServ:
       self.tlv_last_red_top = (now, float(rb.y1))
     self.traffic_light(x, y, color, float(msg.stateConf), src=1)
     self.tlv_det_support = int(msg.relevantDetSupport)
+    self.tlv_range_m = max(0.0, float(getattr(msg, 'relevantRangeM', 0.0)))
     self.tlv_hold_until = now + TLV_HOLD_S
     self.traffic_light_count = int(0.5 / 0.1)
 
@@ -824,6 +831,7 @@ class CarrotServ:
     self.traffic_state_src = 0
     self.tlv_hold_until = 0.0
     self.tlv_det_support = 0
+    self.tlv_range_m = 0.0
 
   def _tlv_fast_go_ok(self, sm, msg) -> bool:
     """W-FGO2: may a cue-gated W150 release publish a TLV go (not only clear the red)?"""
@@ -2060,6 +2068,7 @@ class CarrotServ:
     # UI needs the same three conditions _tlv_top_exit_hold() uses to keep it.
     msg.carrotMan.tlvTopExit = bool(self.tlv_top_exit is not None and self.traffic_state == 1
                                     and self.traffic_state_src == 1)
+    msg.carrotMan.tlvRangeM = float(self.tlv_range_m) if self.traffic_state_src == 1 else 0.0
 
     msg.carrotMan.xPosSpeed = float(v_ego_kph) #float(self.nPosSpeed)
     msg.carrotMan.xPosAngle = float(self.bearing)

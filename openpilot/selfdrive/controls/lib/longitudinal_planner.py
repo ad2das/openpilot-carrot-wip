@@ -390,7 +390,9 @@ class LongitudinalPlanner:
     # prepare experiment, never lets it sit above the plan's own target (a start while
     # still accelerating would otherwise take seconds to come down). tlv_soft_active
     # is only ever set with that toggle on.
-    tier1 = getattr(carrot, 'tlv_soft_active', False)
+    soft_cap = getattr(carrot, 'tlv_soft_cap', None)
+    ramping_out = self._signal_prepare_accel.cap is not None and self._signal_prepare_accel.cap < -1e-6
+    tier1 = getattr(carrot, 'tlv_soft_active', False) and (soft_cap is None or soft_cap < -1e-6 or ramping_out)
     requested = getattr(getattr(carrot, 'prepare_decision', None), 'active', False) or tier1
     active = (requested
               and not reset_state and not cs.gasPressed and not cs.brakePressed
@@ -401,7 +403,8 @@ class LongitudinalPlanner:
     uncapped = self.output_a_target
     self.output_a_target = self._signal_prepare_accel.apply(self.output_a_target, previous, elapsed, active,
                                                            follow_target=tier1,
-                                                           firm=getattr(carrot, 'tlv_soft_firm', True))
+                                                           firm=getattr(carrot, 'tlv_soft_firm', True),
+                                                           floor_override=soft_cap)
     self._signal_prepare_previous = self.output_a_target
     if active:
       # Coasting must not cancel the requested gentle deceleration downstream.

@@ -53,6 +53,8 @@ struct CarrotMan @0x81c2f05a394cf4af {
 	tlvDetSupport @36 :UInt8;
 	# WTOP1 top-exit red hold active (carrot_serv tlv_top_exit) while the src-1 red is held; the C3X prompts a manual start.
 	tlvTopExit @37 :Bool;
+	# Fused monocular range (metres) to the relevant TLV light (0 when unknown or not TLV).
+	tlvRangeM @38 :Float32;
 }
 
 struct CarrotNaviState @0xaedffd8f31e7b55d {
@@ -316,6 +318,8 @@ struct CarrotTlv @0xa4f1eb3323f5f582 {
 	# prob >= 0.80 with no newer red vote, so a held red was released this frame.
 	# A release only lifts the red (state -> none); it never starts the car.
 	relevantReleased @25 :Bool;
+	# Fused monocular range (metres) to the relevant track (width + calibrated grade-compensated elevation; 0 when unknown).
+	relevantRangeM @26 :Float32;
 
 	enum Status {
 		off @0;

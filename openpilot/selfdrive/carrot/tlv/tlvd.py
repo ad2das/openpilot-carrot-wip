@@ -38,7 +38,7 @@ from collections import deque
 # spawn child before importing this module; the module level must stay free of
 # os.environ writes so the manager's preimport (process.py:181-187) leaks
 # nothing. main() re-applies setdefaults for direct runs.
-from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, recorder, resources, tracker
+from openpilot.selfdrive.carrot.tlv import backends, crops, pipeline, range_est, recorder, resources, tracker
 from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNNING, STATUS_SUSPENDED, SuspendWatchdog
 
 CONNECT_RETRY_S = 0.5
@@ -338,6 +338,7 @@ class TlvRunner:
     self.last_view = "far"
     self._horizon_y: float | None = None
     self._calib_rpy = None
+    self._calib_height_m: float | None = None
     self._gate_enabled = False
 
   # -- vision ---------------------------------------------------------------
@@ -382,6 +383,11 @@ class TlvRunner:
     if calib is not None:
       rpy = list(calib.rpyCalib) if len(calib.rpyCalib) == 3 else None
       self._calib_rpy = rpy
+      heights = getattr(calib, "height", None)
+      if heights is not None and len(heights) > 0:
+        h0 = _as_float(heights[0])
+        if h0 is not None and h0 > 0.0:
+          self._calib_height_m = h0
       # Flat-road tail-light gate is only valid on a calibrated camera.
       self._gate_enabled = bool(
         rpy is not None and all(math.isfinite(v) for v in rpy)
@@ -503,6 +509,12 @@ class TlvRunner:
     if self.sm is not None and self.sm.seen["modelV2"] and self._model_fresh():
       return tuple(self.sm["modelV2"].position.y)
     return ()
+
+  def _road_edge_xz(self):
+    sm = getattr(self, "sm", None)
+    if sm is not None and sm.seen["modelV2"] and self._model_fresh():
+      return range_est.road_edges_mean_z(getattr(sm["modelV2"], "roadEdges", None))
+    return None, None
 
   def _model_fresh(self) -> bool:
     return bool(self.sm is not None and time.monotonic() - self.sm.recv_time["modelV2"] <= MODEL_FRESH_S)
@@ -695,6 +707,7 @@ class TlvRunner:
     # Zero box otherwise (relevantTrackId < 0 or no box). Unlike dets[0] this
     # never falls back to an unrelated detection.
     rel_box = self.pipeline.last_relevant_box
+    rel_range_m = 0.0
     if self.pipeline.last_track_id >= 0 and rel_box is not None:
       out.relevantBox.x1 = float(rel_box[0])
       out.relevantBox.y1 = float(rel_box[1])
@@ -702,6 +715,17 @@ class TlvRunner:
       out.relevantBox.y2 = float(rel_box[3])
       out.relevantBox.score = 1.0
       out.relevantBox.cls = 0
+      client = getattr(self, "client", None)
+      width = client.width if client is not None else crops.REFERENCE_WIDTH
+      height = client.height if client is not None else crops.REFERENCE_HEIGHT
+      focal = crops.focal_px_for_width(width)
+      road_x, road_z = self._road_edge_xz()
+      rel_range_m = range_est.fused_tl_range_m(
+        rel_box, getattr(self, "_calib_rpy", None), focal, width, height,
+        h_cam_m=getattr(self, "_calib_height_m", None),
+        road_x=road_x, road_z=road_z,
+      )
+    out.relevantRangeM = float(rel_range_m)
     # Same-track green (W74D): only the light that was confirmed red/redLeft
     # within the last 120 s may release a TLV green/left start downstream.
     out.goAfterRed = bool(

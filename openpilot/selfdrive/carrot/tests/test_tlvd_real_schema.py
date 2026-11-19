@@ -187,3 +187,33 @@ def test_set_process_env_scrubs_gpu_env_and_reenables_backend(monkeypatch):
   assert __import__("os").environ["DEV"] == "CPU"
   assert backends.gpu_env_reason() is None
   assert tlvd_launch.SCRUB_ENV_KEYS  # sanity: the exact-key list stays
+
+
+def test_publish_populates_fused_relevant_range_and_carrot_man_schema():
+  now = time.monotonic()
+  runner = build_runner()
+  runner.sm = real_services(now)
+  sent = []
+
+  class FakePub:
+    def send(self, service, msg):
+      sent.append((service, msg))
+
+  runner.pub = FakePub()
+  runner._update_horizon()
+  runner.pipeline.last_track_id = 7
+  runner.pipeline.last_relevant_box = (950.0, 260.0, 974.0, 270.0)
+  runner._publish("running", "")
+  assert len(sent) == 1
+  svc, msg = sent[0]
+  assert svc == "carrotTlv"
+  assert 50.0 < float(msg.carrotTlv.relevantRangeM) < 250.0
+
+  runner.pipeline.last_track_id = -1
+  runner.pipeline.last_relevant_box = None
+  runner._publish("running", "")
+  assert float(sent[1][1].carrotTlv.relevantRangeM) == 0.0
+
+  cm = messaging.new_message("carrotMan")
+  cm.carrotMan.tlvRangeM = 142.5
+  assert float(cm.carrotMan.tlvRangeM) == pytest.approx(142.5)

@@ -1,21 +1,36 @@
 """W-TLT1: two tiers for the experimental CarrotTlvStopGo toggle.
 
-Tier 1 (soft) caps the acceleration at SOFT_DECEL on a confirmed TLV red in the
-30-100 km/h band, so a phantom detection costs a few km/h instead of a stop.
+Tier 1 (soft) applies a continuous physics-based deceleration cap (0 to -1.0
+m/s^2) derived from the fused monocular range to the red light (width +
+calibrated grade-compensated elevation) and current speed: far reds coast
+without braking or burning the moving-timeout clock, while near/fast reds
+enter full -1.0 m/s^2 immediately without waiting for the model cue. When no
+range is available, tier 1 falls back to -0.5 m/s^2 until the model cue.
 Tier 2 (stop) is the existing commit: it stops at the driving model's own stop
-distance, now allowed up to 100 km/h and, at 40 km/h and above, gated on the
+distance, allowed up to 100 km/h and, at 40 km/h and above, gated on the
 model's own slowdown cue (rx = x_end / (10 * v0)).
 
 Pure python by contract: no cereal, no params, no clock. Time is an input, so
 the planner and an offline replay drive exactly the same state machine.
 """
+from collections import deque
 from dataclasses import dataclass
+import math
+import statistics
 
 TIER_H_S = 2.5                 # red hold; 0000049c had a 2.249 s gap
-SOFT_DECEL = 0.5               # m/s^2 accel upper limit while tier 1 is on
+SOFT_DECEL = 0.5               # m/s^2 fallback cap when range is unknown and no cue
+SOFT_FIRM_DECEL = 1.0          # m/s^2 max tier-1 decel cap
 SOFT_MIN_MPS = 30.0 / 3.6
 SOFT_MAX_MPS = 100.0 / 3.6
 SOFT_MAX_MOVING_S = 12.0       # = TLV_COAST_MAX_MOVING_S
+SOFT_RANGE_WIN_S = 1.0         # rolling median window for fused range_m
+SOFT_RANGE_HOLD_S = TIER_H_S   # odometry propagation horizon across brief dropouts
+SOFT_REACT_S = 1.0             # reaction distance buffer in a_stop_req = v^2 / (2*(d - t*v))
+SOFT_MIN_EFF_RANGE_M = 10.0
+SOFT_A_DEAD = 0.85             # m/s^2: below this, red is far enough to coast without braking
+SOFT_A_FULL = 1.35             # m/s^2: at or above this, full -1.0 m/s^2 cap
+SOFT_TIMER_MIN_DECEL = 0.15    # m/s^2: moving timeout advances only while actually braking
 STOP_MIN_MPS = 0.3
 STOP_MAX_MPS = 100.0 / 3.6
 STOP_MIN_DIST_M = 5.0
@@ -56,10 +71,11 @@ class TierIn:
   cooldown: bool            # tlv_gas_cooldown_frames > 0
   starting: bool            # traffic_starting_count != 0
   enabled: bool             # toggle 1 and TrafficLightDetectMode >= 1 and not High
+  range_m: float = 0.0      # fused monocular range to relevant red light (m); <=0 = unknown
 
 
 class TlvStopTiers:
-  """Tier 1 (soft decel) and tier 2 (model-agreed stop) as one state machine."""
+  """Tier 1 (range-aware soft decel) and tier 2 (model-agreed stop) as one state machine."""
 
   def __init__(self):
     self.soft_active = False
@@ -82,10 +98,46 @@ class TlvStopTiers:
     self.soft_stop_seen = False
     self.soft_moving_s = 0.0
     self.soft_firm = False
+    self.soft_cap = None
+    self.soft_range_m = None
+    self._soft_cue_latched = False
+    self._range_hist = deque(maxlen=64)
+    self._last_range_t = None
+    self._last_range_m = None
 
   def accel_cap(self):
-    """Acceleration upper limit this tick, or None when tier 1 is off."""
-    return -SOFT_DECEL if self.soft_active else None
+    """Acceleration upper limit this tick (m/s^2 in [-1.0, 0.0]), or None when tier 1 is off."""
+    if not self.soft_active:
+      return None
+    if self.soft_cap is not None:
+      return self.soft_cap
+    return -SOFT_FIRM_DECEL if self.soft_firm else -SOFT_DECEL
+
+  def _update_range(self, t: float, range_m: float, v_ego: float):
+    """1.0 s rolling median with odometry decay across brief detector dropouts."""
+    if math.isfinite(range_m) and range_m > 0.0:
+      self._range_hist.append((t, float(range_m)))
+      cutoff = t - SOFT_RANGE_WIN_S
+      while self._range_hist and self._range_hist[0][0] < cutoff:
+        self._range_hist.popleft()
+      self._last_range_m = float(statistics.median(v for _, v in self._range_hist))
+      self._last_range_t = t
+    if self._last_range_t is None:
+      return None
+    age = t - self._last_range_t
+    if age < 0.0 or age > SOFT_RANGE_HOLD_S:
+      return None
+    return max(0.0, self._last_range_m - max(0.0, v_ego) * age)
+
+  @staticmethod
+  def _range_cap(v_ego: float, d_est: float) -> float:
+    """Continuous deceleration cap in [-1.0, 0.0] from stopping physics."""
+    d_eff = max(d_est - SOFT_REACT_S * max(0.0, v_ego), SOFT_MIN_EFF_RANGE_M)
+    a_req = (max(0.0, v_ego) ** 2) / (2.0 * d_eff)
+    if a_req <= SOFT_A_DEAD:
+      return 0.0
+    frac = min(1.0, (a_req - SOFT_A_DEAD) / (SOFT_A_FULL - SOFT_A_DEAD))
+    return -SOFT_FIRM_DECEL * frac
 
   def update(self, i: TierIn) -> None:
     self.events = []
@@ -123,6 +175,12 @@ class TlvStopTiers:
     gated_held = self.last_gated_t is not None and i.t - self.last_gated_t <= TIER_H_S
     if not gated_held:
       self.soft_latched = False
+      self._range_hist.clear()
+      self._last_range_t = None
+      self._last_range_m = None
+    d_est = self._update_range(i.t, i.range_m, i.v_ego)
+    self.soft_range_m = d_est
+
     # driver gas while a confirmed red is recent overrides both tiers for the rest of that red episode
     if not (held_raw or gated_held):
       self.gas_ep = False
@@ -137,16 +195,26 @@ class TlvStopTiers:
     lead_clear = ((self.last_lead_t is None or i.t - self.last_lead_t > LEAD_CLEAR_S)
                   and (self.last_lead_rel_t is None or i.t - self.last_lead_rel_t > LEAD_REARM_S))
 
-    # tier 1 floors at -0.5 until the model's own cue, then -1.0 (see PrepareAccel firm)
-    # tier 1
+    # tier 1: range-scaled cap in [-1.0, 0.0], falling back to -0.5 until cue when range is unknown
     if self.soft_active:
       if i.model_stop:
         self.soft_stop_seen = True
-      self.soft_moving_s = 0.0 if self.soft_stop_seen else self.soft_moving_s + dt
-      if not self.soft_firm and cue:
-        self.soft_firm = True
-        self.soft_moving_s = 0.0
+      cue_latched_now = not self._soft_cue_latched and cue
+      if cue_latched_now:
+        self._soft_cue_latched = True
         self.events.append(('soft', 'firm', 'cue'))
+      if self._soft_cue_latched:
+        self.soft_cap = -SOFT_FIRM_DECEL
+      elif d_est is not None:
+        self.soft_cap = self._range_cap(i.v_ego, d_est)
+      else:
+        self.soft_cap = -SOFT_DECEL
+      self.soft_firm = self._soft_cue_latched or self.soft_cap <= -0.95
+      # Advance the moving timeout only while actually braking (never while waiting far out).
+      if self.soft_stop_seen or cue_latched_now:
+        self.soft_moving_s = 0.0
+      elif self.soft_cap <= -SOFT_TIMER_MIN_DECEL:
+        self.soft_moving_s += dt
       r = ('disabled' if not i.enabled else 'go' if i.go else 'red_end' if not gated_held else
            'gas' if (i.gas or i.cooldown) else 'lead' if lead_solid else
            'timeout' if self.soft_moving_s > SOFT_MAX_MOVING_S else
@@ -155,14 +223,23 @@ class TlvStopTiers:
         self.soft_active = False
         self.soft_latched = True
         self.soft_firm = False
+        self.soft_cap = None
+        self._soft_cue_latched = False
         self.events.append(('soft', 'release', r))
     elif (i.enabled and not self.soft_latched and not self.gas_ep and i.conf and i.gated_red
           and SOFT_MIN_MPS <= i.v_ego < SOFT_MAX_MPS
-          and not i.lead and not i.gas and not i.cooldown and not i.blinker):
+          and not i.lead and not i.gas and not i.brake and not i.cooldown and not i.blinker):
       self.soft_active = True
       self.soft_stop_seen = i.model_stop
       self.soft_moving_s = 0.0
-      self.soft_firm = cue
+      self._soft_cue_latched = cue
+      if cue:
+        self.soft_cap = -SOFT_FIRM_DECEL
+      elif d_est is not None:
+        self.soft_cap = self._range_cap(i.v_ego, d_est)
+      else:
+        self.soft_cap = -SOFT_DECEL
+      self.soft_firm = self._soft_cue_latched or self.soft_cap <= -0.95
       self.events.append(('soft', 'start', 'confirmed_red'))
 
     # tier 2
