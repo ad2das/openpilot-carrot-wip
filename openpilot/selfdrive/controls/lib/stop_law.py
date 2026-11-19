@@ -40,11 +40,19 @@ TAU_B = 0.5713120493245386  # brake response lag (s)
 ND = 20              # brake response delay in steps (0.20 s)
 BETA = DT / TAU_B
 P0 = (0.04, 0.09)
-TH_LO = (-0.5, -1.0)
-TH_HI = (0.8, 1.0)
+TH_LO = (-0.25, -1.0)
+TH_HI = (0.40, 1.0)
 U_MIN = -2.0
 U_MAX = 0.0
 DU_LIM = 2.5         # m/s^3, command rate limit
+TAU_S = 0.12         # s, the measured-accel smoothing lag (fb, fu, fw and u_f match it)
+P_MAX = 0.60         # covariance ceiling; conditional forgetting keeps trace(p00+p11) <= P_MAX
+GUARD = True         # asymmetric RLS vetoes (deadband + fast glide release)
+SLEW = True          # slew-limit the parameter step per tick
+U_DB = 0.40          # m/s^2, |command| below which the deadband guard may veto
+FU_REL = 0.12        # m/s^2, band above u_f the release-lag guard keys on
+TH0_SLEW = 0.6       # 1/s, th0 slew limit (applied when SLEW)
+TH1_SLEW = 1.2       # 1/s, th1 slew limit (applied when SLEW)
 DEN_FLOOR = 0.05     # m
 X_CORR = 0.1429370435473798   # m, travel after the standstill timer fires that the law leaves room for
 W_V_HI = 2.0
@@ -78,6 +86,10 @@ class StopLaw:
     self.p00 = P0[0]
     self.p01 = 0.0
     self.p11 = P0[1]
+    self.fb_s = float(a0)
+    self.fu_s = 0.0
+    self.fw_s = 0.0
+    self.u_f = G * uh[-1 - ND]
     self.v_prev = None
 
   def _adapt(self, a_m):
@@ -88,19 +100,39 @@ class StopLaw:
     self.fb += (u_d + C - self.fb) * BETA
     self.fu += (u_d - self.fu) * BETA
     self.fw += (wk - self.fw) * BETA
-    p0, p1 = self.fu, self.fw
+    self.u_f += (u_d - self.u_f) * BETA
+    self.fb_s += (self.fb - self.fb_s) * (DT / TAU_S)
+    self.fu_s += (self.fu - self.fu_s) * (DT / TAU_S)
+    self.fw_s += (self.fw - self.fw_s) * (DT / TAU_S)
+    p0, p1 = self.fu_s, self.fw_s
     t0 = self.p00 * p0 + self.p01 * p1
     t1 = self.p01 * p0 + self.p11 * p1
     den = LAM + p0 * t0 + p1 * t1
     if den != 0.0:
       k0 = t0 / den
       k1 = t1 / den
-      res = (a_m - self.fb) - (p0 * self.th0 + p1 * self.th1)
+      res = (a_m - self.fb_s) - (p0 * self.th0 + p1 * self.th1)
+      if GUARD:
+        if abs(self.uh[-1 - ND]) < U_DB and res > 0.0:                         # deadband: weak brake looks like +offset
+          return
+        if (not self.locked) and u_d > self.u_f + FU_REL and res < 0.0:          # fast glide release looks like -offset
+          return
       th0 = self.th0 + k0 * res
       th1 = self.th1 + k1 * res
-      self.p00 = (self.p00 - k0 * t0) / LAM
-      self.p01 = (self.p01 - k0 * t1) / LAM
-      self.p11 = (self.p11 - k1 * t1) / LAM
+      q00 = self.p00 - k0 * t0
+      q01 = self.p01 - k0 * t1
+      q11 = self.p11 - k1 * t1
+      lam = max(LAM, min(1.0, (q00 + q11) / P_MAX))                               # conditional forgetting: trace <= P_MAX
+      self.p00 = q00 / lam
+      self.p01 = q01 / lam
+      self.p11 = q11 / lam
+      if SLEW:
+        s0 = TH0_SLEW * DT
+        s1 = TH1_SLEW * DT
+        e0 = th0 - self.th0
+        e1 = th1 - self.th1
+        th0 = self.th0 + (s0 if e0 > s0 else (-s0 if e0 < -s0 else e0))
+        th1 = self.th1 + (s1 if e1 > s1 else (-s1 if e1 < -s1 else e1))
       self.th0 = min(max(th0, TH_LO[0]), TH_HI[0])
       self.th1 = min(max(th1, TH_LO[1]), TH_HI[1])
 

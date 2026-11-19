@@ -422,7 +422,16 @@ def test_t9c_butter_stop_off_mid_law(monkeypatch):
   assert out[k50] > out[k50 - 1]
 
 
-def test_t10_stoplaw_fixture():
+@pytest.fixture
+def _c0_config(monkeypatch):
+  """The deployed (c0) law's settings: no smoothing lag, no covariance cap, no guards, old th box.
+  The recorded fixtures were taken from that law, so the replay tests pin it bit for bit."""
+  for name, value in (("TAU_S", SL.DT), ("P_MAX", 1e9), ("GUARD", False), ("SLEW", False),
+                      ("P0", (0.04, 0.09)), ("TH_LO", (-0.5, -1.0)), ("TH_HI", (0.8, 1.0))):
+    monkeypatch.setattr(SL, name, value)
+
+
+def test_t10_stoplaw_fixture(_c0_config):
   z = np.load(os.path.join(FIX, "stoplaw_fixture.npz"), allow_pickle=False)
   worst_u = worst_r = 0.0
   n_cases = int(z["n"])
@@ -444,7 +453,7 @@ _STOPCTL_N = int(np.load(os.path.join(FIX, "stopctl_fixture.npz"), allow_pickle=
 
 
 @pytest.mark.parametrize("i", range(_STOPCTL_N))
-def test_t11_stopctl_fixture(i):
+def test_t11_stopctl_fixture(_c0_config, i):
   z = np.load(os.path.join(FIX, "stopctl_fixture.npz"), allow_pickle=False)
   ctl = SL.StopCtl(**dict(json.loads(str(z["c%d_cfg" % i])), TOL_LOCK=0.0))  # recorded with the D7 law at TOL_LOCK 0
   for u0 in z["c%d_warm" % i]:
@@ -489,14 +498,14 @@ def _replay_ctl(path, i, extra):
 
 
 @pytest.mark.parametrize("i", range(_STOPCTL_TOL_N))
-def test_t13a_stopctl_tol_fixture_at_default(i):
+def test_t13a_stopctl_tol_fixture_at_default(_c0_config, i):
   # recorded with TWIN/PORT2/stop_law2.py at TOL_LOCK 0.3 (the law the sweep ran); stored cfg omits TOL_LOCK
   mism, worst = _replay_ctl(os.path.join(FIX, "stopctl_tol_fixture.npz"), i, {})
   assert mism == 0
   assert worst <= 1e-9
 
 
-def test_t13b_tol_lock_default_and_teeth():
+def test_t13b_tol_lock_default_and_teeth(_c0_config):
   assert SL.CFG["TOL_LOCK"] == 0.3
   worst = max(_replay_ctl(os.path.join(FIX, "stopctl_tol_fixture.npz"), i, {"TOL_LOCK": 0.0})[1] for i in range(_STOPCTL_TOL_N))
   assert worst > 1e-3
@@ -742,6 +751,133 @@ def test_t1_gap_tracks_setting(monkeypatch, stop_cm):
     stop_cm, trace[-1]["gap"], n_law, control._stop_ctl.n_enter, min_gap, first_law_v)
   print(msg)
   assert gap - 0.5 <= trace[-1]["gap"] <= gap + 0.7, msg
+
+
+# --- L6: the smoothing-lag regressors, the covariance cap, the two guard vetoes and the slew ---
+
+def test_l6_s_frs_identity(monkeypatch):
+  # S_frs: a linear plant built from the law's own filters. a_true = fb + (s-1)*fu + d*fw, and a_m is
+  # a first-order lag of a_true with tau TAU_S starting at a0. With GUARD off the law must carry that
+  # plant exactly: at the start of every tick a_m == fb_s + (s-1)*fu_s + d*fw_s, i.e. the regressors
+  # the RLS solves with are the TAU_S-smoothed filters rather than the raw ones.
+  monkeypatch.setattr(SL, "GUARD", False)
+  worst = 0.0
+  for s, d in ((1.1, -0.2), (0.9, 0.3)):
+    a0 = -0.2
+    law = SL.StopLaw(a0, [-0.3] * (SL.ND + 1))
+    assert law.fu == 0.0 and law.fu_s == 0.0
+    assert law.u_f == SL.G * law.uh[-1 - SL.ND]
+    fb, fu, fw = a0, 0.0, 0.0                 # the raw regressors _adapt filters
+    fb_s, fu_s, fw_s = a0, 0.0, 0.0           # their TAU_S smoothing
+    a_m = a0
+    for k in range(2000):
+      # This tick's _adapt inputs, read from the state the law is about to see.
+      u_d = SL.G * law.uh[-1 - SL.ND]
+      wk = SL.dw(law.v_prev) if law.v_prev is not None else None
+      v = max(0.0, 3.0 - 0.0005 * k)
+      u = law.step(v, a_m, max(0.2, 12.0 - 0.005 * k))
+      law.commit(u)
+      if wk is None:
+        continue                            # _adapt returns before touching a filter on tick 0
+      fb += (u_d + SL.C - fb) * SL.BETA
+      fu += (u_d - fu) * SL.BETA
+      fw += (wk - fw) * SL.BETA
+      fb_s += (fb - fb_s) * (SL.DT / SL.TAU_S)
+      fu_s += (fu - fu_s) * (SL.DT / SL.TAU_S)
+      fw_s += (fw - fw_s) * (SL.DT / SL.TAU_S)
+      assert abs(law.fb - fb) <= 1e-12 and abs(law.fu - fu) <= 1e-12 and abs(law.fw - fw) <= 1e-12
+      assert abs(law.fb_s - fb_s) <= 1e-12 and abs(law.fu_s - fu_s) <= 1e-12
+      assert abs(law.fw_s - fw_s) <= 1e-12
+      a_true = fb + (s - 1.0) * fu + d * fw
+      a_m += (a_true - a_m) * (SL.DT / SL.TAU_S)
+      worst = max(worst, abs(a_m - (law.fb_s + (s - 1.0) * law.fu_s + d * law.fw_s)))
+  assert worst <= 1e-12
+
+
+def _l6_cov_run(commands, v=1.0):
+  law = SL.StopLaw(-0.1, [0.0] * (SL.ND + 1))
+  bad = []
+  for k, cmd in enumerate(commands):
+    law.step(v, -0.1 + 0.05 * math.sin(0.1 * k), 8.0)
+    law.commit(cmd)
+    det = law.p00 * law.p11 - law.p01 ** 2
+    if not (law.p00 >= 0.0 and law.p11 >= 0.0 and det >= -1e-15 and law.p00 + law.p11 <= SL.P_MAX + 1e-9):
+      bad.append((k, law.p00, law.p11, det))
+  return bad
+
+
+@pytest.mark.parametrize("name,commands", [
+  ("glide", [0.0] * 1000),
+  ("impulse", [(-2.0 if (k // 30) % 2 == 0 else 0.0) for k in range(1000)]),
+])
+def test_l6_covariance_invariants(name, commands):
+  bad = _l6_cov_run(commands)
+  assert bad == [], "%s: %d violations, first %s" % (name, len(bad), bad[:3])
+
+
+def _l6_adapt_state(kind, sign, locked=False):
+  """One _adapt call on a prepared state; returns (before, after) tuples of th0/th1/p00/p01/p11."""
+  law = SL.StopLaw(-0.5, [(-0.2 if kind == "db" else -1.0)] * (SL.ND + 1))
+  law.v_prev = 1.0
+  law.locked = locked
+  if kind == "rel":
+    # Command history is flat 0.0, so u_d == G*0.0 == 0.0 > u_f + FU_REL once u_f is negative.
+    law.uh = [0.0] * (2 * SL.ND + 2)
+    law.u_f = SL.G * -1.0
+  law._adapt(-0.5)
+  before = (law.th0, law.th1, law.p00, law.p01, law.p11)
+  law._adapt(-0.5 + (0.5 if sign > 0 else -0.5))
+  return before, (law.th0, law.th1, law.p00, law.p01, law.p11)
+
+
+def test_l6_deadband_veto():
+  assert abs(SL.G * -0.2) < SL.U_DB
+  before, after = _l6_adapt_state("db", +1)
+  assert after == before
+  before, after = _l6_adapt_state("db", -1)
+  assert after != before
+
+
+def test_l6_release_veto():
+  before, after = _l6_adapt_state("rel", -1, locked=False)
+  assert after == before
+  before, after = _l6_adapt_state("rel", -1, locked=True)
+  assert after != before
+
+
+@pytest.mark.parametrize("seed", [1, 2, 3])
+def test_l6_box_slew_rate(seed):
+  rnd = np.random.default_rng(seed)
+  law = SL.StopLaw(-0.3, [-0.3] * (SL.ND + 1))
+  up = law.u_prev
+  t0, t1 = law.th0, law.th1
+  viol = []
+  for k in range(1500):
+    u = law.step(max(0.0, 3.0 - 0.002 * k), float(rnd.uniform(-1.5, 0.5)), max(0.2, 15.0 - 0.01 * k))
+    law.commit(u)
+    if not (SL.TH_LO[0] <= law.th0 <= SL.TH_HI[0] and SL.TH_LO[1] <= law.th1 <= SL.TH_HI[1]):
+      viol.append(("box", k, law.th0, law.th1))
+    if abs(law.th0 - t0) > SL.TH0_SLEW * SL.DT + 1e-12 or abs(law.th1 - t1) > SL.TH1_SLEW * SL.DT + 1e-12:
+      viol.append(("slew", k, law.th0 - t0, law.th1 - t1))
+    if abs(u - up) > SL.DU_LIM * SL.DT + 1e-12:
+      viol.append(("rate", k, u - up))
+    t0, t1, up = law.th0, law.th1, u
+  assert viol == [], "seed %d: %d violations, first %s" % (seed, len(viol), viol[:3])
+
+
+def test_l6_constants():
+  assert SL.TAU_S == 0.12
+  assert SL.P_MAX == 0.60
+  assert SL.GUARD is True
+  assert SL.SLEW is True
+  assert SL.U_DB == 0.40
+  assert SL.FU_REL == 0.12
+  assert SL.TH0_SLEW == 0.6
+  assert SL.TH1_SLEW == 1.2
+  assert SL.TH_LO == (-0.25, -1.0)
+  assert SL.TH_HI == (0.40, 1.0)
+  assert SL.P0 == (0.04, 0.09)
+  assert SL.LAM == 0.98
 
 
 def test_release_ramp_ends_at_zero_before_handover(monkeypatch):
