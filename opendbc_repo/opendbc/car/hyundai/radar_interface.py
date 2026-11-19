@@ -18,6 +18,14 @@ RADAR_REQUIRED_MSG_COUNT = 32
 RADAR_MSG_COUNT4 = 8
 RADAR_GROUP4_MAX_LONG_DIST = 325.0
 RADAR_GROUP4_MAX_YREL = 6.0
+# Legacy Mando (0x500-0x53f) track confirmation, see mando_track_state().
+MANDO_CONFIRM_WINDOW = 10      # distinct radar cycles
+MANDO_CONFIRM_MIN_HITS = 8     # cycles with STATE 3 (beam return) inside the window
+MANDO_MOVING_SPEED = 1.0       # m/s, |vLead|
+MANDO_MOVING_UPDATES = 3       # consecutive STATE 3 updates at or above MANDO_MOVING_SPEED
+MANDO_FAR_DIST = 75.0          # m, dRel
+MANDO_FAR_MAX_YREL = 1.2       # m, |yRel|
+MANDO_CYCLE_SIGNALS = ('UNKNOWN_1', 'AZIMUTH', 'STATE', 'LONG_DIST', 'REL_ACCEL', 'COUNTER', 'STATE_3', 'REL_SPEED', 'STATE_2')
 RADAR_START_ADDR_CANFD1 = 0x210
 RADAR_MSG_COUNT1 = 16
 RADAR_START_ADDR_CANFD2 = 0x3A5  # Group 2; Group 1 uses two 0x210 messages. Pending validation.
@@ -251,6 +259,43 @@ def get_radar_can_parser_scc(CP):
   bus = CAN.CAM if CP.flags & HyundaiFlags.CAMERA_SCC else bus
   return CANParser(DBC[CP.carFingerprint][Bus.pt], messages, bus)
 
+class MandoTrackConfirm:
+  __slots__ = ("last", "hits", "moving_updates", "moved")
+
+  def __init__(self):
+    self.last = None
+    self.hits = deque(maxlen=MANDO_CONFIRM_WINDOW)
+    self.moving_updates = 0
+    self.moved = False
+
+
+def mando_track_state(confirm: MandoTrackConfirm, msg, valid: bool, d_rel: float, y_rel: float, v_lead: float) -> int:
+  # Legacy Mando STATE 3 is a beam return in this cycle; STATE 4 coasts a prediction (STATE_2 == 0), and
+  # 0/1/2/7 end or precede a track. Raw STATE 3 alone also confirms overhead and roadside clutter, so a track
+  # counts as confirmed (3) only when it returned in >= 8 of its last 10 distinct cycles and either has moved
+  # (3 consecutive updates with |vLead| >= 1 m/s, kept for the track's life) or sits far and central.
+  # The CAN bus repeats a radar cycle's payload, so only a changed payload is a new cycle.
+  key = tuple(msg[s] for s in MANDO_CYCLE_SIGNALS)
+  state = int(msg['STATE'])
+  if key != confirm.last:
+    confirm.last = key
+    if state in (3, 4):
+      confirm.hits.append(state == 3)
+    else:
+      confirm.hits.clear()
+      confirm.moving_updates = 0
+      confirm.moved = False
+  if not valid or state != 3:
+    return 0
+  confirm.moving_updates = confirm.moving_updates + 1 if abs(v_lead) >= MANDO_MOVING_SPEED else 0
+  if confirm.moving_updates >= MANDO_MOVING_UPDATES:
+    confirm.moved = True
+  if sum(confirm.hits) < MANDO_CONFIRM_MIN_HITS:
+    return 0
+  far = d_rel >= MANDO_FAR_DIST and abs(y_rel) <= MANDO_FAR_MAX_YREL
+  return 3 if (confirm.moved or far) else 0
+
+
 class RadarInterface(RadarInterfaceBase):
   def __init__(self, CP):
     super().__init__(CP)
@@ -277,6 +322,7 @@ class RadarInterface(RadarInterfaceBase):
     self.radar_required_msg_count = self.radar_msg_count
     if not self.canfd and not self.radar_group4:
       self.radar_required_msg_count = RADAR_REQUIRED_MSG_COUNT
+    self.mando_confirm: dict[int, MandoTrackConfirm] = {}
 
     self.params = Params()
     self.radar_tracks = self.params.get_int("EnableRadarTracks") >= 1
@@ -571,6 +617,11 @@ class RadarInterface(RadarInterfaceBase):
         self.pts[t_id].vLead = self.pts[t_id].vRel + self.v_ego
         self.pts[t_id].aRel = msg['REL_ACCEL']
         self.pts[t_id].yvRel = 0.0
+
+      if not self.canfd and not self.radar_group4:
+        confirm = self.mando_confirm.setdefault(addr, MandoTrackConfirm())
+        point = self.pts[t_id]
+        point.trackState = mando_track_state(confirm, msg, valid, point.dRel, point.yRel, point.vLead)
 
       t_id += 1
     # Radar group 1 carries two messages per object.

@@ -2,7 +2,7 @@ import math
 
 import pytest
 
-from opendbc.can import CANParser
+from opendbc.can import CANPacker, CANParser
 from opendbc.car import Bus, structs
 import opendbc.car.hyundai.hyundaicanfd as hyundaicanfd
 import opendbc.car.hyundai.radar_interface as radar_interface_module
@@ -466,3 +466,59 @@ class TestCornerRadar430CandidateFilter:
 
     assert 300 not in points
     assert all(str(point.radarSource) != "corner430" for point in points.values())
+
+
+class TestMandoTrackConfirmation:
+  @staticmethod
+  def setup(monkeypatch):
+    radar_interface = TestMandoRadar.make_interface(monkeypatch)
+    radar_interface.v_ego = 20.0
+    packer = CANPacker("hyundai_kia_mando_front_radar_generated")
+    lower_bank = [(addr, bytes(8), 1) for addr in range(0x500, 0x520) if addr != 0x503]
+    return radar_interface, packer, lower_bank
+
+  @staticmethod
+  def step(radar_interface, packer, lower_bank, state, dist, rel_speed, counter, azimuth=0.0):
+    addr, dat, _ = packer.make_can_msg("RADAR_TRACK_503", 1, {"STATE": state, "LONG_DIST": dist, "REL_SPEED": rel_speed,
+                                                              "COUNTER": counter % 2, "AZIMUTH": azimuth})
+    radar_data = radar_interface.update([0, lower_bank + [(addr, dat, 1)]])
+    point = next((point for point in radar_data.points if point.trackId == 35), None)
+    return point.trackState if point is not None else None
+
+  def run(self, monkeypatch, cycles):
+    radar_interface, packer, lower_bank = self.setup(monkeypatch)
+    return [self.step(radar_interface, packer, lower_bank, *cycle) for cycle in cycles]
+
+  def test_far_central_stationary_needs_hits_and_drops_inside_75m(self, monkeypatch):
+    cycles = [(3, 100.0 - 0.1 * k, -20.0, k) for k in range(8)] + [(3, 74.0, -20.0, 8)]
+    assert self.run(monkeypatch, cycles) == [0, 0, 0, 0, 0, 0, 0, 3, 0]
+
+  def test_moving_track_latches_after_it_stops(self, monkeypatch):
+    cycles = [(3, 40.0 - 0.1 * k, -18.0, k) for k in range(8)] + [(3, 30.0, -20.0, 8)]
+    assert self.run(monkeypatch, cycles) == [0, 0, 0, 0, 0, 0, 0, 3, 3]
+
+  def test_moving_needs_three_consecutive_updates(self, monkeypatch):
+    cycles = [(3, 40.0 - 0.1 * k, -20.0, k) for k in range(10)]
+    cycles += [(3, 39.0 - 0.1 * k, -20.0 if k == 2 else -18.0, 10 + k) for k in range(6)]
+    assert self.run(monkeypatch, cycles) == [0] * 15 + [3]
+
+  def test_coasted_cycles_are_misses_and_never_confirmed(self, monkeypatch):
+    cycles = [(4, 100.0 - 0.1 * k, -20.0, k) for k in range(2)] + [(3, 99.0 - 0.1 * k, -20.0, 2 + k) for k in range(8)]
+    cycles += [(4, 98.0, -20.0, 10), (3, 97.9, -20.0, 11)]
+    assert self.run(monkeypatch, cycles) == [0] * 9 + [3, 0, 3]
+    cycles = [(4, 100.0 - 0.1 * k, -20.0, k) for k in range(3)] + [(3, 99.0 - 0.1 * k, -20.0, 3 + k) for k in range(7)]
+    assert self.run(monkeypatch, cycles) == [0] * 10
+
+  def test_track_end_clears_history_and_motion(self, monkeypatch):
+    cycles = [(3, 40.0 - 0.1 * k, -18.0, k) for k in range(8)] + [(0, 0.0, 0.0, 8)]
+    cycles += [(3, 40.0 - 0.1 * k, -20.0, 9 + k) for k in range(8)]
+    assert self.run(monkeypatch, cycles) == [0] * 7 + [3, None] + [0] * 8
+
+  def test_repeated_payload_is_one_cycle(self, monkeypatch):
+    assert self.run(monkeypatch, [(3, 100.0, -20.0, 0)] * 12) == [0] * 12
+
+  def test_far_needs_central_lateral(self, monkeypatch):
+    wide = [(3, 100.0 - 0.1 * k, -20.0, k, 2.0) for k in range(8)]
+    central = [(3, 100.0 - 0.1 * k, -20.0, k, 1.2) for k in range(8)]
+    assert self.run(monkeypatch, wide) == [0] * 8
+    assert self.run(monkeypatch, central) == [0] * 7 + [3]
