@@ -156,3 +156,72 @@ def test_l7_b1_floor_prev_reseeds_after_an_override(monkeypatch):
   assert control.long_control_state == LongCtrlState.pid
   assert out == -0.5 + lcmod.STOP_LAW_RELEASE_JERK * lcmod.DT_CTRL, out
   assert control._butter_floor_prev is None, control._butter_floor_prev
+
+
+# --- L7 Q11: an owned stop's held command eases up to stoppingAccel once standstill is confirmed ---
+
+def _l7_hold_run(monkeypatch, *, owned=True, held=-1.6, floor=-0.25, n=300, v=None, soft_hold=None,
+                 creep_latched_at=None, rate=None):
+  """The B1 hand-off tick at 1.0 m/s (owner: firm cap when owned), then n stopping ticks. v and soft_hold
+  map a tick index to vEgo / softHoldActive (default 0.0 / 0). Returns the hand-off output, the n outputs
+  and the n _butter_standstill_confirmed flags read after each tick."""
+  from openpilot.selfdrive.controls.lib import longcontrol as lcmod
+  from openpilot.selfdrive.controls.lib.longcontrol import LongCtrlState
+  from openpilot.selfdrive.controls.tests.test_butter_stop import stopping_inputs
+  if rate is not None:
+    monkeypatch.setattr(lcmod, "B1_HOLD_RELEASE_RATE", rate)
+  control = _l7_control(monkeypatch)
+  first = _l7_stopping_tick(control, held, firm=owned, floor=floor)
+  assert control._butter_no_taper_stop is owned
+  outs, flags = [], []
+  for i in range(n):
+    if creep_latched_at is not None and i == creep_latched_at:
+      control._butter_creep_latched = True
+    cs, plan, radar = stopping_inputs(v_ego=(v or {}).get(i, 0.0), standstill=True)
+    cs.softHoldActive = (soft_hold or {}).get(i, 0)
+    outs.append(float(control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)[0]))
+    flags.append(bool(control._butter_standstill_confirmed))
+    assert control.long_control_state == LongCtrlState.stopping, i
+  return first, outs, flags
+
+
+def test_l7_q11_owned_hold_is_flat_until_standstill_is_confirmed_then_eases_to_stopping_accel(monkeypatch):
+  from openpilot.selfdrive.controls.lib import longcontrol as lcmod
+  first, outs, flags = _l7_hold_run(monkeypatch)
+  assert first == -1.6
+  c = flags.index(True)
+  assert c >= round(lcmod.STANDSTILL_T / lcmod.DT_CTRL) - 2, c
+  assert all(o == -1.6 for o in outs[:c]), outs[:c + 2]                 # (a) flat until confirmed
+  step = lcmod.B1_HOLD_RELEASE_RATE * lcmod.DT_CTRL
+  assert abs(outs[c] - (-1.6 + step)) < 1e-12, outs[c]                 # (b) the ease starts on the confirming tick
+  steps = [b - a for a, b in zip(outs[c:], outs[c + 1:])]
+  assert all(0.0 <= s <= step + 1e-12 for s in steps)                  # (b) up only, at the rate
+  assert outs[-1] == -0.5 and max(outs) == -0.5                        # (b) exact clamp at stoppingAccel, no overshoot
+
+
+def test_l7_q11_ease_pauses_while_rolling_creep_latched_or_soft_hold(monkeypatch):
+  from openpilot.selfdrive.controls.lib import longcontrol as lcmod
+  step = lcmod.B1_HOLD_RELEASE_RATE * lcmod.DT_CTRL
+  # (c1) rolling at STANDSTILL_V or more pauses the ease; it resumes at rest (the confirmation is kept)
+  _, outs, _ = _l7_hold_run(monkeypatch, n=120, v={i: 0.06 for i in range(60, 80)})
+  assert outs[59] > -1.6
+  assert all(o == outs[59] for o in outs[60:80]), outs[58:82]
+  assert abs(outs[80] - (outs[79] + step)) < 1e-12, outs[78:82]
+  # (c2) the creep guard owns the stop: no ease
+  _, outs, _ = _l7_hold_run(monkeypatch, n=120, creep_latched_at=0)
+  assert all(o == -1.6 for o in outs), outs[:5]
+  # (c3) soft hold: identical to the same run with the ease rate at 0
+  hold = {i: 1 for i in range(120)}
+  got = _l7_hold_run(monkeypatch, n=120, soft_hold=hold)[1]
+  ref = _l7_hold_run(monkeypatch, n=120, soft_hold=hold, rate=0.0)[1]
+  assert got == ref
+
+
+def test_l7_q11_non_owned_stop_is_unchanged(monkeypatch):
+  # (d) no hand-off owner: no latch, the taper bookkeeping as before. With no taper floor the command stays
+  # below stoppingAccel at confirmed standstill, so a missing owner gate would ease it.
+  got = _l7_hold_run(monkeypatch, owned=False, floor=None)
+  ref = _l7_hold_run(monkeypatch, owned=False, floor=None, rate=0.0)
+  assert got[0] == -1.6
+  assert got[1] == ref[1]
+  assert all(o == -1.6 for o in got[1])

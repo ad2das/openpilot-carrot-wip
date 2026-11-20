@@ -62,6 +62,7 @@ STOP_LAW_ENABLED = True                         # tests patch this to get the pr
 STOP_LAW_CARS = (HYUNDAI_CAR.HYUNDAI_PALISADE,)
 STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the ordinary command after the law lets go
 STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events
+B1_HOLD_RELEASE_RATE = 0.5                      # m/s^3, an owned stop's held command eases up to stoppingAccel at confirmed standstill
 
 
 def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
@@ -755,6 +756,13 @@ class LongControl:
       if output_accel > self.stopping_accel:
         output_accel = min(output_accel, 0.0)
         output_accel -= ramp_rate * DT_CTRL
+      if (self.butter_stop and self._butter_no_taper_stop and self._butter_standstill_confirmed
+          and not soft_hold_active and not self._butter_creep_latched
+          and float(CS.vEgo) < STANDSTILL_V and output_accel < self.stopping_accel):
+        # B1 hold release (Neon Q11): the law / firm-cap / release hand-off stays flat while rolling; once
+        # standstill is confirmed it eases up to stoppingAccel, so the stopping -> pid departure starts from
+        # the same command as an ordinary stop. Rolling again, the creep guard or soft hold pause it.
+        output_accel = min(self.stopping_accel, output_accel + B1_HOLD_RELEASE_RATE * DT_CTRL)
       if self.butter_stop and not self._butter_standstill_confirmed and not self._butter_no_taper_stop:
         floor = None
         if butter_floor_value is not None:
