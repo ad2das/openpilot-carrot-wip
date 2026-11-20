@@ -58,7 +58,7 @@ FINAL_STOP_ENABLED = True  # ButterStop's final stop (firm finish / K5 probe); t
 # ButterStop stop law (stop_law.py), Palisade only: owns the pid command for a stop behind a stopped
 # or nearly stopped lead from 3.5 m/s down to the ESC standstill flag and steers one continuous decel
 # to it. The taper floor and the firm finish stand aside while it runs. Fitted on the Palisade twin.
-STOP_LAW_ENABLED = True                         # tests patch this to get the pre-law ButterStop arm
+STOP_LAW_ENABLED = False                        # folded back 11-20 until the L7 law is verified; tests patch it on
 STOP_LAW_CARS = (HYUNDAI_CAR.HYUNDAI_PALISADE,)
 STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the ordinary command after the law lets go
 STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events

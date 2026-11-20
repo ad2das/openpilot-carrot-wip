@@ -104,6 +104,18 @@ FIX = os.path.join(os.path.dirname(__file__), "stop_law_fixtures")
 LIMITS = (-3.5, 2.0)
 AGE = 0.05
 
+SHIPPED_STOP_LAW_ENABLED = lc.STOP_LAW_ENABLED  # read at import, before the autouse fixture below
+
+
+@pytest.fixture(autouse=True)
+def _stop_law_on(monkeypatch):
+  # The shipped tree has the law folded back; these tests exercise the law itself.
+  monkeypatch.setattr(lc, "STOP_LAW_ENABLED", True)
+
+
+def test_stop_law_folded_back():
+  assert SHIPPED_STOP_LAW_ENABLED is False
+
 
 class DictParams:
   def __init__(self, values):
