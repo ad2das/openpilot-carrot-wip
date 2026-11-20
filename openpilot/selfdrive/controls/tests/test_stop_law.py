@@ -902,3 +902,158 @@ def test_release_ramp_ends_at_zero_before_handover(monkeypatch):
   assert outs[0] == 0.0
   assert outs[0] - (-0.0197) <= lc.STOP_LAW_RELEASE_JERK * DT_CTRL + 1e-12
   assert outs[1] > 0.0
+
+
+# --- creeping-lead and plan-go exits (Neon rulings 1120d + 1120e; field 000004d2--14bfd535b3--4) ---
+def _kin_run(ctl, n, lead_x, v_lead_f, a_target_f, v0=3.0, a_cmd=-0.7):
+  # Kinematic ego (constant decel), not closed loop: only the StopCtl gates are under test here.
+  _warm(ctl)
+  s, v, out = 0.0, v0, []
+  for k in range(n):
+    t = k * SL.DT
+    u = ctl.update(True, v, a_cmd if v > 0.0 else 0.0, True, lead_x(t) - s, v_lead_f(t), a_target_f(t), INF)
+    out.append((t, v, u, ctl.why if u is None else ""))
+    ctl.commit(u if u is not None else -0.5)
+    v = max(0.0, v + a_cmd * SL.DT)
+    s += v * SL.DT
+    if u is None and k > 0:
+      break
+  return out
+
+
+def _prof(pts, n, x0=12.8):
+  # Lead speed piecewise-linear through (t, v) points (held after the last), position integrated at DT.
+  vl, xs, x = [], [], x0
+  for k in range(n):
+    t = k * SL.DT
+    v = pts[-1][1]
+    for (t0, v0), (t1, v1) in zip(pts, pts[1:]):
+      if t0 <= t < t1:
+        v = v0 + (v1 - v0) * (t - t0) / (t1 - t0)
+        break
+    vl.append(v)
+    xs.append(x)
+    x += v * SL.DT
+  idx = lambda t: min(int(round(t / SL.DT)), n - 1)
+  return (lambda t: xs[idx(t)]), (lambda t: vl[idx(t)])
+
+
+def _old_ctl():
+  # 6833e0170 behaviour: neither new exit can fire and the re-entry lock releases on the next tick
+  return SL.StopCtl(VL_CREEP=INF, PG_A=INF, VL_REIN=INF)
+
+
+def test_p10_creeping_lead_ends_law_before_lock():
+  for vl, t_max in ((1.0, 1.45), (0.8, 1.65)):
+    lead_x = lambda t, vl=vl: 12.8 + max(0.0, t - 0.3) * vl
+    v_lead = lambda t, vl=vl: 0.0 if t < 0.3 else vl
+    tr = _kin_run(SL.StopCtl(), 400, lead_x, v_lead, lambda t: -0.5)
+    t, v, u, why = tr[-1]
+    assert u is None and why == "lead_go" and t <= t_max and v > SL.V_FLOOR
+    old = _kin_run(_old_ctl(), 400, lead_x, v_lead, lambda t: -0.5)
+    assert len(old) == 400 and all(r[2] is not None for r in old[1:])
+
+
+def test_p11_vlead_noise_on_stopped_lead_changes_nothing():
+  v_lead = lambda t: 1.2 if abs(t - 0.5) < 0.005 else (0.8 if 1.0 <= t < 1.5 else 0.0)
+  new = _kin_run(SL.StopCtl(), 380, lambda t: 12.8, v_lead, lambda t: -0.5)
+  old = _kin_run(_old_ctl(), 380, lambda t: 12.8, v_lead, lambda t: -0.5)
+  assert len(new) == len(old) == 380
+  assert all(a[2] == b[2] for a, b in zip(new, old))
+
+
+def test_p12_plan_go_releases_the_held_command():
+  for n_pos, on in ((19, True), (20, False)):
+    c = SL.StopCtl()
+    _warm(c)
+    _tick(c)
+    c.commit(c.u_out)
+    for _ in range(80):
+      c.commit(_tick(c, v=0.7, a=-0.7, d_rel=4.8 + 0.4))
+    assert c.frozen
+    for _ in range(n_pos):
+      u = _tick(c, v=0.7, a=-0.7, d_rel=4.8 + 0.4, a_target=0.1)
+      if u is not None:
+        c.commit(u)
+    assert (c.law is not None) == on
+    if not on:
+      assert c.why == "plan_go" and not c.creep_lock
+  c = SL.StopCtl()
+  _warm(c)
+  _tick(c)
+  c.commit(c.u_out)
+  for _ in range(20):
+    u = _tick(c, v=0.2, a=-0.5, d_rel=4.8 + 0.2, a_target=0.1)
+    if u is not None:
+      c.commit(u)
+  assert c.law is None and c.why == "plan_go" and not c.frozen
+
+
+def test_p13_stopped_lead_stop_unchanged():
+  new = _kin_run(SL.StopCtl(), 500, lambda t: 9.0, lambda t: 0.0, lambda t: -0.6)
+  old = _kin_run(_old_ctl(), 500, lambda t: 9.0, lambda t: 0.0, lambda t: -0.6)
+  assert len(new) == len(old) == 500
+  assert all(a[2] == b[2] for a, b in zip(new, old))
+
+
+def test_p14_lead_still_slowing_never_creep_exits():
+  # fleet 42a--7 / 479--3 / 4a6--6 / 4b7--1: entry just under VL_IN, the lead slows to ~0.65, lingers, then stops
+  n = 450
+  lead_x, v_lead = _prof([(0.0, 0.99), (1.2, 0.65), (1.8, 0.70), (2.4, 0.65), (3.0, 0.70), (3.2, 0.65), (4.5, 0.0)], n)
+  new = _kin_run(SL.StopCtl(), n, lead_x, v_lead, lambda t: -0.5)
+  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  assert len(new) == len(old) == n
+  assert all(a[2] == b[2] for a, b in zip(new, old))
+
+
+def test_p15_lead_go_locks_reentry_until_the_lead_slows():
+  c, o = SL.StopCtl(), _old_ctl()
+  for ctl in (c, o):
+    _warm(ctl)
+    u = _tick(ctl)
+    assert u is not None
+    ctl.commit(u)
+    assert _tick(ctl, v_lead=1.6) is None and ctl.why == "lead_go"
+    ctl.commit(-0.5)
+  assert c.creep_lock
+  assert _tick(o, v_lead=0.8) is not None          # 6833e0170: re-enters on the next tick
+  for _ in range(50):
+    assert _tick(c, v_lead=0.8) is None           # locked while the lead stays above VL_REIN
+    c.commit(-0.5)
+  assert c.creep_lock
+  assert _tick(c, v_lead=0.4) is not None and not c.creep_lock
+  for release in ("idle", "fast", "lead"):
+    c = SL.StopCtl()
+    _warm(c)
+    c.commit(_tick(c))
+    assert _tick(c, v_lead=1.6) is None and c.creep_lock
+    c.commit(-0.5)
+    if release == "idle":
+      c.idle()
+    elif release == "fast":
+      assert _tick(c, v=4.5, v_lead=0.8) is None
+    else:
+      assert _tick(c, lead_status=False, v_lead=0.8) is None
+    assert not c.creep_lock
+
+
+def test_p16_bounce_below_the_rise_never_creep_exits():
+  # fleet 4a5--39: the lead slows 0.80 -> 0.58, bounces to 1.15 (rise 0.57 < DV_RISE) for 1 s, then stops
+  n = 450
+  lead_x, v_lead = _prof([(0.0, 0.80), (0.6, 0.58), (1.4, 1.15), (2.4, 1.15), (3.9, 0.0)], n)
+  new = _kin_run(SL.StopCtl(), n, lead_x, v_lead, lambda t: -0.5)
+  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  assert len(new) == len(old) == n
+  assert all(a[2] == b[2] for a, b in zip(new, old))
+
+
+def test_p17_rise_from_a_slow_lead_ends_law():
+  # field 4d1--9: the lead slows to 0.3 and pulls away at 1.3 (below VL_OUT): lead_go once, no re-entry
+  n = 400
+  lead_x, v_lead = _prof([(0.0, 0.9), (0.5, 0.3), (1.0, 1.3)], n)
+  c = SL.StopCtl()
+  tr = _kin_run(c, n, lead_x, v_lead, lambda t: -0.5)
+  t, v, u, why = tr[-1]
+  assert u is None and why == "lead_go" and 1.0 < t <= 2.5 and c.creep_lock
+  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  assert len(old) == n and all(r[2] is not None for r in old[1:])

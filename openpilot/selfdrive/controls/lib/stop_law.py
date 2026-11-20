@@ -207,6 +207,15 @@ CFG = dict(
   Q_ENTER=0.4,         # needed decel / |A_H| at which the law may start
   VL_IN=1.0,           # m/s, the lead counts as stopping below this
   VL_OUT=1.5,          # m/s, the law ends when the lead is faster
+  VL_CREEP=0.75,       # m/s, creep exit: the lead is at least this fast ...
+  DV_RISE=0.65,        # m/s, ... and this much faster than its slowest (>= 0) since the law started ...
+  VL_CREEP_HYST=0.15,  # m/s, (the creep timer clears this far below that threshold and holds in between)
+  T_CREEP=0.6,         # s, ... for this long ...
+  DX_CREEP=0.8,        # m, ... and has moved this far past its nearest filtered position since that slowest point (lead_go)
+  VL_REIN=0.5,         # m/s, after a lead_go the law starts again only once the lead is slower than this
+  PG_V=0.25,           # m/s, once the command is held or the car is below this speed, ...
+  PG_A=0.05,           # m/s^2, ... a plan asking for more than this ...
+  PG_T=0.2,            # s, ... for this long ends the law (plan_go)
   D_MIN=3.0,           # m, hard minimum gap: no start below it, and the guard stops the car short of it
   NEED_PLAN_BRAKE=True,  # start only while the plan itself brakes (a_target < 0)
   Q_PLAN=float("inf"),   # above this q the command is never softer than u_plan
@@ -284,6 +293,11 @@ class StopCtl:
     self.t_flag = 0.0
     self.frozen = False
     self.u_out = 0.0
+    self.vl_min = None       # slowest lead speed (>= 0) since the law started
+    self.x_creep_ref = None  # nearest filtered lead position since that slowest point (odometry frame)
+    self.t_creep = 0.0
+    self.t_plan_go = 0.0
+    self.creep_lock = False  # set by a lead_go drop: no new start until idle, lead loss, v > V_EXIT or v_lead < VL_REIN
     # telemetry
     self.d_eff = None
     self.d_stop = float("nan")
@@ -299,6 +313,11 @@ class StopCtl:
     self.law = None
     self.t_flag = 0.0
     self.frozen = False
+    self.vl_min = None
+    self.x_creep_ref = None
+    self.t_creep = 0.0
+    self.t_plan_go = 0.0
+    self.creep_lock = why == "lead_go"
 
   def idle(self):
     """A tick on which the law cannot run (not in pid, pedal, fcw, stale plan): drop it and forget the lead."""
@@ -329,16 +348,42 @@ class StopCtl:
     self.d_stop = d_stop
     self.q = q
     if self.law is None:
+      if self.creep_lock and (v > c["V_EXIT"] or v_lead < c["VL_REIN"]):
+        self.creep_lock = False
       if not (c["V_ENTER_MIN"] < v <= c["V_ENTER"] and v_lead < c["VL_IN"] and d_rel >= c["D_MIN"]
               and q >= c["Q_ENTER"] and (a_target < 0.0 or not c["NEED_PLAN_BRAKE"])
-              and len(self.uh) >= ND + 1):
+              and len(self.uh) >= ND + 1 and not self.creep_lock):
         return None
       self.law = StopLaw(a, self.uh[-UH_KEEP:], c["TOL_LOCK"])
       self.t_flag = 0.0
       self.frozen = False
       self.n_enter += 1
+      self.vl_min = v_lead if v_lead > 0.0 else 0.0
+      self.x_creep_ref = self.filt.x_f
+      self.t_creep = 0.0
+      self.t_plan_go = 0.0
     else:
       if v_lead >= c["VL_OUT"]:
+        self._drop("lead_go")
+        return None
+      # A lead creeping away below VL_OUT must not hold the car at rest behind it. Only a rise above the lead's
+      # slowest speed since the law started counts, so a lead that is still slowing to its own stop never does.
+      vl_pos = v_lead if v_lead > 0.0 else 0.0
+      if vl_pos < self.vl_min:
+        self.vl_min = vl_pos
+        self.x_creep_ref = self.filt.x_f
+        self.t_creep = 0.0
+      elif self.filt.x_f < self.x_creep_ref:
+        self.x_creep_ref = self.filt.x_f
+      vl_thr = self.vl_min + c["DV_RISE"]
+      if vl_thr < c["VL_CREEP"]:
+        vl_thr = c["VL_CREEP"]
+      if v_lead >= vl_thr:
+        self.t_creep += DT
+      elif v_lead < vl_thr - c["VL_CREEP_HYST"]:
+        self.t_creep = 0.0
+      if (v_lead >= vl_thr and self.t_creep >= c["T_CREEP"] - 1e-9
+          and self.filt.x_f - self.x_creep_ref >= c["DX_CREEP"]):
         self._drop("lead_go")
         return None
       if v > c["V_EXIT"]:
@@ -351,6 +396,14 @@ class StopCtl:
       self.frozen = False
     if self.t_flag >= c["T_FLAG"] - 1e-9:
       self.frozen = True
+    # The plan wants to move off while the law holds the car (held command or nearly at rest): hand back.
+    if (self.frozen or v < c["PG_V"]) and a_target > c["PG_A"]:
+      self.t_plan_go += DT
+    else:
+      self.t_plan_go = 0.0
+    if self.t_plan_go >= c["PG_T"] - 1e-9:
+      self._drop("plan_go")
+      return None
     u = self.u_out if self.frozen else self.law.step(v, a, d_stop)
     # Lead guard: only when stopping short of D_MIN needs more than |A_H|. It never eases.
     room = (d_eff if d_eff < d_rel else d_rel) - c["D_MIN"]
