@@ -87,7 +87,7 @@ def run_planner_events(mocker, brand, configured_mode, radar_period_ms, *, stopp
     'cloudlog': mocker.Mock(),
     'RuntimeDiagnostics': RuntimeDiagnostics,
     'LongitudinalPlanner': mocker.Mock(return_value=planner),
-    'LateralPlanner': mocker.Mock(),
+    'LateralPlanner': mocker.Mock(return_value=mocker.Mock(hybrid_solve_ms=0.0)),
     'FastRadarOverlay': mocker.Mock(return_value=fast_radar),
     'RadarStateOverride': RadarStateOverride,
     'StoppingLeadFilter': StoppingLeadFilter,

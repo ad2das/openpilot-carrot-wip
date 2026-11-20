@@ -58,7 +58,7 @@ def main():
   # Hyundai's two inputs wake this serial loop independently; no MPC overlaps.
   sm = messaging.SubMaster(
     ['carControl', 'carState', 'controlsState', 'liveParameters', 'radarState',
-     'liveTracks', 'modelV2', 'selfdriveState', 'carrotMan', 'livePose'],
+     'liveTracks', 'modelV2', 'selfdriveState', 'carrotMan', 'livePose', 'liveDelay'],
     poll=(['modelV2', 'liveTracks'] if live_tracks_longitudinal else 'modelV2'),
     ignore_avg_freq=['radarState'],
   )
@@ -171,6 +171,7 @@ def main():
       model_frame += 1
       lateral_planner.update(sm, carrot)
       lateral_planner.publish(sm, pm, carrot)
+      timings['hybrid_mpc_ms'] = lateral_planner.hybrid_solve_ms
 
       ldw.update(model_frame, sm['modelV2'], sm['carState'], sm['carControl'])
       msg = messaging.new_message('driverAssistance')

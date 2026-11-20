@@ -17,6 +17,9 @@ from types import SimpleNamespace
 
 import numpy as np
 
+from openpilot.selfdrive.controls.lib.curve_lane_hybrid import (
+  CurveLaneHybrid, CausalMedian, HybridFrame, RUN_V_MIN, PREWARM_ROAD_A, PREWARM_CURVE_A,
+)
 from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
 
 DEFAULT_SOURCE = Path(__file__).parents[1] / 'lib/lateral_planner.py'
@@ -92,8 +95,8 @@ class Message:
 def make_planner(param_value=0, source=None):
   src = Path(source or os.environ.get('LATERAL_PLANNER_SOURCE', DEFAULT_SOURCE))
   tree = ast.parse(src.read_text(encoding='utf8'))
-  params = SimpleNamespace(get_int=lambda _: param_value, get_float=lambda _: 1.0,
-                           get=lambda _: None, put_nonblocking=lambda *_: None)
+  params = SimpleNamespace(get_int=lambda *_: param_value, get_float=lambda *_: 1.0,
+                           get=lambda *_: None, put_nonblocking=lambda *_: None)
   namespace = {
     'np': np,
     'DT_MDL': 0.05,
@@ -101,11 +104,25 @@ def make_planner(param_value=0, source=None):
     'MIN_SPEED': 1.0,
     'LAT_MPC_N': 32,
     'CONTROL_N': 32,
+    'LATERAL_ACCEL_COST': 0.0,
+    'LATERAL_JERK_COST': 0.04,
+    'STEERING_RATE_COST': 700.0,
+    'HYBRID_CONTINUOUS': False,
+    'HYBRID_RUN_ALWAYS': False,
     'Params': lambda: params,
     'LateralMpc': StubMpc,
     'LanePlanner': StubLanePlanner,
     'LaneModelSpeedGuard': LaneModelSpeedGuard,
     'LaneCenterBlend': StubLaneCenterBlend,
+    'CurveLaneHybrid': CurveLaneHybrid,
+    'CausalMedian': CausalMedian,
+    'HybridFrame': HybridFrame,
+    'RUN_V_MIN': RUN_V_MIN,
+    'PREWARM_ROAD_A': PREWARM_ROAD_A,
+    'PREWARM_CURVE_A': PREWARM_CURVE_A,
+    'FIT_HORIZON_S': 2.0,
+    'FIT_MIN_M': 20.0,
+    'get_lag_adjusted_curvature': lambda cp, v, psis, curvatures, delay, distances: float(curvatures[0]),
     'dump_table': lambda table: '[]',
     'load_table': lambda text: None,
     'time': SimpleNamespace(monotonic=lambda: 0),
@@ -114,12 +131,10 @@ def make_planner(param_value=0, source=None):
     'messaging': SimpleNamespace(new_message=Message),
     'yaw_from_path_no_scipy': lambda *a, **k: (np.zeros(33), np.zeros(33)),
   }
-  exec(
-    compile(ast.Module(body=[n for n in tree.body
-                             if isinstance(n, ast.ClassDef) and n.name == 'LateralPlanner'],
-                       type_ignores=[]), str(src), 'exec'),
-    namespace,
-  )
+  # The hybrid path is a second planner object inside LateralPlanner, so its classes compile too.
+  body = [n for n in tree.body if isinstance(n, ast.ClassDef) and
+          n.name in ('_HybridParams', 'HybridLanePath', 'LateralPlanner')]
+  exec(compile(ast.Module(body=body, type_ignores=[]), str(src), 'exec'), namespace)
   cp = SimpleNamespace(wheelbase=2.7, centerToFront=1.1, mass=1800, tireStiffnessRear=100000)
   return namespace['LateralPlanner'](cp)
 
@@ -141,17 +156,21 @@ def inputs(speed=30.0, start=30.0, end=30.0, lane_speed=1):
     orientationRate=SimpleNamespace(z=np.zeros(33)),
     velocity=SimpleNamespace(x=np.linspace(start, end, 33), y=np.zeros(33), z=np.zeros(33)),
     acceleration=SimpleNamespace(x=np.zeros(33)),
+    action=SimpleNamespace(desiredCurvature=0.0),
+    laneLineStds=[0.1, 0.1, 0.1],
     meta=SimpleNamespace(desire=0, laneChangeState=0, laneChangeDirection=0,
                          laneWidthLeft=3.5, laneWidthRight=3.5),
   )
   sm = {
     'modelV2': model,
     'carState': SimpleNamespace(vEgo=speed, useLaneLineSpeed=lane_speed, steeringPressed=False),
-    'controlsState': SimpleNamespace(curvature=0.0),
+    'controlsState': SimpleNamespace(curvature=0.0, desiredCurvature=0.0),
+    'carControl': SimpleNamespace(latActive=False),
     'carrotMan': SimpleNamespace(vTurnSpeed=200),
     'logMonoTime': {'modelV2': 123},
   }
   sm['all_checks'] = lambda service_list: True
+  sm['seen'] = {'carControl': True}
   return _Msg(sm)
 
 
@@ -220,3 +239,17 @@ def test_assist_on_laneline_publishes_blend_only():
     assert lp.laneRecenterCurvature == 0.0
     assert lp.laneCenterBlendCurvature == blend.curvature
     assert lp.laneRecenterActive is False
+
+
+def test_assist_off_publishes_no_hybrid_term():
+  """LaneRecenterAssist 0 leaves the hybrid path inert: no term, and the new fields still written."""
+  planner = make_planner(param_value=0)
+  for _ in range(25):
+    planner.update(inputs(lane_speed=0), SimpleNamespace(atc_active=False))
+  published = run_frames(planner, 3, lane_speed=0)
+  for msg in published:
+    lp = msg.lateralPlan
+    assert lp.curveHybridCurvature == 0.0
+    assert lp.curveHybridActive is False
+  assert planner.hybrid_ran is False
+  assert planner.hybrid_curvature == 0.0

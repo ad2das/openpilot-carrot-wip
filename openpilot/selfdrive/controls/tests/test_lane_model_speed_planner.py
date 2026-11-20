@@ -7,6 +7,8 @@ from types import SimpleNamespace
 import numpy as np
 
 from openpilot.selfdrive.controls.lib.lane_model_speed import LaneModelSpeedGuard
+from openpilot.selfdrive.controls.lib.curve_lane_hybrid import (CurveLaneHybrid, CausalMedian, HybridFrame, RUN_V_MIN,
+                                                                PREWARM_ROAD_A, PREWARM_CURVE_A)
 
 
 class StubMpc:
@@ -55,12 +57,23 @@ class StubLanePlanner:
     return path, self.lanefull_mode
 
 
+class StubHybridLanePath:
+  # The curve hybrid's own lane MPC. Routing tests run with LaneRecenterAssist 0, so the hybrid stays inert.
+  def __init__(self, CP, params):
+    self.ran = False
+
+
+def _hybrid_fault(*args, **kwargs):
+  raise AssertionError('the curve hybrid raised inside the routing harness')
+
+
 def make_planner():
   # Compile the complete, unchanged production class. Only the numerical MPC,
   # lane geometry, Params and IPC imports are substituted for routing tests.
   source = Path(__file__).parents[1] / 'lib/lateral_planner.py'
   tree = ast.parse(source.read_text(encoding='utf8'))
-  params = SimpleNamespace(get_int=lambda _: 1, get_float=lambda _: 1.0, get=lambda _: None, put_nonblocking=lambda *_: None)
+  params = SimpleNamespace(get_int=lambda name: 0 if name == 'LaneRecenterAssist' else 1, get_float=lambda _: 1.0,
+                           get=lambda _: None, put_nonblocking=lambda *_: None)
   namespace = {
     'np': np,
     'DT_MDL': 0.05,
@@ -77,6 +90,16 @@ def make_planner():
     'time': SimpleNamespace(monotonic=lambda: 0),
     'log': SimpleNamespace(Desire=SimpleNamespace(none=0), LaneChangeState=SimpleNamespace(off=0)),
     'yaw_from_path_no_scipy': lambda *a, **k: (np.zeros(33), np.zeros(33)),
+    'HybridLanePath': StubHybridLanePath,
+    'CurveLaneHybrid': CurveLaneHybrid,
+    'CausalMedian': CausalMedian,
+    'HybridFrame': HybridFrame,
+    'RUN_V_MIN': RUN_V_MIN,
+    'PREWARM_ROAD_A': PREWARM_ROAD_A,
+    'PREWARM_CURVE_A': PREWARM_CURVE_A,
+    'HYBRID_CONTINUOUS': False,
+    'HYBRID_RUN_ALWAYS': False,
+    'cloudlog': SimpleNamespace(exception=_hybrid_fault),
   }
   exec(
     compile(ast.Module(body=[n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'LateralPlanner'], type_ignores=[]), str(source), 'exec'),

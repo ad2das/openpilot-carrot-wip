@@ -1355,6 +1355,14 @@ struct LateralPlan @0xe1e9318e2ae8b51e {
   laneRecenterCurvature @42 :Float32;
   laneRecenterActive @43 :Bool;
 
+  # Curve-lane hybrid (Stage 2b): the added lane-mode curvature, whether its gate is on, this
+  # frame's raw guard bits (1 shape, 2 w45, 4 lane width, 8 bad lane measurement) and the hybrid
+  # MPC solve time in ms. Zero/off whenever LaneRecenterAssist is 0.
+  curveHybridCurvature @44 :Float32;
+  curveHybridActive @45 :Bool;
+  curveHybridGuards @46 :UInt8;
+  curveHybridSolveTime @47 :Float32;
+
   struct SolverState {
     x @0 :List(List(Float32));
     u @1 :List(Float32);
