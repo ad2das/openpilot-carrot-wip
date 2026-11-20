@@ -104,18 +104,6 @@ FIX = os.path.join(os.path.dirname(__file__), "stop_law_fixtures")
 LIMITS = (-3.5, 2.0)
 AGE = 0.05
 
-SHIPPED_STOP_LAW_ENABLED = lc.STOP_LAW_ENABLED  # read at import, before the autouse fixture below
-
-
-@pytest.fixture(autouse=True)
-def _stop_law_on(monkeypatch):
-  # The shipped tree has the law folded back; these tests exercise the law itself.
-  monkeypatch.setattr(lc, "STOP_LAW_ENABLED", True)
-
-
-def test_stop_law_folded_back():
-  assert SHIPPED_STOP_LAW_ENABLED is False
-
 
 class DictParams:
   def __init__(self, values):
@@ -440,6 +428,10 @@ def _c0_config(monkeypatch):
   The recorded fixtures were taken from that law, so the replay tests pin it bit for bit."""
   for name, value in (("TAU_S", SL.DT), ("P_MAX", 1e9), ("GUARD", False), ("SLEW", False),
                       ("P0", (0.04, 0.09)), ("TH_LO", (-0.5, -1.0)), ("TH_HI", (0.8, 1.0))):
+    monkeypatch.setattr(SL, name, value)
+  # The L7 constants change the command these fixtures recorded; the replays pin the
+  # deployed (c0) law, so they are pinned back to it.
+  for name, value in (("U_MAX", 0.0), ("DEN_LOCK", 0.05)):
     monkeypatch.setattr(SL, name, value)
 
 
@@ -843,18 +835,28 @@ def _l6_adapt_state(kind, sign, locked=False):
 
 
 def test_l6_deadband_veto():
+  # L7 A2: inside the deadband both res signs are vetoed while th1 >= 0 (a weak brake fakes a
+  # -offset), and a +res may only correct a negative th1.
   assert abs(SL.G * -0.2) < SL.U_DB
-  before, after = _l6_adapt_state("db", +1)
-  assert after == before
-  before, after = _l6_adapt_state("db", -1)
-  assert after != before
+  for sign in (+1, -1):
+    before, after = _l6_adapt_state("db", sign)
+    assert after == before
+  law = SL.StopLaw(-0.5, [-0.2] * (SL.ND + 1))
+  law.v_prev = 1.0
+  law.th1 = -0.20
+  law._adapt(-0.5)
+  before = law.th1
+  law._adapt(-0.0)                     # res > 0
+  assert law.th1 > before
 
 
 def test_l6_release_veto():
-  before, after = _l6_adapt_state("rel", -1, locked=False)
-  assert after == before
-  before, after = _l6_adapt_state("rel", -1, locked=True)
-  assert after != before
+  # Inside the deadband the A2 guard vetoes both signs while th1 >= 0; the release guard outside
+  # the deadband is test_l7_a4a.
+  for locked in (False, True):
+    for sign in (+1, -1):
+      before, after = _l6_adapt_state("rel", sign, locked=locked)
+      assert after == before
 
 
 @pytest.mark.parametrize("seed", [1, 2, 3])
@@ -886,8 +888,11 @@ def test_l6_constants():
   assert SL.FU_REL == 0.12
   assert SL.TH0_SLEW == 0.6
   assert SL.TH1_SLEW == 1.2
-  assert SL.TH_LO == (-0.25, -1.0)
+  assert SL.TH_LO == (-0.25, -0.40)
   assert SL.TH_HI == (0.40, 1.0)
+  assert SL.U_MAX == -0.15
+  assert SL.DEN_LOCK == 0.35
+  assert SL.DEN_FLOOR == 0.05
   assert SL.P0 == (0.04, 0.09)
   assert SL.LAM == 0.98
 
@@ -1069,3 +1074,125 @@ def test_p17_rise_from_a_slow_lead_ends_law():
   assert u is None and why == "lead_go" and 1.0 < t <= 2.5 and c.creep_lock
   old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
   assert len(old) == n and all(r[2] is not None for r in old[1:])
+
+
+# --- L7: minimum brake, deadband/release guard polarity, one-axis forgetting, locked den floor ---
+
+def test_l7_a1_law_never_releases_fully():
+  # A1. The clip was U_MAX 0.0, so once the car reached the stop point with a released command and
+  # the measured decel led the model, u_out clamped at exactly 0.000 and idle creep pushed the car
+  # (W-LAWQ1 A-1 table: u_out 0.000 on 4d7--16, 991.0-991.7). The clip is now U_MAX = -0.15.
+  assert SL.U_MAX == -0.15
+  law = SL.StopLaw(0.0, [0.0] * (SL.ND + 1))       # entry with the brake released
+  law.th0 = 0.0
+  law.th1 = 0.0
+  us = []
+  for _ in range(60):
+    u = law.step(0.02, -0.35, 0.02)                # at the stop point, measured decel ahead of the model
+    law.commit(u)
+    us.append(u)
+  assert all(u < 0.0 for u in us), max(us)          # base's first tick is exactly 0.000
+  # U_MAX is the clamp the rate limiter walks to, and it does get there
+  assert us[-1] <= SL.U_MAX + 1e-12, us[-1]
+  clamped = [k for k, u in enumerate(us) if abs(u - SL.U_MAX) < 1e-12]
+  assert clamped, "U_MAX never bound"
+  assert max(us) - min(us) <= SL.DU_LIM * SL.DT * (len(us) + 1) + 1e-9
+
+
+def test_l7_a2_deadband_guard_polarity():
+  # A2. The guard vetoed only res > 0, so a res < 0 at small |u| walked th1 to -0.479 (W-LAWQ1
+  # 991.499). Now res < 0 is vetoed too, and a +res may only correct a negative th1.
+  def run(res, th1_0, u_db=-0.2):
+    law = SL.StopLaw(-0.5, [u_db] * (SL.ND + 1))
+    law.v_prev = 1.0
+    law.th1 = th1_0
+    law._adapt(-0.5)
+    before = law.th1
+    law._adapt(-0.5 + res)
+    return before, law.th1
+
+  assert abs(SL.G * -0.2) < SL.U_DB
+  # a res < 0 no longer moves th1 inside the deadband
+  assert run(-0.5, 0.0) == (0.0, 0.0)
+  # disconfirm the old polarity on the state that used to move it
+  assert run(+0.5, 0.0) == (0.0, 0.0)
+  # a negative th1 is still correctable by a +res
+  b, a = run(+0.5, -0.20)
+  assert a > b
+  # the new floor holds
+  assert SL.TH_LO == (-0.25, -0.40)
+  law = SL.StopLaw(-1.0, [-0.2] * (SL.ND + 1))
+  law.v_prev = 1.0
+  for _ in range(600):
+    law._adapt(-1.5)
+  assert law.th1 >= -0.40 - 1e-12, law.th1
+
+
+def _rel_prep(locked):
+  """A law with the th1 axis excited, a command outside the deadband, and a fast release pending
+  (u_d > u_f + FU_REL), so the release guard is the only thing deciding the update."""
+  law = SL.StopLaw(-0.5, [-0.5] * (SL.ND + 1))
+  law.v_prev = 1.0
+  for k in range(40):                      # excite fw_s below W_V_HI
+    u = law.step(max(0.2, 1.6 - 0.01 * k), -0.5, 6.0)
+    law.commit(u)
+  law.uh = [-0.5] * (2 * SL.ND + 2)        # u_d = G*-0.5, |u_d| > U_DB
+  law.u_f = SL.G * -1.0                    # u_d > u_f + FU_REL
+  law.locked = locked
+  return law
+
+
+def _rel_step(law, res):
+  """One _adapt whose residual is exactly `res`, built from this law's own prediction."""
+  p0, p1 = law.fu_s, law.fw_s
+  return law._adapt(law.fb_s + p0 * law.th0 + p1 * law.th1 + res)
+
+
+def test_l7_a4a_release_guard_runs_on_locked_ticks():
+  # A4a. The guard skipped every locked tick, so a locked fast release with res > 0 moved th1
+  # (-0.043 -> +0.231 on 4d6--6). The guard now runs while locked and vetoes that false +res; it
+  # leaves the genuine res < 0 and the unlocked behaviour alone.
+  law = _rel_prep(True)
+  before = law.th1
+  _rel_step(law, +0.30)
+  assert law.th1 == before, (before, law.th1)     # base moves th1 up here
+  law = _rel_prep(True)
+  before = law.th1
+  _rel_step(law, -0.30)
+  assert law.th1 < before                         # a real -res still adapts
+  law = _rel_prep(False)
+  before = law.th1
+  _rel_step(law, +0.30)
+  assert law.th1 == before
+  law = _rel_prep(False)
+  before = law.th1
+  _rel_step(law, -0.30)
+  assert law.th1 == before                        # unlocked res < 0 keeps today's veto
+
+
+def test_l7_a3_locked_den_floor():
+  # A3. The locked branch floored den_l at DEN_FLOOR 0.05, so a_kin blew up once d_stop went
+  # negative (-0.4^2/(2*0.05) = -1.6, and -1.40 after the J_FIRM slew). It floors at DEN_LOCK 0.35
+  # now, so the locked hold stays at A_H; the pre-lock q path and the lead guard keep DEN_FLOOR.
+  assert SL.DEN_LOCK == 0.35
+  assert SL.DEN_FLOOR == 0.05
+  assert -0.4 ** 2 / (2.0 * SL.DEN_LOCK) > SL.A_H
+  assert -0.4 ** 2 / (2.0 * SL.DEN_FLOOR) < SL.A_H
+
+  law = SL.StopLaw(-0.7, [-0.7] * (SL.ND + 1), 0.3)
+  law.locked = True
+  law.r_prev = SL.A_H
+  r = None
+  for _ in range(300):
+    r = law._ref(0.4, -0.1)
+  assert r == pytest.approx(SL.A_H), r            # base reached -1.40 here
+
+  # the lead guard still floors at DEN_FLOOR through its own 0.05 clip and still binds
+  ctl = SL.StopCtl(V_ENTER_MIN=0.0, NEED_PLAN_BRAKE=False)
+  for _ in range(30):
+    ctl.commit(-0.8)
+  ctl.update(True, 1.5, -0.5, True, 6.0, 0.0, -1.0, INF)   # enter the law normally
+  ctl.law = SL.StopLaw(-0.5, [-0.5] * 64)                  # fresh law: the guard is what binds
+  u = ctl.update(True, 1.5, -0.5, True, 3.1, 0.0, -1.0, INF)
+  assert ctl.n_guard == 1
+  assert u is not None and u < SL.A_H, u

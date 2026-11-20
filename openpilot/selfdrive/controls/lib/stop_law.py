@@ -40,10 +40,10 @@ TAU_B = 0.5713120493245386  # brake response lag (s)
 ND = 20              # brake response delay in steps (0.20 s)
 BETA = DT / TAU_B
 P0 = (0.04, 0.09)
-TH_LO = (-0.25, -1.0)
+TH_LO = (-0.25, -0.40)
 TH_HI = (0.40, 1.0)
 U_MIN = -2.0
-U_MAX = 0.0
+U_MAX = -0.15        # keep a minimum brake while the law owns the stop; a full release let idle creep push the car
 DU_LIM = 2.5         # m/s^3, command rate limit
 TAU_S = 0.12         # s, the measured-accel smoothing lag (fb, fu, fw and u_f match it)
 P_MAX = 0.60         # covariance ceiling; conditional forgetting keeps trace(p00+p11) <= P_MAX
@@ -54,6 +54,7 @@ FU_REL = 0.12        # m/s^2, band above u_f the release-lag guard keys on
 TH0_SLEW = 0.6       # 1/s, th0 slew limit (applied when SLEW)
 TH1_SLEW = 1.2       # 1/s, th1 slew limit (applied when SLEW)
 DEN_FLOOR = 0.05     # m
+DEN_LOCK = 0.35      # m, den_l floor in the locked branch only
 X_CORR = 0.1429370435473798   # m, travel after the standstill timer fires that the law leaves room for
 W_V_HI = 2.0
 W_V_LO = 0.45
@@ -113,9 +114,9 @@ class StopLaw:
       k1 = t1 / den
       res = (a_m - self.fb_s) - (p0 * self.th0 + p1 * self.th1)
       if GUARD:
-        if abs(self.uh[-1 - ND]) < U_DB and res > 0.0:                         # deadband: weak brake looks like +offset
+        if abs(self.uh[-1 - ND]) < U_DB and (res < 0.0 or self.th1 >= 0.0):    # deadband: a weak brake fakes a -offset; a +res may only correct a negative th1
           return
-        if (not self.locked) and u_d > self.u_f + FU_REL and res < 0.0:          # fast glide release looks like -offset
+        if u_d > self.u_f + FU_REL and (res > 0.0 or not self.locked):           # fast release: the measured decel leads the model, res is unreliable; locked only vetoes the false +res
           return
       th0 = self.th0 + k0 * res
       th1 = self.th1 + k1 * res
@@ -153,8 +154,8 @@ class StopLaw:
       self.locked = True
       if self.tol_lock > 0.0:
         den_l = d_stop + self.tol_lock - X_CORR
-        if den_l < DEN_FLOOR:
-          den_l = DEN_FLOOR
+        if den_l < DEN_LOCK:
+          den_l = DEN_LOCK
         a_kin = -v * v / (2.0 * den_l)
       r_t = a_kin if a_kin < A_H else A_H      # never softer than a_kin once a_kin is firmer than A_H
     dr = r_t - self.r_prev

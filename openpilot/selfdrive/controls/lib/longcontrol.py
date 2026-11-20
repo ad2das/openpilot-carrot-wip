@@ -58,7 +58,7 @@ FINAL_STOP_ENABLED = True  # ButterStop's final stop (firm finish / K5 probe); t
 # ButterStop stop law (stop_law.py), Palisade only: owns the pid command for a stop behind a stopped
 # or nearly stopped lead from 3.5 m/s down to the ESC standstill flag and steers one continuous decel
 # to it. The taper floor and the firm finish stand aside while it runs. Fitted on the Palisade twin.
-STOP_LAW_ENABLED = False                        # folded back 11-20 until the L7 law is verified; tests patch it on
+STOP_LAW_ENABLED = True                         # tests patch this to get the pre-law ButterStop arm
 STOP_LAW_CARS = (HYUNDAI_CAR.HYUNDAI_PALISADE,)
 STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the ordinary command after the law lets go
 STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events
@@ -212,6 +212,7 @@ class LongControl:
     self._butter_creep_logged = False
     self._butter_near_rest = False
     self._butter_rest_floor = None
+    self._butter_no_taper_stop = False
     self._butter_v_min = float("inf")
     self._depart_t = None
     self._depart_floor = None
@@ -666,8 +667,13 @@ class LongControl:
         self._butter_creep_logged = False
         self._butter_near_rest = False
         self._butter_rest_floor = None
+        self._butter_no_taper_stop = False
         self._butter_v_min = float("inf")
       else:
+        # A law / firm-cap / soft-release hand-off owns the first stopping tick. The
+        # background-slewed taper floor must not re-limit that command.
+        if self.stop_law_last or self._stop_release is not None or self._firm_cap is not None:
+          self._butter_no_taper_stop = True
         try:
           v_ego_now = float(CS.vEgo)
         except (TypeError, ValueError):
@@ -749,7 +755,7 @@ class LongControl:
       if output_accel > self.stopping_accel:
         output_accel = min(output_accel, 0.0)
         output_accel -= ramp_rate * DT_CTRL
-      if self.butter_stop and not self._butter_standstill_confirmed:
+      if self.butter_stop and not self._butter_standstill_confirmed and not self._butter_no_taper_stop:
         floor = None
         if butter_floor_value is not None:
           # The taper only limits braking while the car is still rolling.
@@ -826,6 +832,7 @@ class LongControl:
         output_accel = stop_u
         self._firm_cap = None
         self._stop_release = stop_u
+        self._butter_floor_prev = None
       if stop_u is None and butter_floor_value is not None and output_accel < butter_floor_value:
         # ButterStop taper: only remove braking above the floor, never add any.
         # Freeze the integrator while limited, like the coasting relief.
@@ -865,6 +872,7 @@ class LongControl:
           # Do not integrate the speed error the cap is overriding.
           self.pid.i = previous_integral
           output_accel = self._firm_cap
+          self._butter_floor_prev = None
       if stop_u is None and self._stop_release is not None:
         # Soft hand-back after the law lets go: relax at STOP_LAW_RELEASE_JERK; a harder ordinary
         # command passes at once; pedals or cruise standstill end it at once.
@@ -877,6 +885,7 @@ class LongControl:
           # there lets one tick step past STOP_LAW_RELEASE_JERK. It is released one tick later.
           self.pid.i = previous_integral
           output_accel = self._stop_release
+          self._butter_floor_prev = None
           if self._stop_release >= 0.0:
             self._stop_release = None
       guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
