@@ -2,7 +2,7 @@ from collections import deque
 
 import numpy as np
 from opendbc.can import CANPacker
-from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, common_fault_avoidance, make_tester_present_msg, structs, apply_std_steer_angle_limits
+from opendbc.car import Bus, DT_CTRL, CanData, apply_driver_steer_torque_limits, common_fault_avoidance, make_tester_present_msg, structs, apply_std_steer_angle_limits
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.hyundai import hyundaicanfd, hyundaican
 from opendbc.car.hyundai.carstate import CarState
@@ -10,7 +10,8 @@ from opendbc.car.hyundai.stopping import CanfdStopping
 from opendbc.car.hyundai.steering_handover import SteeringHandover
 from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
-from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR, CAN_GEARS, HyundaiExtFlags
+from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, Buttons, CarControllerParams, CAR, CAN_GEARS, HyundaiExtFlags
+from opendbc.car.hyundai.palisade_cgw_test import PalisadeCgwTest
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.vehicle_model import VehicleModel
 from openpilot.common.filter_simple import MyMovingAverage
@@ -196,6 +197,8 @@ class CarController(CarControllerBase):
     self.CAN = CanBus(CP)
     self.params = CarControllerParams(CP)
     self.packer = CANPacker(dbc_names[Bus.pt])
+    self.cgw_test = PalisadeCgwTest() if (CP.safetyConfigs and
+                                          CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.PALISADE_CGW_TEST) else None
     self.angle_limit_counter = 0
 
     self.accel_last = 0
@@ -690,6 +693,13 @@ class CarController(CarControllerBase):
     new_actuators.torqueOutputCan = steering_authority if angle_control else apply_torque
     new_actuators.steeringAngleDeg = float(apply_angle)
     new_actuators.accel = accel
+
+    if self.cgw_test is not None:
+      wheels = CS.out.wheelSpeeds
+      parked = (CS.out.gearShifter == structs.CarState.GearShifter.park
+                and all(speed == 0 for speed in (wheels.fl, wheels.fr, wheels.rl, wheels.rr)))
+      can_sends.extend(CanData(*f) for f in self.cgw_test.update(now_nanos, CS.cgw_test_raw, CS.cgw_test_timestamps, parked,
+                                                                   not (CC.enabled or CC.latActive or CC.longActive)))
 
     self.frame += 1
     return new_actuators, can_sends
