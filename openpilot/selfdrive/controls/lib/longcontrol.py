@@ -64,15 +64,27 @@ STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the 
 STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events
 
 
-def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+def firm_plan_ok(firm_a, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
   if firm_a <= 0.0 or gas or brake or cruise_standstill:
     return False
   if not (0.0 <= t_since_plan <= MAX_PLAN_AGE) or len(plan_speeds) == 0:
     return False
   v_end = float(plan_speeds[-1])
-  if not (math.isfinite(v_ego) and math.isfinite(a_target) and math.isfinite(v_end)):
+  if not (math.isfinite(a_target) and math.isfinite(v_end)):
     return False
-  return a_target < FIRM_ATGT and v_end < FIRM_VPLAN_END and FIRM_V_LO <= v_ego <= FIRM_V_HI
+  return a_target < FIRM_ATGT and v_end < FIRM_VPLAN_END
+
+
+def firm_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+  if not firm_plan_ok(firm_a, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+    return False
+  return math.isfinite(v_ego) and FIRM_V_LO <= v_ego <= FIRM_V_HI
+
+
+def firm_ease_gate(firm_a, v_ego, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+  if not firm_plan_ok(firm_a, a_target, plan_speeds, t_since_plan, gas, brake, cruise_standstill):
+    return False
+  return math.isfinite(v_ego) and FIRM_V_HI < v_ego <= FIRM_EASE_V_HI
 
 
 def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
@@ -85,19 +97,25 @@ def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
   return None if cap >= 0.0 else cap
 
 
-# Firm-finish decel tracker. Inside the firm band the cap follows the car's own
-# decel toward FIRM_A instead of only flooring the command. With no lead, no fcw
-# and a plan no harder than FIRM_TRACK_ATGT it may also ease a command that brakes
-# harder than FIRM_A, so the car does not reach the Palisade ESC standstill flag
-# still decelerating hard (field 4b5 seg 11: -0.87 at the flag, J ~10). With a
-# lead, or any doubt, it only ever adds braking.
-# The ease stops at FIRM_TRACK_MIN: below ~2 m/s the Palisade ESC follows a release
-# but does not build braking back (field 4ba seg 5: eased to -0.55, the ESC held
-# -0.56..-0.66 under a -1.0 request, flagged at 0.49 m/s and crawled 0.97 m).
+# Firm-finish decel tracker (Neon Q22, 11-21). Below FIRM_V_HI the Palisade ESC follows a release but does
+# not build braking back (field 4ba seg 5: eased to -0.55, the ESC held -0.56..-0.66 under a -1.0 request;
+# field 4db--2: eased -1.18 -> -0.79 at 2.0 m/s, arrived at 0.67 m/s^2 and crawled 5.4 s under StopReq).
+# With no lead, no fcw and a plan no harder than FIRM_TRACK_ATGT:
+# - in (FIRM_V_HI, FIRM_EASE_V_HI] the tracker may only ease a pid command that brakes harder than it
+#   (firm_track_step from the last applied command), so a soft approach is untouched;
+# - in [FIRM_V_LO, FIRM_V_HI] the cap owns the command and never lets it rise (firm_lock_step): a soft entry
+#   ramps to -FIRM_TRACK_MIN, holds it FIRM_SETTLE_S for the car, then trims down at FIRM_TRIM_JERK.
+# With a lead, fcw or a hard plan the cap only ever adds braking.
 FIRM_TRACK_KP = 1.0        # m/s^2 of command per m/s^2 the car is off FIRM_A
 FIRM_TRACK_MAX = 1.2       # m/s^2, most braking the tracker asks for
-FIRM_TRACK_MIN = 0.70      # m/s^2, least braking it asks for (no lead only)
+FIRM_TRACK_MIN = 0.80      # m/s^2, least braking it asks for (no lead only; Neon Q22, was 0.70)
 FIRM_TRACK_ATGT = -1.2     # m/s^2, a plan harder than this is a real need: never ease
+FIRM_EASE_V_HI = 3.2       # m/s, top of the ease-only band above the firm band
+FIRM_SETTLE_S = 0.50       # s, a soft entry holds -FIRM_TRACK_MIN this long before trimming (plant delay)
+FIRM_TRIM_JERK = 0.5       # m/s^3, most the owned command deepens per second once settled
+FIRM_LOCK_RAMP = 0         # firm_lock_step phases
+FIRM_LOCK_SETTLE = 1
+FIRM_LOCK_TRIM = 2
 
 
 def firm_track_target(firm_a, a_ego):
@@ -113,6 +131,23 @@ def firm_track_step(cap, last_output, firm_a, a_ego, ease_ok):
   if not ease_ok:
     target = min(target, -firm_a)
   return base + max(-FIRM_JERK * DT_CTRL, min(FIRM_RELEASE_JERK * DT_CTRL, target - base))
+
+
+def firm_lock_step(phase, settle_t, last_output, firm_a, a_ego):
+  """One owned firm-band tick with no lead: the command never rises. Returns (cap, phase, settle_t)."""
+  base = min(float(last_output), 0.0)
+  if phase == FIRM_LOCK_RAMP:
+    cap = min(base, max(-FIRM_TRACK_MIN, base - FIRM_JERK * DT_CTRL))
+    if cap <= -FIRM_TRACK_MIN + 1e-9:
+      return cap, FIRM_LOCK_SETTLE, 0.0
+    return cap, phase, settle_t
+  if phase == FIRM_LOCK_SETTLE:
+    settle_t += DT_CTRL
+    return base, (FIRM_LOCK_TRIM if settle_t >= FIRM_SETTLE_S - 1e-9 else phase), settle_t
+  if not math.isfinite(a_ego):
+    a_ego = -firm_a
+  target = firm_track_target(firm_a, a_ego)
+  return base + max(-FIRM_TRIM_JERK * DT_CTRL, min(0.0, target - base)), phase, settle_t
 
 
 STOPPING_ACCEL_DEFAULT = -50  # Params use hundredths of m/s^2
@@ -202,6 +237,11 @@ class LongControl:
     self._refresh_butter_stop()
     self._firm_cap = None
     self._firm_logged = False
+    self._firm_lock_phase = None
+    self._firm_settle_t = 0.0
+    self._firm_eased = False
+    self._firm_ease_logged = False
+    self.firm_band_last = 0
     self.j_lead = 0.0
 
     # ButterStop stop-episode state. The standstill hold/release decision itself
@@ -839,6 +879,7 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = self.pid.update(error, speed=CS.vEgo, feedforward=a_target_ff, freeze_integrator=True)
         output_accel = min(0.0, max(output_accel, butter_floor_value))
+      self.firm_band_last = 0
       # Off-identity: with the param off and no cap in flight the block is not
       # entered at all, so it cannot even read CS. The _firm_cap half keeps the
       # soft release alive when the param is switched off mid-stop.
@@ -848,31 +889,60 @@ class LongControl:
         # (no .speeds) and a bare read raises on every tick before the gate is even
         # entered. An absent plan is "no plan", which the gate rejects.
         plan_speeds = getattr(long_plan, "speeds", ())
-        gate = firm_gate(self.firm_a, float(CS.vEgo), float(a_target_ff), plan_speeds, t_since_plan,
-                         bool(CS.gasPressed), bool(CS.brakePressed), bool(CS.cruiseState.standstill))
+        gate_args = (self.firm_a, float(CS.vEgo), float(a_target_ff), plan_speeds, t_since_plan,
+                     bool(CS.gasPressed), bool(CS.brakePressed), bool(CS.cruiseState.standstill))
+        gate = firm_gate(*gate_args)
+        ease_gate = (not gate) and firm_ease_gate(*gate_args)
         was_capped = self._firm_cap is not None
         ease_ok = False
-        if gate:
+        if gate or ease_gate:
           # A missing lead object counts as a lead: never ease without proof there is none.
           lead_one = getattr(radarState, "leadOne", None) if radarState is not None else None
           no_lead = lead_one is not None and not bool(getattr(lead_one, "status", True))
           ease_ok = (no_lead and not bool(getattr(long_plan, "fcw", False))
                      and float(a_target_ff) >= FIRM_TRACK_ATGT)
+        owned = gate and ease_ok
+        if owned:
+          if self._firm_lock_phase is None:
+            soft = min(float(self.last_output_accel), 0.0) > -FIRM_TRACK_MIN
+            self._firm_lock_phase = FIRM_LOCK_RAMP if (soft and not self._firm_eased) else FIRM_LOCK_TRIM
+            self._firm_settle_t = 0.0
+          self._firm_cap, self._firm_lock_phase, self._firm_settle_t = firm_lock_step(
+            self._firm_lock_phase, self._firm_settle_t, self.last_output_accel, self.firm_a, float(CS.aEgo))
+        elif gate:
           self._firm_cap = firm_track_step(self._firm_cap, self.last_output_accel, self.firm_a,
-                                           float(CS.aEgo), ease_ok)
+                                           float(CS.aEgo), False)
         else:
           self._firm_cap = firm_cap_step(self._firm_cap, self.last_output_accel, self.firm_a, gate, hard_exit)
         if gate and not was_capped and not self._firm_logged:
           cloudlog.event("butterStopFirm", vEgo=float(CS.vEgo), aTarget=float(a_target_ff), firmA=self.firm_a,
-                         ease=bool(ease_ok))
+                         ease=bool(ease_ok), eased=bool(self._firm_eased))
           self._firm_logged = True
-        if float(CS.vEgo) > FIRM_V_HI + 1.0:
+        if float(CS.vEgo) > FIRM_EASE_V_HI + 1.0:
           self._firm_logged = False
-        if self._firm_cap is not None and (ease_ok or output_accel > self._firm_cap):
+          self._firm_ease_logged = False
+          self._firm_eased = False
+          self._firm_lock_phase = None
+        if self._firm_cap is not None and (owned or output_accel > self._firm_cap):
           # Do not integrate the speed error the cap is overriding.
           self.pid.i = previous_integral
           output_accel = self._firm_cap
           self._butter_floor_prev = None
+          if owned:
+            self.firm_band_last = 2
+        elif ease_gate and ease_ok:
+          # Ease-only band: a pid command harder than the tracker is eased toward it; a softer one passes.
+          ease_cap = firm_track_step(None, self.last_output_accel, self.firm_a, float(CS.aEgo), True)
+          if ease_cap > output_accel:
+            if not self._firm_ease_logged:
+              cloudlog.event("butterStopFirmEase", vEgo=float(CS.vEgo), aTarget=float(a_target_ff),
+                             pid=float(output_accel), cap=float(ease_cap))
+              self._firm_ease_logged = True
+            self.pid.i = previous_integral
+            output_accel = ease_cap
+            self._butter_floor_prev = None
+            self._firm_eased = True
+            self.firm_band_last = 1
       if stop_u is None and self._stop_release is not None:
         # Soft hand-back after the law lets go: relax at STOP_LAW_RELEASE_JERK; a harder ordinary
         # command passes at once; pedals or cruise standstill end it at once.
@@ -898,6 +968,9 @@ class LongControl:
       self._firm_cap = None
       self._stop_release = None
       self.stop_law_last = False
+      self._firm_lock_phase = None
+      self._firm_eased = False
+      self.firm_band_last = 0
     self.last_output_accel = np.clip(output_accel, accel_limits[0], accel_limits[1])
     if self._stop_ctl is not None:
       self._stop_ctl.commit(float(self.last_output_accel))

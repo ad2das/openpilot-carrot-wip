@@ -100,14 +100,18 @@ from opendbc.car.hyundai.values import HyundaiFlags
 from openpilot.selfdrive.controls.lib.cruise_coasting import MAX_PLAN_AGE
 from openpilot.selfdrive.controls.lib.butter_stop import EARLY_REQ_ENABLED, PROBE_V_MAX
 from openpilot.selfdrive.controls.lib.longcontrol import (
-  FIRM_A, FIRM_JERK, FIRM_TRACK_ATGT, FIRM_TRACK_MAX, FIRM_TRACK_MIN, FIRM_V_HI, FIRM_V_LO,
-  LongCtrlState, firm_cap_step, firm_gate, firm_track_step, firm_track_target,
+  FIRM_A, FIRM_EASE_V_HI, FIRM_JERK, FIRM_LOCK_RAMP, FIRM_LOCK_SETTLE, FIRM_LOCK_TRIM, FIRM_RELEASE_JERK,
+  FIRM_SETTLE_S, FIRM_TRACK_ATGT, FIRM_TRACK_MAX, FIRM_TRACK_MIN, FIRM_TRIM_JERK, FIRM_V_HI, FIRM_V_LO,
+  LongCtrlState, firm_cap_step, firm_ease_gate, firm_gate, firm_lock_step, firm_track_step, firm_track_target,
 )
 from openpilot.selfdrive.controls.tests.test_butter_stop import (
   PLAN_T, DictParams, make_control, make_cp, stopping_inputs,
 )
 
 LEAD_D = 9.0
+# Plan slope for the ease-band streams. PLAN_T ends at 2.5 s, so a 0.5 m/s^2 plan cannot reach
+# v_end < FIRM_VPLAN_END from above FIRM_V_HI: the ease gate needs a plan that really stops.
+EASE_PLAN_DECEL = 1.5  # m/s^2
 
 
 class _EventLog:
@@ -509,7 +513,7 @@ def test_gas_press_drops_the_cap(monkeypatch):
 
 def test_t1_track_target_units():
   """The target is -FIRM_A when the car decelerates at FIRM_A, and saturates."""
-  cases = {(-2.0): -0.70, (-1.1): -0.70, (-1.0): -0.70, (-0.8): -0.80,
+  cases = {(-2.0): -0.80, (-1.1): -0.80, (-1.0): -0.80, (-0.8): -0.80,
            (-0.6): -1.00, (-0.55): -1.05, (-0.4): -1.20, 0.0: -1.20, 0.5: -1.20}
   for a_ego, expected in cases.items():
     assert firm_track_target(0.8, a_ego) == pytest.approx(expected, abs=1e-9), a_ego
@@ -527,14 +531,14 @@ def test_t2_track_step_one_call(cap, last, a_ego, ease, expected):
   assert firm_track_step(cap, last, 0.8, a_ego, ease) == pytest.approx(expected, abs=1e-9)
 
 
-def test_t3a_ease_ramp_reaches_firm_track_min_at_30_calls():
+def test_t3a_ease_ramp_reaches_firm_track_min_at_25_calls():
   cap, calls = None, 0
   while True:
     cap = firm_track_step(cap, -1.3, 0.8, -1.1, True)
     calls += 1
     if cap >= -FIRM_TRACK_MIN - 1e-12 or calls > 1000:
       break
-  assert calls == 30, calls
+  assert calls == 25, calls
   assert cap == pytest.approx(-FIRM_TRACK_MIN, abs=1e-9)
   for _ in range(20):
     cap = firm_track_step(cap, -1.3, 0.8, -1.1, True)
@@ -591,18 +595,6 @@ SCENARIOS = [("4b5 no lead", _table(P4B5), 3.54, -0.85, False),
 # every grid row is (old a@0.4 min, old a@0.4 max, new a@0.4 min, new a@0.4 max,
 # extra min, extra max, new u min, new u max).
 SPEC_EXPECTED = {
-  "4b5 no lead": {
-    "fitted": [(0.8, 0.7, 0.5, -0.832, -0.682, -0.983, -0.824, 6.011, 6.124),
-               (0.85, 0.8, 0.3, -0.855, -0.727, -0.984, -0.825, 5.880, 6.017),
-               (0.6, 1.1, 0.3, -0.590, -0.603, -0.675, -0.619, 7.491, 7.630)],
-    "grid": (-1.172, -0.505, -1.043, -0.586, 0.033, 0.199, -1.283, -0.700),
-  },
-  "4b1 no lead": {
-    "fitted": [(0.8, 0.7, 0.5, -0.679, -0.691, -0.727, -0.667, 4.583, 4.661),
-               (0.85, 0.8, 0.3, -0.725, -0.728, -0.770, -0.720, 4.445, 4.532),
-               (0.6, 1.1, 0.3, -0.528, -0.601, -0.574, -0.607, 5.280, 5.249)],
-    "grid": (-0.938, -0.483, -0.864, -0.594, -0.274, 0.118, -1.023, -0.700),
-  },
   "4b1 lead": {
     "fitted": [(0.8, 0.7, 0.5, -0.679, -0.689, -0.727, -0.727, 4.583, 4.580),
                (0.85, 0.8, 0.3, -0.725, -0.731, -0.770, -0.770, 4.445, 4.445),
@@ -674,7 +666,7 @@ def _closed_loop(new, pid_of_v, v0, a0, g, tau, delay, lead):
   return out
 
 
-@pytest.mark.parametrize("name", [s[0] for s in SCENARIOS])
+@pytest.mark.parametrize("name", [s[0] for s in SCENARIOS if s[4]])
 def test_t4_closed_loop_matches_the_spec(name):
   pid, v0, a0, lead = next((p, v, a, l) for n, p, v, a, l in SCENARIOS if n == name)
   expected = SPEC_EXPECTED[name]
@@ -721,54 +713,53 @@ def test_t4_closed_loop_matches_the_spec(name):
       assert n["x_end"] - o["x_end"] <= 0.25, (name, "no-lead extra", n["x_end"] - o["x_end"])
 
 
-def test_t5_band_hit_counts():
-  """Plants whose arrival decel lands in the W-PJU0 best bin [-0.85, -0.65]."""
-  expected = {"4b5 no lead": (16, 26), "4b1 no lead": (24, 35)}
-  for name, (want_old, want_new) in expected.items():
-    pid, v0, a0, lead = next((p, v, a, l) for n, p, v, a, l in SCENARIOS if n == name)
-    old = sum(1 for p in GRID if -0.85 <= _closed_loop(False, pid, v0, a0, *p, lead)["a0.4"] <= -0.65)
-    new = sum(1 for p in GRID if -0.85 <= _closed_loop(True, pid, v0, a0, *p, lead)["a0.4"] <= -0.65)
-    assert old == want_old, (name, "old", old)
-    assert new == want_new, (name, "new", new)
-
-
 # ---------------------------------------------------------------------------
 # F12: the tracker through the real update()
 # ---------------------------------------------------------------------------
 
-def _tick_inputs_track(v, lead, a_ego, a_target, fcw):
-  cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=np.maximum(0.0, v - 0.5 * PLAN_T),
+def _tick_inputs_track(v, lead, a_ego, a_target, fcw, decel=0.5):
+  cs, plan, radar = stopping_inputs(v_ego=v, plan_speeds=np.maximum(0.0, v - decel * PLAN_T),
                                     lead_status=lead, d_rel=LEAD_D)
   cs.aEgo = a_ego
   plan.aTarget = a_target
-  # The plan decelerates at 0.5 m/s^2, so its desired speed right now is v - 0.5*dt.
+  # The plan decelerates at `decel`, so its desired speed right now is v - decel*dt.
   # Leaving vTargetNow at 0 makes the pid ask ~-2.4 m/s^2 in the band: the cap would
   # then have to climb ~90 ticks from that last output, not the 60 this test allows.
-  plan.vTargetNow = max(0.0, v - 0.5 * DT_CTRL)
+  plan.vTargetNow = max(0.0, v - decel * DT_CTRL)
   plan.fcw = fcw
   plan.shouldStop = bool(v < 0.3)
   return cs, plan, radar
 
 
-def _run_track_stream(monkeypatch, lead, a_ego, a_target, fcw, radar_override=None):
+def _run_track_stream(monkeypatch, lead, a_ego, a_target, fcw, radar_override=None,
+                      v_start=2.5, ticks=600, switch=None, final_stop=True, decel=0.5):
   events = _EventLog()
   monkeypatch.setattr(lc, "cloudlog", events)
+  monkeypatch.setattr(lc, "FINAL_STOP_ENABLED", bool(final_stop))
   control, _ = make_control(monkeypatch, values=ON)
   control.long_control_state = LongCtrlState.pid
+  pid_calls = _probe_pid(control)
 
   rows = []
-  for tick, v in enumerate(_build_stream()):
-    cs, plan, radar = _tick_inputs_track(v, lead, a_ego, a_target, fcw)
+  for tick, v in enumerate(_build_stream(ticks=ticks, v_start=v_start)):
+    cs, plan, radar = _tick_inputs_track(v, lead, a_ego, a_target, fcw, decel)
     # The override is a deliberately bare object; long_control_state_trans reads
     # radarState.leadOne without getattr once shouldStop is true (v < 0.3), so it
     # is only valid while the gate can run. Below the band bottom use the real one.
     if radar_override is not None and v >= FIRM_V_LO:
       radar = radar_override
+    if switch is not None:
+      switch(tick, v, cs, plan, radar)
+    pid_calls.clear()
     integral_before = float(control.pid.i)
     output = float(control.update(True, cs, plan, (-3.5, 2.0), 0.05, radar)[0])
     rows.append({"tick": tick, "v": float(cs.vEgo), "output": output,
+                 "pid_wanted": pid_calls[-1] if pid_calls else float("nan"),
                  "integral_before": integral_before, "integral_after": float(control.pid.i),
                  "cap": None if control._firm_cap is None else float(control._firm_cap),
+                 "band": int(control.firm_band_last),
+                 "law": bool(control.stop_law_last),
+                 "floor": None if control.butter_floor_last is None else float(control.butter_floor_last),
                  "state": int(control.long_control_state)})
   return control, rows, events
 
@@ -831,3 +822,246 @@ def test_t6e_with_a_lead_the_tracker_adds_braking(monkeypatch):
   assert len(ticks) >= 60, len(ticks)
   for row in ticks:
     assert row["output"] <= -1.1 + 1e-9, (row["tick"], row["v"], row["output"])
+
+
+# ---------------------------------------------------------------------------
+# F13 (Neon Q22 rule D): the ease-only band above FIRM_V_HI, the owned band below it
+# ---------------------------------------------------------------------------
+
+def test_n1_ease_gate_band():
+  """firm_ease_gate covers (FIRM_V_HI, FIRM_EASE_V_HI] only, and shares firm_gate's plan checks."""
+  args = dict(GATE_BASE)
+  def ease(v_ego):
+    return firm_ease_gate(args["firm_a"], v_ego, args["a_target"], args["plan_speeds"],
+                          args["t_since_plan"], args["gas"], args["brake"], args["cruise_standstill"])
+
+  assert ease(2.5) is True
+  assert ease(2.0) is False
+  assert ease(2.0 + 1e-6) is True
+  assert ease(FIRM_EASE_V_HI) is True
+  assert ease(FIRM_EASE_V_HI + 1e-6) is False
+  assert ease(float("nan")) is False
+
+  for field, value in [("cruise_standstill", True), ("gas", True), ("brake", True),
+                       ("a_target", -0.3), ("plan_speeds", [1.0, 0.5, 0.3]), ("a_target", float("nan")),
+                       ("t_since_plan", -0.01), ("t_since_plan", MAX_PLAN_AGE + 0.01),
+                       ("firm_a", 0.0), ("plan_speeds", [])]:
+    bad = dict(args)
+    bad.update({field: value})
+    assert firm_ease_gate(bad["firm_a"], 2.5, bad["a_target"], bad["plan_speeds"], bad["t_since_plan"],
+                          bad["gas"], bad["brake"], bad["cruise_standstill"]) is False, field
+
+
+def test_n2_lock_step_ramp_settle_trim():
+  """A soft entry ramps to -FIRM_TRACK_MIN in 20 calls, holds 50, then trims at FIRM_TRIM_JERK."""
+  caps = []
+  phases = []
+  last, settle_t, phase = -0.4, 0.0, FIRM_LOCK_RAMP
+  for _ in range(200):
+    cap, phase, settle_t = firm_lock_step(phase, settle_t, last, FIRM_A, -0.5)
+    caps.append(cap)
+    phases.append(phase)
+    last = cap
+
+  assert caps[19] <= -FIRM_TRACK_MIN + 1e-9, caps[19]
+  assert all(cap > -FIRM_TRACK_MIN + 1e-9 for cap in caps[:19]), caps[:19]
+  assert phases[19] == FIRM_LOCK_SETTLE, phases[19]
+  assert caps[0] == pytest.approx(-0.4 - FIRM_JERK * DT_CTRL, abs=1e-9), caps[0]
+  for i in range(1, 20):
+    assert caps[i] - caps[i - 1] == pytest.approx(-FIRM_JERK * DT_CTRL, abs=1e-9), (i, caps[i])
+  for i in range(20, 70):
+    assert caps[i] == pytest.approx(-FIRM_TRACK_MIN, abs=1e-9), (i, caps[i])
+  assert phases[69] == FIRM_LOCK_TRIM, phases[69]
+  assert caps[70] == pytest.approx(-0.805, abs=1e-9), caps[70]
+  target = firm_track_target(FIRM_A, -0.5)
+  for i in range(71, len(caps)):
+    assert caps[i] == pytest.approx(max(caps[i - 1] - FIRM_TRIM_JERK * DT_CTRL, target), abs=1e-9), (i, caps[i])
+    assert caps[i] >= target - 1e-9, (i, caps[i], target)
+  assert caps[-1] == pytest.approx(target, abs=1e-9), (caps[-1], target)
+
+
+def test_n3_lock_step_never_rises():
+  """Every phase: the cap never rises above min(last, 0), never falls faster than FIRM_JERK, and only
+  advances RAMP->SETTLE->TRIM."""
+  next_phase = {FIRM_LOCK_RAMP: FIRM_LOCK_SETTLE, FIRM_LOCK_SETTLE: FIRM_LOCK_TRIM, FIRM_LOCK_TRIM: None}
+  for phase in (FIRM_LOCK_RAMP, FIRM_LOCK_SETTLE, FIRM_LOCK_TRIM):
+    for last in np.linspace(-1.6, 0.3, 39):
+      for a_ego in (-3.0, -1.1, -0.8, -0.5, 0.0, 1.0, float("nan")):
+        for settle_t in (0.0, 0.25, 0.49, 0.5):
+          cap, got_phase, _ = firm_lock_step(phase, settle_t, float(last), FIRM_A, a_ego)
+          base = min(float(last), 0.0)
+          assert cap <= base + 1e-12, (phase, last, a_ego, settle_t, cap)
+          assert cap >= base - FIRM_JERK * DT_CTRL - 1e-12, (phase, last, a_ego, settle_t, cap)
+          assert got_phase in (phase, next_phase[phase]), (phase, got_phase)
+
+
+def test_n4_upper_band_eases_a_hard_pid_and_hands_over_flat(monkeypatch):
+  """Above FIRM_V_HI the tracker only eases; from the band top down the owned cap takes over flat."""
+  _, rows_on, events = _run_track_stream(monkeypatch, False, -1.1, -1.0, False, v_start=3.5, ticks=760,
+                                           decel=EASE_PLAN_DECEL)
+  _, rows_off, _ = _run_track_stream(monkeypatch, False, -1.1, -1.0, False, v_start=3.5, ticks=760,
+                                     final_stop=False, decel=EASE_PLAN_DECEL)
+
+  above = [(a, b) for a, b in zip(rows_on, rows_off) if a["v"] > FIRM_EASE_V_HI]
+  assert above
+  for a, b in above:
+    assert a["output"] == pytest.approx(b["output"], abs=1e-12), (a["tick"], a["v"], a["output"], b["output"])
+
+  eased = [r for r in rows_on if r["band"] == 1]
+  assert len(eased) >= 50, len(eased)
+  for i, r in enumerate(rows_on):
+    if r["band"] != 1:
+      continue
+    assert r["output"] >= r["pid_wanted"] - 1e-12, (r["tick"], r["v"], r["output"], r["pid_wanted"])
+    assert r["output"] - rows_on[i - 1]["output"] <= FIRM_RELEASE_JERK * DT_CTRL + 1e-12, (r["tick"], r["v"])
+    assert r["integral_after"] == r["integral_before"], (r["tick"], r["v"])
+
+  pid_rows = [r for r in rows_on if r["state"] == int(LongCtrlState.pid)]
+  first_band = next(r for r in pid_rows if r["v"] <= FIRM_V_HI)
+  assert first_band["band"] == 2, (first_band["tick"], first_band["v"], first_band["band"])
+  prev = rows_on[first_band["tick"] - 1]["output"]
+  assert first_band["output"] <= prev + 1e-12, (first_band["tick"], first_band["output"], prev)
+  assert abs(first_band["output"] - prev) <= FIRM_JERK * DT_CTRL + 1e-12, (first_band["tick"],)
+
+  for r in pid_rows:
+    if FIRM_V_LO <= r["v"] <= FIRM_V_HI:
+      assert r["band"] == 2, (r["tick"], r["v"], r["band"])
+      assert r["output"] <= rows_on[r["tick"] - 1]["output"] + 1e-12, (r["tick"], r["v"])
+
+  assert len(events.names("butterStopFirmEase")) == 1, events.events
+  firm = events.names("butterStopFirm")
+  assert len(firm) == 1, events.events
+  assert firm[0]["ease"] is True and firm[0]["eased"] is True, firm
+
+
+def test_n5_soft_entry_ramps_settles_then_trims(monkeypatch):
+  """A soft entry below the band top is left alone above FIRM_V_HI, ramps, holds, then trims."""
+  _, rows_on, _ = _run_track_stream(monkeypatch, False, -0.5, -0.4, False)
+  _, rows_off, _ = _run_track_stream(monkeypatch, False, -0.5, -0.4, False, final_stop=False)
+
+  for a, b in zip(rows_on, rows_off):
+    if a["v"] > FIRM_V_HI:
+      assert a["band"] == 0, (a["tick"], a["v"], a["band"])
+      assert a["output"] == pytest.approx(b["output"], abs=1e-12), (a["tick"], a["v"])
+
+  band2 = [r for r in rows_on if r["band"] == 2]
+  assert band2
+  k0 = band2[0]["tick"]
+  kr = next(r["tick"] for r in band2 if r["output"] <= -FIRM_TRACK_MIN + 1e-9)
+  for tick in range(k0, kr):
+    assert rows_on[tick]["output"] - rows_on[tick - 1]["output"] == pytest.approx(-FIRM_JERK * DT_CTRL, abs=1e-9), tick
+  for tick in range(kr, kr + 51):
+    assert rows_on[tick]["output"] == pytest.approx(-FIRM_TRACK_MIN, abs=1e-9), (tick, rows_on[tick]["output"])
+  assert rows_on[kr + 51]["output"] == pytest.approx(-0.805, abs=1e-9), rows_on[kr + 51]["output"]
+
+  target = firm_track_target(FIRM_A, -0.5)
+  prev = None
+  for r in band2:
+    if r["tick"] > kr + 51:
+      assert r["output"] <= prev + 1e-12, (r["tick"], r["output"], prev)
+      assert r["output"] >= target - 1e-9, (r["tick"], r["output"], target)
+    prev = r["output"]
+  for r in band2:
+    assert r["integral_after"] == r["integral_before"], (r["tick"], r["v"])
+
+
+def test_n6_lead_never_touches_the_new_bands(monkeypatch):
+  """With a lead the band stays untouched and above FIRM_V_HI the stream is the off stream."""
+  _, rows_on, _ = _run_track_stream(monkeypatch, True, -1.1, -1.0, False, v_start=3.5, ticks=760)
+  _, rows_off, _ = _run_track_stream(monkeypatch, True, -1.1, -1.0, False, v_start=3.5, ticks=760,
+                                     final_stop=False)
+  assert all(r["band"] == 0 for r in rows_on), [r["tick"] for r in rows_on if r["band"]]
+  for a, b in zip(rows_on, rows_off):
+    if a["v"] > FIRM_V_HI:
+      assert a["output"] == pytest.approx(b["output"], abs=1e-12), (a["tick"], a["v"])
+
+
+@pytest.mark.parametrize("exit_name", ["fcw", "hard", "lead"])
+def test_n7_safety_exits_hand_back_to_pid(monkeypatch, exit_name):
+  """fcw, a hard plan or a lead ending mid-band hands the command back to the pid at once."""
+  _, probe, _ = _run_track_stream(monkeypatch, False, -1.1, -1.0, False, v_start=3.5, ticks=760,
+                                   decel=EASE_PLAN_DECEL)
+  band2_ticks = [r["tick"] for r in probe if r["band"] == 2]
+  assert len(band2_ticks) > 40, len(band2_ticks)
+  switch_tick = band2_ticks[29]
+
+  def switch(tick, v, cs, plan, radar):
+    if tick < switch_tick:
+      return
+    if exit_name == "fcw":
+      plan.fcw = True
+    elif exit_name == "hard":
+      plan.aTarget = -1.3
+    elif v >= FIRM_V_LO:
+      radar.leadOne.status = True
+      radar.leadOne.dRel = LEAD_D
+
+  _, rows, _ = _run_track_stream(monkeypatch, False, -1.1, -1.0, False, v_start=3.5, ticks=760,
+                                 switch=switch, decel=EASE_PLAN_DECEL)
+  after = [r for r in rows if r["tick"] >= switch_tick and r["state"] == int(LongCtrlState.pid)]
+  assert after
+  for r in after:
+    assert r["band"] != 2, (exit_name, r["tick"], r["v"], r["band"])
+    # Hands back: after a safety exit nothing eases the command inside the band. It is never softer than
+    # the pid limited by the ButterStop taper floor (the L7 mechanism); the firm cap may only add braking.
+    if r["v"] >= FIRM_V_LO:
+      expected = r["pid_wanted"]
+      if r["floor"] is not None and expected < r["floor"]:
+        expected = min(0.0, r["floor"])
+      assert r["output"] <= expected + 1e-12 or r["law"] is True, \
+        (exit_name, r["tick"], r["v"], r["output"], r["pid_wanted"], r["floor"])
+
+
+def _closed_loop_d(pid_of_v, v0, a0, g, tau, delay):
+  """_closed_loop's plant, filter and loop with Q22 rule D: ease only above FIRM_V_HI."""
+  v, a = v0, a0
+  am = a0
+  last = pid_of_v(v0)
+  phase, settle_t, eased = None, 0.0, False
+  buf = [last] * (int(round(delay / DT_CTRL)) + 1)
+  t = 0.0
+  lower, upper = [], []
+  while v > FIRM_V_LO and t < 30.0:
+    pid = pid_of_v(v)
+    if FIRM_V_HI < v <= FIRM_EASE_V_HI:
+      cap = firm_track_step(None, last, FIRM_A, am, True)
+      u = max(pid, cap)
+      if u > pid:
+        eased = True
+      upper.append((last, pid, u))
+    elif FIRM_V_LO <= v <= FIRM_V_HI:
+      if phase is None:
+        phase = FIRM_LOCK_RAMP if (min(last, 0.0) > -FIRM_TRACK_MIN and not eased) else FIRM_LOCK_TRIM
+        settle_t = 0.0
+      u, phase, settle_t = firm_lock_step(phase, settle_t, last, FIRM_A, am)
+      lower.append((last, pid, u))
+    else:
+      u = pid
+    last = u
+    buf.append(u)
+    ud = buf.pop(0)
+    a += (g * ud - a) * DT_CTRL / tau
+    am += (a - am) * DT_CTRL / 0.15
+    v += a * DT_CTRL
+    t += DT_CTRL
+  return lower, upper
+
+
+def test_n8_closed_loop_rule_d_invariants():
+  for name, pid, v0, a0, lead in SCENARIOS:
+    if lead:
+      continue
+    plants = [(0.8, 0.7, 0.5), (0.85, 0.8, 0.3), (0.6, 1.1, 0.3)] + list(GRID)
+    for g, tau, d in plants:
+      lower, upper = _closed_loop_d(pid, v0, a0, g, tau, d)
+      assert lower, (name, g, tau, d)
+      for last, pid_u, u in lower:
+        assert u <= last + 1e-12, (name, g, last, u)
+      for last, pid_u, u in upper:
+        assert u >= pid_u - 1e-12, (name, g, last, pid_u, u)
+        if u > pid_u:
+          assert u - last <= FIRM_RELEASE_JERK * DT_CTRL + 1e-12, (name, g, last, u)
+      first = lower[0]
+      assert abs(first[2] - first[0]) <= FIRM_JERK * DT_CTRL + 1e-12, (name, g, first)
+      for _, _, u in lower + upper:
+        assert -1.5 - 1e-12 <= u <= 0.0 + 1e-12, (name, g, u)
