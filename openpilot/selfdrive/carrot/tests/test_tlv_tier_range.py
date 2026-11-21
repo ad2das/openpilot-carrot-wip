@@ -20,6 +20,8 @@ from openpilot.selfdrive.carrot.tlv_stop_tiers import (
   SOFT_A_DEAD,
   SOFT_A_FULL,
   SOFT_DECEL,
+  SOFT_FAST_NOCUE_S,
+  SOFT_FAST_TIMEOUT_COOLDOWN_S,
   SOFT_FIRM_DECEL,
   SOFT_MAX_MOVING_S,
   SOFT_RANGE_HOLD_S,
@@ -123,13 +125,13 @@ def test_far_red_coasts_without_braking_or_burning_timeout_clock():
     t = round(t + DT, 4)
 
 
-def test_near_fast_red_reaches_firm_immediately_before_model_cue():
-  """4ab shape (81 km/h at 135 m, no model cue): immediate -1.0 m/s^2 cap."""
+def test_near_fast_red_without_cue_caps_at_soft_decel():
+  """4ab shape (81 km/h at 135 m, no model cue): -0.5 m/s^2 until the cue."""
   state = TlvStopTiers()
   state.update(tier_in(0.0, v=81.0 / 3.6, rx=1.0, range_m=135.0))
   assert state.soft_active is True
-  assert state.accel_cap() == pytest.approx(-SOFT_FIRM_DECEL)
-  assert state.soft_firm is True
+  assert state.accel_cap() == pytest.approx(-SOFT_DECEL)
+  assert state.soft_firm is False
 
 
 def test_continuous_ramp_and_non_latching_single_tick_spike():
@@ -151,7 +153,8 @@ def test_continuous_ramp_and_non_latching_single_tick_spike():
   d_mid = (v * v) / (2.0 * a_mid) + v
   state2 = TlvStopTiers()
   state2.update(tier_in(0.0, v=v, range_m=d_mid))
-  assert state2.accel_cap() == pytest.approx(-0.5, abs=0.02)
+  # a_req midway -> half of the no-cue -0.5 cap.
+  assert state2.accel_cap() == pytest.approx(-0.25, abs=0.02)
   assert state2.soft_firm is False
 
 
@@ -190,13 +193,196 @@ def test_braking_timeout_still_bounds_stuck_false_red():
   state = TlvStopTiers()
   t = 0.0
   state.update(tier_in(t, v=18.0, range_m=100.0))
-  assert state.accel_cap() == pytest.approx(-1.0)
+  assert state.accel_cap() == pytest.approx(-SOFT_DECEL)
   while state.soft_active and t < 20.0:
     t = round(t + DT, 4)
     state.update(tier_in(t, v=18.0, range_m=100.0))
   assert not state.soft_active
   assert t == pytest.approx(SOFT_MAX_MOVING_S + DT, abs=0.06)
   assert state.events == [('soft', 'release', 'timeout')]
+
+
+def test_no_cue_cap_never_below_soft_decel_at_any_speed():
+  """No cue: the range cap is scaled into [-0.5, 0.0] at every speed."""
+  for v_kph in (40, 60, 81, 96):
+    v = v_kph / 3.6
+    state = TlvStopTiers()
+    t = 0.0
+    while t <= 2.0 + 1e-9:
+      state.update(tier_in(t, v=v, rx=1.0, range_m=60.0))
+      assert state.accel_cap() >= -SOFT_DECEL - 1e-9
+      assert state.soft_firm is False
+      t = round(t + DT, 4)
+
+
+def test_cue_unlocks_firm():
+  """The model cue alone deepens tier 1 to -1.0 m/s^2."""
+  state = TlvStopTiers()
+  v = 81.0 / 3.6
+  t = 0.0
+  while t <= 1.0 + 1e-9:
+    state.update(tier_in(t, v=v, rx=1.0, range_m=135.0))
+    assert state.soft_firm is False
+    t = round(t + DT, 4)
+  cue_t = None
+  cue_events = []
+  while t <= 1.6 + 1e-9:
+    state.update(tier_in(t, v=v, rx=0.7, range_m=135.0))
+    if cue_t is None and state.soft_firm:
+      cue_t = t
+      cue_events = [e for e in state.events if e[0] == 'soft']
+    if cue_t is not None and t >= cue_t:
+      assert state.accel_cap() == pytest.approx(-SOFT_FIRM_DECEL)
+      assert state.soft_firm is True
+    t = round(t + DT, 4)
+  assert cue_t is not None
+  assert cue_t == pytest.approx(1.0 + 0.5, abs=0.06)
+  assert cue_events == [('soft', 'firm', 'cue')]
+
+
+def test_fast_no_cue_times_out_after_short_braking():
+  """96 km/h at 247 m without the cue: release after 4.5 s of braking, not 12 s."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 96.0 / 3.6
+  state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+  assert state.accel_cap() == pytest.approx(-SOFT_DECEL)
+  while state.soft_active and t < 20.0:
+    t = round(t + DT, 4)
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+  assert not state.soft_active
+  assert t == pytest.approx(SOFT_FAST_NOCUE_S + DT, abs=0.06)
+  assert state.events == [('soft', 'release', 'timeout')]
+
+
+def test_fast_timeout_latches_start_speed():
+  """The short timeout keys on the start speed, then falls back to 12 s below 80 km/h."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 85.0 / 3.6
+  state.update(tier_in(t, v=v, rx=1.0, range_m=120.0))
+  while state.soft_active and t < 20.0:
+    t = round(t + DT, 4)
+    v = max(0.0, v - 0.5 * DT)
+    state.update(tier_in(t, v=v, rx=1.0, range_m=120.0))
+  assert not state.soft_active
+  assert t == pytest.approx(SOFT_FAST_NOCUE_S + DT, abs=0.06)
+  assert state.events == [('soft', 'release', 'timeout')]
+
+  state2 = TlvStopTiers()
+  t = 0.0
+  v = 79.0 / 3.6
+  state2.update(tier_in(t, v=v, rx=1.0, range_m=120.0))
+  while state2.soft_active and t < 20.0:
+    t = round(t + DT, 4)
+    state2.update(tier_in(t, v=v, rx=1.0, range_m=120.0))
+    if t < SOFT_MAX_MOVING_S - 0.1:
+      assert state2.soft_active is True
+      assert state2.events == []
+  assert not state2.soft_active
+  assert t == pytest.approx(SOFT_MAX_MOVING_S + DT, abs=0.06)
+  assert state2.events == [('soft', 'release', 'timeout')]
+
+
+def test_cue_before_fast_timeout_keeps_tier1():
+  """A cue inside the 4.5 s window cancels the fast timeout."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 96.0 / 3.6
+  while t <= 3.0 + 1e-9:
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+    assert state.soft_active is True
+    t = round(t + DT, 4)
+  while t <= 6.0 + 1e-9:
+    state.update(tier_in(t, v=v, rx=0.7, range_m=247.0))
+    assert state.soft_active is True
+    if t >= 3.6:
+      assert state.accel_cap() == pytest.approx(-SOFT_FIRM_DECEL)
+    t = round(t + DT, 4)
+  assert [e for e in state.events if e[1] == 'release'] == []
+
+
+def test_model_stop_blocks_fast_timeout():
+  """A model-planned stop is not a false red: no fast timeout."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 96.0 / 3.6
+  while t <= 6.0 + 1e-9:
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0, model_stop=True))
+    assert state.soft_active is True
+    t = round(t + DT, 4)
+
+
+def test_fast_timeout_cooldown_blocks_no_cue_restart():
+  """The phantom cluster seen again after a 2.6 s gap may not brake twice without the cue."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 96.0 / 3.6
+  t_to = None
+  while t < 20.0:
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+    if not state.soft_active:
+      assert ('soft', 'release', 'timeout') in state.events
+      t_to = t
+      break
+    t = round(t + DT, 4)
+  assert t_to == pytest.approx(SOFT_FAST_NOCUE_S, abs=0.06)
+
+  gap_end = round(t_to + 2.6, 4)
+  while t < gap_end + 1e-9:
+    t = round(t + DT, 4)
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0, raw_red=False, conf=False, gated_red=False))
+    assert state.soft_active is False
+
+  start_t = None
+  while t <= t_to + 12.0 + 1e-9:
+    t = round(t + DT, 4)
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+    if start_t is None:
+      if ('soft', 'start', 'confirmed_red') in state.events:
+        start_t = t
+      elif t < t_to + SOFT_FAST_TIMEOUT_COOLDOWN_S - 0.06:
+        assert state.soft_active is False
+  assert start_t == pytest.approx(t_to + SOFT_FAST_TIMEOUT_COOLDOWN_S, abs=0.06)
+
+
+def test_fast_timeout_cooldown_allows_cue_restart():
+  """The cue bypasses the cooldown: -1.0 m/s^2 0.5 s after the red returns."""
+  state = TlvStopTiers()
+  t = 0.0
+  v = 96.0 / 3.6
+  t_to = None
+  while t < 20.0:
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0))
+    if not state.soft_active:
+      assert ('soft', 'release', 'timeout') in state.events
+      t_to = t
+      break
+    t = round(t + DT, 4)
+  assert t_to == pytest.approx(SOFT_FAST_NOCUE_S, abs=0.06)
+
+  gap_end = round(t_to + 2.6, 4)
+  while t < gap_end + 1e-9:
+    t = round(t + DT, 4)
+    state.update(tier_in(t, v=v, rx=1.0, range_m=247.0, raw_red=False, conf=False, gated_red=False))
+    assert state.soft_active is False
+
+  t_red = None
+  start_t = None
+  while t <= gap_end + 3.0 + 1e-9:
+    t = round(t + DT, 4)
+    state.update(tier_in(t, v=v, rx=0.7, range_m=247.0))
+    if t_red is None:
+      t_red = t
+    if start_t is None:
+      if ('soft', 'start', 'confirmed_red') in state.events:
+        start_t = t
+        assert t < t_to + SOFT_FAST_TIMEOUT_COOLDOWN_S
+        assert state.accel_cap() == pytest.approx(-SOFT_FIRM_DECEL)
+        assert state.soft_firm is True
+      else:
+        assert state.soft_active is False
+  assert start_t == pytest.approx(t_red + 0.5, abs=0.06)
 
 
 # --- PrepareAccel smooth bidirectional floor tests ---------------------------

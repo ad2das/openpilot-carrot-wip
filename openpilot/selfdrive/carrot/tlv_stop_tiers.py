@@ -3,9 +3,12 @@
 Tier 1 (soft) applies a continuous physics-based deceleration cap (0 to -1.0
 m/s^2) derived from the fused monocular range to the red light (width +
 calibrated grade-compensated elevation) and current speed: far reds coast
-without braking or burning the moving-timeout clock, while near/fast reds
-enter full -1.0 m/s^2 immediately without waiting for the model cue. When no
-range is available, tier 1 falls back to -0.5 m/s^2 until the model cue.
+without braking or burning the moving-timeout clock. Without the driving
+model's own slowdown cue the cap is the range cap scaled into [-0.5, 0.0];
+only the cue unlocks -1.0 m/s^2. A no-cue tier 1 that started at 80 km/h or
+above releases after 4.5 s of braking. A new no-cue tier 1 then waits 10 s
+(the cue bypasses that). When no range is available, tier 1
+falls back to -0.5 m/s^2 until the model cue.
 Tier 2 (stop) is the existing commit: it stops at the driving model's own stop
 distance, allowed up to 100 km/h and, at 40 km/h and above, gated on the
 model's own slowdown cue (rx = x_end / (10 * v0)).
@@ -38,6 +41,9 @@ STOP_MAX_DIST_M = 220.0
 STOP_DIST_PER_MPS = 10.5
 STOP_MAX_Y_M = 5.0
 STOP_AGE_MPS = 22.2            # = TLV_FAST_GATE_MPS
+SOFT_FAST_MPS = STOP_AGE_MPS   # 80 km/h: a no-cue tier 1 started at or above this gets the short timeout
+SOFT_FAST_NOCUE_S = 4.5        # s of braking a no-cue fast tier 1 may spend (real >= 80 km/h reds cued within 3.3 s)
+SOFT_FAST_TIMEOUT_COOLDOWN_S = 10.0  # s after a fast no-cue timeout before a new no-cue tier 1 may start (~250 m at 90 km/h)
 STOP_AGE_S = 1.0
 VETO_MPS = 40.0 / 3.6
 CUE_RX_MAX = 0.80
@@ -101,6 +107,8 @@ class TlvStopTiers:
     self.soft_cap = None
     self.soft_range_m = None
     self._soft_cue_latched = False
+    self.soft_v0 = None
+    self.last_fast_timeout_t = None
     self._range_hist = deque(maxlen=64)
     self._last_range_t = None
     self._last_range_m = None
@@ -195,7 +203,7 @@ class TlvStopTiers:
     lead_clear = ((self.last_lead_t is None or i.t - self.last_lead_t > LEAD_CLEAR_S)
                   and (self.last_lead_rel_t is None or i.t - self.last_lead_rel_t > LEAD_REARM_S))
 
-    # tier 1: range-scaled cap in [-1.0, 0.0], falling back to -0.5 until cue when range is unknown
+    # tier 1: without the model cue the range-scaled cap stays in [-0.5, 0.0]; only the cue unlocks -1.0
     if self.soft_active:
       if i.model_stop:
         self.soft_stop_seen = True
@@ -206,40 +214,48 @@ class TlvStopTiers:
       if self._soft_cue_latched:
         self.soft_cap = -SOFT_FIRM_DECEL
       elif d_est is not None:
-        self.soft_cap = self._range_cap(i.v_ego, d_est)
+        self.soft_cap = (SOFT_DECEL / SOFT_FIRM_DECEL) * self._range_cap(i.v_ego, d_est)
       else:
         self.soft_cap = -SOFT_DECEL
-      self.soft_firm = self._soft_cue_latched or self.soft_cap <= -0.95
+      self.soft_firm = self._soft_cue_latched
       # Advance the moving timeout only while actually braking (never while waiting far out).
       if self.soft_stop_seen or cue_latched_now:
         self.soft_moving_s = 0.0
       elif self.soft_cap <= -SOFT_TIMER_MIN_DECEL:
         self.soft_moving_s += dt
+      fast_timeout = (not self._soft_cue_latched and not self.soft_stop_seen and self.soft_v0 is not None
+                      and self.soft_v0 >= SOFT_FAST_MPS and self.soft_moving_s >= SOFT_FAST_NOCUE_S - 1e-9)
       r = ('disabled' if not i.enabled else 'go' if i.go else 'red_end' if not gated_held else
            'gas' if (i.gas or i.cooldown) else 'lead' if lead_solid else
            'timeout' if self.soft_moving_s > SOFT_MAX_MOVING_S else
+           'timeout' if fast_timeout else
            'slow' if i.v_ego < SOFT_MIN_MPS else None)
       if r:
+        if r == 'timeout' and fast_timeout:
+          self.last_fast_timeout_t = i.t
         self.soft_active = False
         self.soft_latched = True
         self.soft_firm = False
         self.soft_cap = None
         self._soft_cue_latched = False
+        self.soft_v0 = None
         self.events.append(('soft', 'release', r))
     elif (i.enabled and not self.soft_latched and not self.gas_ep and i.conf and i.gated_red
           and SOFT_MIN_MPS <= i.v_ego < SOFT_MAX_MPS
-          and not i.lead and not i.gas and not i.brake and not i.cooldown and not i.blinker):
+          and not i.lead and not i.gas and not i.brake and not i.cooldown and not i.blinker
+          and (cue or self.last_fast_timeout_t is None or i.t - self.last_fast_timeout_t >= SOFT_FAST_TIMEOUT_COOLDOWN_S)):
       self.soft_active = True
       self.soft_stop_seen = i.model_stop
       self.soft_moving_s = 0.0
       self._soft_cue_latched = cue
+      self.soft_v0 = i.v_ego
       if cue:
         self.soft_cap = -SOFT_FIRM_DECEL
       elif d_est is not None:
-        self.soft_cap = self._range_cap(i.v_ego, d_est)
+        self.soft_cap = (SOFT_DECEL / SOFT_FIRM_DECEL) * self._range_cap(i.v_ego, d_est)
       else:
         self.soft_cap = -SOFT_DECEL
-      self.soft_firm = self._soft_cue_latched or self.soft_cap <= -0.95
+      self.soft_firm = self._soft_cue_latched
       self.events.append(('soft', 'start', 'confirmed_red'))
 
     # tier 2
