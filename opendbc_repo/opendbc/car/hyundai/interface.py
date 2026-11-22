@@ -248,10 +248,6 @@ class CarInterface(CarInterfaceBase):
     elif ret.flags & HyundaiFlags.FCEV:
       ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.FCEV_GAS.value
 
-    # Palisade CGW1 blinker test (panda safety_hyundai.h hyundai_cgw_test): classic, non-legacy, stock CGW1 on bus 0
-    if candidate == CAR.HYUNDAI_PALISADE and not ret.flags & (HyundaiFlags.CANFD | HyundaiFlags.LEGACY) and 0x541 in fingerprint[0]:
-      ret.safetyConfigs[-1].safetyParam |= HyundaiSafetyFlags.PALISADE_CGW_TEST.value
-
     # Car specific configuration overrides
 
     if candidate == CAR.KIA_OPTIMA_G4_FL:

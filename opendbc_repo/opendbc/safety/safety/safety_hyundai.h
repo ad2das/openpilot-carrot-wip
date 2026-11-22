@@ -128,119 +128,9 @@ static uint32_t hyundai_compute_checksum(const CANPacket_t *to_push) {
   return chksum;
 }
 
-// Palisade CGW1 0x541 blinker test (port of joongyu01 b6fd849d3 / 4ffd69d78), phase 1: parked only.
-static struct {
-  bool enabled, template_valid, wheels_valid, gear_valid, stationary, park;
-  bool attempted, sent, trial_active, cutoff;
-  uint8_t template[8];
-  uint32_t template_ts, wheels_ts, gear_ts, attempt_ts, sent_ts, trial_ts;
-} hyundai_cgw_test;
-
-// An accepted frame is held here and sent right behind the next stock CGW1 (hyundai_rx_tx_hook), never on its own:
-// direct 20 Hz sending gave 32 bus-0 errors in 0.5 s (joongyu01, 10-27).
-static struct {
-  CANPacket_t pkt;
-  bool pending;
-  uint32_t push_us;
-} hyundai_cgw_pb;
-#define HYUNDAI_CGW_PB_HOLD_US 150000U  // stock CGW1 is 10 Hz: a held frame older than this is dropped, not sent
-#define HYUNDAI_CGW_TRIAL_US 3000000U   // one parked trial
-
-static void hyundai_cgw_test_init(uint16_t param) {
-  hyundai_cgw_test = (__typeof__(hyundai_cgw_test)){0};  // no libc here (host libsafety build has no memset)
-  hyundai_cgw_test.enabled = (param & 32768U) != 0U;  // HyundaiSafetyFlags.PALISADE_CGW_TEST
-  hyundai_cgw_pb = (__typeof__(hyundai_cgw_pb)){0};
-}
-
-// The frame may differ from the stock one (tmpl) only in that side's lamp bit and the lever side. Hazard, the driver's
-// lever and the opposite lamp must be off in the stock frame. Checked at TX and again against the stock frame it rides
-// behind.
-static bool hyundai_cgw_frame_fits(const CANPacket_t *msg, const uint8_t *tmpl) {
-  // Stock: the lamp bit flashes 0.35 s on / 0.35 s off while byte 5 bits 1..2 hold the lever side (2 left, 1 right).
-  unsigned int left = (GET_BYTE(msg, 2) >> 3) & 3U;
-  unsigned int right = GET_BYTE(msg, 7) >> 6;
-  unsigned int lever = (GET_BYTE(msg, 5) >> 1) & 3U;
-  bool fits = ((lever == 2U) && (left <= 1U) && (right == 0U)) || ((lever == 1U) && (left == 0U) && (right <= 1U));
-  fits = fits && ((tmpl[4] & 0x06U) == 0U) && ((tmpl[5] & 0x06U) == 0U);
-  fits = fits && ((lever == 2U) ? ((tmpl[7] & 0xC0U) == 0U) : ((tmpl[2] & 0x18U) == 0U));
-  for (int i = 0; i < 8; i++) {
-    uint8_t mask = (i == 2) ? 0xE7U : ((i == 7) ? 0x3FU : ((i == 5) ? 0xF9U : 0xFFU));
-    fits = fits && ((GET_BYTE(msg, i) & mask) == (tmpl[i] & mask));
-  }
-  return fits;
-}
-
-static bool hyundai_cgw_test_tx(const CANPacket_t *msg) {
-  uint32_t now = microsecond_timer_get();
-  // Count rejected requests as activity too, so a running sender cannot rearm itself.
-  if (hyundai_cgw_test.attempted && (get_ts_elapsed(now, hyundai_cgw_test.attempt_ts) >= 1000000U)) {
-    hyundai_cgw_test.trial_active = false;
-    hyundai_cgw_test.cutoff = false;
-  }
-  hyundai_cgw_test.attempted = true;
-  hyundai_cgw_test.attempt_ts = now;
-  // Phase 1: parked only - P, all four wheel speeds exactly 0, not engaged, gear and wheel frames fresh.
-  bool parked = !controls_allowed && hyundai_cgw_test.wheels_valid && hyundai_cgw_test.gear_valid &&
-                hyundai_cgw_test.stationary && hyundai_cgw_test.park &&
-                (get_ts_elapsed(now, hyundai_cgw_test.wheels_ts) <= 250000U) &&
-                (get_ts_elapsed(now, hyundai_cgw_test.gear_ts) <= 250000U);
-  if (hyundai_cgw_test.trial_active && (get_ts_elapsed(now, hyundai_cgw_test.trial_ts) >= HYUNDAI_CGW_TRIAL_US)) {
-    hyundai_cgw_test.cutoff = true;
-  }
-  bool allowed = hyundai_cgw_test.enabled && !relay_malfunction && parked &&
-                 (GET_BUS(msg) == 0) && (GET_LEN(msg) == 8) && !msg->extended && !msg->fd &&
-                 hyundai_cgw_test.template_valid && !hyundai_cgw_test.cutoff &&
-                 (get_ts_elapsed(now, hyundai_cgw_test.template_ts) <= 250000U) &&
-                 (!hyundai_cgw_test.sent || (get_ts_elapsed(now, hyundai_cgw_test.sent_ts) >= 50000U));
-  // parked: both stock lamps must be off too
-  allowed = allowed && hyundai_cgw_frame_fits(msg, hyundai_cgw_test.template) &&
-            ((hyundai_cgw_test.template[2] & 0x18U) == 0U) && ((hyundai_cgw_test.template[7] & 0xC0U) == 0U);
-  if (allowed) {
-    if (!hyundai_cgw_test.trial_active) {
-      hyundai_cgw_test.trial_active = true;
-      hyundai_cgw_test.trial_ts = now;
-    }
-    hyundai_cgw_test.sent = true;
-    hyundai_cgw_test.sent_ts = now;
-    hyundai_cgw_pb.pkt = *msg;
-    hyundai_cgw_pb.pending = true;
-    hyundai_cgw_pb.push_us = now;
-    extern bool safety_tx_buffered_for_fwd;
-    safety_tx_buffered_for_fwd = true;
-  }
-  return allowed;
-}
-
 static void hyundai_rx_hook(const CANPacket_t *to_push) {
   int bus = GET_BUS(to_push);
   int addr = GET_ADDR(to_push);
-
-  if (hyundai_cgw_test.enabled && (bus == 0)) {
-    bool valid = (GET_LEN(to_push) == 8) && !to_push->extended && !to_push->fd;
-    uint32_t now = microsecond_timer_get();
-    if (addr == 0x541) {
-      hyundai_cgw_test.template_valid = valid;
-      if (valid) {
-        for (int i = 0; i < 8; i++) {
-          hyundai_cgw_test.template[i] = to_push->data[i];
-        }
-        hyundai_cgw_test.template_ts = now;
-      }
-    } else if (addr == 0x367) {
-      // hyundai_kia_generic.dbc: LVR12 CF_Lvr_Gear bits 32..35, P = 0.
-      hyundai_cgw_test.gear_valid = valid;
-      hyundai_cgw_test.park = (GET_BYTE(to_push, 4) & 0xFU) == 0U;
-      hyundai_cgw_test.gear_ts = now;
-    } else if (addr == 0x386) {
-      // All four 14-bit wheel speeds must be exactly zero, not the driving standstill threshold.
-      hyundai_cgw_test.wheels_valid = valid;
-      hyundai_cgw_test.stationary = true;
-      for (int i = 0; i < 8; i += 2) {
-        hyundai_cgw_test.stationary &= (GET_BYTES(to_push, i, 2) & 0x3FFFU) == 0U;
-      }
-      hyundai_cgw_test.wheels_ts = now;
-    }
-  }
 
   // SCC12 is on bus 2 for camera-based SCC cars, bus 0 on all others
   if (addr == 0x421) {
@@ -320,10 +210,6 @@ static bool hyundai_tx_hook(const CANPacket_t *to_send) {
 
   bool tx = true;
   int addr = GET_ADDR(to_send);
-
-  if (addr == 0x541) {
-    return hyundai_cgw_test_tx(to_send);
-  }
 
   // FCA11: Block any potential actuation
   if (false && addr == 0x38D) {
@@ -552,18 +438,6 @@ static safety_config hyundai_init_carrot(bool legacy_car) {
         if(legacy_car) ret = BUILD_SAFETY_CFG(hyundai_rx_checks_legacy, HYUNDAI_TX_MSGS);
         else ret = BUILD_SAFETY_CFG(hyundai_rx_checks, HYUNDAI_TX_MSGS);
     }
-    if (hyundai_cgw_test.enabled) {
-      // every TX list here has at most as many entries as HYUNDAI_TX_MSGS (14 / 11 / 12); the guard keeps it so
-      static CanMsg test_tx_msgs[(sizeof(HYUNDAI_TX_MSGS) / sizeof(HYUNDAI_TX_MSGS[0])) + 1U];
-      if (ret.tx_msgs_len < (int)(sizeof(test_tx_msgs) / sizeof(test_tx_msgs[0]))) {
-        for (int i = 0; i < ret.tx_msgs_len; i++) {
-          test_tx_msgs[i] = ret.tx_msgs[i];
-        }
-        test_tx_msgs[ret.tx_msgs_len] = (CanMsg){0x541, 0, 8};
-        ret.tx_msgs = test_tx_msgs;
-        ret.tx_msgs_len += 1;
-      }
-    }
     return ret;
 }
 
@@ -590,7 +464,6 @@ static safety_config hyundai_init(uint16_t param) {
   };
 
   hyundai_common_init(param);
-  hyundai_cgw_test_init(param);
   hyundai_legacy = false;
   return hyundai_init_carrot(hyundai_legacy);
 
@@ -629,7 +502,6 @@ static safety_config hyundai_legacy_init(uint16_t param) {
   };
 
   hyundai_common_init(param);
-  hyundai_cgw_test_init(0U);  // legacy never forges CGW1
   hyundai_legacy = true;
 
   return hyundai_init_carrot(hyundai_legacy);
@@ -639,28 +511,11 @@ static safety_config hyundai_legacy_init(uint16_t param) {
   return BUILD_SAFETY_CFG(hyundai_legacy_rx_checks, HYUNDAI_TX_MSGS);
 }
 
-static bool hyundai_rx_tx_hook(const CANPacket_t *to_push, CANPacket_t *to_send) {
-  bool send = false;
-  if (hyundai_cgw_test.enabled && (GET_BUS(to_push) == 0) && (GET_ADDR(to_push) == 0x541) &&
-      !to_push->extended && !to_push->fd && hyundai_cgw_pb.pending) {
-    hyundai_cgw_pb.pending = false;
-    // the stock frame it rides behind may have changed since TX (the BCM sends an extra CGW1 ~11 ms after any
-    // change): the driver's lever, hazard, the opposite lamp or a door bit now wins
-    if ((get_ts_elapsed(microsecond_timer_get(), hyundai_cgw_pb.push_us) < HYUNDAI_CGW_PB_HOLD_US) &&
-        (GET_LEN(to_push) == 8) && hyundai_cgw_frame_fits(&hyundai_cgw_pb.pkt, to_push->data)) {
-      *to_send = hyundai_cgw_pb.pkt;
-      send = true;
-    }
-  }
-  return send;
-}
-
 const safety_hooks hyundai_hooks = {
   .init = hyundai_init,
   .rx = hyundai_rx_hook,
   .tx = hyundai_tx_hook,
   .fwd = hyundai_fwd_hook,
-  .rx_tx = hyundai_rx_tx_hook,
   .get_counter = hyundai_get_counter,
   .get_checksum = hyundai_get_checksum,
   .compute_checksum = hyundai_compute_checksum,

@@ -11,7 +11,7 @@ from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.stopping import read_isg
 from opendbc.car.hyundai.steering_touch import HyundaiSteeringTouch
-from opendbc.car.hyundai.values import HyundaiFlags, HyundaiSafetyFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
+from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
                                        EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
                                        EV_MODE_STATUS_SIGNAL
 from opendbc.car.interfaces import CarStateBase
@@ -142,8 +142,6 @@ NUMERIC_TO_TZ = {
 class CarState(CarStateBase):
   def __init__(self, CP):
     super().__init__(CP)
-    self.cgw_test_raw = b""
-    self.cgw_test_timestamps = (0, 0, 0)
     can_define = CANDefine(DBC[CP.carFingerprint][Bus.pt])
 
     self.cruise_buttons: deque = deque([Buttons.NONE] * PREV_BUTTON_SAMPLES, maxlen=PREV_BUTTON_SAMPLES)
@@ -527,11 +525,6 @@ class CarState(CarStateBase):
     ret.yawRate = cp.vl["ESP12"]["YAW_RATE"]
     ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(
       50, cp.vl["CGW1"]["CF_Gway_TurnSigLh"], cp.vl["CGW1"]["CF_Gway_TurnSigRh"])
-    if self.CP.safetyConfigs and self.CP.safetyConfigs[-1].safetyParam & HyundaiSafetyFlags.PALISADE_CGW_TEST:
-      # Palisade CGW1 parked blinker test (palisade_cgw_test.py): raw stock CGW1 + when CGW1 / gear / wheels last came
-      self.cgw_test_raw = cp.dat.get(0x541, b"")
-      self.cgw_test_timestamps = tuple(max(cp.ts_nanos.get(name, {}).values(), default=0)
-                                       for name in ("CGW1", "LVR12", "WHL_SPD11"))
     ret.steeringTorque = cp.vl["MDPS12"]["CR_Mdps_StrColTq"]
     ret.steeringTorqueEps = cp.vl["MDPS12"]["CR_Mdps_OutTq"]
     ret.steeringPressed = self.update_steering_pressed(abs(ret.steeringTorque) > self.params.STEER_THRESHOLD, 5)
