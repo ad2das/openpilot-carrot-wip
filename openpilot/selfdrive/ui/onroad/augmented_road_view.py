@@ -1,4 +1,3 @@
-import math
 import time
 import numpy as np
 import pyray as rl
@@ -11,18 +10,9 @@ from openpilot.selfdrive.ui.onroad import hud_style as hs
 from openpilot.selfdrive.ui.onroad.alert_renderer import AlertRenderer
 from openpilot.selfdrive.ui.onroad.hud_renderer import HudRenderer
 from openpilot.selfdrive.ui.onroad.model_renderer import ModelRenderer
-from openpilot.selfdrive.ui.onroad.tesla_3d_renderer import Tesla3DRenderer
-from openpilot.selfdrive.ui.onroad.tesla_ar_renderer import TeslaArRenderer
-from openpilot.selfdrive.ui.onroad.tesla_hud import (
-  TESLA_MODE_3D,
-  TESLA_MODE_AR,
-  TESLA_MODE_QUIET,
-  TeslaDayNightController,
-  TeslaHudRenderer,
-)
 from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
 from openpilot.selfdrive.ui.onroad.cameraview import CameraView
-from openpilot.system.ui.lib.application import gui_app, MouseEvent
+from openpilot.system.ui.lib.application import gui_app
 from openpilot.common.transformations.camera import DEVICE_CAMERAS, DeviceCameraConfig, view_frame_from_device_frame
 from openpilot.common.transformations.orientation import rot_from_euler
 
@@ -71,17 +61,8 @@ class AugmentedRoadView(CameraView):
 
     self.model_renderer = ModelRenderer()
     self._render_diagnostics = RenderDiagnostics('ui')
-    self._tesla_3d = Tesla3DRenderer()
-    self._tesla_ar = TeslaArRenderer(self.model_renderer)
-    self._hud_renderer = TeslaHudRenderer()
-    self._theme_ctrl = TeslaDayNightController()
-    self._legacy_hud_renderer: HudRenderer | None = None
+    self._hud_renderer = HudRenderer()
     self.alert_renderer = AlertRenderer()
-
-    # Touch / horizontal swipe gesture tracking for 3-mode Tesla switching
-    self._swipe_start_pos: tuple[float, float] | None = None
-    self._swipe_last_pos: tuple[float, float] | None = None
-    self._swipe_consumed = False
 
     # debug
     self._pm = messaging.PubMaster(['uiDebug'])
@@ -105,13 +86,6 @@ class AugmentedRoadView(CameraView):
   def set_cluster_hud_connected(self, connected: bool, show_camera: bool = False) -> None:
     self._suppress_camera_for_cluster = connected and not show_camera
 
-  @property
-  def tesla_mode(self) -> int:
-    return self._hud_renderer.mode
-
-  def set_tesla_mode(self, mode: int, show_dock: bool = True) -> None:
-    self._hud_renderer.set_mode(mode, show_dock=show_dock)
-
   def _render(self, rect):
     # plotMode 갱신(가끔 파일 읽기)은 drawTime 창 밖에서 — total을 오염시키지 않는다
     self._refresh_plot_mode(time.monotonic())
@@ -121,19 +95,26 @@ class AugmentedRoadView(CameraView):
       return
     timing = self._render_diagnostics
     timing.start()
+    # Preserve uiDebug wall timers and draw order; runtimeTiming also measures
+    # thread CPU work so scheduler/GPU waits are not mistaken for render work.
+    # scissor begin/end는 raylib 배치 flush 지점이라 특정 구간에 귀속시키지 않는다 —
+    # total과 구간 합의 차이(미귀속)로 남는다. extras = carrot 테두리(+텍스트)
     cam_ms = model_ms = ds_ms = hud_ms = alert_ms = extras_ms = 0.0
-    mode = self._hud_renderer.mode
-    is_day = self._theme_ctrl.update(getattr(ui_state, "light_sensor", -1.0), start_draw)
-    self._tesla_3d.set_day_mode(is_day)
-    self._hud_renderer.set_day_mode(is_day)
 
     if not self._suppress_camera_for_cluster:
       self._switch_stream_if_needed(ui_state.sm)
       self._update_calibration()
 
-    # Full-bleed frameless OLED content rect (zero thick bezel frame)
-    self._content_rect = rl.Rectangle(rect.x, rect.y, rect.width, rect.height)
+    # Create inner content area with border padding
+    self._content_rect = rl.Rectangle(
+      rect.x + UI_BORDER_SIZE,
+      rect.y + UI_BORDER_SIZE,
+      rect.width - 2 * UI_BORDER_SIZE,
+      rect.height - 2 * UI_BORDER_SIZE,
+    )
 
+    # Enable scissor mode to clip all rendering within content rectangle boundaries
+    # This creates a rendering viewport that prevents graphics from drawing outside the border
     rl.begin_scissor_mode(
       int(self._content_rect.x),
       int(self._content_rect.y),
@@ -144,36 +125,33 @@ class AugmentedRoadView(CameraView):
     _t = time.monotonic()
     if self._suppress_camera_for_cluster:
       rl.draw_rectangle_rec(self._content_rect, rl.BLACK)
-      self._hud_renderer.set_lead_3d_anchor(None)
     else:
-      if mode == TESLA_MODE_AR:
-        timing.call('camera', super()._render, rect)
-        self._hud_renderer.set_lead_3d_anchor(None)
-      elif mode == TESLA_MODE_3D:
-        timing.call('camera', self._tesla_3d.render, self._content_rect)
-        self._hud_renderer.set_lead_3d_anchor(self._tesla_3d.lead_screen_anchor)
-      else:
-        timing.call('camera', self._hud_renderer.render_quiet_background, self._content_rect)
-        self._hud_renderer.set_lead_3d_anchor(None)
+      # Render the base camera view
+      timing.call('camera', super()._render, rect)
     cam_ms = (time.monotonic() - _t) * 1000.0
 
     if not self._suppress_camera_for_cluster:
+      # Draw the model overlay only with the camera view
       _t = time.monotonic()
-      if mode == TESLA_MODE_AR:
-        timing.call('model', self._tesla_ar.render, self._content_rect)
+      timing.call('model', self.model_renderer.render, self._content_rect)
       model_ms = (time.monotonic() - _t) * 1000.0
     _t = time.monotonic()
-    timing.call('hud', self._hud_renderer.render, self._content_rect)
+    timing.call('hud', self._hud_renderer.render, self._content_rect)  # includes plot when enabled
     hud_ms = (time.monotonic() - _t) * 1000.0
     _t = time.monotonic()
     timing.call('alert', self.alert_renderer.render, self._content_rect)
     alert_ms = (time.monotonic() - _t) * 1000.0
+    # The C3 onroad screen no longer shows the driver-camera preview card; ds_ms stays 0 in uiDebug.
 
+    # Custom UI extension point - add custom overlays here
+    # Use self._content_rect for positioning within camera bounds
+
+    # End clipping region
     rl.end_scissor_mode()
 
-    # Minimal frameless status hairline / optional debug telemetry only
+    # Draw colored border based on driving state
     _t = time.monotonic()
-    timing.call('border', self._draw_tesla_edge_accent, rect)
+    timing.call('border', self._draw_border_carrot, rect)
     extras_ms = (time.monotonic() - _t) * 1000.0
 
     # publish uiDebug
@@ -191,66 +169,12 @@ class AugmentedRoadView(CameraView):
     self._pm.send('uiDebug', msg)
     timing.finish()
 
-  def _draw_tesla_edge_accent(self, rect: rl.Rectangle) -> None:
-    """Whisper-thin 2px OLED top edge status accent (replaces legacy 30px green box border)."""
-    status = ui_state.status
-    if status == UIStatus.ENGAGED:
-      col = hs.rgba(59, 164, 255, 96)
-    elif status == UIStatus.OVERRIDE:
-      col = hs.rgba(255, 182, 46, 120)
-    else:
-      return
-    hs.hgradient_line(rect.x + rect.width * 0.15, rect.y, rect.width * 0.70, 2.5, col)
-
-  def _handle_mouse_event(self, mouse_event: MouseEvent) -> None:
-    """Distinguishes horizontal 3-mode swipes & dock taps from clean sidebar taps."""
-    pos = mouse_event.pos
-    if mouse_event.left_pressed:
-      self._swipe_start_pos = (float(pos.x), float(pos.y))
-      self._swipe_last_pos = self._swipe_start_pos
-      self._swipe_consumed = False
-      return
-
-    if mouse_event.left_down and self._swipe_start_pos is not None:
-      self._swipe_last_pos = (float(pos.x), float(pos.y))
-      dx = self._swipe_last_pos[0] - self._swipe_start_pos[0]
-      dy = self._swipe_last_pos[1] - self._swipe_start_pos[1]
-      if abs(dx) > 36.0 and abs(dx) > abs(dy) * 1.2:
-        self._hud_renderer.set_drag_offset(dx)
-      return
-
-    if mouse_event.left_released and self._swipe_start_pos is not None:
-      sx, sy = self._swipe_start_pos
-      ex, ey = float(pos.x), float(pos.y)
-      dx, dy = ex - sx, ey - sy
-      dist = math.hypot(dx, dy)
-      self._swipe_start_pos = None
-      self._swipe_last_pos = None
-      self._hud_renderer.set_drag_offset(0.0)
-
-      # 1. Horizontal swipe switches between 3D FSD (0) <-> AR 카메라 (1) <-> Quiet (2)
-      if abs(dx) >= 110.0 and abs(dx) > abs(dy) * 1.35:
-        self._hud_renderer.step_mode(1 if dx < 0 else -1)
-        return
-
-      # 2. Clean tap on bottom 3-mode dock tab or whisper swipe handle
-      if dist < 42.0:
-        dock_hit = self._hud_renderer.hit_test_dock(ex, ey)
-        if dock_hit is not None:
-          if dock_hit == -1:
-            self._hud_renderer.reveal_dock(4.5)
-          else:
-            self._hud_renderer.set_mode(dock_hit, show_dock=True)
-          return
-
-        # 3. Clean tap anywhere else toggles Sidebar (preserved openpilot UX)
-        if not self._hud_renderer.user_interacting() and self._click_callback is not None:
-          self._click_callback()
-
   def _handle_mouse_press(self, _):
-    pass
+    if not self._hud_renderer.user_interacting() and self._click_callback is not None:
+      self._click_callback()
 
   def _handle_mouse_release(self, _):
+    # We only call click callback on press if not interacting with HUD
     pass
 
   def _draw_border(self, rect: rl.Rectangle):
