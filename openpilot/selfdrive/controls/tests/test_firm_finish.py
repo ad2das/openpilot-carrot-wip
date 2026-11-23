@@ -1065,3 +1065,41 @@ def test_n8_closed_loop_rule_d_invariants():
       assert abs(first[2] - first[0]) <= FIRM_JERK * DT_CTRL + 1e-12, (name, g, first)
       for _, _, u in lower + upper:
         assert -1.5 - 1e-12 <= u <= 0.0 + 1e-12, (name, g, u)
+
+
+def test_n9_ease_band_respects_firm_ease_min(monkeypatch):
+  """Regression for 000004e3 seg 2/5: upper-band ease must not drop command above -FIRM_EASE_MIN."""
+  _, rows, events = _run_track_stream(monkeypatch, False, -1.0, -0.95, False, v_start=2.8, ticks=400,
+                                      decel=EASE_PLAN_DECEL)
+  eased = [r for r in rows if r["band"] == 1]
+  assert eased, "ease band must run"
+  for r in eased:
+    assert r["output"] <= -lc.FIRM_EASE_MIN + 1e-9, (r["tick"], r["v"], r["output"])
+  assert len(events.names("butterStopFirmEase")) == 1
+
+
+def test_n10_near_rest_firm_cap_stays_latched_when_atarget_tapers(monkeypatch):
+  """Regression for 000004e3 seg 5: aTarget tapering above -0.30 while shouldStop is true must not drop firm cap."""
+  def taper(tick, v, cs, plan, radar):
+    if 0.30 <= v <= 0.45:
+      plan.shouldStop = True
+      plan.aTarget = -0.25
+
+  _, rows, _ = _run_track_stream(monkeypatch, False, -0.65, -0.5, False, v_start=1.6, ticks=350,
+                                 switch=taper)
+  taper_ticks = [r for r in rows if r["state"] == int(LongCtrlState.pid) and 0.30 <= r["v"] <= 0.45]
+  assert taper_ticks
+  for r in taper_ticks:
+    assert r["cap"] is not None and r["cap"] <= -FIRM_TRACK_MIN + 1e-9, (r["tick"], r["v"], r["cap"])
+    assert r["output"] <= -FIRM_TRACK_MIN + 1e-9, (r["tick"], r["v"], r["output"])
+
+  # A positive aTarget (plan wants to go) must still release the cap cleanly.
+  def release_go(tick, v, cs, plan, radar):
+    if v <= 0.45:
+      plan.shouldStop = False
+      plan.aTarget = 0.2
+
+  _, rows_go, _ = _run_track_stream(monkeypatch, False, -0.65, -0.5, False, v_start=1.6, ticks=350,
+                                    switch=release_go)
+  after_go = [r for r in rows_go if r["v"] <= 0.40]
+  assert any(r["output"] > -0.5 for r in after_go)

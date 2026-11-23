@@ -61,6 +61,8 @@ FINAL_STOP_ENABLED = True  # ButterStop's final stop (firm finish / K5 probe); t
 STOP_LAW_ENABLED = True                         # tests patch this to get the pre-law ButterStop arm
 STOP_LAW_CARS = (HYUNDAI_CAR.HYUNDAI_PALISADE,)
 STOP_LAW_RELEASE_JERK = 2.0                     # m/s^3, relax rate back to the ordinary command after the law lets go
+STOP_LAW_RELEASE_GO_JERK = 4.0                  # m/s^3, faster brake release when plan actively requests acceleration
+STOP_LAW_GO_JERK = 3.0                          # m/s^3, positive accel slew after brake release finishes (no 1-tick surge)
 STOP_LAW_LOG_RESET_V = 4.0                      # m/s, re-arms the once-per-stop log events
 
 
@@ -109,6 +111,7 @@ def firm_cap_step(cap, last_output, firm_a, gate, hard_exit):
 FIRM_TRACK_KP = 1.0        # m/s^2 of command per m/s^2 the car is off FIRM_A
 FIRM_TRACK_MAX = 1.2       # m/s^2, most braking the tracker asks for
 FIRM_TRACK_MIN = 0.80      # m/s^2, least braking it asks for (no lead only; Neon Q22, was 0.70)
+FIRM_EASE_MIN = 0.95       # m/s^2, upper-band ease floor so Palisade (a ~ 0.934*u + 0.066) stays >= 0.8 m/s^2
 FIRM_TRACK_ATGT = -1.2     # m/s^2, a plan harder than this is a real need: never ease
 FIRM_EASE_V_HI = 3.2       # m/s, top of the ease-only band above the firm band
 FIRM_SETTLE_S = 0.50       # s, a soft entry holds -FIRM_TRACK_MIN this long before trimming (plant delay)
@@ -224,6 +227,7 @@ class LongControl:
     self._stop_law_car = getattr(CP, "carFingerprint", None) in STOP_LAW_CARS
     self._stop_ctl = None
     self._stop_release = None
+    self._stop_go_cap = None
     self._stop_logged = False
     self._stop_drop_logged = False
     self.stop_law = False
@@ -872,6 +876,7 @@ class LongControl:
         output_accel = stop_u
         self._firm_cap = None
         self._stop_release = stop_u
+        self._stop_go_cap = None
         self._butter_floor_prev = None
       if stop_u is None and butter_floor_value is not None and output_accel < butter_floor_value:
         # ButterStop taper: only remove braking above the floor, never add any.
@@ -892,6 +897,15 @@ class LongControl:
         gate_args = (self.firm_a, float(CS.vEgo), float(a_target_ff), plan_speeds, t_since_plan,
                      bool(CS.gasPressed), bool(CS.brakePressed), bool(CS.cruiseState.standstill))
         gate = firm_gate(*gate_args)
+        # Keep an active firm cap latched near rest while the plan is still stopping, so a slight
+        # aTarget taper above FIRM_ATGT (-0.30) right before stopping cannot soft-release the brake.
+        if (not gate and self._firm_cap is not None and not hard_exit
+            and 0.0 <= t_since_plan <= MAX_PLAN_AGE and len(plan_speeds) > 0
+            and math.isfinite(float(CS.vEgo)) and FIRM_V_LO <= float(CS.vEgo) <= FIRM_V_HI
+            and math.isfinite(float(a_target_ff)) and float(a_target_ff) < 0.0
+            and math.isfinite(float(plan_speeds[-1])) and float(plan_speeds[-1]) < FIRM_VPLAN_END
+            and bool(should_stop)):
+          gate = True
         ease_gate = (not gate) and firm_ease_gate(*gate_args)
         was_capped = self._firm_cap is not None
         ease_ok = False
@@ -931,8 +945,10 @@ class LongControl:
           if owned:
             self.firm_band_last = 2
         elif ease_gate and ease_ok:
-          # Ease-only band: a pid command harder than the tracker is eased toward it; a softer one passes.
-          ease_cap = firm_track_step(None, self.last_output_accel, self.firm_a, float(CS.aEgo), True)
+          # Ease-only band: a pid command harder than the tracker is eased toward it, but never
+          # above -FIRM_EASE_MIN so Palisade's brake response stays firm above the ESC no-rebuild cliff.
+          ease_cap = min(firm_track_step(None, self.last_output_accel, self.firm_a, float(CS.aEgo), True),
+                         -FIRM_EASE_MIN)
           if ease_cap > output_accel:
             if not self._firm_ease_logged:
               cloudlog.event("butterStopFirmEase", vEgo=float(CS.vEgo), aTarget=float(a_target_ff),
@@ -944,20 +960,35 @@ class LongControl:
             self._firm_eased = True
             self.firm_band_last = 1
       if stop_u is None and self._stop_release is not None:
-        # Soft hand-back after the law lets go: relax at STOP_LAW_RELEASE_JERK; a harder ordinary
-        # command passes at once; pedals or cruise standstill end it at once.
-        self._stop_release = min(0.0, self._stop_release + STOP_LAW_RELEASE_JERK * DT_CTRL)
+        # Soft hand-back after the law lets go: relax faster when the plan wants to accelerate
+        # (a_target_ff > 0.05) so we do not brake to a dead stop behind a departing lead; a harder
+        # ordinary command passes at once; pedals or cruise standstill end it at once.
+        plan_wants_go = math.isfinite(float(a_target_ff)) and float(a_target_ff) > 0.05
+        rel_jerk = STOP_LAW_RELEASE_GO_JERK if plan_wants_go else STOP_LAW_RELEASE_JERK
+        self._stop_release = min(0.0, self._stop_release + rel_jerk * DT_CTRL)
         release_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
         if release_exit or output_accel <= self._stop_release:
           self._stop_release = None
         else:
           # The ramp owns this tick even at its 0.0 endpoint: handing the ordinary command control
-          # there lets one tick step past STOP_LAW_RELEASE_JERK. It is released one tick later.
+          # there lets one tick step past STOP_LAW_RELEASE_JERK. It is released one tick later,
+          # and if the plan is accelerating, _stop_go_cap slews positive accel smoothly from 0.0.
           self.pid.i = previous_integral
           output_accel = self._stop_release
           self._butter_floor_prev = None
           if self._stop_release >= 0.0:
             self._stop_release = None
+            if plan_wants_go:
+              self._stop_go_cap = 0.0
+      elif stop_u is None and self._stop_go_cap is not None:
+        go_exit = bool(CS.gasPressed) or bool(CS.brakePressed) or bool(CS.cruiseState.standstill)
+        self._stop_go_cap += STOP_LAW_GO_JERK * DT_CTRL
+        if go_exit or output_accel <= self._stop_go_cap:
+          self._stop_go_cap = None
+        else:
+          self.pid.i = previous_integral
+          output_accel = self._stop_go_cap
+          self._butter_floor_prev = None
       guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
       if guarded > output_accel:
         # Do not integrate the speed error the guard is overriding.
@@ -967,6 +998,7 @@ class LongControl:
     if self.long_control_state != LongCtrlState.pid:
       self._firm_cap = None
       self._stop_release = None
+      self._stop_go_cap = None
       self.stop_law_last = False
       self._firm_lock_phase = None
       self._firm_eased = False

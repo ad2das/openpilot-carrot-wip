@@ -207,6 +207,8 @@ CFG = dict(
   V_EXIT=4.0,          # m/s, the law ends when the car is faster again
   Q_ENTER=0.4,         # needed decel / |A_H| at which the law may start
   VL_IN=1.0,           # m/s, the lead counts as stopping below this
+  VL_STILL=0.5,        # m/s, below this the lead counts as stopped regardless of closing speed
+  DV_ENTER=0.6,        # m/s, when lead is rolling (VL_STILL <= v_lead < VL_IN), require ego closing speed >= this
   VL_OUT=1.5,          # m/s, the law ends when the lead is faster
   VL_CREEP=0.75,       # m/s, creep exit: the lead is at least this fast ...
   DV_RISE=0.65,        # m/s, ... and this much faster than its slowest (>= 0) since the law started ...
@@ -351,7 +353,8 @@ class StopCtl:
     if self.law is None:
       if self.creep_lock and (v > c["V_EXIT"] or v_lead < c["VL_REIN"]):
         self.creep_lock = False
-      if not (c["V_ENTER_MIN"] < v <= c["V_ENTER"] and v_lead < c["VL_IN"] and d_rel >= c["D_MIN"]
+      lead_stopping = v_lead < c["VL_STILL"] or (v_lead < c["VL_IN"] and (v - v_lead) >= c["DV_ENTER"])
+      if not (c["V_ENTER_MIN"] < v <= c["V_ENTER"] and lead_stopping and d_rel >= c["D_MIN"]
               and q >= c["Q_ENTER"] and (a_target < 0.0 or not c["NEED_PLAN_BRAKE"])
               and len(self.uh) >= ND + 1 and not self.creep_lock):
         return None

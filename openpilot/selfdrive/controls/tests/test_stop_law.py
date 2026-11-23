@@ -1196,3 +1196,52 @@ def test_l7_a3_locked_den_floor():
   u = ctl.update(True, 1.5, -0.5, True, 3.1, 0.0, -1.0, INF)
   assert ctl.n_guard == 1
   assert u is not None and u < SL.A_H, u
+
+
+def test_p18_creeping_lead_matching_ego_speed_never_enters():
+  """Regression for 000004e3 seg 7: a rolling lead matched closely by ego speed must not trigger StopLaw."""
+  ctl = SL.StopCtl(GAP=4.3)
+  _warm(ctl, u=-0.4)
+  # Ego creeping at 1.22 -> 1.02 behind lead rolling at 0.92 -> 0.65 (closing speed 0.30..0.47 < DV_ENTER).
+  for k in range(100):
+    v = 1.22 - 0.002 * k
+    vl = 0.92 if k < 20 else 0.68
+    u = ctl.update(True, v, -0.3, True, 5.7 - 0.004 * k, vl, -0.45, INF)
+    assert u is None, (k, v, vl, u)
+    ctl.commit(-0.4)
+  assert ctl.n_enter == 0
+
+  # Behind a genuinely stopped lead (v_lead < VL_STILL), slow ego approach still enters normally.
+  ctl2 = SL.StopCtl(GAP=4.3)
+  _warm(ctl2, u=-0.4)
+  u2 = ctl2.update(True, 1.15, -0.3, True, 5.5, 0.30, -0.45, INF)
+  assert u2 is not None and ctl2.n_enter == 1
+
+
+def test_release_after_lead_go_clears_faster_and_ramps_positive_accel(monkeypatch):
+  """Regression for 000004e3 seg 7: departing lead release avoids dead-stop hold and 1-tick accel surge."""
+  silence_cloudlog(monkeypatch)
+  control, _ = make_control(monkeypatch)
+  control._stop_ctl = None
+  plant = NominalPlant(0.30, a0=-0.45)
+  for _ in range(25):
+    cs, plan, radar = tick_inputs(plant, 10.0, lead_status=True, v_lead=2.0, a_target=0.0,
+                                  v_target_now=plant.v, should_stop=False)
+    control.update(True, cs, plan, LIMITS, AGE, radar)
+  assert control.long_control_state == LongCtrlState.pid
+  control._stop_release = -1.62
+  outs = [-1.62]
+  for _ in range(120):
+    cs, plan, radar = tick_inputs(plant, 8.0, lead_status=True, v_lead=3.0, a_target=1.40,
+                                  v_target_now=plant.v + 0.8, should_stop=False)
+    outs.append(float(control.update(True, cs, plan, LIMITS, AGE, radar)[0]))
+  t_zero = next((i * DT_CTRL for i, u in enumerate(outs) if u >= 0.0), 99.0)
+  assert t_zero <= 0.45, f"brake release too slow: {t_zero:.2f}s"
+  diffs = np.diff(outs)
+  max_jerk = float(np.max(diffs)) / DT_CTRL
+  assert max_jerk <= lc.STOP_LAW_RELEASE_GO_JERK + 1e-6, f"1-tick accel surge: {max_jerk:.1f} m/s^3"
+  # Positive ramp obeys STOP_LAW_GO_JERK once above zero.
+  pos_idx = next(i for i, u in enumerate(outs) if u >= 0.0)
+  pos_diffs = np.diff(outs[pos_idx:])
+  assert float(np.max(pos_diffs)) <= lc.STOP_LAW_GO_JERK * DT_CTRL + 1e-9
+  assert outs[-1] > 1.0, f"did not smoothly hand over to positive accel: {outs[-1]}"
