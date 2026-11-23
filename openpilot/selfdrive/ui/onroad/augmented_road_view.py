@@ -17,6 +17,7 @@ from openpilot.selfdrive.ui.onroad.tesla_hud import (
   TESLA_MODE_3D,
   TESLA_MODE_AR,
   TESLA_MODE_QUIET,
+  TeslaDayNightController,
   TeslaHudRenderer,
 )
 from openpilot.selfdrive.ui.render_diagnostics import RenderDiagnostics
@@ -73,6 +74,7 @@ class AugmentedRoadView(CameraView):
     self._tesla_3d = Tesla3DRenderer()
     self._tesla_ar = TeslaArRenderer(self.model_renderer)
     self._hud_renderer = TeslaHudRenderer()
+    self._theme_ctrl = TeslaDayNightController()
     self._legacy_hud_renderer: HudRenderer | None = None
     self.alert_renderer = AlertRenderer()
 
@@ -121,6 +123,9 @@ class AugmentedRoadView(CameraView):
     timing.start()
     cam_ms = model_ms = ds_ms = hud_ms = alert_ms = extras_ms = 0.0
     mode = self._hud_renderer.mode
+    is_day = self._theme_ctrl.update(getattr(ui_state, "light_sensor", -1.0), start_draw)
+    self._tesla_3d.set_day_mode(is_day)
+    self._hud_renderer.set_day_mode(is_day)
 
     if not self._suppress_camera_for_cluster:
       self._switch_stream_if_needed(ui_state.sm)

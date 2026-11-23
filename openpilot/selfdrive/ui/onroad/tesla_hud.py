@@ -36,7 +36,91 @@ TESLA_AMBER = hs.rgba(255, 182, 46)
 TESLA_RED = hs.rgba(255, 68, 62)
 TESLA_SIGN_RED = hs.rgba(225, 39, 41)
 TESLA_CARD_DARK = (hs.rgba(18, 25, 39, 204), hs.rgba(13, 18, 29, 210), hs.rgba(10, 14, 23, 218))
+TESLA_CARD_LIGHT = (hs.rgba(255, 255, 255, 240), hs.rgba(248, 251, 255, 242), hs.rgba(240, 245, 252, 245))
 TESLA_CARD_WARN = (hs.rgba(96, 22, 28, 222), hs.rgba(62, 12, 17, 228), hs.rgba(40, 8, 12, 234))
+TESLA_CARD_WARN_DAY = (hs.rgba(218, 36, 44, 244), hs.rgba(192, 26, 34, 246), hs.rgba(168, 20, 28, 248))
+
+# Daytime Studio Light HUD Ink & Accents (Mode 0 3D FSD when ambient light is daytime)
+TESLA_DAY_INK = hs.rgba(16, 23, 36)
+TESLA_DAY_INK_SUB = hs.rgba(72, 88, 112)
+TESLA_DAY_BLUE = hs.rgba(14, 108, 242)
+TESLA_DAY_EMERALD = hs.rgba(5, 132, 88)
+TESLA_DAY_AMBER = hs.rgba(217, 119, 6)
+TESLA_DAY_RED = hs.rgba(220, 38, 38)
+
+
+class TeslaDayNightController:
+  """Auto day/night theme resolver driven by C3X ui_state.light_sensor (0..100).
+
+  Uses EMA smoothing + wide hysteresis (day >= 42, night <= 26) + sustained hold
+  (1.5 s) so brief highway overpasses or streetlights never strobe the UI, while
+  snapping immediately on the first valid camera exposure sample.
+  """
+
+  DAY_ON_THRESHOLD = 42.0
+  DAY_OFF_THRESHOLD = 26.0
+  INIT_SPLIT_THRESHOLD = 34.0
+  HOLD_SEC = 1.5
+  EMA_TAU = 1.8
+
+  def __init__(self, default_day: Optional[bool] = None):
+    if default_day is None:
+      hr = time.localtime().tm_hour
+      default_day = (7 <= hr < 19)
+    self._is_day: bool = bool(default_day)
+    self._ema: Optional[float] = None
+    self._last_t: Optional[float] = None
+    self._pending_state: Optional[bool] = None
+    self._pending_since: float = 0.0
+    self._force_day: Optional[bool] = None
+
+  @property
+  def is_day(self) -> bool:
+    return self._force_day if self._force_day is not None else self._is_day
+
+  def set_override(self, force_day: Optional[bool]) -> None:
+    self._force_day = None if force_day is None else bool(force_day)
+
+  def update(self, light_sensor: float, now: Optional[float] = None) -> bool:
+    if self._force_day is not None:
+      return self._force_day
+    if now is None:
+      now = time.monotonic()
+
+    ls = float(light_sensor)
+    if ls < 0.0:
+      # Sensor not live yet — keep clock-seeded / current state without drifting
+      self._last_t = now
+      return self._is_day
+
+    if self._ema is None:
+      self._ema = ls
+      self._is_day = ls >= self.INIT_SPLIT_THRESHOLD
+      self._last_t = now
+      self._pending_state = None
+      return self._is_day
+
+    dt = max(0.0, min(1.0, now - (self._last_t if self._last_t is not None else now)))
+    self._last_t = now
+    alpha = 1.0 - math.exp(-dt / self.EMA_TAU) if dt > 0.0 else 0.0
+    self._ema += (ls - self._ema) * alpha
+
+    want: Optional[bool] = None
+    if not self._is_day and self._ema >= self.DAY_ON_THRESHOLD:
+      want = True
+    elif self._is_day and self._ema <= self.DAY_OFF_THRESHOLD:
+      want = False
+
+    if want is None:
+      self._pending_state = None
+    elif self._pending_state != want:
+      self._pending_state = want
+      self._pending_since = now
+    elif (now - self._pending_since) >= self.HOLD_SEC:
+      self._is_day = want
+      self._pending_state = None
+
+    return self._is_day
 
 # Driving mode names & accent dot colors (Carrot myDrivingMode: 1=연비, 2=안전, 3=일반, 4=고속)
 DRIVING_MODES = {
@@ -170,6 +254,7 @@ class TeslaHudRenderer(Widget):
     self._mode_switch_t: float = -10.0
     self._dock_visible_until: float = time.monotonic() + 4.0
     self._drag_offset_x: float = 0.0
+    self._day_mode: bool = False
 
     # Hit rectangles updated each frame for direct dock / handle tap interaction
     self._dock_tab_rects: list[tuple[float, float, float, float]] = []
@@ -196,6 +281,17 @@ class TeslaHudRenderer(Widget):
   @property
   def mode(self) -> int:
     return self._mode
+
+  @property
+  def day_mode(self) -> bool:
+    return self._day_mode
+
+  def set_day_mode(self, is_day: bool) -> None:
+    self._day_mode = bool(is_day)
+
+  @property
+  def _is_light_ui(self) -> bool:
+    return self._day_mode and self._mode == TESLA_MODE_3D
 
   def set_mode(self, mode: int, show_dock: bool = True) -> None:
     clamped = max(TESLA_MODE_3D, min(TESLA_MODE_QUIET, int(mode)))
@@ -466,7 +562,7 @@ class TeslaHudRenderer(Widget):
   # ------------------------------------------------------------------
   # Shared Tesla V12 Primitives
   # ------------------------------------------------------------------
-  def _draw_power_regen_bar(self, rect: rl.Rectangle, accel: float, quiet: bool) -> None:
+  def _draw_power_regen_bar(self, rect: rl.Rectangle, accel: float, quiet: bool, light: bool = False) -> None:
     """Extreme-left vertical Tesla EV power/regen bar sized for 6-inch C3X OLED peripheral vision."""
     x = rect.x + 14.0
     top = rect.y + 132.0
@@ -474,38 +570,50 @@ class TeslaHudRenderer(Widget):
     w = 18.0
     mid_y = top + bar_h * 0.52
 
-    hs.pill(x, top, w, bar_h, hs.rgba(255, 255, 255, 36 if quiet else 48))
-    rl.draw_rectangle_rounded(rl.Rectangle(x - 6.0, mid_y - 2.5, w + 12.0, 5.0), 1.0, 4, hs.rgba(255, 255, 255, 168))
+    track_col = hs.rgba(16, 26, 44, 34) if light else hs.rgba(255, 255, 255, 36 if quiet else 48)
+    tick_col = hs.rgba(16, 26, 44, 148) if light else hs.rgba(255, 255, 255, 168)
+    hs.pill(x, top, w, bar_h, track_col)
+    rl.draw_rectangle_rounded(rl.Rectangle(x - 6.0, mid_y - 2.5, w + 12.0, 5.0), 1.0, 4, tick_col)
 
     if accel >= 0.05:
       frac = min(1.0, accel / 2.2)
       fh = max(24.0, frac * (mid_y - top - 18.0))
       fy = mid_y - fh - 5.0
-      hs.ellipse_glow(x + w * 0.5, fy + fh * 0.4, 28.0, fh * 0.58, hs.rgba(130, 206, 255, 108))
-      hs.gradient_rect(
-        x, fy, w, fh, w * 0.5,
-        (hs.rgba(255, 255, 255, 255), hs.rgba(148, 212, 255, 242), hs.rgba(59, 164, 255, 195)),
+      if not light:
+        hs.ellipse_glow(x + w * 0.5, fy + fh * 0.4, 28.0, fh * 0.58, hs.rgba(130, 206, 255, 108))
+      power_grad = (
+        (hs.rgba(12, 92, 232, 255), hs.rgba(28, 126, 255, 248), hs.rgba(72, 162, 255, 224))
+        if light else
+        (hs.rgba(255, 255, 255, 255), hs.rgba(148, 212, 255, 242), hs.rgba(59, 164, 255, 195))
       )
-      hs.gradient_rect(x + 3.0, mid_y + 12.0, w - 6.0, 96.0, 5.0,
-                       (hs.rgba(46, 229, 157, 78), hs.rgba(46, 229, 157, 6)))
+      hs.gradient_rect(x, fy, w, fh, min(w * 0.42, fh * 0.42), power_grad, stops=(0.0, 0.5, 1.0))
+      hs.gradient_rect(x + 3.0, mid_y + 12.0, w - 6.0, 96.0, 4.5,
+                       (hs.rgba(14, 158, 108, 72) if light else hs.rgba(46, 229, 157, 78), hs.rgba(46, 229, 157, 6)),
+                       stops=(0.0, 1.0))
     elif accel <= -0.05:
       frac = min(1.0, (-accel) / 2.8)
       fh = max(24.0, frac * (top + bar_h - mid_y - 18.0))
       fy = mid_y + 6.0
-      hs.ellipse_glow(x + w * 0.5, fy + fh * 0.55, 30.0, fh * 0.58, hs.rgba(46, 229, 157, 126))
-      hs.gradient_rect(
-        x, fy, w, fh, w * 0.5,
-        (hs.rgba(46, 229, 157, 215), hs.rgba(68, 242, 172, 252), hs.rgba(182, 255, 224, 255)),
+      if not light:
+        hs.ellipse_glow(x + w * 0.5, fy + fh * 0.55, 30.0, fh * 0.58, hs.rgba(46, 229, 157, 126))
+      regen_grad = (
+        (hs.rgba(8, 150, 102, 245), hs.rgba(18, 184, 126, 252), hs.rgba(52, 214, 154, 255))
+        if light else
+        (hs.rgba(46, 229, 157, 215), hs.rgba(68, 242, 172, 252), hs.rgba(182, 255, 224, 255))
       )
+      hs.gradient_rect(x, fy, w, fh, min(w * 0.42, fh * 0.42), regen_grad, stops=(0.0, 0.5, 1.0))
     else:
-      hs.gradient_rect(x + 2.5, mid_y - 60.0, w - 5.0, 52.0, 5.0,
-                       (hs.rgba(165, 218, 255, 148), hs.rgba(59, 164, 255, 88)))
-      hs.gradient_rect(x + 3.0, mid_y + 12.0, w - 6.0, 78.0, 5.0,
-                       (hs.rgba(46, 229, 157, 64), hs.rgba(46, 229, 157, 6)))
+      hs.gradient_rect(x + 2.5, mid_y - 60.0, w - 5.0, 52.0, 4.5,
+                       (hs.rgba(24, 118, 242, 120) if light else hs.rgba(165, 218, 255, 148),
+                        hs.rgba(59, 164, 255, 64) if light else hs.rgba(59, 164, 255, 88)),
+                       stops=(0.0, 1.0))
+      hs.gradient_rect(x + 3.0, mid_y + 12.0, w - 6.0, 78.0, 4.5,
+                       (hs.rgba(14, 158, 108, 60) if light else hs.rgba(46, 229, 157, 64), hs.rgba(46, 229, 157, 6)),
+                       stops=(0.0, 1.0))
 
   def _draw_steering_wheel_icon(self, cx: float, cy: float, r: float, color: rl.Color, glow_on: bool) -> None:
     if glow_on:
-      hs.glow(cx, cy, r * 1.9, hs.with_alpha(color, 86))
+      hs.glow(cx, cy, r * 1.9, hs.with_alpha(color, 72))
     stroke = max(5.5, r * 0.21)
     rl.draw_ring(rl.Vector2(cx, cy), r - stroke, r, 0.0, 360.0, 36, color)
     rl.draw_circle_v(rl.Vector2(cx, cy), r * 0.26, color)
@@ -527,40 +635,48 @@ class TeslaHudRenderer(Widget):
     getattr(rl, "_orig_draw_text_ex", rl.draw_text_ex)(f, value, pos, size, spacing, color)
     return w
 
-  def _draw_gear_strip(self, x: float, baseline: float, active_gear: str, size: float = 54.0) -> None:
+  def _draw_gear_strip(self, x: float, baseline: float, active_gear: str, size: float = 54.0,
+                       light: bool = False) -> None:
     cx = x
     for g in GEAR_LABELS:
       is_on = (g == active_gear)
-      col = hs.TEXT if is_on else hs.rgba(255, 255, 255, 92)
+      if light:
+        col = TESLA_DAY_INK if is_on else hs.rgba(20, 32, 52, 86)
+      else:
+        col = hs.TEXT if is_on else hs.rgba(255, 255, 255, 92)
       gs = size + 8.0 if is_on else size
-      w = self._type.draw(g, cx, baseline, gs, col, hs.BOLD if is_on else hs.SEMI, shadow=True)
+      w = self._type.draw(g, cx, baseline, gs, col, hs.BOLD if is_on else hs.SEMI, shadow=not light)
       cx += w + 34.0
 
   def _draw_max_dial(self, cx: float, cy: float, dia: float, set_speed: int, cruise_set: bool,
-                     engaged: bool, override_tag: Optional[tuple[str, rl.Color]]) -> None:
+                     engaged: bool, override_tag: Optional[tuple[str, rl.Color]],
+                     light: bool = False) -> None:
     r = dia * 0.5
     if override_tag is not None:
       lbl, ring_col = override_tag
     elif engaged and cruise_set:
-      lbl, ring_col = "MAX", TESLA_BLUE
+      lbl, ring_col = "MAX", TESLA_DAY_BLUE if light else TESLA_BLUE
     elif cruise_set:
-      lbl, ring_col = "MAX", hs.rgba(148, 168, 196, 228)
+      lbl, ring_col = "MAX", hs.rgba(104, 122, 148, 228) if light else hs.rgba(148, 168, 196, 228)
     else:
-      lbl, ring_col = "MAX", hs.rgba(255, 255, 255, 86)
+      lbl, ring_col = "MAX", hs.rgba(128, 142, 164, 170) if light else hs.rgba(255, 255, 255, 86)
 
-    if engaged and cruise_set:
+    if engaged and cruise_set and not light:
       hs.glow(cx, cy, r * 1.48, hs.with_alpha(ring_col, 88))
-    hs.glow(cx, cy + 7.0, r * 1.18, hs.rgba(0, 0, 0, 140))
-    rl.draw_circle_v(rl.Vector2(cx, cy), r, hs.rgba(11, 18, 30, 220))
+    hs.glow(cx, cy + 7.0, r * 1.18, hs.rgba(16, 28, 48, 62) if light else hs.rgba(0, 0, 0, 140))
+    disc_fill = hs.rgba(255, 255, 255, 250) if light else hs.rgba(11, 18, 30, 220)
+    rl.draw_circle_v(rl.Vector2(cx, cy), r, disc_fill)
     rl.draw_ring(rl.Vector2(cx, cy), r - max(8.0, dia * 0.048), r, 0.0, 360.0, 48, ring_col)
 
-    lbl_col = hs.with_alpha(ring_col, 252) if cruise_set else hs.rgba(255, 255, 255, 148)
+    lbl_col = hs.with_alpha(ring_col, 252) if cruise_set else (TESLA_DAY_INK_SUB if light else hs.rgba(255, 255, 255, 148))
     lbl_sz = max(32.0, dia * 0.175)
     self._type.draw_mid(lbl, cx, cy - r * 0.39, lbl_sz, lbl_col, hs.BOLD, align=0.5, spacing=1.2)
     val_txt = str(set_speed) if cruise_set else "--"
     val_size = dia * (0.41 if len(val_txt) >= 3 else 0.47)
-    self._type.draw_mid(val_txt, cx, cy + r * 0.20, val_size, hs.TEXT if cruise_set else hs.rgba(255, 255, 255, 145),
-                        hs.BOLD, align=0.5, spacing=-2.5)
+    val_col = (TESLA_DAY_INK if cruise_set else hs.rgba(96, 112, 136, 190)) if light else (
+      hs.TEXT if cruise_set else hs.rgba(255, 255, 255, 145)
+    )
+    self._type.draw_mid(val_txt, cx, cy + r * 0.20, val_size, val_col, hs.BOLD, align=0.5, spacing=-2.5)
 
   def _draw_speed_limit_disc(self, cx: float, cy: float, dia: float, limit_speed: int, cam_alarm: bool) -> None:
     if limit_speed <= 0:
@@ -577,10 +693,15 @@ class TeslaHudRenderer(Widget):
     self._type.draw_mid(txt, cx, cy + 1.0, sz, hs.rgba(14, 17, 22, 255), hs.BOLD, align=0.5, spacing=-3.0)
 
   def _draw_mode_gap_pill(self, x: float, y: float, driving_mode: int, gap: int, max_gap: int,
-                          engaged: bool, h: float = 106.0, font_size: float = 52.0) -> float:
+                          engaged: bool, h: float = 106.0, font_size: float = 52.0,
+                          light: bool = False) -> float:
     name, dot_col = DRIVING_MODES.get(driving_mode, DRIVING_MODES[3])
+    if light and driving_mode == 3:
+      dot_col = TESLA_DAY_BLUE
+    elif light and driving_mode == 1:
+      dot_col = TESLA_DAY_EMERALD
     if not engaged:
-      dot_col = hs.rgba(170, 184, 206, 220)
+      dot_col = hs.rgba(124, 140, 164, 220) if light else hs.rgba(170, 184, 206, 220)
     w_name = self._type.width(name, font_size, hs.BOLD)
     bar_w = 34.0 if font_size >= 50.0 else 28.0
     bar_h = 15.0 if font_size >= 50.0 else 13.0
@@ -588,63 +709,80 @@ class TeslaHudRenderer(Widget):
     bars_total = max_gap * bar_w + max(0, max_gap - 1) * bar_gap
     pill_w = 36.0 + 22.0 + 20.0 + w_name + 26.0 + 26.0 + bars_total + 34.0
 
-    hs.chip(x, y, pill_w, h, fill=hs.rgba(12, 18, 29, 202), ring=hs.rgba(255, 255, 255, 62), ring_width=2.0)
+    fill_col = hs.rgba(255, 255, 255, 234) if light else hs.rgba(12, 18, 29, 202)
+    ring_col = hs.rgba(18, 32, 56, 40) if light else hs.rgba(255, 255, 255, 62)
+    hs.chip(x, y, pill_w, h, fill=fill_col, ring=ring_col, ring_width=2.0)
     cy = y + h * 0.5
     dot_x = x + 42.0
-    hs.glow(dot_x, cy, 24.0, hs.with_alpha(dot_col, 112))
+    if not light:
+      hs.glow(dot_x, cy, 24.0, hs.with_alpha(dot_col, 112))
     hs.dot(dot_x, cy, 11.0, dot_col)
 
     name_x = dot_x + 28.0
-    self._type.draw_mid(name, name_x, cy, font_size, hs.TEXT, hs.BOLD)
+    self._type.draw_mid(name, name_x, cy, font_size, TESLA_DAY_INK if light else hs.TEXT, hs.BOLD)
 
     sep_x = name_x + w_name + 24.0
-    rl.draw_rectangle(int(sep_x), int(cy - 22.0), 2, 44, hs.rgba(255, 255, 255, 68))
+    rl.draw_rectangle(int(sep_x), int(cy - 22.0), 2, 44,
+                      hs.rgba(18, 32, 56, 44) if light else hs.rgba(255, 255, 255, 68))
 
     bx = sep_x + 26.0
-    active_bar_col = TESLA_CYAN if engaged else hs.rgba(208, 220, 236, 198)
+    if light:
+      active_bar_col = TESLA_DAY_BLUE if engaged else hs.rgba(104, 122, 148, 210)
+      off_bar_col = hs.rgba(18, 32, 56, 42)
+    else:
+      active_bar_col = TESLA_CYAN if engaged else hs.rgba(208, 220, 236, 198)
+      off_bar_col = hs.rgba(255, 255, 255, 64)
     for i in range(max_gap):
       on = (i < gap)
-      if on and engaged:
+      if on and engaged and not light:
         hs.glow(bx + bar_w * 0.5, cy, 22.0, hs.rgba(104, 194, 255, 92))
       rl.draw_rectangle_rounded(
         rl.Rectangle(bx, cy - bar_h * 0.5, bar_w, bar_h), 1.0, 4,
-        active_bar_col if on else hs.rgba(255, 255, 255, 64),
+        active_bar_col if on else off_bar_col,
       )
       bx += bar_w + bar_gap
     return pill_w
 
-  def _draw_traffic_pill(self, right_x: float, cy: float, traffic_light: int) -> float:
+  def _draw_traffic_pill(self, right_x: float, cy: float, traffic_light: int, light: bool = False) -> float:
     """High-visibility traffic signal pill sized for instant glance on 6-inch C3X OLED."""
     if traffic_light not in (1, 2):
       return 0.0
     is_red = (traffic_light == 1)
-    col = TESLA_RED if is_red else TESLA_EMERALD
+    col = (TESLA_DAY_RED if light else TESLA_RED) if is_red else (TESLA_DAY_EMERALD if light else TESLA_EMERALD)
     txt = "정지" if is_red else "진행"
     pw, ph = 208.0, 80.0
     px = right_x - pw
     py = cy - ph * 0.5
-    hs.chip(px, py, pw, ph, fill=hs.rgba(14, 18, 28, 222), ring=hs.with_alpha(col, 200), ring_width=3.0)
-    hs.glow(px + 44.0, cy, 28.0, hs.with_alpha(col, 138))
+    fill = hs.rgba(255, 255, 255, 244) if light else hs.rgba(14, 18, 28, 222)
+    hs.chip(px, py, pw, ph, fill=fill, ring=hs.with_alpha(col, 224 if light else 200), ring_width=3.2 if light else 3.0)
+    if not light:
+      hs.glow(px + 44.0, cy, 28.0, hs.with_alpha(col, 138))
     hs.dot(px + 44.0, cy, 13.5, col)
-    self._type.draw_mid(txt, px + 76.0, cy, 50.0, hs.TEXT, hs.BOLD)
+    self._type.draw_mid(txt, px + 76.0, cy, 50.0, TESLA_DAY_INK if light else hs.TEXT, hs.BOLD)
     return pw + 26.0
 
-  def _draw_carrot_link_pill(self, right_x: float, cy: float, active_carrot: int) -> float:
+  def _draw_carrot_link_pill(self, right_x: float, cy: float, active_carrot: int, light: bool = False) -> float:
     """High-visibility Carrot link pill: green APN (activeCarrot>=2) or blue APM (activeCarrot==1)."""
     if active_carrot < 1:
       return 0.0
     is_apn = active_carrot >= 2
     label = "APN" if is_apn else "APM"
-    accent = TESLA_EMERALD if is_apn else TESLA_BLUE
-    fill = hs.rgba(10, 40, 28, 224) if is_apn else hs.rgba(10, 26, 48, 224)
-    text_col = hs.rgba(176, 255, 220, 255) if is_apn else hs.rgba(172, 224, 255, 255)
+    if light:
+      accent = TESLA_DAY_EMERALD if is_apn else TESLA_DAY_BLUE
+      fill = hs.rgba(234, 252, 243, 244) if is_apn else hs.rgba(234, 244, 255, 244)
+      text_col = hs.rgba(4, 114, 76, 255) if is_apn else hs.rgba(10, 84, 206, 255)
+    else:
+      accent = TESLA_EMERALD if is_apn else TESLA_BLUE
+      fill = hs.rgba(10, 40, 28, 224) if is_apn else hs.rgba(10, 26, 48, 224)
+      text_col = hs.rgba(176, 255, 220, 255) if is_apn else hs.rgba(172, 224, 255, 255)
 
     w_txt = self._type.width(label, 46.0, hs.BOLD, spacing=1.0)
     pw, ph = 70.0 + w_txt + 26.0, 76.0
     px = right_x - pw
     py = cy - ph * 0.5
     hs.chip(px, py, pw, ph, fill=fill, ring=hs.with_alpha(accent, 224), ring_width=3.0)
-    hs.glow(px + 38.0, cy, 26.0, hs.with_alpha(accent, 138))
+    if not light:
+      hs.glow(px + 38.0, cy, 26.0, hs.with_alpha(accent, 138))
     hs.dot(px + 38.0, cy, 11.5, accent)
     self._type.draw_mid(label, px + 68.0, cy + 1.0, 46.0, text_col, hs.BOLD, spacing=1.0)
     return pw + 22.0
@@ -653,41 +791,46 @@ class TeslaHudRenderer(Widget):
   # Mode 0 (3D FSD) & Mode 1 (AR 카메라) Left Cluster (6-inch C3X Scale)
   # ------------------------------------------------------------------
   def _draw_left_cluster_ab(self, rect: rl.Rectangle, snap: dict, is_ar: bool) -> None:
+    light = (not is_ar) and self._day_mode
     x = rect.x + 56.0
     y = rect.y + 38.0
 
-    # Soft radial dark cushion behind borderless type on 3D mode (AR mode uses optical scrim)
-    if not is_ar:
+    # Soft radial dark cushion behind borderless type on night 3D mode (AR uses optical scrim; day sky needs none)
+    if not is_ar and not light:
       hs.ellipse_glow(rect.x + 320.0, rect.y + 470.0, 680.0, 560.0, hs.rgba(6, 9, 15, 152))
 
-    self._draw_gear_strip(x, y + 54.0, snap["gear"], size=54.0)
+    self._draw_gear_strip(x, y + 54.0, snap["gear"], size=54.0, light=light)
 
     # Monumental 6-inch C3X speedometer (sunlight-legible Inter-Medium)
     spd_str = str(snap["speed"])
     overspeed = snap["limit_speed"] > 0 and snap["speed"] > snap["limit_speed"] + 4
-    spd_col = TESLA_RED if (snap["cam_alarm"] and overspeed) else hs.TEXT
+    if snap["cam_alarm"] and overspeed:
+      spd_col = TESLA_DAY_RED if light else TESLA_RED
+    else:
+      spd_col = TESLA_DAY_INK if light else hs.TEXT
     spd_size = 318.0 if is_ar else 338.0
     spd_base = y + (342.0 if is_ar else 356.0)
-    spd_w = self._draw_monumental_speed(spd_str, x - 14.0, spd_base, spd_size, spd_col, shadow=True)
+    spd_w = self._draw_monumental_speed(spd_str, x - 14.0, spd_base, spd_size, spd_col, shadow=not light)
+    unit_col = TESLA_DAY_INK_SUB if light else hs.rgba(255, 255, 255, 212 if is_ar else 168)
     self._type.draw(snap["unit"], x - 14.0 + spd_w + 14.0, spd_base - 22.0, 52.0,
-                    hs.rgba(255, 255, 255, 212 if is_ar else 168), hs.SEMI, shadow=True)
+                    unit_col, hs.SEMI, shadow=not light)
 
     # Steering wheel icon + Self-Driving / Override / Manual
     fsd_y = spd_base + 72.0
     if snap["engaged"]:
-      st_col, st_txt = TESLA_BLUE_TEXT, "Self-Driving"
+      st_col, st_txt = (TESLA_DAY_BLUE if light else TESLA_BLUE_TEXT), "Self-Driving"
     elif snap["override"]:
-      st_col, st_txt = TESLA_AMBER, "Override"
+      st_col, st_txt = (TESLA_DAY_AMBER if light else TESLA_AMBER), "Override"
     else:
-      st_col, st_txt = hs.rgba(182, 196, 216, 232), "Manual"
-    self._draw_steering_wheel_icon(x + 32.0, fsd_y, 31.0, st_col, glow_on=snap["engaged"])
-    self._type.draw_mid(st_txt, x + 82.0, fsd_y, 56.0, st_col, hs.BOLD, shadow=True)
+      st_col, st_txt = (TESLA_DAY_INK_SUB if light else hs.rgba(182, 196, 216, 232)), "Manual"
+    self._draw_steering_wheel_icon(x + 32.0, fsd_y, 31.0, st_col, glow_on=(snap["engaged"] and not light))
+    self._type.draw_mid(st_txt, x + 82.0, fsd_y, 56.0, st_col, hs.BOLD, shadow=not light)
 
     # Speed badges: full C3X-scale MAX circular dial + Korean speed limit sign (204px = real SIGN_R 100)
     badge_cy = fsd_y + 154.0
     dia = 204.0
     self._draw_max_dial(x + dia * 0.5, badge_cy, dia, snap["set_speed"], snap["cruise_set"],
-                        snap["engaged"], snap["override_tag"])
+                        snap["engaged"], snap["override_tag"], light=light)
     if snap["limit_speed"] > 0:
       self._draw_speed_limit_disc(x + dia + 28.0 + dia * 0.5, badge_cy, dia,
                                   snap["limit_speed"], snap["cam_alarm"])
@@ -695,51 +838,57 @@ class TeslaHudRenderer(Widget):
     # Driving mode & gap frosted pill
     pill_y = badge_cy + dia * 0.5 + 34.0
     self._draw_mode_gap_pill(x, pill_y, snap["driving_mode"], snap["gap"],
-                             self._cruise_gap_levels, snap["engaged"], h=106.0, font_size=52.0)
+                             self._cruise_gap_levels, snap["engaged"], h=106.0, font_size=52.0, light=light)
 
     # Only show GPS warning pill if GPS fix is actually lost (zero microscopic car-name fluff on 6" OLED)
     if not snap["gps_ok"]:
       gy = rect.y + rect.height - 96.0
-      hs.chip(x, gy, 240.0, 68.0, fill=hs.rgba(46, 32, 12, 218), ring=TESLA_AMBER, ring_width=2.2)
-      hs.dot(x + 34.0, gy + 34.0, 9.5, TESLA_AMBER)
-      self._type.draw_mid("GPS 대기", x + 62.0, gy + 34.0, 40.0, hs.TEXT, hs.BOLD)
+      g_fill = hs.rgba(255, 247, 230, 240) if light else hs.rgba(46, 32, 12, 218)
+      g_ring = TESLA_DAY_AMBER if light else TESLA_AMBER
+      hs.chip(x, gy, 240.0, 68.0, fill=g_fill, ring=g_ring, ring_width=2.4)
+      hs.dot(x + 34.0, gy + 34.0, 9.5, g_ring)
+      self._type.draw_mid("GPS 대기", x + 62.0, gy + 34.0, 40.0, TESLA_DAY_INK if light else hs.TEXT, hs.BOLD)
 
     # Register left safe zone at top banner height (y=32..228; 3-digit speed ends ~485px, km/h sits below)
     hs.zones["guide"] = (rect.x, rect.y, 492.0, rect.height)
 
   def _draw_right_card_3d(self, rect: rl.Rectangle, snap: dict, clock_txt: str) -> None:
+    light = self._day_mode
     right_x = rect.x + rect.width - 42.0
     top_y = rect.y + 66.0
 
     # Top-right big bold clock + optional traffic light + APN/APM Carrot link badge
-    clk_w = self._type.draw_mid(clock_txt, right_x, top_y, 76.0, hs.rgba(255, 255, 255, 236), hs.BOLD, align=1.0, shadow=True)
+    clk_col = TESLA_DAY_INK if light else hs.rgba(255, 255, 255, 236)
+    clk_w = self._type.draw_mid(clock_txt, right_x, top_y, 76.0, clk_col, hs.BOLD, align=1.0, shadow=not light)
     cur_x = right_x - clk_w - 26.0
-    cur_x -= self._draw_traffic_pill(cur_x, top_y, snap["traffic_light"])
-    cur_x -= self._draw_carrot_link_pill(cur_x, top_y, snap["active_carrot"])
+    cur_x -= self._draw_traffic_pill(cur_x, top_y, snap["traffic_light"], light=light)
+    cur_x -= self._draw_carrot_link_pill(cur_x, top_y, snap["active_carrot"], light=light)
 
     card_w = 740.0
     card_x = right_x - card_w
     card_y = rect.y + 132.0
 
-    # Priority 1: Speed Enforcement Camera Card (vivid crimson accent, 6-inch C3X glance scale!)
+    # Priority 1: Speed Enforcement Camera Card (vivid crimson accent in both day & night!)
     if snap["cam_alarm"] and snap["limit_speed"] > 0:
       card_h = 326.0
-      hs.glass_card(card_x, card_y, card_w, card_h, r=38.0, body=TESLA_CARD_WARN)
+      hs.glass_card(card_x, card_y, card_w, card_h, r=38.0,
+                    body=TESLA_CARD_WARN_DAY if light else TESLA_CARD_WARN)
       self._draw_speed_limit_disc(card_x + 114.0, card_y + 128.0, 166.0, snap["limit_speed"], cam_alarm=True)
 
       val_s, unit_s = _format_dist_parts(snap["cam_dist"]) if snap["cam_dist"] > 0 else ("단속", "")
       tx = card_x + 226.0
       dw = self._type.draw(val_s, tx, card_y + 132.0, 118.0, hs.TEXT, hs.BOLD, spacing=-3.0)
       if unit_s:
-        self._type.draw(unit_s, tx + dw + 10.0, card_y + 132.0, 58.0, hs.rgba(255, 255, 255, 212), hs.SEMI)
-      self._type.draw("과속 단속 구간", tx, card_y + 206.0, 54.0, hs.rgba(255, 224, 220, 250), hs.BOLD)
+        self._type.draw(unit_s, tx + dw + 10.0, card_y + 132.0, 58.0, hs.rgba(255, 255, 255, 224), hs.SEMI)
+      self._type.draw("과속 단속 구간", tx, card_y + 206.0, 54.0, hs.rgba(255, 236, 232, 252), hs.BOLD)
 
       prog_y = card_y + 258.0
       prog_w = card_w - 72.0
-      hs.pill(card_x + 36.0, prog_y, prog_w, 16.0, hs.rgba(255, 255, 255, 44))
+      hs.pill(card_x + 36.0, prog_y, prog_w, 16.0, hs.rgba(255, 255, 255, 58))
       frac = 1.0 - min(1.0, max(0.0, snap["cam_dist"] / 800.0)) if snap["cam_dist"] > 0 else 0.9
       fill_w = max(40.0, prog_w * frac)
-      hs.gradient_rect(card_x + 36.0, prog_y, fill_w, 16.0, 8.0, (TESLA_RED, hs.rgba(255, 134, 122, 255)))
+      bar_grad = (hs.rgba(255, 255, 255, 245), hs.rgba(255, 210, 206, 255)) if light else (TESLA_RED, hs.rgba(255, 134, 122, 255))
+      hs.gradient_rect(card_x + 36.0, prog_y, fill_w, 16.0, 8.0, bar_grad)
       hs.zones["tpms"] = (card_x, card_y, card_w, card_h)
       return
 
@@ -752,41 +901,54 @@ class TeslaHudRenderer(Widget):
 
     has_eta = snap["remain_dist"] > 0 or snap["remain_time"] > 0
     card_h = 362.0 if has_eta else 258.0
-    hs.glass_card(card_x, card_y, card_w, card_h, r=38.0, body=TESLA_CARD_DARK)
+    hs.glass_card(card_x, card_y, card_w, card_h, r=38.0,
+                  body=TESLA_CARD_LIGHT if light else TESLA_CARD_DARK)
+    if light:
+      rl.draw_rectangle_rounded_lines_ex(
+        rl.Rectangle(card_x, card_y, card_w, card_h),
+        min(1.0, 76.0 / card_h), 16, 2.0, hs.rgba(18, 32, 56, 34),
+      )
 
     # Giant maneuver arrow + C3X-scale distance + bold road name
     icon_cx, icon_cy = card_x + 92.0, card_y + 108.0
+    arrow_col = TESLA_DAY_BLUE if light else TESLA_CYAN
     if snap["turn_info"] > 0:
-      hs.maneuver_arrow(snap["turn_info"], icon_cx, icon_cy, 0.84, TESLA_CYAN)
+      hs.maneuver_arrow(snap["turn_info"], icon_cx, icon_cy, 0.84, arrow_col)
     else:
-      hs.polyline([(icon_cx, icon_cy + 40), (icon_cx, icon_cy - 38)], 10.0, TESLA_BLUE)
-      hs.polyline([(icon_cx - 26, icon_cy - 10), (icon_cx, icon_cy - 38), (icon_cx + 26, icon_cy - 10)], 10.0, TESLA_CYAN)
+      hs.polyline([(icon_cx, icon_cy + 40), (icon_cx, icon_cy - 38)], 10.0, arrow_col)
+      hs.polyline([(icon_cx - 26, icon_cy - 10), (icon_cx, icon_cy - 38), (icon_cx + 26, icon_cy - 10)], 10.0, arrow_col)
 
     tx = card_x + 178.0
+    primary_ink = TESLA_DAY_INK if light else hs.TEXT
+    sub_ink = TESLA_DAY_INK_SUB if light else hs.rgba(255, 255, 255, 190)
+    road_ink = hs.rgba(24, 34, 52, 248) if light else hs.rgba(255, 255, 255, 242)
     if snap["dist_turn"] > 0:
       val_s, unit_s = _format_dist_parts(snap["dist_turn"])
-      dw = self._type.draw(val_s, tx, card_y + 122.0, 118.0, hs.TEXT, hs.BOLD, spacing=-3.5)
-      self._type.draw(unit_s, tx + dw + 10.0, card_y + 122.0, 58.0, hs.rgba(255, 255, 255, 190), hs.SEMI)
+      dw = self._type.draw(val_s, tx, card_y + 122.0, 118.0, primary_ink, hs.BOLD, spacing=-3.5)
+      self._type.draw(unit_s, tx + dw + 10.0, card_y + 122.0, 58.0, sub_ink, hs.SEMI)
     road_str = snap["tbt_text"] or "경로 안내 중"
     road_el = _fit_text(self._type, road_str, 54.0, card_w - 210.0, hs.BOLD)
-    self._type.draw(road_el, tx, card_y + 198.0, 54.0, hs.rgba(255, 255, 255, 242), hs.BOLD)
+    self._type.draw(road_el, tx, card_y + 198.0, 54.0, road_ink, hs.BOLD)
 
     prog_y = card_y + 234.0
     prog_w = card_w - 72.0
-    hs.pill(card_x + 36.0, prog_y, prog_w, 12.0, hs.rgba(255, 255, 255, 36))
+    hs.pill(card_x + 36.0, prog_y, prog_w, 12.0, hs.rgba(18, 32, 56, 28) if light else hs.rgba(255, 255, 255, 36))
     frac = 1.0 - min(1.0, max(0.0, snap["dist_turn"] / 1200.0)) if snap["dist_turn"] > 0 else 0.55
     fill_w = max(40.0, prog_w * max(0.14, frac))
-    hs.ellipse_glow(card_x + 36.0 + fill_w * 0.5, prog_y + 6.0, fill_w * 0.55, 22.0, hs.rgba(68, 178, 255, 98))
-    hs.gradient_rect(card_x + 36.0, prog_y, fill_w, 12.0, 6.0, (hs.rgba(37, 124, 255, 255), hs.rgba(108, 199, 255, 255)))
+    if not light:
+      hs.ellipse_glow(card_x + 36.0 + fill_w * 0.5, prog_y + 6.0, fill_w * 0.55, 22.0, hs.rgba(68, 178, 255, 98))
+    hs.gradient_rect(card_x + 36.0, prog_y, fill_w, 12.0, 6.0, (hs.rgba(16, 108, 244, 255), hs.rgba(68, 174, 255, 255)))
 
     if has_eta:
       eta_y = card_y + 304.0
       arr_str, min_str = _format_eta(snap["remain_time"])
       rem_km = f"{snap['remain_dist'] / 1000.0:.1f}" if snap["remain_dist"] >= 1000.0 else f"{int(round(snap['remain_dist']))}m"
-      self._type.draw_mid(arr_str, card_x + 36.0, eta_y, 54.0, hs.TEXT, hs.BOLD)
-      self._type.draw_mid(f"{min_str}분", card_x + card_w * 0.52, eta_y, 54.0, TESLA_CYAN, hs.BOLD, align=0.5)
+      self._type.draw_mid(arr_str, card_x + 36.0, eta_y, 54.0, primary_ink, hs.BOLD)
+      self._type.draw_mid(f"{min_str}분", card_x + card_w * 0.52, eta_y, 54.0,
+                          TESLA_DAY_BLUE if light else TESLA_CYAN, hs.BOLD, align=0.5)
       dist_lbl = f"{rem_km} km" if snap["remain_dist"] >= 1000.0 else rem_km
-      self._type.draw_mid(dist_lbl, card_x + card_w - 36.0, eta_y, 54.0, hs.rgba(255, 255, 255, 232), hs.BOLD, align=1.0)
+      self._type.draw_mid(dist_lbl, card_x + card_w - 36.0, eta_y, 54.0,
+                          hs.rgba(52, 66, 90, 240) if light else hs.rgba(255, 255, 255, 232), hs.BOLD, align=1.0)
 
     hs.zones["tpms"] = (card_x, card_y, card_w, card_h)
 
@@ -794,6 +956,7 @@ class TeslaHudRenderer(Widget):
     anchor = self._lead_3d_anchor
     if anchor is None:
       return
+    light = self._day_mode
     sx, sy, d_rel, v_kph, closing = anchor
     unit = "km/h" if ui_state.is_metric else "mph"
     v_disp = v_kph if ui_state.is_metric else v_kph * 0.621371
@@ -813,26 +976,47 @@ class TeslaHudRenderer(Widget):
       max_x = min(max_x, tpms_zone[0] - pw - 20.0)
     px = max(rect.x + 620.0, min(max_x, sx - pw * 0.5))
 
-    ring_col = hs.rgba(255, 86, 78, 248) if closing else hs.rgba(103, 196, 255, 224)
-    fill_col = hs.rgba(52, 12, 16, 238) if closing else hs.rgba(10, 17, 30, 236)
-    spd_col = hs.rgba(255, 98, 90, 255) if closing else hs.rgba(255, 255, 255, 255)
-    unit_col = hs.rgba(255, 178, 172, 220) if closing else hs.rgba(255, 255, 255, 178)
-    dist_col = hs.rgba(255, 198, 194, 224) if closing else hs.rgba(164, 198, 228, 224)
+    if light:
+      if closing:
+        ring_col = hs.rgba(255, 255, 255, 235)
+        stem_col = hs.rgba(220, 34, 42, 240)
+        fill_col = hs.rgba(218, 34, 42, 244)
+        spd_col = hs.rgba(255, 255, 255, 255)
+        unit_col = hs.rgba(255, 224, 220, 235)
+        dist_col = hs.rgba(255, 232, 228, 245)
+        sep_col = hs.rgba(255, 255, 255, 96)
+      else:
+        ring_col = hs.rgba(20, 118, 246, 238)
+        stem_col = ring_col
+        fill_col = hs.rgba(255, 255, 255, 246)
+        spd_col = hs.rgba(14, 21, 34, 255)
+        unit_col = hs.rgba(76, 94, 120, 225)
+        dist_col = hs.rgba(66, 94, 130, 240)
+        sep_col = hs.rgba(18, 32, 56, 48)
+    else:
+      ring_col = hs.rgba(255, 86, 78, 248) if closing else hs.rgba(103, 196, 255, 224)
+      stem_col = hs.with_alpha(ring_col, 215)
+      fill_col = hs.rgba(52, 12, 16, 238) if closing else hs.rgba(10, 17, 30, 236)
+      spd_col = hs.rgba(255, 98, 90, 255) if closing else hs.rgba(255, 255, 255, 255)
+      unit_col = hs.rgba(255, 178, 172, 220) if closing else hs.rgba(255, 255, 255, 178)
+      dist_col = hs.rgba(255, 198, 194, 224) if closing else hs.rgba(164, 198, 228, 224)
+      sep_col = hs.rgba(255, 255, 255, 68)
 
     if closing:
-      hs.ellipse_glow(px + pw * 0.5, py + ph * 0.5, pw * 0.62, ph * 0.90, hs.rgba(255, 62, 58, 86))
-    rl.draw_line_ex(rl.Vector2(px + pw * 0.5, py + ph), rl.Vector2(sx, sy), 4.0, hs.with_alpha(ring_col, 215))
+      hs.ellipse_glow(px + pw * 0.5, py + ph * 0.5, pw * 0.62, ph * 0.90, hs.rgba(232, 42, 46, 76 if light else 86))
+    rl.draw_line_ex(rl.Vector2(px + pw * 0.5, py + ph), rl.Vector2(sx, sy), 4.0, stem_col)
     hs.chip(px, py, pw, ph, fill=fill_col, ring=ring_col, ring_width=3.8 if closing else 3.4)
 
     cy = py + ph * 0.5
     tx = px + 32.0
-    hs.ellipse_glow(tx + w_spd * 0.5, cy, max(62.0, w_spd * 0.68), 44.0,
-                    hs.rgba(255, 68, 62, 64) if closing else hs.rgba(72, 184, 255, 58))
+    if not light:
+      hs.ellipse_glow(tx + w_spd * 0.5, cy, max(62.0, w_spd * 0.68), 44.0,
+                      hs.rgba(255, 68, 62, 64) if closing else hs.rgba(72, 184, 255, 58))
     self._type.draw_mid(spd_num, tx, cy - 2.0, 98.0, spd_col, hs.BOLD, spacing=-3.0)
     tx += w_spd + 6.0
     self._type.draw_mid(unit, tx, cy + 21.0, 28.0, unit_col, hs.SEMI)
     tx += w_unit + 22.0
-    rl.draw_rectangle(int(tx), int(cy - 26.0), 2, 52, hs.rgba(255, 255, 255, 68))
+    rl.draw_rectangle(int(tx), int(cy - 26.0), 2, 52, sep_col)
     tx += 24.0
     self._type.draw_mid(dist_txt, tx, cy + 1.0, 44.0, dist_col, hs.SEMI)
 
@@ -1063,6 +1247,7 @@ class TeslaHudRenderer(Widget):
   # 3-Mode Bottom Swipe Dock (`3D FSD | AR 카메라 | Quiet`, 6-inch Finger-Friendly!)
   # ------------------------------------------------------------------
   def _draw_mode_dock(self, rect: rl.Rectangle, now: float) -> None:
+    light = self._is_light_ui
     cx = rect.x + rect.width * 0.5
     bot = rect.y + rect.height
     self._dock_tab_rects = []
@@ -1071,7 +1256,8 @@ class TeslaHudRenderer(Widget):
     hw, hh = 220.0, 8.0
     hx, hy = cx - hw * 0.5, bot - 22.0
     self._handle_rect = (hx, hy, hw, hh)
-    hs.pill(hx, hy, hw, hh, hs.rgba(255, 255, 255, 86 if self._mode == TESLA_MODE_QUIET else 74))
+    handle_col = hs.rgba(20, 32, 52, 84) if light else hs.rgba(255, 255, 255, 86 if self._mode == TESLA_MODE_QUIET else 74)
+    hs.pill(hx, hy, hw, hh, handle_col)
 
     if self._mode == TESLA_MODE_QUIET:
       alpha = 1.0
@@ -1092,9 +1278,9 @@ class TeslaHudRenderer(Widget):
     dx = cx - dock_w * 0.5
     dy = bot - 38.0 - dock_h
 
-    hs.chip(dx, dy, dock_w, dock_h,
-            fill=hs.rgba(14, 20, 32, int(226 * alpha)),
-            ring=hs.rgba(255, 255, 255, int(62 * alpha)), ring_width=2.2, shadow=(alpha > 0.5))
+    dock_fill = hs.rgba(255, 255, 255, int(238 * alpha)) if light else hs.rgba(14, 20, 32, int(226 * alpha))
+    dock_ring = hs.rgba(18, 32, 56, int(40 * alpha)) if light else hs.rgba(255, 255, 255, int(62 * alpha))
+    hs.chip(dx, dy, dock_w, dock_h, fill=dock_fill, ring=dock_ring, ring_width=2.2, shadow=(alpha > 0.5))
 
     tx = dx + pad
     ty = dy + pad
@@ -1102,22 +1288,31 @@ class TeslaHudRenderer(Widget):
       self._dock_tab_rects.append((tx, ty, tw, tab_h))
       active = (idx == self._mode)
       if active:
-        hs.pill(tx, ty, tw, tab_h, hs.rgba(255, 255, 255, int(52 * alpha)),
-                hs.rgba(255, 255, 255, int(82 * alpha)))
-        dot_x = tx + 38.0
-        hs.glow(dot_x, ty + tab_h * 0.5, 20.0, hs.rgba(71, 174, 255, int(138 * alpha)))
-        hs.dot(dot_x, ty + tab_h * 0.5, 8.0, hs.rgba(71, 174, 255, int(255 * alpha)))
-        self._type.draw_mid(label, tx + 62.0 + (tw - 78.0) * 0.5, ty + tab_h * 0.5, 46.0,
-                            hs.rgba(255, 255, 255, int(255 * alpha)), hs.BOLD, align=0.5)
+        if light:
+          hs.pill(tx, ty, tw, tab_h, hs.rgba(16, 108, 244, int(28 * alpha)),
+                  hs.rgba(16, 108, 244, int(92 * alpha)))
+          dot_x = tx + 38.0
+          hs.dot(dot_x, ty + tab_h * 0.5, 8.5, hs.rgba(14, 108, 242, int(255 * alpha)))
+          self._type.draw_mid(label, tx + 62.0 + (tw - 78.0) * 0.5, ty + tab_h * 0.5, 46.0,
+                              hs.rgba(14, 21, 34, int(255 * alpha)), hs.BOLD, align=0.5)
+        else:
+          hs.pill(tx, ty, tw, tab_h, hs.rgba(255, 255, 255, int(52 * alpha)),
+                  hs.rgba(255, 255, 255, int(82 * alpha)))
+          dot_x = tx + 38.0
+          hs.glow(dot_x, ty + tab_h * 0.5, 20.0, hs.rgba(71, 174, 255, int(138 * alpha)))
+          hs.dot(dot_x, ty + tab_h * 0.5, 8.0, hs.rgba(71, 174, 255, int(255 * alpha)))
+          self._type.draw_mid(label, tx + 62.0 + (tw - 78.0) * 0.5, ty + tab_h * 0.5, 46.0,
+                              hs.rgba(255, 255, 255, int(255 * alpha)), hs.BOLD, align=0.5)
       else:
-        self._type.draw_mid(label, tx + tw * 0.5, ty + tab_h * 0.5, 46.0,
-                            hs.rgba(255, 255, 255, int(168 * alpha)), hs.SEMI, align=0.5)
+        idle_col = hs.rgba(72, 88, 112, int(224 * alpha)) if light else hs.rgba(255, 255, 255, int(168 * alpha))
+        self._type.draw_mid(label, tx + tw * 0.5, ty + tab_h * 0.5, 46.0, idle_col, hs.SEMI, align=0.5)
       tx += tw + gap
 
   # ------------------------------------------------------------------
   # Global Safety Overlays (All 3 Modes, 6-inch C3X Scale)
   # ------------------------------------------------------------------
   def _draw_safety_overlays(self, rect: rl.Rectangle, snap: dict, now: float) -> None:
+    light = self._is_light_ui
     # 1. Tesla-style Blind-Spot Crimson Screen-Edge Glow
     pulse = 0.72 + 0.28 * math.sin(now * 8.0)
     if snap["left_bsm"]:
@@ -1135,15 +1330,17 @@ class TeslaHudRenderer(Widget):
     blink_on = (int(now * 3.0) % 2) == 0
     if blink_on:
       if snap["left_blink"]:
-        col = TESLA_RED if snap["left_bsm"] else TESLA_EMERALD
+        col = (TESLA_DAY_RED if light else TESLA_RED) if snap["left_bsm"] else (TESLA_DAY_EMERALD if light else TESLA_EMERALD)
         bx, by = rect.x + 686.0, rect.y + 72.0
-        hs.glow(bx, by, 58.0, hs.with_alpha(col, 122))
+        if not light:
+          hs.glow(bx, by, 58.0, hs.with_alpha(col, 122))
         hs.polyline([(bx + 24, by - 28), (bx - 18, by), (bx + 24, by + 28)], 12.0, col)
         hs.polyline([(bx + 56, by - 28), (bx + 14, by), (bx + 56, by + 28)], 9.0, hs.with_alpha(col, 180))
       if snap["right_blink"]:
-        col = TESLA_RED if snap["right_bsm"] else TESLA_EMERALD
+        col = (TESLA_DAY_RED if light else TESLA_RED) if snap["right_bsm"] else (TESLA_DAY_EMERALD if light else TESLA_EMERALD)
         bx, by = rect.x + rect.width - 780.0, rect.y + 72.0
-        hs.glow(bx, by, 58.0, hs.with_alpha(col, 122))
+        if not light:
+          hs.glow(bx, by, 58.0, hs.with_alpha(col, 122))
         hs.polyline([(bx - 24, by - 28), (bx + 18, by), (bx - 24, by + 28)], 12.0, col)
         hs.polyline([(bx - 56, by - 28), (bx - 14, by), (bx - 56, by + 28)], 9.0, hs.with_alpha(col, 180))
 
@@ -1156,10 +1353,16 @@ class TeslaHudRenderer(Widget):
       else:
         px = rect.x + 56.0
         py = rect.y + (836.0 if self._mode == TESLA_MODE_QUIET else 902.0)
-      hs.ellipse_glow(px + pw * 0.5, py + ph * 0.5, pw * 0.64, ph * 0.92, hs.rgba(46, 229, 157, 94))
-      hs.chip(px, py, pw, ph, fill=hs.rgba(10, 26, 22, 238), ring=TESLA_EMERALD, ring_width=3.6)
-      hs.dot(px + 54.0, py + ph * 0.5, 14.0, TESLA_EMERALD)
-      self._type.draw_mid("HOLD", px + 88.0 + (pw - 118.0) * 0.5, py + ph * 0.5, 68.0, hs.TEXT, hs.BOLD, align=0.5, spacing=3.0)
+      if light:
+        hs.chip(px, py, pw, ph, fill=hs.rgba(232, 252, 242, 246), ring=TESLA_DAY_EMERALD, ring_width=3.8)
+        hs.dot(px + 54.0, py + ph * 0.5, 14.0, TESLA_DAY_EMERALD)
+        self._type.draw_mid("HOLD", px + 88.0 + (pw - 118.0) * 0.5, py + ph * 0.5, 68.0,
+                            hs.rgba(4, 102, 68, 255), hs.BOLD, align=0.5, spacing=3.0)
+      else:
+        hs.ellipse_glow(px + pw * 0.5, py + ph * 0.5, pw * 0.64, ph * 0.92, hs.rgba(46, 229, 157, 94))
+        hs.chip(px, py, pw, ph, fill=hs.rgba(10, 26, 22, 238), ring=TESLA_EMERALD, ring_width=3.6)
+        hs.dot(px + 54.0, py + ph * 0.5, 14.0, TESLA_EMERALD)
+        self._type.draw_mid("HOLD", px + 88.0 + (pw - 118.0) * 0.5, py + ph * 0.5, 68.0, hs.TEXT, hs.BOLD, align=0.5, spacing=3.0)
 
     # 4. Traffic-Light Top-Exit Manual Start Prompt (yields to AlertRenderer if banner active)
     if snap["tlv_top_exit"] and not self._banner_alert_active():
@@ -1177,8 +1380,10 @@ class TeslaHudRenderer(Widget):
       ph = 84.0
       px = rect.x + 56.0
       py = rect.y + rect.height - 118.0
-      hs.chip(px, py, pw, ph, fill=hs.rgba(52, 16, 18, 236), ring=TESLA_RED, ring_width=3.0)
-      self._type.draw_mid(txt, px + pw * 0.5, py + ph * 0.5, 50.0, hs.rgba(255, 228, 224, 255), hs.BOLD, align=0.5)
+      fill_tpms = hs.rgba(218, 34, 42, 242) if light else hs.rgba(52, 16, 18, 236)
+      ring_tpms = hs.rgba(255, 255, 255, 220) if light else TESLA_RED
+      hs.chip(px, py, pw, ph, fill=fill_tpms, ring=ring_tpms, ring_width=3.0)
+      self._type.draw_mid(txt, px + pw * 0.5, py + ph * 0.5, 50.0, hs.rgba(255, 244, 242, 255), hs.BOLD, align=0.5)
 
     # 6. eGPU / Jetlink badge if hardware present
     if getattr(ui_state, "usbgpu_present", False):
@@ -1189,15 +1394,19 @@ class TeslaHudRenderer(Widget):
         getattr(ui_state, "usbgpu_startup_failed", False),
         getattr(ui_state, "usbgpu_compile_pending", False),
       )
-      col = TESLA_EMERALD if st == "active" else (TESLA_RED if st == "error" else TESLA_AMBER)
+      col = (TESLA_DAY_EMERALD if light else TESLA_EMERALD) if st == "active" else (
+        (TESLA_DAY_RED if light else TESLA_RED) if st == "error" else (TESLA_DAY_AMBER if light else TESLA_AMBER)
+      )
       lbl = f"eGPU {st.upper()}"
       pw = self._type.width(lbl, 40.0, hs.BOLD) + 86.0
       ph = 68.0
       bx = rect.x + 56.0
       by = rect.y + rect.height - 96.0
-      hs.chip(bx, by, pw, ph, fill=hs.rgba(14, 20, 30, 212), ring=hs.with_alpha(col, 160), ring_width=2.2)
+      hs.chip(bx, by, pw, ph,
+              fill=hs.rgba(255, 255, 255, 236) if light else hs.rgba(14, 20, 30, 212),
+              ring=hs.with_alpha(col, 190), ring_width=2.2)
       hs.dot(bx + 32.0, by + ph * 0.5, 9.5, col)
-      self._type.draw_mid(lbl, bx + 56.0, by + ph * 0.5, 40.0, hs.TEXT, hs.BOLD)
+      self._type.draw_mid(lbl, bx + 56.0, by + ph * 0.5, 40.0, TESLA_DAY_INK if light else hs.TEXT, hs.BOLD)
 
   @staticmethod
   def _banner_alert_active() -> bool:
@@ -1224,7 +1433,7 @@ class TeslaHudRenderer(Widget):
     clock_txt = self._update_clock()
 
     # Extreme-left vertical EV power / regen bar (consistent across all 3 modes)
-    self._draw_power_regen_bar(rect, snap["accel"], quiet=(self._mode == TESLA_MODE_QUIET))
+    self._draw_power_regen_bar(rect, snap["accel"], quiet=(self._mode == TESLA_MODE_QUIET), light=self._is_light_ui)
 
     if self._mode == TESLA_MODE_QUIET:
       self._draw_quiet_layout(rect, snap, clock_txt)
@@ -1258,4 +1467,5 @@ class TeslaHudRenderer(Widget):
     if 0.0 <= switch_dt < 0.22:
       fade_a = int(68 * (1.0 - switch_dt / 0.22) ** 2)
       if fade_a > 1:
-        rl.draw_rectangle_rec(rect, hs.rgba(4, 6, 12, fade_a))
+        shimmer = hs.rgba(235, 240, 248, fade_a) if self._is_light_ui else hs.rgba(4, 6, 12, fade_a)
+        rl.draw_rectangle_rec(rect, shimmer)

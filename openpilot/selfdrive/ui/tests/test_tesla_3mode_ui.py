@@ -278,3 +278,44 @@ def test_carrot_link_badge_maps_active_carrot_to_apm_and_apn(tesla_env, monkeypa
   assert w_apn > 0.0
   assert drawn_labels[-1] == "APN"
   assert drawn_dots[-1] == thud.TESLA_EMERALD
+
+
+def test_day_night_controller_snaps_on_first_sample_and_debounces_tunnels(tesla_env):
+  _, thud, _ = tesla_env
+  ctrl = thud.TeslaDayNightController(default_day=False)
+  assert ctrl.is_day is False
+
+  # Sensor unavailable (-1) preserves initial clock-seeded state
+  assert ctrl.update(-1.0, now=10.0) is False
+
+  # First valid daylight sample snaps immediately to Day
+  assert ctrl.update(72.0, now=11.0) is True
+
+  # Brief highway overpass shadow (1.0 s dark dip) must NOT strobe to Night
+  for i in range(1, 11):
+    assert ctrl.update(10.0, now=11.0 + i * 0.1) is True
+
+  # Returning to sunlight clears pending transition
+  assert ctrl.update(75.0, now=12.2) is True
+
+  # Entering a real tunnel / night (sustained dark > EMA + 1.5s hold) switches cleanly to Night
+  t = 13.0
+  for _ in range(60):
+    t += 0.1
+    ctrl.update(8.0, now=t)
+  assert ctrl.is_day is False
+
+  # Exiting tunnel into sustained sunlight switches cleanly back to Day
+  for _ in range(60):
+    t += 0.1
+    ctrl.update(78.0, now=t)
+  assert ctrl.is_day is True
+
+  # Light HUD flag activates ONLY in Mode 0 (3D FSD) when day_mode is True
+  hud = thud.TeslaHudRenderer()
+  hud.set_day_mode(True)
+  assert hud._is_light_ui is True
+  hud.set_mode(thud.TESLA_MODE_AR)
+  assert hud._is_light_ui is False
+  hud.set_mode(thud.TESLA_MODE_QUIET)
+  assert hud._is_light_ui is False

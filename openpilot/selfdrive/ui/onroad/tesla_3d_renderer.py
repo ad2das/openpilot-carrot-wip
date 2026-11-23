@@ -16,11 +16,17 @@ import pyray as rl
 from openpilot.selfdrive.ui.ui_state import UIStatus, ui_state
 from openpilot.system.ui.lib.application import GL_VERSION
 
-# Deep matte Tesla OLED horizon & twilight palette
-SKY_TOP = rl.Color(5, 8, 15, 255)
-SKY_HORIZON = rl.Color(15, 22, 36, 255)
-FOG_RGB = (9 / 255.0, 13 / 255.0, 22 / 255.0)
-FOG_COLOR = rl.Color(9, 13, 22, 255)
+# Deep matte Tesla OLED night horizon & twilight palette
+SKY_TOP = rl.Color(6, 10, 18, 255)
+SKY_HORIZON = rl.Color(18, 28, 46, 255)
+FOG_RGB = (11 / 255.0, 16 / 255.0, 27 / 255.0)
+FOG_COLOR = rl.Color(11, 16, 27, 255)
+
+# Clean Scandinavian Tesla FSD daytime studio light palette
+DAY_SKY_TOP = rl.Color(218, 227, 240, 255)
+DAY_SKY_HORIZON = rl.Color(238, 243, 249, 255)
+DAY_FOG_RGB = (234 / 255.0, 240 / 255.0, 247 / 255.0)
+DAY_FOG_COLOR = rl.Color(234, 240, 247, 255)
 
 # GLSL shaders compatible with OpenGL ES 3.0 (C3X Adreno 630) and Desktop GL 3.3+
 _LIT_VS = GL_VERSION + """
@@ -58,6 +64,7 @@ uniform float uFogDensity;
 uniform float uGlowStrength;
 uniform float uSpecular;
 uniform float uEmissive;
+uniform float uDayMode;
 
 out vec4 finalColor;
 
@@ -72,30 +79,38 @@ void main() {
   if (uEmissive > 0.5) {
     lit = base;
   } else {
-    // Hemisphere studio ambient
     float hemi = N.y * 0.5 + 0.5;
-    vec3 amb = mix(vec3(0.06, 0.08, 0.13), vec3(0.42, 0.52, 0.68), hemi) * 0.55;
-
-    // Softbox overhead-left key light
     vec3 Lkey = normalize(vec3(-0.48, 0.82, 0.42));
     float ndlKey = max(dot(N, Lkey), 0.0);
-    vec3 diffKey = vec3(0.88, 0.93, 1.0) * ndlKey * 0.78;
-
-    // Tesla cobalt-cyan right-front studio rim light
     vec3 Lrim = normalize(vec3(0.72, 0.34, -0.58));
     float ndlRim = max(dot(N, Lrim), 0.0);
-    vec3 diffRim = vec3(0.24, 0.64, 1.0) * ndlRim * 0.42;
 
-    // Subtle upward electric-blue bounce from road underglow onto ego lower flanks
+    // Night studio vs bright Scandinavian Tesla daytime studio lighting
+    vec3 ambNight = mix(vec3(0.08, 0.11, 0.17), vec3(0.46, 0.56, 0.72), hemi) * 0.58;
+    vec3 ambDay = mix(vec3(0.46, 0.51, 0.59), vec3(0.96, 0.98, 1.0), hemi) * 0.72;
+    vec3 amb = mix(ambNight, ambDay, uDayMode);
+
+    vec3 diffKeyNight = vec3(0.88, 0.93, 1.0) * ndlKey * 0.78;
+    vec3 diffKeyDay = vec3(1.0, 0.99, 0.98) * ndlKey * 0.58;
+    vec3 diffKey = mix(diffKeyNight, diffKeyDay, uDayMode);
+
+    vec3 diffRimNight = vec3(0.24, 0.64, 1.0) * ndlRim * 0.42;
+    vec3 diffRimDay = vec3(0.58, 0.76, 1.0) * ndlRim * 0.20;
+    vec3 diffRim = mix(diffRimNight, diffRimDay, uDayMode);
+
+    // Subtle upward electric-blue bounce from road underglow (muted in daylight)
     float underMask = clamp(1.0 - vWorldPos.y * 0.95, 0.0, 1.0) * clamp(1.0 - length(vWorldPos.xz) * 0.22, 0.0, 1.0);
-    vec3 underBounce = vec3(0.14, 0.58, 1.0) * max(-N.y * 0.55 + 0.45, 0.0) * underMask * uGlowStrength * 0.52;
+    float underScale = mix(0.52, 0.14, uDayMode);
+    vec3 underBounce = vec3(0.14, 0.58, 1.0) * max(-N.y * 0.55 + 0.45, 0.0) * underMask * uGlowStrength * underScale;
 
     // Crisp Blinn-Phong + Fresnel clearcoat on bodywork and glossy dark glass
     vec3 Hkey = normalize(Lkey + V);
     float specPow = mix(18.0, 72.0, uSpecular);
-    float spec = pow(max(dot(N, Hkey), 0.0), specPow) * uSpecular * 0.65;
-    float fres = pow(1.0 - max(dot(N, V), 0.0), 3.2) * uSpecular * 0.42;
-    vec3 specCol = vec3(0.76, 0.88, 1.0) * spec + vec3(0.32, 0.68, 1.0) * fres;
+    float spec = pow(max(dot(N, Hkey), 0.0), specPow) * uSpecular * mix(0.65, 0.52, uDayMode);
+    float fres = pow(1.0 - max(dot(N, V), 0.0), 3.2) * uSpecular * mix(0.42, 0.28, uDayMode);
+    vec3 specTint = mix(vec3(0.76, 0.88, 1.0), vec3(1.0, 1.0, 1.0), uDayMode);
+    vec3 fresTint = mix(vec3(0.32, 0.68, 1.0), vec3(0.74, 0.86, 1.0), uDayMode);
+    vec3 specCol = specTint * spec + fresTint * fres;
 
     lit = base * (amb + diffKey + diffRim) + underBounce + specCol;
   }
@@ -439,10 +454,11 @@ class Tesla3DRenderer:
     self._failed = False
     self._spline = _RoadSpline()
 
-    # Smooth animation state
+    # Smooth animation & day/night theme state
     self._dash_phase = 0.0
     self._last_t = time.monotonic()
     self._glow_ema = 1.0
+    self._day_mode = False
 
     # Exported screen anchor for floating lead pill in TeslaHudRenderer:
     # (screen_x, screen_y, d_rel_m, v_lead_kph, is_closing)
@@ -484,6 +500,13 @@ class Tesla3DRenderer:
     self._edge_steps = 48
     self._edge_model = None
 
+  def set_day_mode(self, is_day: bool) -> None:
+    self._day_mode = bool(is_day)
+
+  @property
+  def day_mode(self) -> bool:
+    return self._day_mode
+
   def _ensure_init(self) -> bool:
     if self._initialized:
       return True
@@ -506,6 +529,7 @@ class Tesla3DRenderer:
       "glow": rl.get_shader_location(self._lit_shader, "uGlowStrength"),
       "spec": rl.get_shader_location(self._lit_shader, "uSpecular"),
       "emissive": rl.get_shader_location(self._lit_shader, "uEmissive"),
+      "day": rl.get_shader_location(self._lit_shader, "uDayMode"),
     }
 
     self._path_shader = rl.load_shader_from_memory(_PATH_VS, _PATH_FS)
@@ -654,6 +678,10 @@ class Tesla3DRenderer:
     rl.rl_set_texture(0)
     if additive:
       rl.end_blend_mode()
+    else:
+      flush = getattr(rl, "rl_draw_render_batch_active", None)
+      if flush is not None:
+        flush()
     rl.rl_enable_backface_culling()
     rl.rl_enable_depth_mask()
 
@@ -685,14 +713,15 @@ class Tesla3DRenderer:
 
   def _draw_road_strip_rlgl(self, zs: np.ndarray, xs_center: np.ndarray,
                             x_offset: float, half_w: float, y: float,
-                            color: rl.Color, fog_fade: bool = True) -> None:
+                            color: rl.Color, fog_fade: bool = True,
+                            fog_rgb: tuple[float, float, float] = (11.0, 16.0, 27.0)) -> None:
     """Draws a curved flat strip on the road surface with distance fog baked into vertex color."""
     n = len(zs)
     if n < 2:
       return
     rl.rl_disable_backface_culling()
     rl.rl_begin(rl.RL_TRIANGLES)
-    fog_r, fog_g, fog_b = 9.0, 13.0, 22.0
+    fog_r, fog_g, fog_b = fog_rgb
     cam_z = float(self._cam.position.z)
     for i in range(n - 1):
       z0 = float(zs[i])
@@ -739,11 +768,15 @@ class Tesla3DRenderer:
     rl.rl_end()
     rl.rl_enable_backface_culling()
 
-  def _draw_barrier_wall(self, zs: np.ndarray, xs_center: np.ndarray, x_offset: float) -> None:
-    """Draws sleek low dark highway side barrier + subtle lit top cap."""
+  def _draw_barrier_wall(self, zs: np.ndarray, xs_center: np.ndarray, x_offset: float,
+                         day: bool = False) -> None:
+    """Draws sleek low highway side barrier + subtle lit top cap matched to day/night palette."""
     n = len(zs)
     if n < 2:
       return
+    wall_r, wall_g, wall_b = (172.0, 184.0, 202.0) if day else (34.0, 44.0, 64.0)
+    fog_r, fog_g, fog_b = (234.0, 240.0, 247.0) if day else (11.0, 16.0, 27.0)
+    cap_col = _rgba_color(230, 237, 246, 245) if day else _rgba_color(72, 92, 126, 240)
     rl.rl_disable_backface_culling()
     rl.rl_begin(rl.RL_TRIANGLES)
     cam_z = float(self._cam.position.z)
@@ -752,12 +785,12 @@ class Tesla3DRenderer:
       x0, x1 = float(xs_center[i]) + x_offset, float(xs_center[i + 1]) + x_offset
       f0 = 1.0 - math.exp(-((abs(cam_z - z0) * 0.0155) ** 2))
       f1 = 1.0 - math.exp(-((abs(cam_z - z1) * 0.0155) ** 2))
-      r0 = int(28 * (1.0 - f0) + 9 * f0)
-      g0 = int(36 * (1.0 - f0) + 13 * f0)
-      b0 = int(52 * (1.0 - f0) + 22 * f0)
-      r1 = int(28 * (1.0 - f1) + 9 * f1)
-      g1 = int(36 * (1.0 - f1) + 13 * f1)
-      b1 = int(52 * (1.0 - f1) + 22 * f1)
+      r0 = int(wall_r * (1.0 - f0) + fog_r * f0)
+      g0 = int(wall_g * (1.0 - f0) + fog_g * f0)
+      b0 = int(wall_b * (1.0 - f0) + fog_b * f0)
+      r1 = int(wall_r * (1.0 - f1) + fog_r * f1)
+      g1 = int(wall_g * (1.0 - f1) + fog_g * f1)
+      b1 = int(wall_b * (1.0 - f1) + fog_b * f1)
       rl.rl_color4ub(r0, g0, b0, 255)
       rl.rl_vertex3f(x0, 0.0, z0)
       rl.rl_color4ub(r0, g0, b0, 255)
@@ -773,10 +806,11 @@ class Tesla3DRenderer:
       rl.rl_vertex3f(x1, 0.0, z1)
     rl.rl_end()
     rl.rl_enable_backface_culling()
-    self._draw_road_strip_rlgl(zs, xs_center, x_offset, 0.08, 0.51, _rgba_color(64, 82, 114, 240))
+    self._draw_road_strip_rlgl(zs, xs_center, x_offset, 0.08, 0.51, cap_col, fog_rgb=(fog_r, fog_g, fog_b))
 
   def _update_and_draw_shader_ribbon(self, model, steps: int, z_start: float, z_end: float,
-                                     x_offset: float, half_w: float, y: float) -> None:
+                                     x_offset: float, half_w: float, y: float,
+                                     additive: bool = True) -> None:
     zs = np.linspace(z_start, z_end, steps + 1, dtype=np.float32)
     xs = self._spline.xs_at_zs(zs) + x_offset
     ts = np.linspace(0.0, 1.0, steps + 1, dtype=np.float32)
@@ -802,40 +836,48 @@ class Tesla3DRenderer:
     rl.update_mesh_buffer(mesh, 0, v_ptr, len(v_bytes), 0)
     rl.update_mesh_buffer(mesh, 1, u_ptr, len(u_bytes), 0)
 
-    rl.rl_disable_depth_mask()
+    # Disable backface culling BEFORE flushing queued rlgl road/barrier strips so double-sided
+    # road geometry renders intact before direct VAO shader ribbons draw on top.
     rl.rl_disable_backface_culling()
-    rl.begin_blend_mode(rl.BlendMode.BLEND_ADDITIVE)
+    flush = getattr(rl, "rl_draw_render_batch_active", None)
+    if flush is not None:
+      flush()
+    rl.rl_disable_depth_mask()
+    if additive:
+      rl.begin_blend_mode(rl.BlendMode.BLEND_ADDITIVE)
     rl.draw_model(model, rl.Vector3(0.0, 0.0, 0.0), 1.0, rl.WHITE)
-    rl.end_blend_mode()
+    if additive:
+      rl.end_blend_mode()
     rl.rl_enable_backface_culling()
     rl.rl_enable_depth_mask()
 
   def _draw_ego_ioniq5(self, glow_strength: float, braking: bool,
-                       left_blink_on: bool, right_blink_on: bool) -> None:
-    # Electric cyan-blue FSD active underglow pooled richly on dark asphalt
+                       left_blink_on: bool, right_blink_on: bool, day: bool = False) -> None:
+    # Electric cobalt FSD active underglow (alpha-blended in daylight so it never washes out)
     if glow_strength > 0.02:
       self._draw_ground_quad(self._under_tex, 0.0, 0.020, 0.16, 6.1, 8.4,
-                             alpha=glow_strength * 0.98, additive=True)
+                             alpha=glow_strength * (0.42 if day else 0.98), additive=not day)
 
     # Grounded ambient occlusion shadow under wheels & chassis
-    self._draw_ground_quad(self._shadow_tex, 0.0, 0.024, 0.0, 2.38, 4.95, alpha=0.94, additive=False)
+    self._draw_ground_quad(self._shadow_tex, 0.0, 0.024, 0.0, 2.38, 4.95,
+                           alpha=0.58 if day else 0.94, additive=False)
 
-    # Main beveled pearl-silver bodywork
+    # Main beveled pearl-silver / pearl-white bodywork
+    body = _rgba_color(246, 249, 254) if day else _rgba_color(202, 214, 232)
+    glass = _rgba_color(24, 34, 50) if day else _rgba_color(9, 15, 26)
+    trim = _rgba_color(44, 54, 70) if day else _rgba_color(22, 30, 44)
     self._set_lit_uniforms(specular=0.45, emissive=0.0, glow=glow_strength)
-    rl.draw_model(self._ego_body_model, rl.Vector3(0.0, 0.0, 0.0), 1.0, _rgba_color(202, 214, 232))
+    rl.draw_model(self._ego_body_model, rl.Vector3(0.0, 0.0, 0.0), 1.0, body)
 
     # Glossy dark side greenhouse glass (flush across left/right flanks!)
     self._set_lit_uniforms(specular=0.92, emissive=0.0, glow=glow_strength * 0.25)
-    rl.draw_model(self._ego_side_glass_model, rl.Vector3(0.0, 0.0, 0.0), 1.0, _rgba_color(10, 17, 30))
-
-    trim = _rgba_color(22, 30, 44)
-    glass = _rgba_color(9, 15, 26)
-    body = _rgba_color(202, 214, 232)
+    rl.draw_model(self._ego_side_glass_model, rl.Vector3(0.0, 0.0, 0.0), 1.0, glass)
 
     # Lower EV rocker skirt & rear diffuser
     self._draw_lit_box((0.0, 0.34, 0.02), (1.84, 0.21, 4.30), trim, specular=0.22)
     self._draw_lit_box((0.0, 0.35, 2.26), (1.72, 0.15, 0.12), trim, specular=0.22)
-    self._draw_lit_box((0.0, 0.62, 2.30), (0.58, 0.13, 0.03), _rgba_color(150, 164, 186), specular=0.18)
+    self._draw_lit_box((0.0, 0.62, 2.30), (0.58, 0.13, 0.03),
+                       _rgba_color(224, 230, 240) if day else _rgba_color(150, 164, 186), specular=0.18)
 
     # Flush panoramic dark glass roof (seated seamlessly into roof crown at y=1.555!)
     self._draw_lit_box((0.0, 1.560, 0.36), (1.26, 0.024, 1.48), glass, specular=0.94)
@@ -854,8 +896,8 @@ class Tesla3DRenderer:
       self._draw_lit_box((side * 0.94, 1.09, -0.56), (0.20, 0.095, 0.14), body, specular=0.45)
 
     # 4 detailed wheels + gunmetal aero alloy rims
-    tire_col = _rgba_color(16, 21, 30)
-    rim_col = _rgba_color(118, 134, 158)
+    tire_col = _rgba_color(26, 32, 42) if day else _rgba_color(16, 21, 30)
+    rim_col = _rgba_color(150, 164, 184) if day else _rgba_color(118, 134, 158)
     for wx, wz in ((-0.87, -1.36), (0.87, -1.36), (-0.87, 1.38), (0.87, 1.38)):
       self._set_lit_uniforms(specular=0.10, emissive=0.0)
       rl.draw_model_ex(
@@ -893,20 +935,27 @@ class Tesla3DRenderer:
     for c in range(-3, 4):
       self._draw_lit_box((c * 0.092, 0.97, 2.308), (0.050, 0.026, 0.025), red_mid, emissive=1.0)
 
-    # Refined taillight bloom (boosted on braking; amber halo on active turn signal)
-    red_alpha = 1.0 if braking else 0.72
+    # Refined taillight bloom (boosted on braking; softer in daylight so it doesn't wash out)
+    red_alpha = (0.52 if braking else 0.24) if day else (1.0 if braking else 0.72)
     for side in (-1.0, 1.0):
       self._draw_vertical_glow(self._red_glow_tex, side * 0.60, 0.97, 2.36, 0.96, 0.40, alpha=red_alpha)
       if (side < 0 and left_blink_on) or (side > 0 and right_blink_on):
-        self._draw_vertical_glow(self._amber_glow_tex, side * 0.76, 0.97, 2.38, 0.76, 0.42, alpha=1.0)
+        self._draw_vertical_glow(self._amber_glow_tex, side * 0.76, 0.97, 2.38, 0.76, 0.42,
+                                 alpha=0.65 if day else 1.0)
 
-  def _draw_traffic_car(self, cx: float, cz: float, yaw_rad: float, is_suv: bool, is_lead: bool) -> None:
+  def _draw_traffic_car(self, cx: float, cz: float, yaw_rad: float, is_suv: bool,
+                        is_lead: bool, day: bool = False) -> None:
     if is_lead:
-      self._draw_ground_quad(self._lead_tex, cx, 0.026, cz, 4.2, 6.6, alpha=0.88, additive=True)
-    self._draw_ground_quad(self._shadow_tex, cx, 0.022, cz, 2.5, 5.2, alpha=0.90, additive=False)
+      self._draw_ground_quad(self._lead_tex, cx, 0.026, cz, 4.4, 6.8,
+                             alpha=0.74 if day else 0.88, additive=not day)
+    self._draw_ground_quad(self._shadow_tex, cx, 0.022, cz, 2.5, 5.2,
+                           alpha=(0.56 if is_lead else 0.44) if day else 0.90, additive=False)
 
     yaw_deg = math.degrees(yaw_rad)
-    body_col = _rgba_color(148, 164, 188) if is_lead else _rgba_color(100, 114, 136)
+    if day:
+      body_col = _rgba_color(134, 152, 178) if is_lead else _rgba_color(168, 180, 198)
+    else:
+      body_col = _rgba_color(156, 172, 196) if is_lead else _rgba_color(110, 126, 150)
     model = self._suv_body_model if is_suv else self._sedan_body_model
 
     self._set_lit_uniforms(specular=0.35, emissive=0.0, glow=0.0)
@@ -921,16 +970,16 @@ class Tesla3DRenderer:
 
     roof_h = 1.66 if is_suv else 1.42
     rw_z = 1.92 if is_suv else 1.62
-    glass_col = _rgba_color(16, 23, 36)
+    glass_col = _rgba_color(32, 42, 58) if day else _rgba_color(16, 23, 36)
     self._draw_lit_box(to_world(0.0, roof_h - 0.24, rw_z), (1.32, 0.34, 0.08), glass_col,
                        rot_axis=(0.0, 1.0, 0.0), rot_deg=yaw_deg, specular=0.82)
 
-    tl_col = _rgba_color(255, 62, 77) if is_lead else _rgba_color(210, 50, 62)
+    tl_col = _rgba_color(240, 42, 54) if is_lead else _rgba_color(205, 52, 62)
     for side in (-1.0, 1.0):
       self._draw_lit_box(to_world(side * 0.56, 0.94, 2.25), (0.44, 0.095, 0.05), tl_col,
                          rot_axis=(0.0, 1.0, 0.0), rot_deg=yaw_deg, emissive=1.0)
 
-    tire_col = _rgba_color(15, 20, 29)
+    tire_col = _rgba_color(28, 34, 44) if day else _rgba_color(15, 20, 29)
     for wx, wz in ((-0.86, -1.30), (0.86, -1.30), (-0.86, 1.30), (0.86, 1.30)):
       wp = to_world(wx, 0.35, wz)
       self._draw_lit_box(wp, (0.24, 0.66, 0.66), tire_col, rot_axis=(0.0, 1.0, 0.0), rot_deg=yaw_deg, specular=0.08)
@@ -1007,11 +1056,16 @@ class Tesla3DRenderer:
     self._last_t = now
     self.lead_screen_anchor = None
 
-    # 1. Twilight vertical sky/horizon gradient matched to 3D exponential fog (#090D16)
+    day = self._day_mode
+
+    # 1. Sky/horizon gradient matched to 3D exponential fog (Daylight studio vs OLED night)
     x, y, w, h = int(rect.x), int(rect.y), int(rect.width), int(rect.height)
     hor_h = int(h * 0.34)
-    rl.draw_rectangle_gradient_v(x, y, w, hor_h, SKY_TOP, SKY_HORIZON)
-    rl.draw_rectangle_gradient_v(x, y + hor_h, w, h - hor_h, SKY_HORIZON, FOG_COLOR)
+    sky_top = DAY_SKY_TOP if day else SKY_TOP
+    sky_hor = DAY_SKY_HORIZON if day else SKY_HORIZON
+    fog_c = DAY_FOG_COLOR if day else FOG_COLOR
+    rl.draw_rectangle_gradient_v(x, y, w, hor_h, sky_top, sky_hor)
+    rl.draw_rectangle_gradient_v(x, y + hor_h, w, h - hor_h, sky_hor, fog_c)
 
     if not self._ensure_init():
       return
@@ -1058,10 +1112,13 @@ class Tesla3DRenderer:
     s = self._lit_shader
     L = self._lit_locs
     cam_pos = rl.ffi.new("float[3]", [self._cam.position.x, self._cam.position.y, self._cam.position.z])
-    fog_col = rl.ffi.new("float[3]", list(FOG_RGB))
+    fog_rgb_norm = DAY_FOG_RGB if day else FOG_RGB
+    fog_rgb_255 = (234.0, 240.0, 247.0) if day else (11.0, 16.0, 27.0)
+    fog_col = rl.ffi.new("float[3]", list(fog_rgb_norm))
     rl.set_shader_value(s, L["cam"], cam_pos, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
     rl.set_shader_value(s, L["fog_col"], fog_col, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
     rl.set_shader_value(s, L["fog_den"], rl.ffi.new("float *", 0.0155), rl.ShaderUniformDataType.SHADER_UNIFORM_FLOAT)
+    rl.set_shader_value(s, L["day"], rl.ffi.new("float *", 1.0 if day else 0.0), rl.ShaderUniformDataType.SHADER_UNIFORM_FLOAT)
 
     # Compute display Z for lead car (clamped nicely in visual perspective sweet spot)
     lead_vis_z = -52.0
@@ -1073,72 +1130,86 @@ class Tesla3DRenderer:
 
     rl.begin_mode_3d(self._cam)
 
-    # 2. Deep charcoal asphalt surface & center ego lane
+    # 2. Asphalt / architectural concrete surface & center ego lane
     road_zs = np.linspace(16.0, -165.0, 56, dtype=np.float32)
     road_xs = self._spline.xs_at_zs(road_zs)
     lw = self._spline.left_lane_w
     rw = self._spline.right_lane_w
     half_road = max(6.2, self._spline.left_edge_w, self._spline.right_edge_w)
 
-    # Outer dark ground apron & matte asphalt deck
-    self._draw_road_strip_rlgl(road_zs, road_xs, 0.0, 68.0, -0.025, _rgba_color(5, 7, 12, 255))
-    self._draw_road_strip_rlgl(road_zs, road_xs, 0.0, half_road, 0.0, _rgba_color(11, 15, 23, 255))
-    self._draw_road_strip_rlgl(road_zs, road_xs, (rw - lw) * 0.5, (lw + rw) * 0.5, 0.005, _rgba_color(15, 21, 34, 255))
+    apron_col = _rgba_color(220, 229, 240, 255) if day else _rgba_color(6, 9, 16, 255)
+    deck_col = _rgba_color(182, 194, 212, 255) if day else _rgba_color(15, 20, 31, 255)
+    ego_lane_col = _rgba_color(196, 208, 224, 255) if day else _rgba_color(21, 29, 44, 255)
 
-    # Solid muted silver-white outer shoulder lines
-    shoulder_col = _rgba_color(86, 104, 133, 186)
-    self._draw_road_strip_rlgl(road_zs, road_xs, -self._spline.left_edge_w, 0.075, 0.015, shoulder_col)
-    self._draw_road_strip_rlgl(road_zs, road_xs, self._spline.right_edge_w, 0.075, 0.015, shoulder_col)
+    self._draw_road_strip_rlgl(road_zs, road_xs, 0.0, 68.0, -0.025, apron_col, fog_rgb=fog_rgb_255)
+    self._draw_road_strip_rlgl(road_zs, road_xs, 0.0, half_road, 0.0, deck_col, fog_rgb=fog_rgb_255)
+    self._draw_road_strip_rlgl(road_zs, road_xs, (rw - lw) * 0.5, (lw + rw) * 0.5, 0.005, ego_lane_col, fog_rgb=fog_rgb_255)
+
+    # Solid outer shoulder lines
+    shoulder_col = _rgba_color(134, 149, 172, 224) if day else _rgba_color(94, 114, 146, 194)
+    self._draw_road_strip_rlgl(road_zs, road_xs, -self._spline.left_edge_w, 0.075, 0.015, shoulder_col, fog_rgb=fog_rgb_255)
+    self._draw_road_strip_rlgl(road_zs, road_xs, self._spline.right_edge_w, 0.075, 0.015, shoulder_col, fog_rgb=fog_rgb_255)
 
     # Scrolling crisp white dashed lane dividers
-    dash_col_l = _rgba_color(220, 230, 245, int(140 + 95 * min(1.0, self._spline.left_prob)))
-    dash_col_r = _rgba_color(220, 230, 245, int(140 + 95 * min(1.0, self._spline.right_prob)))
+    if day:
+      dash_col_l = _rgba_color(255, 255, 255, int(195 + 60 * min(1.0, self._spline.left_prob)))
+      dash_col_r = _rgba_color(255, 255, 255, int(195 + 60 * min(1.0, self._spline.right_prob)))
+    else:
+      dash_col_l = _rgba_color(224, 234, 248, int(146 + 98 * min(1.0, self._spline.left_prob)))
+      dash_col_r = _rgba_color(224, 234, 248, int(146 + 98 * min(1.0, self._spline.right_prob)))
     z_cur = 12.0 + self._dash_phase
     while z_cur > -148.0:
       dz = np.linspace(z_cur, z_cur - 3.8, 4, dtype=np.float32)
       dx = self._spline.xs_at_zs(dz)
-      self._draw_road_strip_rlgl(dz, dx, -lw, 0.068, 0.018, dash_col_l)
-      self._draw_road_strip_rlgl(dz, dx, rw, 0.068, 0.018, dash_col_r)
+      self._draw_road_strip_rlgl(dz, dx, -lw, 0.068, 0.018, dash_col_l, fog_rgb=fog_rgb_255)
+      self._draw_road_strip_rlgl(dz, dx, rw, 0.068, 0.018, dash_col_r, fog_rgb=fog_rgb_255)
       z_cur -= dash_period
 
     # Low sleek highway edge barriers
     bar_zs = np.linspace(14.0, -150.0, 42, dtype=np.float32)
     bar_xs = self._spline.xs_at_zs(bar_zs)
-    self._draw_barrier_wall(bar_zs, bar_xs, -(self._spline.left_edge_w + 0.90))
-    self._draw_barrier_wall(bar_zs, bar_xs, self._spline.right_edge_w + 0.90)
+    self._draw_barrier_wall(bar_zs, bar_xs, -(self._spline.left_edge_w + 0.90), day=day)
+    self._draw_barrier_wall(bar_zs, bar_xs, self._spline.right_edge_w + 0.90, day=day)
 
     # 3. Subtle glowing active lane-lock edges (crimson red if blind-spot occupied on that side!)
     for side_x, prob, is_bsm in ((-lw, self._spline.left_prob, left_bsm), (rw, self._spline.right_prob, right_bsm)):
       if is_bsm:
-        ecol = rl.ffi.new("float[3]", [1.0, 0.22, 0.24])
-        ea = 0.95
+        ecol = rl.ffi.new("float[3]", [0.95, 0.16, 0.20] if day else [1.0, 0.22, 0.24])
+        ea = 0.96
       elif engaged and prob > 0.25:
-        ecol = rl.ffi.new("float[3]", [0.22, 0.64, 1.0])
-        ea = 0.55 * min(1.0, prob + 0.25)
+        ecol = rl.ffi.new("float[3]", [0.10, 0.48, 0.98] if day else [0.22, 0.64, 1.0])
+        ea = (0.72 if day else 0.55) * min(1.0, prob + 0.25)
       else:
-        ecol = rl.ffi.new("float[3]", [0.42, 0.52, 0.68])
-        ea = 0.16
+        ecol = rl.ffi.new("float[3]", [0.48, 0.56, 0.68] if day else [0.42, 0.52, 0.68])
+        ea = 0.26 if day else 0.16
       rl.set_shader_value(self._edge_shader, self._edge_locs["col"], ecol, rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
       rl.set_shader_value(self._edge_shader, self._edge_locs["alpha"], rl.ffi.new("float *", ea), rl.ShaderUniformDataType.SHADER_UNIFORM_FLOAT)
-      self._update_and_draw_shader_ribbon(self._edge_model, self._edge_steps, 6.0, -68.0, side_x, 0.24 if is_bsm else 0.20, 0.022)
+      self._update_and_draw_shader_ribbon(self._edge_model, self._edge_steps, 6.0, -68.0, side_x,
+                                          0.24 if is_bsm else 0.20, 0.022, additive=not day)
 
     # 4. Iconic Tesla FSD luminous single trajectory ribbon
     path_end_z = max(-52.0, lead_vis_z + 2.4) if lead_info is not None else -52.0
     if engaged:
       if braking:
-        outer_c, mid_c, core_c, pa = [0.85, 0.18, 0.22], [1.0, 0.42, 0.36], [1.0, 0.88, 0.86], 0.94
+        if day:
+          outer_c, mid_c, core_c, pa = [0.88, 0.14, 0.20], [0.96, 0.24, 0.26], [1.0, 0.62, 0.60], 0.96
+        else:
+          outer_c, mid_c, core_c, pa = [0.85, 0.18, 0.22], [1.0, 0.42, 0.36], [1.0, 0.88, 0.86], 0.94
       else:
-        outer_c, mid_c, core_c, pa = [0.08, 0.44, 1.0], [0.28, 0.76, 1.0], [0.88, 0.97, 1.0], 0.96
+        if day:
+          outer_c, mid_c, core_c, pa = [0.05, 0.38, 0.96], [0.10, 0.52, 1.0], [0.46, 0.78, 1.0], 0.96
+        else:
+          outer_c, mid_c, core_c, pa = [0.08, 0.44, 1.0], [0.28, 0.76, 1.0], [0.88, 0.97, 1.0], 0.96
     elif override:
-      outer_c, mid_c, core_c, pa = [0.24, 0.54, 0.78], [0.56, 0.78, 0.95], [0.90, 0.96, 1.0], 0.58
+      outer_c, mid_c, core_c, pa = ([0.18, 0.48, 0.86], [0.36, 0.64, 0.94], [0.76, 0.88, 1.0], 0.72) if day else ([0.24, 0.54, 0.78], [0.56, 0.78, 0.95], [0.90, 0.96, 1.0], 0.58)
     else:
-      outer_c, mid_c, core_c, pa = [0.30, 0.36, 0.46], [0.55, 0.62, 0.72], [0.85, 0.90, 0.96], 0.34
+      outer_c, mid_c, core_c, pa = ([0.44, 0.52, 0.64], [0.56, 0.64, 0.76], [0.80, 0.86, 0.94], 0.52) if day else ([0.30, 0.36, 0.46], [0.55, 0.62, 0.72], [0.85, 0.90, 0.96], 0.34)
 
     rl.set_shader_value(self._path_shader, self._path_locs["outer"], rl.ffi.new("float[3]", outer_c), rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
     rl.set_shader_value(self._path_shader, self._path_locs["mid"], rl.ffi.new("float[3]", mid_c), rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
     rl.set_shader_value(self._path_shader, self._path_locs["core"], rl.ffi.new("float[3]", core_c), rl.ShaderUniformDataType.SHADER_UNIFORM_VEC3)
     rl.set_shader_value(self._path_shader, self._path_locs["alpha"], rl.ffi.new("float *", pa), rl.ShaderUniformDataType.SHADER_UNIFORM_FLOAT)
-    self._update_and_draw_shader_ribbon(self._path_model, self._path_steps, -2.2, path_end_z, 0.0, 1.46, 0.038)
+    self._update_and_draw_shader_ribbon(self._path_model, self._path_steps, -2.2, path_end_z, 0.0, 1.46, 0.038, additive=not day)
 
     # 5. Sculpted 3D surrounding radar traffic (back-to-front for crisp alpha shadows)
     draw_list: list[tuple[float, float, float, bool, bool]] = []
@@ -1159,10 +1230,10 @@ class Tesla3DRenderer:
 
     draw_list.sort(key=lambda item: item[0])  # farthest (-Z) first
     for z_c, x_c, yaw_c, is_suv, is_lead in draw_list:
-      self._draw_traffic_car(x_c, z_c, yaw_c, is_suv=is_suv, is_lead=is_lead)
+      self._draw_traffic_car(x_c, z_c, yaw_c, is_suv=is_suv, is_lead=is_lead, day=day)
 
     # 6. Sculpted 3D Hyundai IONIQ 5 ego vehicle (always foreground)
-    self._draw_ego_ioniq5(self._glow_ema, braking, left_blink_on, right_blink_on)
+    self._draw_ego_ioniq5(self._glow_ema, braking, left_blink_on, right_blink_on, day=day)
 
     rl.end_mode_3d()
 
