@@ -233,7 +233,7 @@ def inputs(t, speed=SPEED, lane_speed=0.0, lat=True, y_off=0.0, dc=0.02, desire=
     'carState': SimpleNamespace(vEgo=speed, useLaneLineSpeed=lane_speed, steeringPressed=False),
     'controlsState': SimpleNamespace(curvature=0.01, desiredCurvature=dc),
     'carControl': SimpleNamespace(latActive=lat),
-    'carrotMan': SimpleNamespace(vTurnSpeed=200, atc_active=False),
+    'carrotMan': SimpleNamespace(vTurnSpeed=200),
     'logMonoTime': {'modelV2': int(round(t / 1e-9))},
   }
   sm['all_checks'] = lambda service_list: True
@@ -527,3 +527,22 @@ def test_hybrid_exception_is_contained_and_p0_is_unchanged(monkeypatch):
   assert quiet.hybrid_errors == 0
   for lp, ref in zip(calls, oracle):
     assert _p0_fields(lp) == _p0_fields(ref), 'a hybrid fault changed a P0 published field'
+
+
+def test_hybrid_reads_atc_active_from_carrot_not_carrot_man():
+  """Regression for 000004e3: CarrotMan capnp has no atc_active field; it lives on carrot."""
+  planner, _ = build_planner(lra=1)
+  sm = inputs(1.0, lane_speed=0.0, lat=True, y_off=0.5)
+  assert not hasattr(sm['carrotMan'], 'atc_active')
+  planner.LP.set_shape(CURVE_A)
+  for i in range(30):
+    sm = inputs(1.0 + i * DT, lane_speed=0.0, lat=True, y_off=0.5)
+    planner.update(sm, SimpleNamespace(atc_active=False))
+  assert planner.hybrid_errors == 0
+  assert hybrid_mpc(planner).runs > 0
+  assert planner.hybrid_lane.LP.lane_change_multiplier == 1.0
+
+  sm_atc = inputs(1.0 + 30 * DT, lane_speed=0.0, lat=True, y_off=0.5)
+  planner.update(sm_atc, SimpleNamespace(atc_active=True))
+  assert planner.hybrid_errors == 0
+  assert planner.hybrid_lane.LP.lane_change_multiplier == 0.0

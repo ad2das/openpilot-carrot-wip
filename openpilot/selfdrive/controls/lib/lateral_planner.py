@@ -400,7 +400,7 @@ class LateralPlanner:
     self.hybrid_solve_ms = 0.0
 
   def _update_curve_hybrid(self, sm, md, model_path_x, model_path_y, v_ego_car,
-                           measured_curvature, rec_enabled, lane_change_active):
+                           measured_curvature, rec_enabled, lane_change_active, atc_active=False):
     """One frame of the curve-lane hybrid (SPEC_2B section 2).
 
     A skip frame does no hybrid MPC work at all; the frame's masks still advance, because the chain
@@ -442,7 +442,7 @@ class LateralPlanner:
       triple = self.hybrid_lane.step(
         md, v_ego_car, v_ego_car * 3.6, measured_curvature, self.curve_speed, seed,
         (self.hybrid_path_cost, self.hybrid_motion_cost, self.hybrid_jerk_cost,
-         self.hybrid_srate_cost), bool(sm['carrotMan'].atc_active), self.pathOffset)
+         self.hybrid_srate_cost), bool(atc_active), self.pathOffset)
       self.hybrid_ran = triple is not None
       if self.hybrid_ran:
         self.hybrid_status = self.hybrid_lane.status
@@ -583,7 +583,8 @@ class LateralPlanner:
     # the inert state for this frame and counts the failure instead of propagating.
     try:
       self._update_curve_hybrid(sm, md, model_path_x, model_path_y, v_ego_car,
-                                measured_curvature, rec_enabled, lane_change_active)
+                                measured_curvature, rec_enabled, lane_change_active,
+                                atc_active=bool(carrot.atc_active))
     except Exception:
       self.hybrid_errors += 1
       if self.hybrid_errors == 1 or self.hybrid_errors % 1000 == 0:

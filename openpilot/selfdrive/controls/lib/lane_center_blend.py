@@ -8,9 +8,11 @@ from openpilot.common.realtime import DT_MDL
 # Learned aim offset (m, model path-y units) per road curvature knot (1/m, path-y units).
 KNOTS = np.array([-0.010, -0.005, -0.002, 0.0, 0.002, 0.005, 0.010])
 OFFSET_MAX = 0.30        # per-knot aim offset cap, m
-T_I = 5.0                # learning time constant, s (route replay: only 5 s reaches 70% of the
-                         # left-curve target within one drive on both reviewer routes; 8/10 stall)
+T_I = 10.0               # learning time constant, s (slow enough to resist curve-entry windup
+                         # while still converging within one drive on straight/curve bias)
 DEADBAND = 0.05          # no learning below this car-to-centre error, m
+WRONG_WAY_E_LO = 0.10    # m, start tapering learned offset that pushes further toward lane edge
+WRONG_WAY_E_HI = 0.22    # m, zero wrong-way offset at/above this lateral error
 LOOKAHEAD_S = 2.0        # pure-pursuit lookahead time for offset -> curvature
 LOOKAHEAD_MIN = 20.0
 LOOKAHEAD_MAX = 60.0
@@ -369,7 +371,13 @@ class LaneCenterBlend:
       t_base = T_BASE_HOLD if avoid_now else T_BASE
       self.r_base = self.r_base + h * (self.r_far - float(h @ self.r_base)) * DT_MDL / t_base
 
-    self.offset = float(h @ self.table)
+    raw_offset = float(h @ self.table)
+    # Never let a learned or persisted offset push the car further toward a lane edge it is
+    # already hugging (offset * e < 0: e = centre[0] = -car_right). Keep full bias cancellation
+    # near centre (|e| <= WRONG_WAY_E_LO) and taper smoothly to zero by WRONG_WAY_E_HI.
+    if valid and raw_offset * self.e < 0.0:
+      raw_offset *= float(np.interp(abs(self.e), [WRONG_WAY_E_LO, WRONG_WAY_E_HI], [1.0, 0.0]))
+    self.offset = raw_offset
     lookahead = float(np.clip(LOOKAHEAD_S * v_ego, LOOKAHEAD_MIN, LOOKAHEAD_MAX))
     k_max = LAT_ACCEL_MAX / max(v_ego, 1.0) ** 2
     self.curvature = float(np.clip(2.0 * self.w * self.offset / lookahead ** 2, -k_max, k_max))

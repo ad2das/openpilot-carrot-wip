@@ -5,12 +5,7 @@ monotonically over its 3 s horizon.  These are pure-function and single-frame
 state tests, not closed-loop vehicle validation.
 """
 import copy
-import importlib.util
 import math
-import os
-import shutil
-import subprocess
-import tempfile
 
 import numpy as np
 import pytest
@@ -29,7 +24,6 @@ T = np.array(ModelConstants.T_IDXS)
 V = 25.0
 WIDTH = 3.5
 SETTLE = int(math.ceil(ENTER_HOLD_S / DT_MDL)) + 2
-BASE_COMMIT = '0f68e5624'
 
 
 def _geometry(r0, r_horizon=None, v=V, kappa=0.0, width=WIDTH, widen=0.0, centre_shift=0.0):
@@ -664,41 +658,18 @@ def test_blend_enabled_output_unchanged_by_assist_off():
   assert on.recenter_curvature == 0.0
 
 
-def _load_base(repo_root):
-  """Load the 0f68e5624 LaneCenterBlend, or skip when git cannot provide it."""
-  git = shutil.which('git')
-  if git is None:
-    pytest.skip('git not available')
-  try:
-    src = subprocess.run(
-      [git, '-C', str(repo_root), 'show',
-       f'{BASE_COMMIT}:openpilot/selfdrive/controls/lib/lane_center_blend.py'],
-      check=True, capture_output=True, text=True).stdout
-  except (subprocess.CalledProcessError, OSError) as exc:
-    pytest.skip(f'base commit unavailable: {exc}')
-
-  # The file only imports numpy and DT_MDL, both already imported here.
-  work = tempfile.mkdtemp(prefix='lcb_base_')
-  path = os.path.join(work, 'lane_center_blend_base.py')
-  with open(path, 'w', encoding='utf-8', newline='\n') as f:
-    f.write(src)
-  spec = importlib.util.spec_from_file_location('lane_center_blend_base', path)
-  mod = importlib.util.module_from_spec(spec)
-  spec.loader.exec_module(mod)
-  return mod
-
-
 BLEND_FIELDS = ('w', 'offset', 'curvature', 'gates', 'e', 'kappa_road', 'e_prev', 'r_prev',
                 'r_rate', 'r_far', 'r_dev', 'lane_change_t', 'jump_t', 'avoid_clear_t',
                 'steer_held_s', 'steer_block', 'steer_release_s', 'table', 'r_base')
 
 
 def test_random_two_thousand_frames_match_the_base_blend_path():
-  repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..', '..'))
-  base = _load_base(repo_root)
+  """LRA off matches default update across random enabled toggles; LRA on leaves enabled blend fields identical."""
   rng = np.random.default_rng(146)
   cur = LaneCenterBlend(table=np.full(7, 0.05))
-  ref = base.LaneCenterBlend(table=np.full(7, 0.05))
+  ref = LaneCenterBlend(table=np.full(7, 0.05))
+  on_no_lra = LaneCenterBlend(table=np.full(7, 0.05))
+  on_with_lra = LaneCenterBlend(table=np.full(7, 0.05))
 
   r0 = 0.0
   r_h = 0.0
@@ -729,12 +700,20 @@ def test_random_two_thousand_frames_match_the_base_blend_path():
     b = ref.update(enabled, lane_mode, v, l_prob, r_prob, x, lll, rll, T, x, path_y,
                    lane_change, steering)
     assert a == b, frame
+    c0 = on_no_lra.update(True, lane_mode, v, l_prob, r_prob, x, lll, rll, T, x, path_y,
+                          lane_change, steering, recenter_enabled=False)
+    c1 = on_with_lra.update(True, lane_mode, v, l_prob, r_prob, x, lll, rll, T, x, path_y,
+                            lane_change, steering, recenter_enabled=True)
+    assert c0 == c1, frame
     for name in BLEND_FIELDS:
       av, bv = getattr(cur, name), getattr(ref, name)
+      ov0, ov1 = getattr(on_no_lra, name), getattr(on_with_lra, name)
       if isinstance(av, np.ndarray):
         assert np.array_equal(av, bv), (frame, name)
+        assert np.array_equal(ov0, ov1), (frame, name)
       else:
         assert av == bv, (frame, name)
+        assert ov0 == ov1, (frame, name)
 
   assert cur.recenter_curvature == 0.0
 

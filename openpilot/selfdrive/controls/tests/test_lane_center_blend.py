@@ -13,7 +13,7 @@ from openpilot.common.realtime import DT_MDL
 from openpilot.selfdrive.controls.lib.lane_center_blend import (
   GATE_AVOID, GATE_CURVE, GATE_E_LARGE, GATE_INVALID, GATE_JUMP, GATE_LANE_CHANGE,
   GATE_LANE_MODE, GATE_OFF, GATE_PROB, GATE_SPEED, GATE_STEER, GATE_WIDTH,
-  LaneCenterBlend, OFFSET_MAX, dump_table, load_table,
+  LaneCenterBlend, OFFSET_MAX, WRONG_WAY_E_HI, WRONG_WAY_E_LO, dump_table, load_table,
 )
 from openpilot.selfdrive.modeld.constants import ModelConstants
 
@@ -406,3 +406,42 @@ def test_large_straight_bias_still_corrected(b0):
   mean_on = _mean_abs(on.p_hist, 30.0)
   print(f"straight b0={b0:+.2f}: mean|p| last 30 s ON={mean_on:.4f}")
   assert mean_on < 0.10
+
+
+@pytest.mark.parametrize("table_val,kr", [
+  (+0.25, +0.002),   # right curve with positive offset pushing right
+  (-0.25, -0.005),   # left curve with stale negative offset pushing left
+  (+0.20, 0.0),      # straight with positive offset
+])
+def test_wrong_way_offset_tapers_to_zero_on_both_sides(table_val, kr):
+  """A learned offset must never push the car further toward a lane line it is already hugging."""
+  sign = 1.0 if table_val > 0 else -1.0
+  # Wrong-way error has opposite sign to table_val (e = centre[0] = -car_right).
+  def eval_at(e_val):
+    b = LaneCenterBlend(table=np.full(7, table_val))
+    b.w = 1.0
+    x, lll, rll, centre = _synth(centre0=e_val, kr=kr)
+    # Use a steering-blocked frame so the table stays fixed while testing the output taper.
+    b.steer_block = True
+    k = b.update(True, False, V, 0.9, 0.9, x, lll, rll, T, x, centre, False, True)
+    return b.offset, k
+
+  # Near centre (|e| <= WRONG_WAY_E_LO): full offset preserved.
+  off_near, k_near = eval_at(-sign * (WRONG_WAY_E_LO - 0.01))
+  assert off_near == pytest.approx(table_val, abs=1e-9)
+  assert abs(k_near) > 0.0
+
+  # Mid-band: smoothly reduced to ~50%.
+  mid_e = 0.5 * (WRONG_WAY_E_LO + WRONG_WAY_E_HI)
+  off_mid, _ = eval_at(-sign * mid_e)
+  assert abs(off_mid) == pytest.approx(0.5 * abs(table_val), abs=1e-6)
+
+  # Hugging the lane line (|e| >= WRONG_WAY_E_HI): zero wrong-way push.
+  off_hug, k_hug = eval_at(-sign * (WRONG_WAY_E_HI + 0.05))
+  assert off_hug == 0.0
+  assert k_hug == 0.0
+
+  # Same magnitude on the helpful side (offset * e > 0): full restoring push preserved.
+  off_help, k_help = eval_at(+sign * (WRONG_WAY_E_HI + 0.05))
+  assert off_help == pytest.approx(table_val, abs=1e-9)
+  assert k_help * sign > 0.0
