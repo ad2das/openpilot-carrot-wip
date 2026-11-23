@@ -312,6 +312,7 @@ class TeslaHudRenderer(Widget):
       "lead": None,
       "low_tpms": [],
       "gps_ok": True,
+      "active_carrot": 0,  # 0=off, 1=APM, >=2=APN
     }
 
     if sm is None:
@@ -369,6 +370,7 @@ class TeslaHudRenderer(Widget):
 
     if sm.alive.get("carrotMan", False):
       cm = sm["carrotMan"]
+      snap["active_carrot"] = int(getattr(cm, "activeCarrot", 0) or 0)
       spd_lim = int(float(getattr(cm, "xSpdLimit", 0) or 0))
       sign_type = int(float(getattr(cm, "xSignType", 0) or 0))
       road_lim = int(float(getattr(cm, "nRoadLimitSpeed", 0) or 0))
@@ -627,6 +629,26 @@ class TeslaHudRenderer(Widget):
     self._type.draw_mid(txt, px + 76.0, cy, 50.0, hs.TEXT, hs.BOLD)
     return pw + 26.0
 
+  def _draw_carrot_link_pill(self, right_x: float, cy: float, active_carrot: int) -> float:
+    """High-visibility Carrot link pill: green APN (activeCarrot>=2) or blue APM (activeCarrot==1)."""
+    if active_carrot < 1:
+      return 0.0
+    is_apn = active_carrot >= 2
+    label = "APN" if is_apn else "APM"
+    accent = TESLA_EMERALD if is_apn else TESLA_BLUE
+    fill = hs.rgba(10, 40, 28, 224) if is_apn else hs.rgba(10, 26, 48, 224)
+    text_col = hs.rgba(176, 255, 220, 255) if is_apn else hs.rgba(172, 224, 255, 255)
+
+    w_txt = self._type.width(label, 46.0, hs.BOLD, spacing=1.0)
+    pw, ph = 70.0 + w_txt + 26.0, 76.0
+    px = right_x - pw
+    py = cy - ph * 0.5
+    hs.chip(px, py, pw, ph, fill=fill, ring=hs.with_alpha(accent, 224), ring_width=3.0)
+    hs.glow(px + 38.0, cy, 26.0, hs.with_alpha(accent, 138))
+    hs.dot(px + 38.0, cy, 11.5, accent)
+    self._type.draw_mid(label, px + 68.0, cy + 1.0, 46.0, text_col, hs.BOLD, spacing=1.0)
+    return pw + 22.0
+
   # ------------------------------------------------------------------
   # Mode 0 (3D FSD) & Mode 1 (AR 카메라) Left Cluster (6-inch C3X Scale)
   # ------------------------------------------------------------------
@@ -689,9 +711,11 @@ class TeslaHudRenderer(Widget):
     right_x = rect.x + rect.width - 42.0
     top_y = rect.y + 66.0
 
-    # Top-right big bold clock + optional traffic light badge
+    # Top-right big bold clock + optional traffic light + APN/APM Carrot link badge
     clk_w = self._type.draw_mid(clock_txt, right_x, top_y, 76.0, hs.rgba(255, 255, 255, 236), hs.BOLD, align=1.0, shadow=True)
-    self._draw_traffic_pill(right_x - clk_w - 28.0, top_y, snap["traffic_light"])
+    cur_x = right_x - clk_w - 26.0
+    cur_x -= self._draw_traffic_pill(cur_x, top_y, snap["traffic_light"])
+    cur_x -= self._draw_carrot_link_pill(cur_x, top_y, snap["active_carrot"])
 
     card_w = 740.0
     card_x = right_x - card_w
@@ -722,7 +746,8 @@ class TeslaHudRenderer(Widget):
     # Priority 2: Big Bold Frosted Turn-by-Turn Navigation + ETA Card (real C3X NAV_TEXT/NAV_DIST scale)
     has_nav = (snap["turn_info"] > 0 or snap["dist_turn"] > 0 or bool(snap["tbt_text"]) or snap["remain_dist"] > 0)
     if not has_nav:
-      hs.zones["tpms"] = (right_x - 360.0, rect.y, 360.0, 126.0)
+      top_left = min(right_x - 360.0, cur_x)
+      hs.zones["tpms"] = (top_left, rect.y, right_x - top_left, 126.0)
       return
 
     has_eta = snap["remain_dist"] > 0 or snap["remain_time"] > 0
@@ -815,7 +840,9 @@ class TeslaHudRenderer(Widget):
     right_x = rect.x + rect.width - 42.0
     top_y = rect.y + 66.0
     clk_w = self._type.draw_mid(clock_txt, right_x, top_y, 76.0, hs.rgba(255, 255, 255, 248), hs.BOLD, align=1.0, shadow=True)
-    self._draw_traffic_pill(right_x - clk_w - 28.0, top_y, snap["traffic_light"])
+    cur_x = right_x - clk_w - 26.0
+    cur_x -= self._draw_traffic_pill(cur_x, top_y, snap["traffic_light"])
+    cur_x -= self._draw_carrot_link_pill(cur_x, top_y, snap["active_carrot"])
 
     # In AR mode, ONLY show a bold top-right crimson card when an enforcement camera is active
     if snap["cam_alarm"] and snap["limit_speed"] > 0:
@@ -828,7 +855,8 @@ class TeslaHudRenderer(Widget):
       self._type.draw_mid("과속 단속 구간", cx + 194.0, cy + 150.0, 48.0, hs.rgba(255, 224, 220, 248), hs.BOLD)
       hs.zones["tpms"] = (cx, cy, cw, ch)
     else:
-      hs.zones["tpms"] = (right_x - 360.0, rect.y, 360.0, 126.0)
+      top_left = min(right_x - 360.0, cur_x)
+      hs.zones["tpms"] = (top_left, rect.y, right_x - top_left, 126.0)
 
     # Single bold floating bottom-right ETA capsule (compact 3 values, 50px Bold for 6-inch C3X!)
     if snap["remain_dist"] > 0 or snap["remain_time"] > 0:
@@ -865,14 +893,21 @@ class TeslaHudRenderer(Widget):
     right_x = rect.x + rect.width - 52.0
     top_y = rect.y + 66.0
 
-    # Top bar: P R N D on left | Traffic pill + GPS dot + Giant Clock on right
+    # Top bar: P R N D on left | APN/APM + Traffic pill + Giant Clock on right
     self._draw_gear_strip(left_x, top_y + 22.0, snap["gear"], size=56.0)
 
     clk_w = self._type.draw_mid(clock_txt, right_x, top_y, 76.0, hs.rgba(255, 255, 255, 232), hs.BOLD, align=1.0)
-    dot_x = right_x - clk_w - 34.0
-    hs.glow(dot_x, top_y, 22.0, hs.rgba(46, 229, 157, 120))
-    hs.dot(dot_x, top_y, 9.5, TESLA_EMERALD if snap["gps_ok"] else TESLA_AMBER)
-    self._draw_traffic_pill(dot_x - 36.0, top_y, snap["traffic_light"])
+    cur_x = right_x - clk_w - 26.0
+    cur_x -= self._draw_traffic_pill(cur_x, top_y, snap["traffic_light"])
+    cur_x -= self._draw_carrot_link_pill(cur_x, top_y, snap["active_carrot"])
+    if not snap["gps_ok"]:
+      gw, gh = 220.0, 68.0
+      gx, gy = cur_x - gw, top_y - gh * 0.5
+      hs.chip(gx, gy, gw, gh, fill=hs.rgba(46, 32, 12, 218), ring=TESLA_AMBER, ring_width=2.4)
+      hs.dot(gx + 34.0, top_y, 9.5, TESLA_AMBER)
+      self._type.draw_mid("GPS 대기", gx + 60.0, top_y, 38.0, hs.TEXT, hs.BOLD)
+      cur_x = gx - 22.0
+    quiet_top_left = min(rect.x + rect.width - 480.0, cur_x)
 
     # Left column: Giant 390px speed + Self-Driving + inline 192px MAX / Limit / Mode pill
     spd_str = str(snap["speed"])
@@ -1022,7 +1057,7 @@ class TeslaHudRenderer(Widget):
       self._type.draw_mid("전방 시야 확보", rx + 78.0, cy, 48.0, hs.rgba(255, 255, 255, 212), hs.BOLD)
 
     hs.zones["guide"] = (rect.x, rect.y, 480.0, 140.0)
-    hs.zones["tpms"] = (rect.x + rect.width - 480.0, rect.y, 480.0, 140.0)
+    hs.zones["tpms"] = (quiet_top_left, rect.y, rect.x + rect.width - quiet_top_left, 140.0)
 
   # ------------------------------------------------------------------
   # 3-Mode Bottom Swipe Dock (`3D FSD | AR 카메라 | Quiet`, 6-inch Finger-Friendly!)

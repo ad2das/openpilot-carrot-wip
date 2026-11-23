@@ -246,3 +246,35 @@ def test_hud_snapshot_safe_when_submaster_empty(tesla_env):
   assert snap["speed"] == 0
   assert snap["gear"] == "D"
   assert snap["low_tpms"] == []
+  assert snap["active_carrot"] == 0
+
+
+def test_carrot_link_badge_maps_active_carrot_to_apm_and_apn(tesla_env, monkeypatch):
+  _, thud, fake_ui_state = tesla_env
+  hud = thud.TeslaHudRenderer()
+
+  # Verify snapshot extraction for 0 / 1 (APM) / 2 (APN)
+  for ac in (0, 1, 2, 3):
+    fake_ui_state.sm = _FakeSubMaster({"carrotMan": SimpleNamespace(activeCarrot=ac)})
+    assert hud._read_snapshot(0.05)["active_carrot"] == ac
+
+  # Verify rendered badge text and accent colors
+  drawn_labels = []
+  drawn_dots = []
+  monkeypatch.setattr(thud.hs, "chip", lambda *a, **k: None, raising=False)
+  monkeypatch.setattr(thud.hs, "glow", lambda *a, **k: None, raising=False)
+  monkeypatch.setattr(thud.hs, "dot", lambda x, y, r, col: drawn_dots.append(col), raising=False)
+  monkeypatch.setattr(hud._type, "draw_mid", lambda txt, *a, **k: drawn_labels.append(txt) or 80.0)
+
+  assert hud._draw_carrot_link_pill(1800.0, 66.0, 0) == 0.0
+  assert drawn_labels == []
+
+  w_apm = hud._draw_carrot_link_pill(1800.0, 66.0, 1)
+  assert w_apm > 0.0
+  assert drawn_labels[-1] == "APM"
+  assert drawn_dots[-1] == thud.TESLA_BLUE
+
+  w_apn = hud._draw_carrot_link_pill(1800.0, 66.0, 2)
+  assert w_apn > 0.0
+  assert drawn_labels[-1] == "APN"
+  assert drawn_dots[-1] == thud.TESLA_EMERALD
