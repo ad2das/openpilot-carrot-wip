@@ -154,7 +154,7 @@ def test_hold_s_zero_releases_frame_after_latch():
   states, mod = on_states(seq)
   assert HOLD_S == 0.0
   assert states == [True, True, False, False]
-  assert GATE_HOLD_A == 0.5
+  assert GATE_HOLD_A == 0.45
   assert mod.on is False
 
 
@@ -331,18 +331,29 @@ def test_road_strength_exact_boundary():
 
 
 def test_reentry_clause_needs_cs():
-  # curve_a = a_road = 0.625 in [0.5, 0.8)
+  # curve_a = a_road = 0.625 in [GATE_REENTRY_A (0.45), GATE_ON_A (0.65))
   lo = dict(kappa=0.001, dc=0.001)
-  _a, m = run([frame(0.0, c_s=0.20, **lo)])
+  _a, m = run([frame(0.0, c_s=0.15, **lo)])
   assert m.on is False
   _a, m = run([frame(0.0, c_s=GATE_REENTRY_CS, **lo)])
   assert m.on is True
-  assert GATE_REENTRY_A == 0.5
+  assert GATE_REENTRY_A == 0.45
 
 
 def test_below_reentry_strength_never_enters():
   _a, m = run([frame(0.0, c_s=0.9, kappa=0.0007, dc=0.0007)])   # curve_a 0.4375
   assert m.on is False
+
+
+def test_midspeed_narrow_right_curve_restores_left():
+  """Regression for 000004e5 seg 10/12: 50 km/h right curve on 2.50 m narrow lane activates and pulls left."""
+  v = 50.0 / 3.6
+  kw = dict(v=v, c_s=0.22, w0=2.50, w15=2.54, w30=2.58, w0_g=2.50, w45=2.65,
+            kappa=0.0045, dc=0.0045, k_model=0.0045, k_lane=0.0038)
+  a, m = run([frame(0.0, **kw), frame(DT, **kw)])
+  assert m.eligible is True
+  assert m.on is True
+  assert m.tgt < 0.0 and a[1] < 0.0
 
 
 # --- masks ----------------------------------------------------------------------------------
@@ -355,7 +366,7 @@ def test_base_mask_fields():
 
 def test_strict_mask_fields():
   for kw in (dict(lprob=0.69), dict(rprob=0.69), dict(std1=0.26), dict(std2=0.26),
-             dict(w0=2.59), dict(w0=4.21), dict(w15=2.5), dict(w30=4.3),
+             dict(w0=2.44), dict(w0=4.21), dict(w15=2.4), dict(w30=4.3),
              dict(w30=3.7, w0=3.2)):          # |w30 - w0| = 0.5 > W_TAPER
     _a, m = run([frame(0.0, **kw)])
     assert m.eligible is False, kw

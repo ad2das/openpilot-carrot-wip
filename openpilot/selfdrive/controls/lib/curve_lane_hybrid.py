@@ -22,12 +22,12 @@ STEP_MAX_DT = 0.1
 # --- eligibility (report_hyb.py:14-22) ------------------------------------------------------
 STRICT_PROB = 0.7
 STRICT_STD = 0.25
-W_LO, W_HI = 2.6, 4.2
+W_LO, W_HI = 2.45, 4.2
 W_TAPER = 0.45
 JUMP_C = 0.25
 JUMP_W = 0.35
 SPIKE_OK_RUN = 10
-V_MIN = 60.0 / 3.6
+V_MIN = 40.0 / 3.6
 
 # --- guards (report_hybrid5.py:41-49) -------------------------------------------------------
 G_SHAPE_BAR = 0.45
@@ -38,11 +38,11 @@ GUARD_REARM_S = 0.5
 
 # --- gate (report_hybrid5.py:50-58) ---------------------------------------------------------
 CAP_A = 0.8
-GATE_ON_A = 0.8
-GATE_REENTRY_A = 0.5
-GATE_REENTRY_CS = 0.30
+GATE_ON_A = 0.65
+GATE_REENTRY_A = 0.45
+GATE_REENTRY_CS = 0.20
 GATE_ROAD_A = 0.3
-GATE_HOLD_A = 0.5
+GATE_HOLD_A = 0.45
 HOLD_LATCH_CS = 0.20
 HOLD_RELEASE_CS = 0.15
 HOLD_S = 0.0
@@ -56,7 +56,7 @@ J_DOWN = 0.27
 CS_MEDIAN_N = 3
 PREWARM_ROAD_A = 0.20
 PREWARM_CURVE_A = 0.40
-RUN_V_MIN = 60.0 / 3.6
+RUN_V_MIN = 35.0 / 3.6
 
 GUARD_SHAPE = 1
 GUARD_W45 = 2

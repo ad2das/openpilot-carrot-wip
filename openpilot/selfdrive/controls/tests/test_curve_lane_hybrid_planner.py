@@ -546,3 +546,23 @@ def test_hybrid_reads_atc_active_from_carrot_not_carrot_man():
   planner.update(sm_atc, SimpleNamespace(atc_active=True))
   assert planner.hybrid_errors == 0
   assert planner.hybrid_lane.LP.lane_change_multiplier == 0.0
+
+
+def test_prewarm_below_v_min_clears_guard_before_curve_entry():
+  """Regression for 000004e5 seg 11: pre-warming between RUN_V_MIN and V_MIN avoids a 0.5 s GUARD_BAD blackout."""
+  from openpilot.selfdrive.controls.lib.curve_lane_hybrid import V_MIN
+  assert RUN_V_MIN < V_MIN
+  planner, _ = build_planner(lra=1)
+  planner.LP.set_shape(CURVE_A)
+  # Warm in the pre-warm speed band (between RUN_V_MIN and V_MIN) for > GUARD_REARM_S (0.5 s).
+  v_warm = 0.5 * (RUN_V_MIN + V_MIN)
+  for i in range(15):
+    planner.update(inputs(1.0 + i * DT, speed=v_warm, lane_speed=0.0, lat=True, y_off=0.5),
+                   SimpleNamespace(atc_active=False))
+  assert hybrid_mpc(planner).runs >= 10
+  assert planner.curve_hybrid.guard is False
+  assert planner.curve_hybrid.on is False
+  # Crossing V_MIN activates on the very first frame without any re-arm blackout.
+  planner.update(inputs(1.0 + 15 * DT, speed=V_MIN + 0.5, lane_speed=0.0, lat=True, y_off=0.5),
+                 SimpleNamespace(atc_active=False))
+  assert planner.curve_hybrid.on is True
