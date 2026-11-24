@@ -206,9 +206,9 @@ CFG = dict(
   V_ENTER_MIN=1.0,     # m/s, and only above this one
   V_EXIT=4.0,          # m/s, the law ends when the car is faster again
   Q_ENTER=0.4,         # needed decel / |A_H| at which the law may start
-  VL_IN=1.0,           # m/s, the lead counts as stopping below this
+  VL_IN=0.5,           # m/s, the lead counts as stopping only once nearly at rest (< 1.8 km/h)
   VL_STILL=0.5,        # m/s, below this the lead counts as stopped regardless of closing speed
-  DV_ENTER=0.6,        # m/s, when lead is rolling (VL_STILL <= v_lead < VL_IN), require ego closing speed >= this
+  DV_ENTER=0.6,        # m/s, when VL_IN > VL_STILL (caller override), require ego closing speed >= this
   VL_OUT=1.5,          # m/s, the law ends when the lead is faster
   VL_CREEP=0.75,       # m/s, creep exit: the lead is at least this fast ...
   DV_RISE=0.65,        # m/s, ... and this much faster than its slowest (>= 0) since the law started ...

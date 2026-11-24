@@ -433,6 +433,7 @@ def _c0_config(monkeypatch):
   # deployed (c0) law, so they are pinned back to it.
   for name, value in (("U_MAX", 0.0), ("DEN_LOCK", 0.05)):
     monkeypatch.setattr(SL, name, value)
+  monkeypatch.setitem(SL.CFG, "VL_IN", 1.0)
 
 
 def test_t10_stoplaw_fixture(_c0_config):
@@ -1014,17 +1015,17 @@ def test_p13_stopped_lead_stop_unchanged():
 
 
 def test_p14_lead_still_slowing_never_creep_exits():
-  # fleet 42a--7 / 479--3 / 4a6--6 / 4b7--1: entry just under VL_IN, the lead slows to ~0.65, lingers, then stops
+  # fleet 42a--7 / 479--3 / 4a6--6 / 4b7--1: entry just under VL_IN=1.0, the lead slows to ~0.65, lingers, then stops
   n = 450
   lead_x, v_lead = _prof([(0.0, 0.99), (1.2, 0.65), (1.8, 0.70), (2.4, 0.65), (3.0, 0.70), (3.2, 0.65), (4.5, 0.0)], n)
-  new = _kin_run(SL.StopCtl(), n, lead_x, v_lead, lambda t: -0.5)
-  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  new = _kin_run(SL.StopCtl(VL_IN=1.0), n, lead_x, v_lead, lambda t: -0.5)
+  old = _kin_run(SL.StopCtl(VL_IN=1.0, VL_CREEP=INF, PG_A=INF, VL_REIN=INF), n, lead_x, v_lead, lambda t: -0.5)
   assert len(new) == len(old) == n
   assert all(a[2] == b[2] for a, b in zip(new, old))
 
 
 def test_p15_lead_go_locks_reentry_until_the_lead_slows():
-  c, o = SL.StopCtl(), _old_ctl()
+  c, o = SL.StopCtl(VL_IN=1.0), SL.StopCtl(VL_IN=1.0, VL_CREEP=INF, PG_A=INF, VL_REIN=INF)
   for ctl in (c, o):
     _warm(ctl)
     u = _tick(ctl)
@@ -1058,8 +1059,8 @@ def test_p16_bounce_below_the_rise_never_creep_exits():
   # fleet 4a5--39: the lead slows 0.80 -> 0.58, bounces to 1.15 (rise 0.57 < DV_RISE) for 1 s, then stops
   n = 450
   lead_x, v_lead = _prof([(0.0, 0.80), (0.6, 0.58), (1.4, 1.15), (2.4, 1.15), (3.9, 0.0)], n)
-  new = _kin_run(SL.StopCtl(), n, lead_x, v_lead, lambda t: -0.5)
-  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  new = _kin_run(SL.StopCtl(VL_IN=1.0), n, lead_x, v_lead, lambda t: -0.5)
+  old = _kin_run(SL.StopCtl(VL_IN=1.0, VL_CREEP=INF, PG_A=INF, VL_REIN=INF), n, lead_x, v_lead, lambda t: -0.5)
   assert len(new) == len(old) == n
   assert all(a[2] == b[2] for a, b in zip(new, old))
 
@@ -1068,11 +1069,11 @@ def test_p17_rise_from_a_slow_lead_ends_law():
   # field 4d1--9: the lead slows to 0.3 and pulls away at 1.3 (below VL_OUT): lead_go once, no re-entry
   n = 400
   lead_x, v_lead = _prof([(0.0, 0.9), (0.5, 0.3), (1.0, 1.3)], n)
-  c = SL.StopCtl()
+  c = SL.StopCtl(VL_IN=1.0)
   tr = _kin_run(c, n, lead_x, v_lead, lambda t: -0.5)
   t, v, u, why = tr[-1]
   assert u is None and why == "lead_go" and 1.0 < t <= 2.5 and c.creep_lock
-  old = _kin_run(_old_ctl(), n, lead_x, v_lead, lambda t: -0.5)
+  old = _kin_run(SL.StopCtl(VL_IN=1.0, VL_CREEP=INF, PG_A=INF, VL_REIN=INF), n, lead_x, v_lead, lambda t: -0.5)
   assert len(old) == n and all(r[2] is not None for r in old[1:])
 
 
@@ -1216,6 +1217,25 @@ def test_p18_creeping_lead_matching_ego_speed_never_enters():
   _warm(ctl2, u=-0.4)
   u2 = ctl2.update(True, 1.15, -0.3, True, 5.5, 0.30, -0.45, INF)
   assert u2 is not None and ctl2.n_enter == 1
+
+
+def test_p19_rolling_lead_at_high_closing_speed_never_slams():
+  """Regression for 000004e5 seg 7: a lead still rolling at 0.6..0.95 m/s must not trigger stationary StopLaw."""
+  ctl = SL.StopCtl(GAP=4.3)
+  _warm(ctl, u=-1.06)
+  # Ego approaching at 2.52 -> 1.70 m/s behind lead rolling at 0.95 -> 0.62 m/s (d=7.02 -> 5.98 m).
+  for k in range(150):
+    v = max(1.1, 2.52 - 0.008 * k)
+    vl = max(0.55, 0.95 - 0.0025 * k)
+    d = max(5.6, 7.02 - 0.009 * k)
+    u = ctl.update(True, v, -1.1, True, d, vl, -0.90, INF)
+    assert u is None, (k, v, vl, u)
+    ctl.commit(-0.90)
+  assert ctl.n_enter == 0
+
+  # Once the lead genuinely slows below VL_IN (0.5 m/s), StopLaw still takes over immediately.
+  u_stop = ctl.update(True, 2.1, -1.0, True, 6.8, 0.45, -0.90, INF)
+  assert u_stop is not None and ctl.n_enter == 1
 
 
 def test_release_after_lead_go_clears_faster_and_ramps_positive_accel(monkeypatch):
