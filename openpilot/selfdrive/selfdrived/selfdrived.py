@@ -267,9 +267,8 @@ class SelfdriveD:
         self.dm_uncertain_alerted = False
       self.dm_disabled_prev = dm_disabled
       if not dm_disabled:
-        if self.dm_camera_notice.update(self.sm.frame * DT_CTRL, self.sm.all_checks(['driverMonitoringState']),
-                                        self.sm['driverMonitoringState'].cameraUnavailable, dm_disabled):
-          self.events.add(EventName.driverMonitorFallback)
+        # Camera availability silently selects vision or interaction monitoring.
+        # Actual attention warnings, lockout and service-health checks still apply.
         self.update_dm_lockout()
         # No entry conditions
         if self.sm['driverMonitoringState'].lockout or self.sm['driverMonitoringState'].alwaysOnLockout:
@@ -537,7 +536,8 @@ class SelfdriveD:
       self.events.add(EventName.fcw)
 
     # Stop creep warning: the car rolls on while openpilot asks it to stop (route 6db, 10-25)
-    if self.stop_creep.update(self.enabled, self.sm['longitudinalPlan'].shouldStop, CS.vEgo,
+    if self.stop_creep.update(self.enabled and self.CP.openpilotLongitudinalControl,
+                              self.sm['longitudinalPlan'].shouldStop, CS.vEgo,
                               CS.gasPressed, CS.brakePressed) and not self.CP.notCar:
       self.events.add(EventName.stopCreepWarning)
 

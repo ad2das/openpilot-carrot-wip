@@ -281,15 +281,18 @@ def mando_track_state(confirm: MandoTrackConfirm, msg, valid: bool, d_rel: float
     confirm.last = key
     if state in (3, 4):
       confirm.hits.append(state == 3)
+      if valid and state == 3 and abs(v_lead) >= MANDO_MOVING_SPEED:
+        confirm.moving_updates += 1
+        if confirm.moving_updates >= MANDO_MOVING_UPDATES:
+          confirm.moved = True
+      else:
+        confirm.moving_updates = 0
     else:
       confirm.hits.clear()
       confirm.moving_updates = 0
       confirm.moved = False
   if not valid or state != 3:
     return 0
-  confirm.moving_updates = confirm.moving_updates + 1 if abs(v_lead) >= MANDO_MOVING_SPEED else 0
-  if confirm.moving_updates >= MANDO_MOVING_UPDATES:
-    confirm.moved = True
   if sum(confirm.hits) < MANDO_CONFIRM_MIN_HITS:
     return 0
   far = d_rel >= MANDO_FAR_DIST and abs(y_rel) <= MANDO_FAR_MAX_YREL
@@ -340,6 +343,9 @@ class RadarInterface(RadarInterfaceBase):
     self.corner_object_missed_updates = 0
     self.corner_object_180_missed_updates = 0
     self.corner_object_430_missed_updates = 0
+    self.corner_object_seen_since_publish = False
+    self.corner_object_180_seen_since_publish = False
+    self.corner_object_430_seen_since_publish = False
     self.corner_object_track_ids = CornerObjectTrackIdManager()
     self.rcp_tracks = get_radar_can_parser(
       CP, self.radar_tracks, self.radar_start_addr, self.radar_msg_count,
@@ -463,16 +469,19 @@ class RadarInterface(RadarInterfaceBase):
     if corner_ready:
       self._update_corner_objects(self.updated_corner_objects)
       self.corner_object_missed_updates = 0
+      self.corner_object_seen_since_publish = True
       self.updated_corner_objects.clear()
 
     if corner_180_ready:
       self._update_corner_objects_180(self.updated_corner_objects_180)
       self.corner_object_180_missed_updates = 0
+      self.corner_object_180_seen_since_publish = True
       self.updated_corner_objects_180.clear()
 
     if corner_430_ready:
       self._update_corner_objects_430(self.updated_corner_objects_430)
       self.corner_object_430_missed_updates = 0
+      self.corner_object_430_seen_since_publish = True
       self.updated_corner_objects_430.clear()
 
     # Corner radar runs at its own cadence. Do not let corner-only frames publish
@@ -484,33 +493,30 @@ class RadarInterface(RadarInterfaceBase):
     if self.rcp_scc is not None:
       self._update_scc(self.updated_scc)
     if self.rcp_corner_objects is not None:
-      if self.updated_corner_objects:
-        self._update_corner_objects(self.updated_corner_objects)
+      if self.corner_object_seen_since_publish or self.updated_corner_objects:
         self.corner_object_missed_updates = 0
+        self.corner_object_seen_since_publish = False
       else:
         self.corner_object_missed_updates += 1
         if self.corner_object_missed_updates > 10:
           self._clear_corner_objects()
     if self.rcp_corner_objects_180 is not None:
-      if self.updated_corner_objects_180:
-        self._update_corner_objects_180(self.updated_corner_objects_180)
+      if self.corner_object_180_seen_since_publish or self.updated_corner_objects_180:
         self.corner_object_180_missed_updates = 0
+        self.corner_object_180_seen_since_publish = False
       else:
         self.corner_object_180_missed_updates += 1
         if self.corner_object_180_missed_updates > 10:
           self._clear_corner_objects_180()
     if self.rcp_corner_objects_430 is not None:
-      if self.updated_corner_objects_430:
-        self._update_corner_objects_430(self.updated_corner_objects_430)
+      if self.corner_object_430_seen_since_publish or self.updated_corner_objects_430:
         self.corner_object_430_missed_updates = 0
+        self.corner_object_430_seen_since_publish = False
       else:
         self.corner_object_430_missed_updates += 1
         if self.corner_object_430_missed_updates > 10:
           self._clear_corner_objects_430()
     self.updated_scc.clear()
-    self.updated_corner_objects.clear()
-    self.updated_corner_objects_180.clear()
-    self.updated_corner_objects_430.clear()
 
     ret = structs.RadarData()
     if ((self.rcp_tracks is not None and self.radar_tracks and not self.rcp_tracks.can_valid) or
@@ -958,6 +964,7 @@ class RadarInterface(RadarInterfaceBase):
 
   def _clear_point(self, t_id):
     self.pts[t_id].measured = False
+    self.pts[t_id].trackId = t_id
     self.pts[t_id].dRel = 0
     self.pts[t_id].yRel = 0
     self.pts[t_id].vRel = 0

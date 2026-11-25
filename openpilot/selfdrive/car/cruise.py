@@ -803,20 +803,28 @@ class VCruiseCarrot:
     # availability/interlocks below and selfdrived's normal no-entry checks remain.
     if enable > 0 and not self._cruise_available:
       self._activate_cruise = 0
+      self._soft_hold_active = 0
       self._add_log(reason + " > Cruise unavailable")
       return
     if enable > 0 and self._steering_interlock_active:
       self._activate_cruise = 0
+      self._soft_hold_active = 0
       self._add_log(reason + " > Steering angle interlock active")
       return
     if enable > 0 and self._hold_interlock_active:
       self._activate_cruise = 0
+      self._soft_hold_active = 0
       self._add_log(reason + " > Brake hold interlock active")
       return
     if self._cruise_cancel_state and not allow_cancel_state:
+      if enable > 0:
+        self._activate_cruise = 0
+        self._soft_hold_active = 0
       self._add_log(reason + " > Cancel state")
     elif enable > 0 and self._cancel_timer > 0 and cancel_timer >= 0:
       enable = 0
+      self._activate_cruise = 0
+      self._soft_hold_active = 0
       self._add_log(reason + " > Canceled")
     else:
       if not manual and self.autoCruiseControl == 0 and enable != 0:
@@ -833,12 +841,11 @@ class VCruiseCarrot:
       self._add_log(reason)
 
   def _check_safe_stop(self, CS, safe_distance = 3):
-    v_ego = CS.vEgo
     decel_rate = 1.5
-    d_stop_ego = (v_ego ** 2) / (2 * decel_rate)
-    d_stop_rel = (self.v_rel ** 2) / (2 * decel_rate)
+    v_closing = max(0.0, -float(self.v_rel))
+    d_stop_closing = (v_closing ** 2) / (2 * decel_rate)
 
-    d_final = self.d_rel - d_stop_ego - d_stop_rel
+    d_final = self.d_rel - d_stop_closing
 
     if d_final >= safe_distance:
       return True, d_final
@@ -957,8 +964,8 @@ class VCruiseCarrot:
       elif self.params.get_bool("ActivateCruiseAfterBrake"):
         self.params.put_bool_nonblocking("ActivateCruiseAfterBrake", False)
         self._cruise_control(1, -1, "Cruise on (brake)")
-      elif self.v_cruise_kph < self.v_ego_kph_set:
-        self.v_cruise_kph = self.v_ego_kph_set
+      elif v_cruise_kph < self.v_ego_kph_set:
+        v_cruise_kph = self.v_ego_kph_set
 
     if self._soft_hold_active > 0:
       #self.events.append(EventName.softHold)

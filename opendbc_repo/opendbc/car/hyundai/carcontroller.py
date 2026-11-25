@@ -520,7 +520,7 @@ class CarController(CarControllerBase):
     self.activeCarrot = hud_control.activeCarrot
     if active_speed_decel and self.speedCameraHapticEndFrame < 0: # 과속카메라 감속시작
       self.speedCameraHapticEndFrame = self.frame + (8.0 / DT_CTRL)  #8초간 켜줌.
-    elif not active_speed_decel:
+    elif hud_control.activeCarrot != 3:
       self.speedCameraHapticEndFrame = -1
 
     if 0 <= self.speedCameraHapticEndFrame - self.frame < int(8.0 / DT_CTRL) and self.hapticFeedbackWhenSpeedCamera > 0:
@@ -723,9 +723,11 @@ class CarController(CarControllerBase):
       # carrot.. 왜 alt_cruise_button는 값이 리스트일까?, 그리고 왜? 빈데이터가 들어오는것일까?
       if CS.cruise_buttons_msg is not None and self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
         try:
-          cruise_buttons_msg_values = {key: value[0] for key, value in CS.cruise_buttons_msg.items()}
-        except: # IndexError:
-          #print("IndexError....")
+          cruise_buttons_msg_values = {
+            key: (value[0] if isinstance(value, (list, tuple)) else value)
+            for key, value in CS.cruise_buttons_msg.items()
+          }
+        except (IndexError, TypeError):
           cruise_buttons_msg_values = None
           self.cruise_buttons_msg_cnt += 1
         if cruise_buttons_msg_values is not None:

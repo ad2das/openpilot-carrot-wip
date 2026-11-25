@@ -433,7 +433,7 @@ class LongControl:
     self.pid.reset()
     self.coasting.reset()
 
-  def _depart_guard(self, output_accel, a_target_ff, should_stop, CS, radarState):
+  def _depart_guard(self, output_accel, a_target_ff, should_stop, CS, radarState, long_plan=None, t_since_plan=0.0):
     self.depart_guard_last = False
     if not self.butter_stop:
       self._depart_t = None
@@ -444,12 +444,21 @@ class LongControl:
     try:
       v_ego = float(CS.vEgo)
       a_ff = float(a_target_ff)
+      brake_pressed = bool(getattr(CS, "brakePressed", False))
+      fcw = bool(getattr(long_plan, "fcw", False)) if long_plan is not None else False
+      plan_age = float(t_since_plan)
+      plan_fresh = math.isfinite(plan_age) and 0.0 <= plan_age <= MAX_PLAN_AGE
       lead = radarState.leadOne
       lead_ok = (not lead.status) or (float(lead.vLead) >= v_ego and float(lead.dRel) >= DEPART_MIN_DREL)
     except (TypeError, ValueError, AttributeError):
       v_ego = a_ff = float("nan")
+      brake_pressed = False
+      fcw = False
+      plan_fresh = False
       lead_ok = False
-    if not (lead_ok and not should_stop and math.isfinite(v_ego) and math.isfinite(a_ff)):
+    hard_decel = math.isfinite(a_ff) and a_ff <= -0.8
+    if not (lead_ok and not should_stop and not brake_pressed and not fcw and plan_fresh
+            and not hard_decel and math.isfinite(v_ego) and math.isfinite(a_ff)):
       # Safety exits drop the guard at once and end it for this departure.
       self._depart_t = None
       self._depart_floor = None
@@ -875,7 +884,10 @@ class LongControl:
         self.pid.i = previous_integral
         output_accel = stop_u
         self._firm_cap = None
-        self._stop_release = stop_u
+        self._firm_lock_phase = None
+        self._firm_settle_t = 0.0
+        self._firm_eased = False
+        self._stop_release = float(np.clip(stop_u, accel_limits[0], accel_limits[1]))
         self._stop_go_cap = None
         self._butter_floor_prev = None
       if stop_u is None and butter_floor_value is not None and output_accel < butter_floor_value:
@@ -924,9 +936,15 @@ class LongControl:
           self._firm_cap, self._firm_lock_phase, self._firm_settle_t = firm_lock_step(
             self._firm_lock_phase, self._firm_settle_t, self.last_output_accel, self.firm_a, float(CS.aEgo))
         elif gate:
+          self._firm_lock_phase = None
+          self._firm_settle_t = 0.0
           self._firm_cap = firm_track_step(self._firm_cap, self.last_output_accel, self.firm_a,
                                            float(CS.aEgo), False)
         else:
+          self._firm_lock_phase = None
+          self._firm_settle_t = 0.0
+          if hard_exit:
+            self._firm_eased = False
           self._firm_cap = firm_cap_step(self._firm_cap, self.last_output_accel, self.firm_a, gate, hard_exit)
         if gate and not was_capped and not self._firm_logged:
           cloudlog.event("butterStopFirm", vEgo=float(CS.vEgo), aTarget=float(a_target_ff), firmA=self.firm_a,
@@ -989,7 +1007,7 @@ class LongControl:
           self.pid.i = previous_integral
           output_accel = self._stop_go_cap
           self._butter_floor_prev = None
-      guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState)
+      guarded = self._depart_guard(output_accel, a_target_ff, should_stop, CS, radarState, long_plan, t_since_plan)
       if guarded > output_accel:
         # Do not integrate the speed error the guard is overriding.
         self.pid.i = previous_integral
