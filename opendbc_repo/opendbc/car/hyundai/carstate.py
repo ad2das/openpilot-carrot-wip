@@ -370,6 +370,20 @@ class CarState(CarStateBase):
         setattr(self, attr, parser.vl[name])
         carlog.info(f"CAN-FD camera TX template ready: {name} bus={parser.bus} ready_count={self.controls_ready_count}")
 
+  def _discover_canfd_isg_status(self, parser):
+    # Startup CAN dropouts must not permanently disable ISG_STATUS (0x0B5) tracking.
+    # Absent platforms (e.g. Palisade/EVs) never put 0x0B5 in seen_addresses, so this
+    # adds no CAN validity checks there.
+    if self.isg_status is not None or self.controls_ready_count < 126:
+      return
+    msg = parser.dbc.name_to_msg.get("ISG_STATUS")
+    if msg is None or msg.address not in parser.seen_addresses:
+      return
+    if msg.address not in parser.addresses:
+      parser._add_message("ISG_STATUS", ignore_counter=True)
+    if "ISG_STATUS" in parser.vl:
+      self.isg_status = parser.vl["ISG_STATUS"]
+
   def monitor_fingerprint(self, can_parsers, canfd):
     # Keep observing after startup fingerprint registration has finished.
     # Reading seen_addresses does not register extra CAN validity checks.
@@ -470,6 +484,7 @@ class CarState(CarStateBase):
 
     if canfd and self.CP.flags & HyundaiFlags.CANFD:
       self._discover_canfd_camera_tx_messages(can_parsers[Bus.cam])
+      self._discover_canfd_isg_status(can_parsers[Bus.pt])
 
 
 

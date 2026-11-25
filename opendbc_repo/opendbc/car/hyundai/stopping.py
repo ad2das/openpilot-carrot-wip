@@ -265,6 +265,12 @@ class CanfdStopping:
       elif self.isg_mode == "depart" and leaving:
         self.isg_mode = "brake"
         event = "isg_wait_brake"
+    elif isg_auto_stop and ok and speed <= MOVING_SPEED and released and self.isg_mode == "":
+      # Direct driver takeover (gas or gear change) from an openpilot hold while still ISG-stopped:
+      # hand StopReq back immediately, but still emit CRUSE_INFO_SET_2 = 2 on the release frame.
+      self.isg_mode = "post"
+      self.isg_frames = 0
+      event = "isg_released"
 
     # 3) apply
     if self.isg_mode in ("depart", "brake"):

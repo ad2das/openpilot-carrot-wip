@@ -508,5 +508,83 @@ def test_oem_autohold_without_prior_openpilot_hold_is_untouched(camera):
   assert a.isg_mode == ""
 
 
+@pytest.mark.parametrize("camera", [True, False])
+def test_direct_gas_from_hold_releases_immediately_with_restart_request(camera):
+  """Pressing gas directly from an openpilot ISG hold must drop StopReq immediately AND send CIS2=2."""
+  live, reference = isg_cs(), isg_cs()
+  a, b = CanfdStopping(), isg_off(CanfdStopping())
+  for cs in (live, reference):
+    cs.canfdSccHoldActive = True
+  for _ in range(3):
+    assert payload(camera, a, live, stopping=True, accel=-0.5) == \
+           payload(camera, b, reference, stopping=True, accel=-0.5)
+  assert a.isg_mode == ""
+
+  for cs in (live, reference):
+    cs.out.gasPressed = True
+  live_values = decode(payload(camera, a, live, stopping=True, accel=-0.5, override=True))
+  base_values = decode(payload(camera, b, reference, stopping=True, accel=-0.5, override=True))
+  assert live_values["StopReq"] == 0
+  assert live_values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert a.isg_mode == "post"
+  for key in ("CRUSE_INFO_SET_2", "CHECKSUM"):
+    live_values.pop(key)
+    base_values.pop(key)
+  assert live_values == base_values
+
+  at_rest(live, 0.2)
+  at_rest(reference, 0.2)
+  assert decode(payload(camera, a, live, stopping=False, accel=0.5, override=True))["CRUSE_INFO_SET_2"] == base_cis2(camera)
+  assert a.isg_mode == ""
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_direct_neutral_from_hold_releases_immediately_with_restart_request(camera):
+  """Shifting directly out of drive during an openpilot ISG hold must drop StopReq immediately AND send CIS2=2."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  assert controller.isg_mode == ""
+
+  cs.out.gearShifter = "neutral"
+  values = send(camera, controller, cs, enabled=False)
+  assert values["ACCMode"] == 0
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+  cs.isgAutoStop = False
+  for frame in range(ISG_POST_FRAMES):
+    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"post frame {frame}"
+  assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == base_cis2(camera)
+  assert controller.isg_mode == ""
+
+
+def test_late_isg_status_registration_recovers_after_startup_window():
+  """If 0x0B5 arrives after the initial startup frame 126 window, _discover_canfd_isg_status still registers it."""
+  from opendbc.car.hyundai.carstate import CarState
+
+  parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  parser.controls_ready = True
+  cs = CarState.__new__(CarState)
+  cs.isg_status = None
+  cs.controls_ready_count = 200
+
+  # Bus without 0x0B5 (e.g. Palisade/EV): must stay None and add no extra tracked address.
+  t = 1_000_000_000
+  parser.update([t, [(96, bytes(24), 0)]])
+  cs._discover_canfd_isg_status(parser)
+  assert cs.isg_status is None
+  assert 181 not in parser.addresses
+
+  # Once 0x0B5 appears on bus 0, discovery registers it and subsequent frames decode ISG_STATE=8.
+  auto = bytes.fromhex(ISG_HEX_AUTO_STOP)
+  parser.update([t + 10_000_000, [(181, auto, 0)]])
+  cs._discover_canfd_isg_status(parser)
+  assert cs.isg_status is not None
+  assert 181 in parser.addresses
+  parser.update([t + 20_000_000, [(181, auto, 0)]])
+  assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
+
+
 if __name__ == "__main__":
   raise SystemExit(pytest.main([__file__, "-q"]))
