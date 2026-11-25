@@ -1388,14 +1388,25 @@ class Tunnel:
     self.proc = proc
 
   def stop(self) -> None:
-    if self.proc and self.proc.poll() is None:
+    if self.proc is None:
+      return
+    if self.proc.poll() is None:
       try:
         self.proc.terminate()
         try:
           self.proc.wait(timeout=4)
         except Exception:
           self.proc.kill()
+          try:
+            self.proc.wait(timeout=2)
+          except Exception:
+            pass
       except Exception:
+        pass
+    if self.proc.stdout is not None:
+      try:
+        self.proc.stdout.close()
+      except OSError:
         pass
 
 
@@ -1403,10 +1414,15 @@ def _drain_pipe(stream) -> None:
   if stream is None:
     return
   try:
-    for _ in iter(stream.readline, ""):
+    while stream.read(4096):
       pass
   except Exception:
     pass
+  finally:
+    try:
+      stream.close()
+    except OSError:
+      pass
 
 
 def _start_quick_tunnel(local_url: str, timeout_s: float = 25.0) -> Tunnel:
@@ -1416,33 +1432,51 @@ def _start_quick_tunnel(local_url: str, timeout_s: float = 25.0) -> Tunnel:
   binary = _cloudflared_path() or _download_cloudflared()
   proc = subprocess.Popen(
     [binary, "tunnel", "--url", local_url],
-    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
+    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0,
   )
   url = ""
   deadline = time.monotonic() + timeout_s
   use_select = os.name != "nt" and proc.stdout is not None
   if use_select:
     import select
+  buf = bytearray()
+  fd = proc.stdout.fileno() if use_select else -1
   while True:
+    # Process all buffered complete lines before blocking on select/read,
+    # otherwise a multi-line write can sit in the buffer while select waits.
+    while b"\n" in buf:
+      nl = buf.index(b"\n")
+      line = bytes(buf[:nl + 1]).decode("utf-8", errors="replace")
+      del buf[:nl + 1]
+      match = TRYCLOUDFLARE_RE.search(line)
+      if match:
+        url = match.group(0)
+        break
+    if url:
+      break
     remaining = deadline - time.monotonic()
     if remaining <= 0.0:
       break
     if use_select:
       try:
-        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+        ready, _, _ = select.select([fd], [], [], remaining)
       except (OSError, ValueError):
         break
       if not ready:
         break
-    line = proc.stdout.readline() if proc.stdout else ""
-    if not line:
-      if proc.poll() is not None:
+      try:
+        chunk = os.read(fd, 4096)
+      except OSError:
         break
-      continue
-    match = TRYCLOUDFLARE_RE.search(line)
-    if match:
-      url = match.group(0)
+    else:
+      chunk = proc.stdout.read(4096) if proc.stdout else b""
+    if not chunk:
+      if buf:
+        match = TRYCLOUDFLARE_RE.search(bytes(buf).decode("utf-8", errors="replace"))
+        if match:
+          url = match.group(0)
       break
+    buf.extend(chunk)
   if not url:
     Tunnel(url="", proc=proc).stop()
     raise RuntimeError("cloudflared did not provide a trycloudflare URL")

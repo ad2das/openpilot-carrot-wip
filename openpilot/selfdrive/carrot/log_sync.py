@@ -264,7 +264,7 @@ class LogSync:
     if ok:
       after = tlvrec_files(session_dir)
       if after == files and _tlvrec_active_session(time.time()) != name:  # noqa: TID251
-        await asyncio.to_thread(shutil.rmtree, session_dir, True)
+        await asyncio.to_thread(shutil.rmtree, session_dir, ignore_errors=True)
         cloudlog.event("carrot_log_sync_tlvrec_ok", session=name, files=len(files), bytes=sum(files.values()))
       else:
         cloudlog.event("carrot_log_sync_tlvrec_changed", session=name)

@@ -156,3 +156,75 @@ def test_xiaoge_broadcaster_caps_clients_and_drops_dead_client():
   b.handle_client(overflow, ("127.0.0.1", 9999))
   assert overflow in closed
   assert ("127.0.0.1", 9999) not in b.clients
+
+
+def test_xiaoge_handle_client_preserves_partial_frame_across_socket_timeout():
+  import socket
+  import struct
+  from openpilot.selfdrive.carrot.xiaoge_data import CLIENT_SEND_TIMEOUT_S, XiaogeDataBroadcaster
+
+  b = XiaogeDataBroadcaster.__new__(XiaogeDataBroadcaster)
+  b.clients = {}
+  b.client_send_locks = {}
+  b.clients_lock = threading.Lock()
+  b.server_running = True
+
+  sent = []
+  ping = struct.pack("!I", 2)
+  steps = iter([ping[:2], socket.timeout("idle"), ping[2:], b""])
+
+  class PartialSock:
+    def __init__(self):
+      self.timeout = None
+
+    def settimeout(self, t):
+      self.timeout = t
+
+    def setsockopt(self, *args):
+      pass
+
+    def recv(self, n):
+      item = next(steps)
+      if isinstance(item, BaseException):
+        raise item
+      assert n >= len(item)
+      return item
+
+    def sendall(self, data):
+      sent.append(data)
+
+    def close(self):
+      pass
+
+  sock = PartialSock()
+  b.handle_client(sock, ("127.0.0.1", 5000))
+  assert sock.timeout == CLIENT_SEND_TIMEOUT_S
+  assert sent == [struct.pack("!I", 0)]
+
+
+def test_recovery_start_quick_tunnel_handles_multiline_burst_without_timeout(monkeypatch):
+  import sys
+  from openpilot.selfdrive.carrot.recovery import server as recovery_server
+
+  monkeypatch.delenv("CARROT_SUPPORT_FAKE_TUNNEL_URL", raising=False)
+  monkeypatch.setattr(recovery_server, "_cloudflared_path", lambda: sys.executable)
+
+  real_popen = recovery_server.subprocess.Popen
+
+  def fake_popen(_cmd, **kwargs):
+    # Emit two lines in a single write, then stay open until terminated.
+    code = (
+      "import sys, time; "
+      "sys.stdout.buffer.write(b'starting cloudflared\\nhttps://demo-test.trycloudflare.com\\n'); "
+      "sys.stdout.buffer.flush(); "
+      "time.sleep(30)"
+    )
+    return real_popen([sys.executable, "-c", code], **kwargs)
+
+  monkeypatch.setattr(recovery_server.subprocess, "Popen", fake_popen)
+
+  tunnel = recovery_server._start_quick_tunnel("http://127.0.0.1:8080", timeout_s=3.0)
+  try:
+    assert tunnel.url == "https://demo-test.trycloudflare.com"
+  finally:
+    tunnel.stop()

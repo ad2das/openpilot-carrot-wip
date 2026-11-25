@@ -23,7 +23,6 @@ TESLA_AUTOPILOT_PARTY_BUS = 2
 TESLA_DAS_ROAD_TIMEOUT_S = 1.0
 MAX_CLIENTS = 32
 CLIENT_SEND_TIMEOUT_S = 2.0
-CLIENT_RECV_TIMEOUT_S = 5.0
 
 
 def capnp_items(values, limit: int) -> list[Any]:
@@ -73,18 +72,13 @@ class XiaogeDataBroadcaster:
 
   @staticmethod
   def _configure_client_socket(conn: socket.socket) -> None:
-    conn.settimeout(CLIENT_RECV_TIMEOUT_S)
+    # Enforce a bounded send timeout across platforms (CPython settimeout uses poll()
+    # for both sendall and recv; handle_client preserves partial recv bytes across timeouts).
+    conn.settimeout(CLIENT_SEND_TIMEOUT_S)
     try:
       conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
     except OSError:
       pass
-    if hasattr(socket, "SO_SNDTIMEO"):
-      try:
-        sec = int(CLIENT_SEND_TIMEOUT_S)
-        usec = int((CLIENT_SEND_TIMEOUT_S - sec) * 1_000_000)
-        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", sec, usec))
-      except OSError:
-        pass
 
   def send_packet_to_client(self, conn: socket.socket, packet: bytes, send_lock: Any = None) -> bool:
     try:
@@ -110,14 +104,20 @@ class XiaogeDataBroadcaster:
         return
       self.clients[addr] = conn
       self.client_send_locks[addr] = send_lock
+    recv_buf = bytearray()
     try:
       while self.server_running:
         try:
-          command = self.recvall(conn, 4)
+          chunk = conn.recv(4 - len(recv_buf))
         except socket.timeout:
           continue
-        if not command:
+        if not chunk:
           break
+        recv_buf.extend(chunk)
+        if len(recv_buf) < 4:
+          continue
+        command = bytes(recv_buf)
+        recv_buf.clear()
         if struct.unpack("!I", command)[0] == 2:
           with send_lock:
             conn.sendall(struct.pack("!I", 0))

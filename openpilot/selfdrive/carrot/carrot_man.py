@@ -2227,7 +2227,16 @@ class CarrotMan:
             self.remote_addr = addr
             print("Connected:", addr)
             conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            conn.settimeout(60.0)
+            for opt, val in (
+              ("TCP_KEEPIDLE", 30),
+              ("TCP_KEEPINTVL", 10),
+              ("TCP_KEEPCNT", 3),
+            ):
+              if hasattr(socket, opt):
+                try:
+                  conn.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+                except OSError:
+                  pass
             try:
               with conn.makefile("r", encoding="utf-8", errors="ignore") as f:
                 while True:
