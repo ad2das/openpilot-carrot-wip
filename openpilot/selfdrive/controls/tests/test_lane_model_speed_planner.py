@@ -46,6 +46,8 @@ class StubLanePlanner:
     self.debugText = ''
     self.l_prob = 0.0
     self.r_prob = 0.0
+    self.lll_prob = 0.0
+    self.rll_prob = 0.0
     self.ll_x = np.linspace(0, 300, 33)
     self.lll_y = np.full(33, -1.75)
     self.rll_y = np.full(33, 1.75)

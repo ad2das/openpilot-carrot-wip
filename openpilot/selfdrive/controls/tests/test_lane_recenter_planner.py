@@ -66,6 +66,8 @@ class StubLanePlanner:
     self.debugText = ''
     self.l_prob = 0.9
     self.r_prob = 0.9
+    self.lll_prob = 0.9
+    self.rll_prob = 0.9
     self.lane_width = 3.5
     self.lane_width_left = 3.5
     self.lane_width_right = 3.5

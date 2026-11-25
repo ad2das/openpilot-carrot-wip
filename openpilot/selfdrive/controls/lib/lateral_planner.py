@@ -329,8 +329,8 @@ class LateralPlanner:
     """This frame's HybridFrame: pure reads of modelV2, P0's LanePlanner lines and P0's blend.
 
     P0's LanePlanner has already parsed this modelV2 frame (update() runs parse_model, then
-    get_d_path, then this), so ll_x / lll_y / rll_y / l_prob / r_prob are this frame's values and
-    nothing here mutates planner state.
+    get_d_path, then this), so ll_x / lll_y / rll_y / lll_prob / rll_prob are this frame's values
+    and nothing here mutates planner state.
     """
     f = HybridFrame()
     lp = self.LP
@@ -360,8 +360,10 @@ class LateralPlanner:
     f.w0 = float(np.interp(0.0, ll_x, width_pts))
     f.w15 = float(np.interp(15.0, ll_x, width_pts))
     f.w30 = float(np.interp(30.0, ll_x, width_pts))
-    f.lprob = float(lp.l_prob)
-    f.rprob = float(lp.r_prob)
+    # Pass raw model laneLineProbs: lp.l_prob / lp.r_prob already attenuate by std in [0.15, 0.30]
+    # and lane width, which double-penalized CurveLaneHybrid's own strict std/width mask.
+    f.lprob = float(lp.lll_prob)
+    f.rprob = float(lp.rll_prob)
     if len(md.laneLineStds) > 2:
       f.std1 = float(md.laneLineStds[1])
       f.std2 = float(md.laneLineStds[2])

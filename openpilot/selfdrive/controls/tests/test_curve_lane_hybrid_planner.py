@@ -76,6 +76,8 @@ class StubLanePlanner:
     self.debugText = ''
     self.l_prob = 0.95
     self.r_prob = 0.95
+    self.lll_prob = 0.95
+    self.rll_prob = 0.95
     self.lane_width = 3.5
     self.lane_width_left = 3.5
     self.lane_width_right = 3.5
@@ -566,3 +568,34 @@ def test_prewarm_below_v_min_clears_guard_before_curve_entry():
   planner.update(inputs(1.0 + 15 * DT, speed=V_MIN + 0.5, lane_speed=0.0, lat=True, y_off=0.5),
                  SimpleNamespace(atc_active=False))
   assert planner.curve_hybrid.on is True
+
+
+def test_hybrid_uses_raw_lane_probs_and_std_hysteresis():
+  """Regression for night/curve double-penalty: lp.l_prob attenuation must not kill CurveLaneHybrid."""
+  planner, _ = build_planner(lra=1)
+  planner.LP.set_shape(CURVE_A)
+  # Raw model probs stay high while LanePlanner's std-attenuated l_prob/r_prob fall below 0.70.
+  planner.LP.lll_prob = 0.90
+  planner.LP.rll_prob = 0.90
+  planner.LP.l_prob = 0.40
+  planner.LP.r_prob = 0.40
+
+  for i in range(15):
+    sm = inputs(1.0 + i * DT, lane_speed=0.0, lat=True, y_off=0.5)
+    sm['modelV2'].laneLineStds = [0.1, 0.22, 0.22]
+    planner.update(sm, SimpleNamespace(atc_active=False))
+  assert planner.hybrid_errors == 0
+  assert planner.curve_hybrid.eligible is True
+  assert planner.curve_hybrid.on is True
+
+  # While active, std in (0.25, 0.35] holds ON via STRICT_STD_HOLD.
+  sm_hold = inputs(1.0 + 15 * DT, lane_speed=0.0, lat=True, y_off=0.5)
+  sm_hold['modelV2'].laneLineStds = [0.1, 0.30, 0.34]
+  planner.update(sm_hold, SimpleNamespace(atc_active=False))
+  assert planner.curve_hybrid.on is True
+
+  # Exceeding STRICT_STD_HOLD (0.35) turns OFF.
+  sm_drop = inputs(1.0 + 16 * DT, lane_speed=0.0, lat=True, y_off=0.5)
+  sm_drop['modelV2'].laneLineStds = [0.1, 0.36, 0.34]
+  planner.update(sm_drop, SimpleNamespace(atc_active=False))
+  assert planner.curve_hybrid.on is False

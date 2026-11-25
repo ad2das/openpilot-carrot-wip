@@ -22,6 +22,7 @@ STEP_MAX_DT = 0.1
 # --- eligibility (report_hyb.py:14-22) ------------------------------------------------------
 STRICT_PROB = 0.7
 STRICT_STD = 0.25
+STRICT_STD_HOLD = 0.35
 W_LO, W_HI = 2.45, 4.2
 W_TAPER = 0.45
 JUMP_C = 0.25
@@ -182,8 +183,9 @@ class CurveLaneHybrid:
                 and _finite(f.c_s) and _finite(f.c0))
 
   def _strict_inputs(self, f):
+    std_lim = STRICT_STD_HOLD if self._on else STRICT_STD
     return bool(f.lprob >= STRICT_PROB and f.rprob >= STRICT_PROB
-                and f.std1 <= STRICT_STD and f.std2 <= STRICT_STD
+                and f.std1 <= std_lim and f.std2 <= std_lim
                 and W_LO <= f.w0 <= W_HI and W_LO <= f.w15 <= W_HI and W_LO <= f.w30 <= W_HI
                 and abs(f.w30 - f.w0) <= W_TAPER)
 

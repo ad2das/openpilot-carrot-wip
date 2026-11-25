@@ -15,7 +15,8 @@ import numpy as np
 from openpilot.selfdrive.controls.lib.curve_lane_hybrid import (
   CAP_A, CausalMedian, CurveLaneHybrid, GATE_HOLD_A, GATE_REENTRY_A, GATE_REENTRY_CS,
   GATE_ROAD_A, GUARD_BAD, GUARD_LW, GUARD_SHAPE, GUARD_W45, GUARD_REARM_S, HOLD_RELEASE_CS,
-  HOLD_S, J_DOWN, J_UP, JUMP_C, SPIKE_OK_RUN, V_MIN, W_C_LO, W_C_SPAN, HybridFrame,
+  HOLD_S, J_DOWN, J_UP, JUMP_C, SPIKE_OK_RUN, STRICT_STD, STRICT_STD_HOLD, V_MIN, W_C_LO,
+  W_C_SPAN, HybridFrame,
 )
 
 DT = 0.05          # 20 Hz modelV2
@@ -370,6 +371,21 @@ def test_strict_mask_fields():
              dict(w30=3.7, w0=3.2)):          # |w30 - w0| = 0.5 > W_TAPER
     _a, m = run([frame(0.0, **kw)])
     assert m.eligible is False, kw
+
+
+def test_strict_std_hysteresis_holds_after_entry():
+  """Entry requires <= STRICT_STD (0.25); once active, holds up to STRICT_STD_HOLD (0.35)."""
+  assert STRICT_STD == 0.25 and STRICT_STD_HOLD == 0.35
+  seq = [
+    frame(0.0, std1=0.26, std2=0.10),         # blocked on entry
+    frame(DT, std1=0.25, std2=0.25),          # enters at entry boundary
+    frame(2 * DT, std1=0.30, std2=0.35),      # holds through std spike up to STRICT_STD_HOLD
+    frame(3 * DT, std1=0.20, std2=0.36),      # drops when std exceeds STRICT_STD_HOLD
+    frame(4 * DT, std1=0.20, std2=0.30),      # cannot re-enter above STRICT_STD
+    frame(5 * DT, std1=0.20, std2=0.25),      # re-enters once back within STRICT_STD
+  ]
+  states, _m = on_states(seq)
+  assert states == [False, True, True, False, False, True]
 
 
 def test_k_model_must_be_finite():
