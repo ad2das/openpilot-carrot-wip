@@ -142,25 +142,34 @@ class TemplateRelocalizer:
     if r <= 0.0:
       return None
     rw = max(1, int(round(sw * r))); rh = max(1, int(round(sh * r)))
+    tpl_data = tpl.data
+    tw, th = tpl.tw, tpl.th
     m = max(rw, rh)
     if m > self.MAX_WINDOW_PX:
       scale = self.MAX_WINDOW_PX / float(m)
       rw = max(1, int(round(rw * scale))); rh = max(1, int(round(rh * scale)))
+      tw = max(1, int(round(tw * scale))); th = max(1, int(round(th * scale)))
       r *= scale
-    if rh < tpl.th or rw < tpl.tw:
+      tpl_data = cv2.resize(tpl_data, (tw, th), interpolation=cv2.INTER_AREA)
+      tpl_data = tpl_data - float(tpl_data.mean())
+      norm = float(np.linalg.norm(tpl_data))
+      if norm <= 1e-6:
+        return None
+      tpl_data = tpl_data / norm
+    if rh < th or rw < tw:
       return None
 
     win = luma[sy1:sy2, sx1:sx2].astype(np.float32)
     interp = cv2.INTER_AREA if r < 1.0 else cv2.INTER_LINEAR
     win = cv2.resize(win, (rw, rh), interpolation=interp)
-    res = cv2.matchTemplate(win, tpl.data, cv2.TM_CCOEFF_NORMED)
+    res = cv2.matchTemplate(win, tpl_data, cv2.TM_CCOEFF_NORMED)
     _min_v, peak, _min_l, loc = cv2.minMaxLoc(res)
     if peak < self.PEAK_MIN:
       return None
 
     # Margin: the peak must beat the best response outside a +-half-template
     # neighbourhood (a sharp single-light peak; adjacent heads do not confuse it).
-    nx = max(1, int(round(0.5 * tpl.tw))); ny = max(1, int(round(0.5 * tpl.th)))
+    nx = max(1, int(round(0.5 * tw))); ny = max(1, int(round(0.5 * th)))
     ox0 = max(0, loc[0] - nx); oy0 = max(0, loc[1] - ny)
     ox1 = min(res.shape[1], loc[0] + nx + 1); oy1 = min(res.shape[0], loc[1] + ny + 1)
     outside = res.copy()
@@ -171,6 +180,6 @@ class TemplateRelocalizer:
 
     full_tx = sx1 + loc[0] / r
     full_ty = sy1 + loc[1] / r
-    cx = full_tx + 0.5 * (tpl.tw / r)
-    cy = full_ty + 0.5 * (tpl.th / r)
+    cx = full_tx + 0.5 * (tw / r)
+    cy = full_ty + 0.5 * (th / r)
     return (cx - 0.5 * pw, cy - 0.5 * ph, cx + 0.5 * pw, cy + 0.5 * ph)

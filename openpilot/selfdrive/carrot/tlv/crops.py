@@ -265,17 +265,20 @@ class LampCropBuffer:
     self._rows = np.empty((3, LAMP_CROP_H, MODEL_W), dtype=np.uint8)
     self._ys = np.empty(LAMP_CROP_H, dtype=np.intp)
     self._xs = np.empty(LAMP_CROP_W, dtype=np.intp)
+    self.filled_indices: list[int] = []
 
   def build(self, model_input: np.ndarray, geom: ViewGeometry,
             boxes) -> tuple[np.ndarray, int]:
     """Write up to max_tracks lamp crops; returns (crops [4,3,32,64], count)."""
     if model_input.shape != (1, 3, MODEL_H, MODEL_W):
       raise ValueError(f"unexpected model input shape {model_input.shape}")
+    self.filled_indices = []
     count = 0
-    for box in boxes:
+    for idx, box in enumerate(boxes):
       if count >= self.max_tracks:
         break
       if self._fill_crop(model_input[0], geom, box, count):
+        self.filled_indices.append(idx)
         count += 1
     return self.crops, count
 
@@ -288,14 +291,20 @@ class LampCropBuffer:
     pad_y = LAMP_PAD_FRACTION * max(0.0, y2 - y1)
     x1, x2 = x1 - pad_x, x2 + pad_x
     y1, y2 = y1 - pad_y, y2 + pad_y
-    x1 = min(max(x1, 0.0), MODEL_W - 1.0)
-    y1 = min(max(y1, 0.0), MODEL_H - 1.0)
-    x2 = min(max(x2, x1 + 1.0), MODEL_W - 1.0)
-    y2 = min(max(y2, y1 + 1.0), MODEL_H - 1.0)
+    if not (np.isfinite(x1) and np.isfinite(y1) and np.isfinite(x2) and np.isfinite(y2)):
+      return False
+    if x2 <= 0.0 or y2 <= 0.0 or x1 >= MODEL_W or y1 >= MODEL_H:
+      return False
+    x1 = max(x1, 0.0)
+    y1 = max(y1, 0.0)
+    x2 = min(x2, float(MODEL_W))
+    y2 = min(y2, float(MODEL_H))
+    if x2 - x1 < 1.0 or y2 - y1 < 1.0:
+      return False
     for i in range(LAMP_CROP_H):
-      self._ys[i] = int(y1 + (i + 0.5) * (y2 - y1) / LAMP_CROP_H)
+      self._ys[i] = min(MODEL_H - 1, int(y1 + (i + 0.5) * (y2 - y1) / LAMP_CROP_H))
     for j in range(LAMP_CROP_W):
-      self._xs[j] = int(x1 + (j + 0.5) * (x2 - x1) / LAMP_CROP_W)
+      self._xs[j] = min(MODEL_W - 1, int(x1 + (j + 0.5) * (x2 - x1) / LAMP_CROP_W))
     np.take(image, self._ys, axis=1, out=self._rows)
     np.take(self._rows, self._xs, axis=2, out=self.crops[slot])
     return True

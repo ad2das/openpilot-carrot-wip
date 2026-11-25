@@ -217,3 +217,15 @@ def test_lamp_crop_buffer_maps_near_view_and_max_tracks():
   batch, count = buf.build(img, geom, [box_full, box_full, box_full])
   assert count == 2 and batch.shape[0] == 2
   assert int(batch[1, 0, 0, 0]) == int(batch[0, 0, 0, 0])
+
+
+def test_lamp_crop_buffer_skips_out_of_frame_boxes_and_tracks_indices():
+  img = _horizontal_gradient_model_input()
+  buf = crops.LampCropBuffer(max_tracks=4)
+  geom = crops.far_geometry(600.0, W, H, 2648.0)
+  off_left = (geom.x0 - 200.0, geom.y0 + 50.0, geom.x0 - 100.0, geom.y0 + 90.0)
+  in_frame = (geom.x0 + 100.0, geom.y0 + 50.0, geom.x0 + 140.0, geom.y0 + 90.0)
+  batch, count = buf.build(img, geom, [off_left, in_frame])
+  assert count == 1
+  assert buf.filled_indices == [1]
+  assert 90 <= int(batch[0, 0, 0, 0]) <= 96

@@ -466,8 +466,10 @@ class CarrotServ:
           if color in ["Red Light", "Yellow Light"]:
             traffic_red_trig += cnf
             traffic_red += cnf
-          elif color in ["Green Light", "Left turn"]:
+          elif color == "Green Light":
             traffic_green += cnf
+          elif color == "Left turn":
+            traffic_left += cnf
         elif pcolor in ["Red Light", "Yellow Light"]:
           if color in ["Green Light"]: #, "Left turn"]:
             traffic_green_trig += cnf
@@ -497,16 +499,23 @@ class CarrotServ:
       self.traffic_state = 2
       #self._add_log("Green light continued")
       #print("Green light continued")
+    elif traffic_left > 0:
+      self.traffic_state = 3
     else:
       self.traffic_state = 0
       #print("TrafficLight none")
 
     # WHOLE1: the previous call left a src-1 red held and this call's queue match
-    # came up empty (every matching entry has aged out), yet the detector still
-    # reports a red. Keep the red rather than publishing a 0 tick, so the model
-    # does not start on a light that is still red.
-    if src == 1 and color == "Red Light" and self.traffic_state == 0 and prev == (1, 1) and self.tlv_hole_slow:
-      self.traffic_state = 1
+    # came up empty (every matching entry has aged out during a hold), yet the
+    # detector still reports a valid state. Keep the red or preserve the go edge
+    # rather than dropping to 0.
+    if src == 1 and self.traffic_state == 0 and prev == (1, 1):
+      if color == "Red Light" and self.tlv_hole_slow:
+        self.traffic_state = 1
+      elif color == "Green Light":
+        self.traffic_state = 2
+      elif color == "Left turn":
+        self.traffic_state = 3
 
     self.traffic_state_src = src if self.traffic_state != 0 else 0
 
@@ -561,10 +570,6 @@ class CarrotServ:
       self.tlv_hole_slow = float(car_state.vEgo) <= TLV_HOLE_HOLD_MAX_MPS and not bool(car_state.gasPressed)
     except Exception:
       self.tlv_hole_slow = False
-    # W139c: default to no detector support; set below only when a TLV state is
-    # accepted. Every early-return path (mode off, not valid/updated, not
-    # running, no relevant track, no confirmed color) leaves 0.
-    self.tlv_det_support = 0
     if now - self.tlv_detect_mode_poll >= 1.0:
       self.tlv_detect_mode_poll = now
       try:
@@ -576,12 +581,14 @@ class CarrotServ:
       except Exception:
         self.tlv_stop_go = 0
     if self.tlv_detect_mode < 1:
+      self.tlv_det_support = 0
       return
     # W148: on an expressway the TLV feeds nothing. Clear a held src-1 state so
     # the coast cap, red stop/hold, starts and the green chime all turn off
     # together; navi-sourced (src 0) states are not touched.
     if self._update_tlv_highway_gate(now):
       self.tlv_top_exit = None
+      self.tlv_det_support = 0
       if self.traffic_state_src == 1:
         self.traffic_state = 0
         self.traffic_state_src = 0
@@ -590,6 +597,7 @@ class CarrotServ:
         self.traffic_light_count = -1
       return
     if not (sm.seen['carrotTlv'] and sm.alive['carrotTlv'] and sm.valid['carrotTlv']):
+      self.tlv_det_support = 0
       return
     if not sm.updated['carrotTlv']:
       return
@@ -603,25 +611,35 @@ class CarrotServ:
       # Keep extending the last accepted src-1 red while the suspension lasts,
       # capped at TLV_SUSPEND_HOLD_MAX_S so a real green is delayed by at most that.
       red_held = self.traffic_state in (1, TLV_GRADED_TRAFFIC_STATE) and self.traffic_state_src == 1
+      held_suspend = False
       if status_raw == 2 and red_held and self.tlv_hole_slow:
         if self.tlv_suspend_since is None:
           self.tlv_suspend_since = now
         if now - self.tlv_suspend_since <= TLV_SUSPEND_HOLD_MAX_S:
           self.tlv_hold_until = max(self.tlv_hold_until, now + TLV_HOLD_S)
+          held_suspend = True
+      if not held_suspend:
+        self.tlv_det_support = 0
       return
     self.tlv_suspend_since = None
     # W138: require the relevant track and a non-degenerate relevantBox; dets[0]
     # is no longer a fallback (it may be an unrelated light).
     if int(msg.relevantTrackId) < 0:
       self.tlv_range_m = 0.0
+      hold_before = self.tlv_hold_until
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
+      if self.tlv_hold_until <= hold_before:
+        self.tlv_det_support = 0
       return
     rb = msg.relevantBox
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
       self.tlv_range_m = 0.0
+      hold_before = self.tlv_hold_until
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
+      if self.tlv_hold_until <= hold_before:
+        self.tlv_det_support = 0
       return
     self.tlv_rel_lost_since = None
     self.tlv_top_exit = None  # WTOP1: a visible relevant track ends the hold
@@ -663,6 +681,7 @@ class CarrotServ:
     red_suppressed = self.tlv_release_latched and released_flag
     if state_raw == TLV_RED_LIKELY_STATE:  # graded redLikely: no confirmed color
       if float(msg.stateConf) < TLV_CONF_MIN or red_suppressed:
+        self.tlv_det_support = 0
         return
       self.traffic_state = TLV_GRADED_TRAFFIC_STATE
       self.traffic_state_src = 1
@@ -672,15 +691,18 @@ class CarrotServ:
       self.traffic_light_count = int(0.5 / 0.1)
       return
     if red_suppressed and state_raw in TLV_RED_FAMILY_STATES:
+      self.tlv_det_support = 0
       return
     color = tlv_state_color(state_raw, self._tlv_left_intent(sm))
     if color is None or float(msg.stateConf) < TLV_CONF_MIN:
+      self.tlv_det_support = 0
       return
     x = 0.5 * (float(rb.x1) + float(rb.x2)) / TLV_FRAME_W
     y = 0.5 * (float(rb.y1) + float(rb.y2)) / TLV_FRAME_H
     if state_raw in TLV_GREEN_FAMILY_STATES:
       self.tlv_last_green = (now, x, y)
     if color == TLV_COLOR_YELLOW and not self._tlv_yellow_after_green(now, x, y):
+      self.tlv_det_support = 0
       return
     # Same-track green (W74D): a TLV green/left may only feed the confirmed
     # color path when it comes from the light that was red-confirmed within
@@ -688,6 +710,8 @@ class CarrotServ:
     # would erase a confirmed red and kill the later red->green/left edge,
     # while holding the previous value can never create a start edge.
     if color in (TLV_COLOR_GREEN, TLV_COLOR_LEFT) and not bool(msg.goAfterRed):
+      if self.traffic_state_src != 1:
+        self.tlv_det_support = 0
       return
     if color == TLV_COLOR_RED:
       self.tlv_last_red_top = (now, float(rb.y1))
@@ -772,6 +796,8 @@ class CarrotServ:
         return True
     except Exception:
       pass
+    if str(getattr(self, "atcType", "")) in LEFT_INTENT_ATCTYPES:
+      return True
     try:
       return str(sm['carrotMan'].atcType) in LEFT_INTENT_ATCTYPES
     except Exception:

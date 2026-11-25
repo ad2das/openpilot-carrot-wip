@@ -48,6 +48,7 @@ class Events:
 def planner_class(source):
   helpers = load_file(REPO / 'openpilot/selfdrive/carrot/t_follow.py', 'replay_tf')
   stop = load_file(REPO / 'openpilot/selfdrive/carrot/traffic_stop.py', 'replay_stop')
+  green_override = load_file(REPO / 'openpilot/selfdrive/carrot/tlv_green_override.py', 'replay_green_override')
   filters = load_file(REPO / 'openpilot/common/filter_simple.py', 'replay_filters')
   driving = Enum('DrivingMode', dict(Eco=1, Safe=2, Normal=3, High=4))
   ns = dict(time=time, np=np, Enum=Enum, DT_MDL=.05, CV=NS(MS_TO_KPH=3.6, KPH_TO_MS=1/3.6),
@@ -58,6 +59,7 @@ def planner_class(source):
             RADAR_TO_CAMERA=1.52, MyMovingAverage=filters.MyMovingAverage,
             TrafficStopModelLeadMatcher=stop.TrafficStopModelLeadMatcher,
             is_traffic_stop_entry_allowed=stop.is_traffic_stop_entry_allowed,
+            GreenHold=green_override.GreenHold, override_ok=green_override.override_ok,
             deque=collections.deque, cloudlog=NS(event=lambda *a, **k: None), CARROT_MAN_TIMEOUT=1.0)
   ns.update({n: getattr(helpers, n) for n in dir(helpers) if not n.startswith('_')})
   tree = ast.parse(source)

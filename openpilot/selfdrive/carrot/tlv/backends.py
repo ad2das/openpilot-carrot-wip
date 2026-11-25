@@ -675,8 +675,26 @@ class DspBackend:
     live = self._proc_cpu(self._proc.pid) if self._proc is not None else 0.0
     return self._reaped_cpu + live
 
+  def _close_shm(self) -> None:
+    for attr in ("_in_map", "_out_map"):
+      mm = getattr(self, attr, None)
+      setattr(self, attr, None)
+      if mm is not None:
+        inner = getattr(mm, "_mmap", None)
+        if inner is not None:
+          try:
+            inner.close()
+          except OSError:
+            pass
+    for path in (self._in_path, self._out_path):
+      try:
+        os.unlink(path)
+      except OSError:
+        pass
+
   def _switch_to_fallback(self, reason: str) -> None:
     self._reap()
+    self._close_shm()
     self._active = "cpu_fallback"
     self.fallback_reason = str(reason)
     fallback = self._fallback_factory()
@@ -737,11 +755,7 @@ class DspBackend:
 
   def close(self) -> None:
     self._reap(graceful=True)
-    for path in (self._in_path, self._out_path):
-      try:
-        os.unlink(path)
-      except OSError:
-        pass
+    self._close_shm()
     if self._fallback is not None:
       self._fallback.close()
       self._fallback = None

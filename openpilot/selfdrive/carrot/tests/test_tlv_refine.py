@@ -338,3 +338,20 @@ def test_yaw_bias_straight_road_keeps_track_id(monkeypatch):
                  anchor=(odo.s, odo.psi, t), crop_box=(0.0, 0.0, W, H), frame_box=(0.0, 0.0, W, H))
     ids.append(light.last_matches[0][1] if light.last_matches else -1)
   assert len(set(ids)) == 1 and ids[0] == 1
+
+
+def test_relocalizer_scales_template_when_search_window_hits_max_window_px():
+  # #15: shrinking search window to MAX_WINDOW_PX must scale template by the same factor.
+  rel = refine.TemplateRelocalizer()
+  if not rel.enabled:
+    pytest.skip("cv2 unavailable")
+  luma = _luma_with_lamp(900, 600)
+  t = _track((880.0, 588.0, 920.0, 612.0), track_id=9)
+  assert rel.refresh(luma, t) is True
+  # Force MAX_WINDOW_PX clamp with a tight window cap while keeping template > 2 px.
+  rel.MAX_WINDOW_PX = 40
+  luma2 = _luma_with_lamp(908, 602)
+  got = rel.refine(luma2, t, (880.0, 588.0, 920.0, 612.0))
+  assert got is not None
+  assert 0.5 * (got[0] + got[2]) == pytest.approx(908.0, abs=4.0)
+  assert 0.5 * (got[1] + got[3]) == pytest.approx(602.0, abs=4.0)

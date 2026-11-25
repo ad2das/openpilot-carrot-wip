@@ -242,6 +242,30 @@ class FramePipeline:
     self._stale_box_ids: set[int] = set()
     self.standstill_box_votes = 0
 
+  def reset(self) -> None:
+    """Clear stale tracks and signal-state outputs after camera loss or suspension."""
+    self.tracker = tracker.TrafficLightTracker()
+    self.machine = tracker.SignalStateMachine()
+    self.relocalizer = refine.TemplateRelocalizer()
+    self.last_dets = []
+    self.last_gated = []
+    self.last_state = tracker.SignalState.none
+    self.last_conf = 0.0
+    self.last_track_id = -1
+    self.last_relevant_box = None
+    self.last_red_likely = False
+    self._last_red_pub_s = None
+    self.last_released = False
+    self.release_sticky = False
+    self.release_track_id = -1
+    self.release_run_start = 0.0
+    self._last_red_confirm_s = None
+    self.last_relevant_det_support = 0
+    self._verified_ids.clear()
+    self._stale_box_ids.clear()
+    self._standstill_since = None
+    self._standstill_s = 0.0
+
   def capture_luma(self, y, width: int) -> None:
     """Copy the full-resolution luma of this frame (y is [height, stride])."""
     height = y.shape[0]
@@ -456,11 +480,16 @@ class FramePipeline:
       return
     _softmax_rows_into(self._classifier_probs, logits)
     votes: list[tuple[int, int, float]] = []
+    filled = getattr(self.lamp_crops, "filled_indices", None)
     for i in range(min(count, len(ordered))):
+      track_idx = filled[i] if filled is not None and i < len(filled) else i
+      if track_idx >= len(ordered):
+        continue
+      track = ordered[track_idx]
       row = self._classifier_probs[i]
       cls = vote_class(row)
       prob = float(row[cls])
-      if ordered[i].track_id in self._stale_box_ids:
+      if track.track_id in self._stale_box_ids:
         # W153: a standstill stale-box vote is recorded ONLY when it is a
         # confident green. Red/yellow/OFF/low-p votes are dropped: a stale red
         # would count as "a red-family vote newer than run_start" and break the
@@ -469,7 +498,7 @@ class FramePipeline:
         if cls not in tracker.GREEN_RELEASE_CLASSES or prob < STANDSTILL_BOX_VOTE_PROB:
           continue
         self.standstill_box_votes += 1
-      votes.append((ordered[i].track_id, cls, prob))
+      votes.append((track.track_id, cls, prob))
     self.tracker.record_votes(now, votes)
 
   def infer(self, view: str, geom: crops.ViewGeometry, *, image_width: int, path_x=(), path_y=(),

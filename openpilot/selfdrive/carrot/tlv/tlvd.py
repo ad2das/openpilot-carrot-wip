@@ -362,6 +362,7 @@ class TlvRunner:
     print("tlvd: vision stream lost; reconnecting", flush=True)
     self.client = None
     self.last_frame_mono = 0.0
+    self.pipeline.reset()
 
   def _drain_newest_frame(self):
     """Newest unread frame; intermediate frames are skips while busy."""
@@ -777,6 +778,8 @@ class TlvRunner:
       return "suspended", STATUS_BASELINE
     if self.watchdog.status == STATUS_SUSPENDED:
       return "suspended", self.watchdog.reason or STATUS_SUSPENDED
+    if self.client is None or not self.client.is_connected():
+      return "suspended", "no_camera"
     return STATUS_RUNNING, ""
 
   # -- logging --------------------------------------------------------------
@@ -904,6 +907,10 @@ class TlvRunner:
           self._disconnect()
 
       status, reason = self._status()
+      is_running = status == STATUS_RUNNING
+      if is_running != getattr(self, "_was_running", False):
+        self.pipeline.reset()
+        self._was_running = is_running
       self._publish(status, reason)
       self._maybe_log_stats(now)
       rk.keep_time()
@@ -964,6 +971,13 @@ def main() -> None:
     close_recorder = getattr(runner, "close_recorder", None)
     if close_recorder is not None:
       close_recorder()
+    for component in (getattr(runner, "backend", None), getattr(runner, "classifier", None)):
+      close_fn = getattr(component, "close", None)
+      if close_fn is not None:
+        try:
+          close_fn()
+        except Exception:
+          pass
 
 
 if __name__ == "__main__":

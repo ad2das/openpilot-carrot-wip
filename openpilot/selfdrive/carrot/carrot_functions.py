@@ -303,7 +303,7 @@ class CarrotPlanner:
     self._stop_x_rl = None
     self._traffic_stop_model_lead_matcher = TrafficStopModelLeadMatcher()
     self.trafficStopModelLeadOffset = 0.0
-    self.last_event_time = 0.0
+    self.last_event_time = -1e9
     self.last_model_start_sign = False
     self.tlv_red_active = False
     self.coast_cap_active = False
@@ -1201,8 +1201,13 @@ class CarrotPlanner:
     if (getattr(self, 'tlvStopGo', 0) != 1 and not getattr(self, 'tlv_stop_committed', False)
         and not getattr(self, 'tlv_soft_active', False)):
       return  # toggle off: touch nothing (byte-identical behaviour)
+    try:
+      sd = sm['selfdriveState']
+      engaged = bool(sd.enabled) if hasattr(sd, 'enabled') else True
+    except Exception:
+      engaged = False
     enabled = (getattr(self, 'tlvStopGo', 0) == 1 and self.trafficLightDetectMode >= 1
-               and self.myDrivingMode != DrivingMode.High)
+               and self.myDrivingMode != DrivingMode.High and engaged)
     tiers = self.tlv_tiers
     stop_x = float(stop_x)
     tiers.update(self._tlv_tier_in(
@@ -1350,7 +1355,7 @@ class CarrotPlanner:
     return v_cruise_kph_apply
 
   def add_event(self, event_name):
-    now = time.time()
+    now = time.monotonic()
     if now - self.last_event_time > 5.0:
       self.events.add(event_name)
       self.last_event_time = now
@@ -1603,7 +1608,7 @@ class CarrotPlanner:
     elif self.actual_stop_distance > 0:  # e2eStop 또는 e2eStopped 상태
       stop_model_x = 0.0
 
-    stopping_active = self.xState not in [XState.e2eStop, XState.e2eStopped]
+    stopping_active = self.xState in [XState.e2eStop, XState.e2eStopped]
     if not stopping_active:
       self._stop_x_rl = stop_model_x_raw
 

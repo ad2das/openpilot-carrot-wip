@@ -1959,3 +1959,29 @@ def test_h3c_red_to_green_edge_still_fires_after_a_queue_gap(monkeypatch):
                                                        rel_box=NEW_BOX),
                                  carState=_slow_car_state(1.2)))
   assert (serv.traffic_state, serv.traffic_state_src) == (2, 1)
+
+
+def test_tlv_left_intent_reads_self_atctype_and_keeps_left_state_and_det_support(monkeypatch):
+  # #17: _tlv_left_intent reads self.atcType when carrotMan is absent from SubMaster.
+  serv = make_serv(2)
+  serv.atcType = "turn left"
+  sm_no_cm = FakeSM(carrotTlv=tlv_message("redLeft", go_after_red=True))
+  assert serv._tlv_left_intent(sm_no_cm) is True
+
+  # #18: consecutive "Left turn" frames keep state 3 instead of downgrading to green (2).
+  serv.traffic_light(0.5, 0.5, "Red Light", 0.9, src=1)
+  serv.traffic_light(0.5, 0.5, "Left turn", 0.9, src=1)
+  assert serv.traffic_state == 3
+  serv.traffic_light(0.5, 0.5, "Left turn", 0.9, src=1)
+  assert serv.traffic_state == 3
+
+  # #19: non-updated 20 Hz ticks preserve tlv_det_support while held.
+  serv2 = make_serv(2)
+  msg = tlv_message("red", rel_id=1)
+  msg.relevantDetSupport = 4
+  serv2._update_tlv_fusion(FakeSM(carrotTlv=msg))
+  assert serv2.tlv_det_support == 4
+  stale_tick = FakeSM(carrotTlv=msg)
+  stale_tick.updated["carrotTlv"] = False
+  serv2._update_tlv_fusion(stale_tick)
+  assert serv2.tlv_det_support == 4
