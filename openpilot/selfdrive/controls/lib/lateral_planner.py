@@ -102,6 +102,7 @@ class HybridLanePath:
 
     self.LP = LanePlanner()
     self.LP.params = self.params
+    self.LP.std_mod_range = None
     self.speed_guard = LaneModelSpeedGuard(recovery_frames=int(1 / DT_MDL))
     self.mpc = LateralMpc()
     self.x0 = np.zeros(4)
@@ -201,6 +202,10 @@ class HybridLanePath:
     self.status = int(self.mpc.solution_status)
     self.nan = bool(np.isnan(self.mpc.x_sol[:, 3]).any())
     self.solve_ms = float(self.mpc.solve_time) * 1000.0
+    if self.status != 0 or self.nan:
+      self.reset_mpc()
+      self.ran = False
+      return None
     self.ran = True
 
     # carry the state exactly as P0 does; the next frame re-seeds x0[3] before its solve
@@ -225,6 +230,7 @@ class LateralPlanner:
     self.solution_invalid_cnt = 0
 
     self.path_xyz = np.zeros((TRAJECTORY_SIZE, 3))
+    self.raw_path_xyz = np.zeros((TRAJECTORY_SIZE, 3))
     self.velocity_xyz = np.zeros((TRAJECTORY_SIZE, 3))
     self.v_plan = np.zeros((TRAJECTORY_SIZE,))
     self.x_sol = np.zeros((TRAJECTORY_SIZE, 4), dtype=np.float32)
@@ -414,18 +420,21 @@ class LateralPlanner:
       self._reset_curve_hybrid()
       return
 
-    f = self.hybrid_frame = self._hybrid_frame(sm, md, lane_change_active, model_path_x,
-                                               model_path_y, v_ego_car)
-    self.hybrid_lagdelay = self._hybrid_lagdelay(sm)
-
     # V4's planner advanced this guard inside every update(); the hybrid must see the same frames
     # for its lane-mode gate to match, and advancing it costs one finite check.
     model_ok = (len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE
                 and len(md.velocity.x) == TRAJECTORY_SIZE)
+    v_ego_raw = float(sm['carState'].vEgo)
     if model_ok:
-      self.hybrid_lane.update_guard(f.v, float(md.velocity.x[0]), float(md.velocity.x[-1]), True)
+      self.hybrid_lane.update_guard(v_ego_raw, float(md.velocity.x[0]), float(md.velocity.x[-1]), True)
     else:
-      self.hybrid_lane.update_guard(f.v, float('nan'), float('nan'), False)
+      self.hybrid_lane.update_guard(v_ego_raw, float('nan'), float('nan'), False)
+      self._reset_curve_hybrid()
+      return
+
+    f = self.hybrid_frame = self._hybrid_frame(sm, md, lane_change_active, model_path_x,
+                                               model_path_y, v_ego_car)
+    self.hybrid_lagdelay = self._hybrid_lagdelay(sm)
 
     v2 = f.v * f.v
     a_road = abs(f.kappa) * v2
@@ -500,7 +509,8 @@ class LateralPlanner:
 
     # clip speed , lateral planning is not possible at 0 speed
     measured_curvature = sm['controlsState'].curvature
-    v_ego_car = max(sm['carState'].vEgo, MIN_SPEED)
+    v_ego_raw = float(sm['carState'].vEgo)
+    v_ego_car = max(v_ego_raw if np.isfinite(v_ego_raw) else 0.0, MIN_SPEED)
     speed_kph = v_ego_car * 3.6
     self.v_ego = v_ego_car
     self.curve_speed = sm['carrotMan'].vTurnSpeed
@@ -511,7 +521,7 @@ class LateralPlanner:
     if (len(md.position.x) == TRAJECTORY_SIZE and len(md.orientation.x) == TRAJECTORY_SIZE and
         len(md.velocity.x) == TRAJECTORY_SIZE):
       model_active = True
-      self.path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
+      self.raw_path_xyz = np.column_stack([md.position.x, md.position.y, md.position.z])
       self.t_idxs = np.array(md.position.t)
       self.plan_yaw = np.array(md.orientation.z)
       self.plan_yaw_rate = np.array(md.orientationRate.z)
@@ -520,10 +530,11 @@ class LateralPlanner:
       self.v_plan = np.clip(car_speed, MIN_SPEED, np.inf)
       self.v_ego = self.v_plan[0]
       self.plan_a = np.array(md.acceleration.x)
-      self.laneless_only = not self.lane_model_speed_guard.update(sm['carState'].vEgo, md.velocity.x[0], md.velocity.x[-1])
+      self.laneless_only = not self.lane_model_speed_guard.update(v_ego_raw, md.velocity.x[0], md.velocity.x[-1])
     else:
-      self.lane_model_speed_guard.update(sm['carState'].vEgo, float('nan'), float('nan'))
+      self.lane_model_speed_guard.update(v_ego_raw, float('nan'), float('nan'))
       self.laneless_only = True
+    self.path_xyz = self.raw_path_xyz.copy()
 
     # Parse model predictions
     self.LP.parse_model(md)
@@ -564,12 +575,13 @@ class LateralPlanner:
       
     lane_change_active = (md.meta.desire != log.Desire.none or bool(carrot.atc_active) or
                           md.meta.laneChangeState != log.LaneChangeState.off)
+    lat_active = bool(sm['carControl'].latActive) if getattr(sm, 'seen', {}).get('carControl', False) else False
     rec_enabled = self.lane_recenter_assist_enabled and not self.lanelines_active and not self.useLaneLineMode
     self.lane_center_blend.update(self.lane_center_blend_enabled, self.lanelines_active, v_ego_car,
                                   self.LP.l_prob, self.LP.r_prob, self.LP.ll_x, self.LP.lll_y, self.LP.rll_y,
                                   self.t_idxs, model_path_x, model_path_y,
                                   lane_change_active, sm['carState'].steeringPressed,
-                                  recenter_enabled=rec_enabled)
+                                  recenter_enabled=rec_enabled, lat_active=lat_active)
     self.lane_center_blend_save_frame += 1
     if self.lane_center_blend_save_frame >= int(30.0 / DT_MDL):
       self.lane_center_blend_save_frame = 0

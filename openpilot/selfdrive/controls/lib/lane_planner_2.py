@@ -71,6 +71,7 @@ class LanePlanner:
 
     self.lanefull_mode = False
     self.d_prob_count = 0
+    self.std_mod_range = (0.15, 0.3)
 
     self.params = Params()
 
@@ -79,7 +80,8 @@ class LanePlanner:
     lane_lines = md.laneLines
     edges = md.roadEdges
 
-    if len(lane_lines) >= 4 and len(lane_lines[0].t) == TRAJECTORY_SIZE:
+    if (len(lane_lines) >= 4 and len(md.laneLineProbs) >= 3 and len(md.laneLineStds) >= 3 and
+        len(lane_lines[1].t) == TRAJECTORY_SIZE and len(lane_lines[2].t) == TRAJECTORY_SIZE):
       self.ll_t = (np.array(lane_lines[1].t) + np.array(lane_lines[2].t))/2
       # left and right ll x is the same
       self.ll_x = lane_lines[1].x
@@ -89,8 +91,12 @@ class LanePlanner:
       self.rll_prob = md.laneLineProbs[2]
       self.lll_std = md.laneLineStds[1]
       self.rll_std = md.laneLineStds[2]
+    else:
+      self.lll_prob = 0.
+      self.rll_prob = 0.
 
-    if len(edges[0].t) == TRAJECTORY_SIZE:
+    if (len(edges) >= 2 and len(md.roadEdgeStds) >= 2 and
+        len(edges[0].t) == TRAJECTORY_SIZE and len(edges[1].t) == TRAJECTORY_SIZE):
       self.le_y = np.array(edges[0].y) + md.roadEdgeStds[0] * 0.4
       self.re_y = np.array(edges[1].y) - md.roadEdgeStds[1] * 0.4
     else:
@@ -98,7 +104,7 @@ class LanePlanner:
       self.re_y = self.rll_y
 
     desire_state = md.meta.desireState
-    if len(desire_state):
+    if len(desire_state) > max(log.Desire.laneChangeLeft, log.Desire.laneChangeRight):
       self.l_lane_change_prob = desire_state[log.Desire.laneChangeLeft]
       self.r_lane_change_prob = desire_state[log.Desire.laneChangeRight]
 
@@ -119,10 +125,12 @@ class LanePlanner:
     r_prob *= mod
 
     # Reduce reliance on uncertain lanelines
-    l_std_mod = np.interp(self.lll_std, [.15, .3], [1.0, 0.0])
-    r_std_mod = np.interp(self.rll_std, [.15, .3], [1.0, 0.0])
-    l_prob *= l_std_mod
-    r_prob *= r_std_mod
+    if self.std_mod_range is not None:
+      std_lo, std_hi = self.std_mod_range
+      l_std_mod = np.interp(self.lll_std, [std_lo, std_hi], [1.0, 0.0])
+      r_std_mod = np.interp(self.rll_std, [std_lo, std_hi], [1.0, 0.0])
+      l_prob *= l_std_mod
+      r_prob *= r_std_mod
 
     self.l_prob, self.r_prob = l_prob, r_prob
 

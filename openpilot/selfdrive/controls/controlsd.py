@@ -206,9 +206,9 @@ class Controls:
       new_desired_curvature = self.curvature
     elif self.is_vw_meb:
       # VW MEB(ID.4/ID.5): 기본은 레인리스(raw 모델곡률 = infiniteCable2 동일).
-      # carrot 횡플래너가 레인모드 활성(lat_plan.useLaneLines, UseLaneLineSpeed>0 & 차선감지)일 때만
+      # carrot 횡플래너가 레인모드 활성(lanefull_mode_enabled)일 때만
       # 차선기반 lateralPlan 경로를 쓴다(opt-in). 모델 경로 출렁임(차선넘나듦)을 차선 지오메트리로 보완.
-      if getattr(lat_plan, 'useLaneLines', False) and len(lat_plan.curvatures) > 0:
+      if self.lanefull_mode_enabled and len(lat_plan.curvatures) > 0:
         curvature = get_lag_adjusted_curvature(self.CP, CS.vEgo, lat_plan.psis, lat_plan.curvatures,
                                                steer_actuator_delay + lat_smooth_seconds, lat_plan.distances)
         new_desired_curvature = smooth_value(curvature, self.desired_curvature, lat_smooth_seconds)
@@ -225,6 +225,11 @@ class Controls:
       blend_fresh = (self.sm.frame - self.sm.recv_frame['lateralPlan']) * DT_CTRL < 0.3
       blend_curvature = float(lat_plan.laneCenterBlendCurvature) if blend_fresh else 0.0
       new_desired_curvature = smooth_value(model_v2.action.desiredCurvature + blend_curvature, self.desired_curvature, 0.1)
+
+    if not math.isfinite(self.desired_curvature):
+      self.desired_curvature = self.curvature if math.isfinite(self.curvature) else 0.0
+    if not math.isfinite(new_desired_curvature):
+      new_desired_curvature = self.desired_curvature
 
     self.desired_curvature, curvature_limited = clip_curvature(CS.vEgo, self.desired_curvature, new_desired_curvature, lp.roll)
 
@@ -244,9 +249,9 @@ class Controls:
       else:
         roll_compensation = -self.VM.roll_compensation(lp.roll, CS.vEgo)
         actual_curvature_vm_no_roll = -self.VM.calc_curvature(steer_angle_without_offset, CS.vEgo, 0.)
-        actual_curvature_vm = actual_curvature_vm_no_roll - roll_compensation
+        actual_curvature_vm = actual_curvature_vm_no_roll + roll_compensation
         actual_curvature = actual_curvature_vm
-        if self.calibrated_pose is not None and CS.vEgo > 5.0:
+        if self.calibrated_pose is not None and CS.vEgo > 2.0:
           actual_curvature_pose = self.calibrated_pose.angular_velocity.yaw / max(CS.vEgo, 0.1)
           actual_curvature = float(np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose]))
         feedforward = self.desired_curvature - roll_compensation
@@ -258,6 +263,12 @@ class Controls:
         # infiniteCable2와 동일: 여기선 clip 안 함. 실제 한계는 carcontroller apply_std_curvature_limits
         # (rate+평균+0.195) 와 panda(0.195)가 bound. 곡률은 물리적으로 bounded(~±0.2)라 NaN검사만으로 충분.
         actuators.curvature = float(output_curvature)
+
+    CC.currentCurvature = self.curvature
+    pose = getattr(self, 'calibrated_pose', None)
+    if pose is not None:
+      CC.orientationNED = pose.orientation.xyz.tolist()
+      CC.angularVelocity = pose.angular_velocity.xyz.tolist()
 
     # 주의: MEB는 위 곡률 PID가 실제 조향을 만들고, 아래 LaC(LatControlAngle)와 lac_log는
     # 파이프라인 형식 유지를 위한 더미임 (로그의 angleState는 실제 제어 상태가 아님).
@@ -285,9 +296,10 @@ class Controls:
     # Orientation and angle rates can be useful for carcontroller
     # Only calibrated (car) frame is relevant for the carcontroller
     CC.currentCurvature = self.curvature
-    if self.calibrated_pose is not None:
-      CC.orientationNED = self.calibrated_pose.orientation.xyz.tolist()
-      CC.angularVelocity = self.calibrated_pose.angular_velocity.xyz.tolist()
+    pose = getattr(self, 'calibrated_pose', None)
+    if pose is not None:
+      CC.orientationNED = pose.orientation.xyz.tolist()
+      CC.angularVelocity = pose.angular_velocity.xyz.tolist()
 
     #acceleration_value = list(self.sm['liveLocationKalman'].accelerationCalibrated.value)
     #if len(acceleration_value) > 2:
@@ -312,6 +324,7 @@ class Controls:
 
     hudControl.activeCarrot = self.sm['carrotMan'].activeCarrot
     hudControl.atcDistance = self.sm['carrotMan'].xDistToTurn
+    hudControl.leadVisible = self.sm['longitudinalPlan'].hasLead
 
     # VW MEB(ID.4/ID.5) 계기판 내비 표시용 - ID.4 선택 시 자동 (토글 없음).
     # carrot_serv의 SDI/ATC/커브 데이터를 hudControl로 전달하고, VW carcontroller가
@@ -409,7 +422,7 @@ class Controls:
       hudControl.leftLaneDepart = self.sm['driverAssistance'].leftLaneDeparture
       hudControl.rightLaneDepart = self.sm['driverAssistance'].rightLaneDeparture
 
-    if self.sm['selfdriveState'].active:
+    if CC.latActive:
       CO = self.sm['carOutput']
       if self.is_vw_meb:
         # VW MEB: 곡률로 액추에이션하므로 곡률 기반으로 steer_limited 계산 (infiniteCable2 curvatureDEPRECATED 분기와 동일).
@@ -421,6 +434,8 @@ class Controls:
                                               STEER_ANGLE_SATURATION_THRESHOLD
       else:
         self.steer_limited_by_safety = abs(CC.actuators.torque - CO.actuatorsOutput.torque) > 1e-2
+    else:
+      self.steer_limited_by_safety = False
 
     # TODO: both controlsState and carControl valids should be set by
     #       sm.all_checks(), but this creates a circular dependency

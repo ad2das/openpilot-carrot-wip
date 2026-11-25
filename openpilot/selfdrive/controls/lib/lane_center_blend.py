@@ -187,6 +187,12 @@ class LaneCenterBlend:
   def reset(self):
     self.table = np.zeros_like(KNOTS)
     self.r_base = np.zeros_like(KNOTS)
+    self.e_prev = None
+    self.r_prev = None
+    self.r_rate = 0.0
+    self.lane_change_t = 0.0
+    self.jump_t = 0.0
+    self.avoid_clear_t = 0.0
     self.steer_held_s = 0.0
     self.steer_block = False
     self.steer_release_s = 0.0
@@ -219,7 +225,7 @@ class LaneCenterBlend:
 
   def update(self, enabled, lane_mode, v_ego, l_prob, r_prob, ll_x, lll_y, rll_y,
              path_t, path_x, path_y, lane_change_active, steering_pressed,
-             recenter_enabled=False) -> float:
+             recenter_enabled=False, lat_active=True) -> float:
     if not enabled and not recenter_enabled:
       self.w = 0.0
       self.offset = 0.0
@@ -228,6 +234,10 @@ class LaneCenterBlend:
       self.e_prev = None
       self.r_prev = None
       self.r_rate = 0.0
+      self.lane_change_t = max(0.0, self.lane_change_t - DT_MDL)
+      self.jump_t = max(0.0, self.jump_t - DT_MDL)
+      self.avoid_clear_t = 0.0
+      self._update_steer_block(steering_pressed)
       self._update_recenter(False, v_ego, 0, None, steering_pressed)
       return 0.0
 
@@ -291,7 +301,7 @@ class LaneCenterBlend:
       self._update_steer_block(steering_pressed)
       if self.steer_block or self.jump_t > 0.0:
         gates |= GATE_STEER
-      self._update_recenter(recenter_enabled, v_ego, gates, geom, steering_pressed,
+      self._update_recenter(recenter_enabled and bool(lat_active), v_ego, gates, geom, steering_pressed,
                             curve_block=curve_block)
       return 0.0
 
@@ -342,7 +352,7 @@ class LaneCenterBlend:
 
     self.avoid_clear_t = 0.0 if (avoid_now or not valid) else self.avoid_clear_t + DT_MDL
     output_ok = gates == 0
-    w_target = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0])) if output_ok else 0.0
+    w_target = float(np.interp(v_ego, [V_OFF, V_ON], [0.0, 1.0])) if (output_ok and lat_active) else 0.0
     if w_target > self.w:
       self.w = min(w_target, self.w + W_UP * DT_MDL)
     else:
@@ -357,7 +367,7 @@ class LaneCenterBlend:
       learn_block |= GATE_E_LARGE
     if self.jump_t > 0.0:
       learn_block |= GATE_JUMP
-    learn = output_ok and learn_block == 0 and v_ego >= V_ON and self.avoid_clear_t >= AVOID_CLEAR_S
+    learn = output_ok and bool(lat_active) and learn_block == 0 and v_ego >= V_ON and self.avoid_clear_t >= AVOID_CLEAR_S
     self.gates = gates | learn_block
 
     h = knot_weights(self.kappa_road)
@@ -367,7 +377,7 @@ class LaneCenterBlend:
     if learn and abs(self.e) > DEADBAND:
       self.table = np.clip(self.table + h * self.e * DT_MDL / T_I, -OFFSET_MAX, OFFSET_MAX)
 
-    if (gates & ~GATE_AVOID) == 0 and not steering_pressed:
+    if (gates & ~GATE_AVOID) == 0 and bool(lat_active) and not steering_pressed:
       t_base = T_BASE_HOLD if avoid_now else T_BASE
       self.r_base = self.r_base + h * (self.r_far - float(h @ self.r_base)) * DT_MDL / t_base
 
@@ -378,14 +388,15 @@ class LaneCenterBlend:
     if valid and raw_offset * self.e < 0.0:
       raw_offset *= float(np.interp(abs(self.e), [WRONG_WAY_E_LO, WRONG_WAY_E_HI], [1.0, 0.0]))
     self.offset = raw_offset
-    lookahead = float(np.clip(LOOKAHEAD_S * v_ego, LOOKAHEAD_MIN, LOOKAHEAD_MAX))
-    k_max = LAT_ACCEL_MAX / max(v_ego, 1.0) ** 2
+    v_safe = float(v_ego) if math.isfinite(v_ego) else 0.0
+    lookahead = float(np.clip(LOOKAHEAD_S * v_safe, LOOKAHEAD_MIN, LOOKAHEAD_MAX))
+    k_max = LAT_ACCEL_MAX / max(v_safe, 1.0) ** 2
     self.curvature = float(np.clip(2.0 * self.w * self.offset / lookahead ** 2, -k_max, k_max))
     recenter_gates = gates & ~(GATE_AVOID | GATE_CURVE)
     if self.steer_block or self.jump_t > 0.0:
       recenter_gates |= GATE_STEER
-    recenter_curve_block = bool(valid and abs(self.kappa_road) * v_ego ** 2 >= LAT_ON)
-    self._update_recenter(recenter_enabled, v_ego, recenter_gates,
+    recenter_curve_block = bool(valid and abs(self.kappa_road) * v_safe ** 2 >= LAT_ON)
+    self._update_recenter(recenter_enabled and bool(lat_active), v_safe, recenter_gates,
                           geom if valid else None, steering_pressed,
                           curve_block=recenter_curve_block)
     return self.curvature
@@ -456,7 +467,8 @@ class LaneCenterBlend:
       return
 
     self.recenter_curve_block = bool(curve_block)
-    prev_k = self.recenter_k
+    v_safe = float(v_ego) if math.isfinite(v_ego) else 0.0
+    prev_k = self.recenter_k if math.isfinite(self.recenter_k) else 0.0
     target_k = 0.0
     active = False
     self.recenter_hold_s = max(0.0, self.recenter_hold_s - DT_MDL)
@@ -550,9 +562,9 @@ class LaneCenterBlend:
         # A curve-limit frame is its own hard reason; a missing profile is not.
         self._release_recenter('curve' if curve_block else 'no_geometry')
 
-    slew = LRA_JERK / max(v_ego, 1.0) ** 2 * DT_MDL
+    slew = LRA_JERK / max(v_safe, 1.0) ** 2 * DT_MDL
     self.recenter_k = float(np.clip(target_k, prev_k - slew, prev_k + slew))
-    if abs(self.recenter_k) < 1e-9:
+    if not math.isfinite(self.recenter_k) or abs(self.recenter_k) < 1e-9:
       self.recenter_k = 0.0
     self.recenter_curvature = self.recenter_k
     # `active` is the intent (assist requested this frame); the curvature itself
