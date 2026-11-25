@@ -46,6 +46,27 @@ def test_closing_range_exception_preserves_nearer_regular_match_and_expires_with
   assert controller.primary_matcher.closing_range_match is None
 
 
+@pytest.mark.parametrize(('v_lead', 'expected'), [(1.5, False), (2.0, False), (2.8, True), (3.9, True)])
+def test_closing_range_covers_slow_departing_band_above_stationary_anchor(v_lead, expected):
+  controller = DPathRadarController(enable_radar_tracks=1)
+  v_ego = 18.3
+  v_rel = v_lead - v_ego
+  qualified = False
+  for i in range(12):
+    t = i * .05
+    d = 95. + v_rel * t
+    point = Point(46, d, 0., v_rel=v_rel, trackState=3)
+    model = model_with_lead(d - 14., 0., 16., probability=.95)
+    model.leadsV3[0].xStd = (12.,)
+    out = controller.update(t, v_ego, [point], model, yaw_rate_rad_s=0.)
+    qualified |= controller.primary_matcher.closing_range_match is not None
+    if expected and i >= 6:
+      assert out.lead_one['radarTrackId'] == 46
+      assert out.lead_one['dRel'] == pytest.approx(d)
+      assert out.lead_one['vLead'] == pytest.approx(v_lead)
+  assert qualified == expected
+
+
 @pytest.mark.parametrize("mode", (1, 2, 3))
 @pytest.mark.parametrize("change", (
   "paired", "missing_corner", "corner_distance", "corner_lateral", "corner_speed",

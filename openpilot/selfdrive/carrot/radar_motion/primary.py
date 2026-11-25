@@ -3532,7 +3532,7 @@ class VisionRadarMatcher:
         d_path = project_to_model_path(path, point.d_rel, point.y_rel).d_path
         if (point.source != "frontRadar" or not point.measured or point.radar_track_state < 2
             or not 40.0 <= point.d_rel <= 150.0 or point.v_rel >= -1.0
-            or not 4.0 < point.v_lead < vision.velocity - 2.0
+            or not STATIONARY_FRONT_ANCHOR_MAX_ABS_VLEAD_MPS < point.v_lead < vision.velocity - 2.0
             or vision.velocity - point.v_lead > 20.0 or not 0.0 <= delta <= limit
             or abs(d_path) > 1.5 or abs(vision_path) > 1.0
             or abs(point.y_rel - vision.y_rel) > 1.25
