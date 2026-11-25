@@ -357,3 +357,37 @@ def test_restore_param_values_from_backup_clamps_numeric_bounds(monkeypatch):
   res = params_service.restore_param_values_from_backup({"SoundVolumeAdjust": "0"})
   assert res == {"ok_cnt": 1, "fail_cnt": 0, "fails": []}
   assert writes == [("SoundVolumeAdjust", 5)]
+
+
+def test_restore_param_values_from_backup_rejects_non_finite_float(monkeypatch):
+  class FakeParamKeyType:
+    BOOL = "bool"
+    INT = "int"
+    FLOAT = "float"
+    TIME = "time"
+    STRING = "string"
+    JSON = "json"
+    BYTES = "bytes"
+
+  class RestoreParams:
+    def get_type(self, key):
+      return FakeParamKeyType.FLOAT
+
+    def get_float(self, key):
+      return 1.0
+
+  writes = []
+  monkeypatch.setattr(params_service, "HAS_PARAMS", True)
+  monkeypatch.setattr(params_service, "ParamKeyType", FakeParamKeyType)
+  monkeypatch.setattr(params_service, "Params", RestoreParams)
+  monkeypatch.setattr(
+    params_service,
+    "_catalog_definitions",
+    lambda: {"CustomFloat": {"min": 0.0, "max": 10.0, "default": 1.0}},
+  )
+  monkeypatch.setattr(params_service, "set_param_value", lambda key, value, definition=None: writes.append((key, value)))
+
+  res = params_service.restore_param_values_from_backup({"CustomFloat": "nan"})
+  assert res["ok_cnt"] == 0
+  assert res["fail_cnt"] == 1
+  assert writes == []

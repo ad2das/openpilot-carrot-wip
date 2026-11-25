@@ -2,6 +2,7 @@ import base64
 import hashlib
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1261,7 +1262,10 @@ def _normalize_param_value(t: Any, value: Any) -> Any:
     return _to_int(value)
 
   if ParamKeyType is not None and t == ParamKeyType.FLOAT:
-    return float(value)
+    fv = float(value)
+    if not math.isfinite(fv):
+      raise ValueError(f"non-finite float value: {value!r}")
+    return fv
 
   return str(value)
 
