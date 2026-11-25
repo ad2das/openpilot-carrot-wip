@@ -64,3 +64,14 @@ def test_manager_loop_kicks_first():
   first = loop.body[0]
   assert ast.unparse(first) == "stall_watchdog.kick()"
   assert ast.unparse(fn).count("StallWatchdog(") == 1
+
+
+def test_stacks_respects_stack_cap_without_zero_slice_overflow(monkeypatch):
+  import openpilot.system.manager.stall_watchdog as sw
+  monkeypatch.setattr(sw, "STACK_CAP", 20)
+  monkeypatch.setattr(sw.sys, "_current_frames", lambda: {1: object(), 2: object()})
+  monkeypatch.setattr(sw.traceback, "format_stack", lambda _f: "A" * 20)
+  wd = StallWatchdog(main_ident=1)
+  stacks = wd._stacks()
+  assert sum(len(v) for v in stacks.values()) <= 20
+  assert len(stacks) == 1

@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 import traceback
+import weakref
 
 STALL_S = 5.0          # a loop iteration longer than this is a stall
 REPEAT_S = 30.0        # re-report while still stalled
@@ -17,6 +18,24 @@ CHECK_S = 1.0
 STACK_CAP = 16000      # chars per report
 FAULT_DIR = "/data/media/0/carrot_manager_stall"
 FAULT_MAX_BYTES = 1_000_000
+
+_ACTIVE_WATCHDOGS: "weakref.WeakSet[StallWatchdog]" = weakref.WeakSet()
+_AT_FORK_REGISTERED = False
+
+
+def _after_fork_child() -> None:
+  try:
+    faulthandler.cancel_dump_traceback_later()
+  except Exception:
+    pass
+  for wd in list(_ACTIVE_WATCHDOGS):
+    fh = wd._fh
+    wd._fh = None
+    if fh is not None:
+      try:
+        fh.close()
+      except OSError:
+        pass
 
 
 def _cloudlog_error(msg: dict) -> None:
@@ -42,6 +61,11 @@ class StallWatchdog:
     self._thread = None
 
   def start(self) -> None:
+    global _AT_FORK_REGISTERED
+    if not _AT_FORK_REGISTERED and hasattr(os, "register_at_fork"):
+      os.register_at_fork(after_in_child=_after_fork_child)
+      _AT_FORK_REGISTERED = True
+    _ACTIVE_WATCHDOGS.add(self)
     try:
       os.makedirs(os.path.dirname(self.fault_path), exist_ok=True)
       if os.path.exists(self.fault_path) and os.path.getsize(self.fault_path) > FAULT_MAX_BYTES:
@@ -85,7 +109,11 @@ class StallWatchdog:
     for ident in order:
       text = "".join(traceback.format_stack(frames[ident]))
       key = f"{names.get(ident, '?')}({ident}){'*' if ident == self.main_ident else ''}"
-      text = text[-max(0, STACK_CAP - total):] if total + len(text) > STACK_CAP else text
+      rem = STACK_CAP - total
+      if rem <= 0:
+        break
+      if len(text) > rem:
+        text = text[-rem:]
       if not text:
         break
       out[key] = text

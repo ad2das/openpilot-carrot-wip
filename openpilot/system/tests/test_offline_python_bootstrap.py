@@ -136,7 +136,7 @@ def test_carrot_aiohttp_runtime_is_available_offline() -> None:
     "multidict": "6.7.1",
     "propcache": "0.4.1",
     "yarl": "1.23.0",
-    "idna": "3.11",
+    "idna": "3.19",
     "typing_extensions": "4.15.0",
   }
 
@@ -236,7 +236,8 @@ def test_known_egpu_prefetch_does_not_block_startup_or_force_build_without_live_
   assert ") >> \"$log_path\" 2>&1 &" in update
 
   launch = launcher[launcher.index("function launch {"):]
-  build = launch.index("./build.py")
+  assert "./build.py" in launcher
+  build = launch.index("carrot_build_if_needed")
   update_start = launch.index("start_big_model_update", build)
   manager = launch.index("start_manager", update_start)
   assert build < update_start < manager

@@ -1515,7 +1515,7 @@
       "cdescr": "仅限非纵向控制车辆，速度按钮信号发送限制时间",
       "min": 1,
       "max": 20,
-      "default": 0,
+      "default": 8,
       "unit": 1
     },
     {
@@ -1531,7 +1531,7 @@
       "cdescr": "仅限非纵向控制车辆 — 速度按钮信号发送暂停时间",
       "min": 1,
       "max": 200,
-      "default": 0,
+      "default": 30,
       "unit": 1
     },
     {
@@ -1547,7 +1547,7 @@
       "cdescr": "仅限非纵向控制车辆 — 连续速度按钮信号计数",
       "min": 1,
       "max": 20,
-      "default": 0,
+      "default": 1,
       "unit": 1
     },
     {
@@ -2889,7 +2889,7 @@
       "cdescr": "调节一般提示音的音量。DM 首次声音警告的增益至少为 70%，最终警告始终为 100%，不会因音量设置或环境噪声调节而降低。",
       "min": 5,
       "max": 200,
-      "default": 0,
+      "default": 100,
       "unit": 5,
       "display_unit": "percent"
     },
@@ -2906,7 +2906,7 @@
       "cdescr": "",
       "min": 5,
       "max": 200,
-      "default": 0,
+      "default": 10,
       "unit": 5,
       "display_unit": "percent"
     },

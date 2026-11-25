@@ -1980,9 +1980,9 @@ class ModelRenderer(Widget):
     if len(left_y) == 0 or len(right_y) == 0:
       return
 
-    # 차량 중심에서 좌/우 차선까지 거리(m). openpilot 모델 +Y=좌측 이므로 우측은 부호 반전.
-    left_m = float(left_y[0])
-    right_m = -float(right_y[0])
+    # 차량 중심에서 좌/우 차선까지 거리(m). openpilot 모델 +Y=우측, -Y=좌측.
+    left_m = -float(left_y[0])
+    right_m = float(right_y[0])
     # 한쪽 차선 인식이 약하면 기본 차선폭(3.0m)으로 반대쪽 추정.
     if probs[1] < 0.3 and probs[2] > 0.3:
       left_m = 3.0 - right_m
@@ -2035,9 +2035,9 @@ class ModelRenderer(Widget):
       color_left = color_right = green
 
     # 타이어 트랙 밴드: 경로중심 ±0.9m 위치에 얇은 리본. 원근투영으로 폭은 자동 축소.
-    # 화면 좌측 타이어 = +Y(y_shift=+0.9), 우측 = -Y. 아래(가까움)=진하게 위(멀리)=투명.
+    # 화면 좌측 타이어 = -Y(y_shift=-0.9), 우측 = +Y(y_shift=+0.9). 아래(가까움)=진하게 위(멀리)=투명.
     band_half = 0.16
-    for y_shift, col in ((0.9, color_left), (-0.9, color_right)):
+    for y_shift, col in ((-0.9, color_left), (0.9, color_right)):
       ribbon = self._map_line_to_polygon(path, band_half, 1.22, max_idx, max_dist, True, y_shift)
       if ribbon.size == 0:
         continue

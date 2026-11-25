@@ -654,7 +654,10 @@ class HudRenderer(Widget):
 
   def _get_nav_path_vertex_count(self) -> int:
     try:
-      return int(ui_state.sm["carrotMan"].navPathVertexCount)
+      navi_paths = str(ui_state.sm["carrotMan"].naviPaths or "").strip()
+      if not navi_paths:
+        return 0
+      return sum(1 for item in navi_paths.split(";") if item)
     except Exception:
       return 0
 
@@ -675,7 +678,7 @@ class HudRenderer(Widget):
 
   def _get_traffic_state_carrot(self) -> int:
     try:
-      return int(ui_state.sm["carrotMan"].trafficStateCarrot)
+      return int(ui_state.sm["longitudinalPlan"].trafficState)
     except Exception:
       return 0
 
@@ -696,7 +699,7 @@ class HudRenderer(Widget):
       x_spd_limit = 0
 
     try:
-      x_sign_type = int(cm.xSignType)
+      x_sign_type = int(cm.xSpdType)
     except Exception:
       x_sign_type = 0
 

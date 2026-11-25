@@ -4,7 +4,7 @@ import json
 import os
 import time
 import urllib.parse
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import ExitStack
 from typing import Any
 
@@ -199,6 +199,7 @@ async def upload_folder_to_web(
   should_cancel: Callable[[], bool] | None = None,
   filenames: Sequence[str] | None = None,
   on_progress: Callable[[str, int, int, int], None] | None = None,
+  refresh_token: Callable[[], Awaitable[str]] | None = None,
 ) -> bool:
   def check_cancel() -> None:
     if should_cancel and should_cancel():
@@ -227,6 +228,7 @@ async def upload_folder_to_web(
   if not token:
     raise RuntimeError("upload session is not configured")
 
+  current_token = token
   headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/octet-stream"}
   timeout = ClientTimeout(total=None, connect=20, sock_read=180)
   async with ClientSession(timeout=timeout, headers=headers) as session:
@@ -258,15 +260,28 @@ async def upload_folder_to_web(
             yield chunk
 
       last_error: Exception | None = None
+      refreshed = False
       for _attempt in range(2):
         check_cancel()
         try:
-          async with session.put(url, data=send_file(), headers={"X-File-Size": str(file_size)}) as resp:
+          req_headers = {
+            "Authorization": f"Bearer {current_token}",
+            "Content-Type": "application/octet-stream",
+            "X-File-Size": str(file_size),
+          }
+          async with session.put(url, data=send_file(), headers=req_headers) as resp:
             text = await resp.text()
             try:
               body = json.loads(text)
             except Exception:
               body = None
+            if resp.status == 403 and refresh_token is not None and not refreshed:
+              refreshed = True
+              new_token = str(await refresh_token() or "").strip()
+              if new_token:
+                current_token = new_token
+                last_error = RuntimeError(f"HTTP {resp.status}: session refreshed")
+                continue
             if not 200 <= resp.status < 300 or not (body or {}).get("ok"):
               error = str((body or {}).get("error") or text or "")[:200]
               raise RuntimeError(f"HTTP {resp.status}: {error}")

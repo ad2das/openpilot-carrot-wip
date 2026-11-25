@@ -181,12 +181,15 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowLaneInfo", {PERSISTENT, INT, "1"}},
     {"ShowRadarInfo", {PERSISTENT, INT, "1"}},
     {"ShowDeviceState", {PERSISTENT, INT, "1"}},
+    {"ShowPathEnd", {PERSISTENT, INT, "1"}},
+    {"ShowRouteInfo", {PERSISTENT, INT, "0"}},
     {"ShowTpms", {PERSISTENT, INT, "1"}},
     {"ShowPathMode", {PERSISTENT, INT, "9"}},
     {"ShowPathColor", {PERSISTENT, INT, "13"}},
     {"ShowPathColorCruiseOff", {PERSISTENT, INT, "19"}},
     {"ShowPathModeLane", {PERSISTENT, INT, "14"}},
     {"ShowPathColorLane", {PERSISTENT, INT, "13"}},
+    {"ShowPathWidth", {PERSISTENT, INT, "100"}},
     {"ShowPlotMode", {PERSISTENT, INT, "0"}},
     {"TimezoneName", {PERSISTENT, STRING, ""}},                // 로컬 타임존 IANA 이름 (예: "Asia/Seoul"), 앱/WiFi/GPS로 해석되면 기록
     {"TimezoneSource", {PERSISTENT, STRING, ""}},              // 타임존 출처 우선순위 추적 ("app" > "wifi" > "gps")

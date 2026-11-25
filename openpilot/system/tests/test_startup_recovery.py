@@ -47,6 +47,14 @@ def test_update_current_branch_then_request_reboot(checkouts):
   assert git(device, 'branch', '--show-current') == 'main'
 
 
+def test_detached_head_reports_clear_branch_error(checkouts):
+  device, _ = checkouts
+  head = git(device, 'rev-parse', 'HEAD')
+  git(device, 'checkout', '--detach', head)
+  with pytest.raises(RuntimeError, match='Select a branch before updating.'):
+    startup_recovery.pull_current_branch(device)
+
+
 def test_build_artifact_fetch_failure_never_blocks_the_update(checkouts, monkeypatch):
   device, target = checkouts
   calls = []

@@ -683,6 +683,66 @@ def test_dashcam_web_upload_reports_chunk_progress(tmp_path: Path, monkeypatch):
   ]
 
 
+def test_dashcam_web_upload_refreshes_token_on_403(tmp_path: Path, monkeypatch):
+  (tmp_path / "qcamera.ts").write_bytes(b"camera-data")
+
+  class RefreshResp:
+    def __init__(self, status, payload):
+      self.status = status
+      self._payload = payload
+
+    async def text(self):
+      return json.dumps(self._payload)
+
+  class RefreshCtx:
+    def __init__(self, sess, headers, data):
+      self.sess = sess
+      self.headers = headers
+      self.data = data
+
+    async def __aenter__(self):
+      body = bytearray()
+      async for chunk in self.data:
+        body.extend(chunk)
+      self.sess.auth_headers.append(self.headers.get("Authorization"))
+      if len(self.sess.auth_headers) == 1:
+        return RefreshResp(403, {"ok": False, "error": "upload session IP mismatch"})
+      return RefreshResp(200, {"ok": True, "size": len(body)})
+
+    async def __aexit__(self, *args):
+      return False
+
+  class RefreshSession:
+    instances = []
+
+    def __init__(self, *args, headers=None, **kwargs):
+      self.headers = headers or {}
+      self.auth_headers = []
+      type(self).instances.append(self)
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *args):
+      return False
+
+    def put(self, url, data, headers=None):
+      return RefreshCtx(self, headers or {}, data)
+
+  monkeypatch.setattr(web_upload, "ClientSession", RefreshSession)
+  refreshes = []
+
+  async def refresh():
+    refreshes.append(True)
+    return "fresh-token"
+
+  assert asyncio.run(web_upload.upload_folder_to_web(
+    str(tmp_path), "device", "route|0", "https://upload.example", "old-token", refresh_token=refresh,
+  ))
+  assert refreshes == [True]
+  assert RefreshSession.instances[-1].auth_headers == ["Bearer old-token", "Bearer fresh-token"]
+
+
 def test_dashcam_upload_summary_selects_only_original_qcamera_and_rlog(tmp_path: Path):
   (tmp_path / "qcamera.ts").write_bytes(b"original-video")
   (tmp_path / "qcamera.mp4").write_bytes(b"converted-video")

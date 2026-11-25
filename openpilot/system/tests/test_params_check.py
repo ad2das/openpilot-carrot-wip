@@ -91,7 +91,12 @@ def test_post_build_check_blocks_manager_if_native_registry_stays_stale(native_r
   guard = launcher.split('  # Never start driving services', 1)[1].split('  start_big_model_update', 1)[0]
   guard = guard[guard.index('\n'):]
   script = f'''
+fast_boot=0
 python3() {{ return {native_result}; }}
+run_startup_command() {{ "$@"; }}
+carrot_drop_fastpath_stamp() {{ :; }}
+carrot_write_fastpath_stamp() {{ :; }}
+show_startup_failure() {{ exit 1; }}
 launch_test() {{{guard}
 echo manager_started
 }}

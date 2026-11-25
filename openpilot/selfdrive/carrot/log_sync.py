@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -159,7 +160,11 @@ def next_tlvrec_session(now: float) -> tuple[str, dict[str, int]] | None:
 def next_segment(base_url: str, now: float) -> tuple[str, dict[str, int]] | None:
   best: tuple[str, dict[str, int]] | None = None
   best_key: tuple[int, int, str, str, int, str] | None = None
-  for name in os.listdir(DASHCAM_ROOT):
+  try:
+    names = os.listdir(DASHCAM_ROOT)
+  except OSError:
+    return None
+  for name in names:
     try:
       seg_dir = os.path.join(DASHCAM_ROOT, name)
       if not os.path.isdir(seg_dir):
@@ -198,6 +203,18 @@ class LogSync:
     self._session = (base_url, token, meta, time.monotonic())
     return token, meta
 
+  async def _refresh_token_for(self, base_url: str) -> str:
+    self._session = None
+    token, _meta = await self._token_for(base_url)
+    return token
+
+  async def _upload_folder(self, local_folder: str, directory: str, remote_path: str, base_url: str,
+                           token: str, filenames: list[str]) -> bool:
+    kwargs: dict[str, Any] = {"filenames": filenames}
+    if "refresh_token" in inspect.signature(upload_folder_to_web).parameters:
+      kwargs["refresh_token"] = lambda: self._refresh_token_for(base_url)
+    return await upload_folder_to_web(local_folder, directory, remote_path, base_url, token, None, **kwargs)
+
   async def run_once(self) -> float:
     base_url = target_url(read_web_settings())
     if base_url is None:
@@ -212,7 +229,7 @@ class LogSync:
     error: str | None = None
     try:
       token, meta = await self._token_for(base_url)
-      ok = await upload_folder_to_web(seg_dir, upload_device_id(meta), name, base_url, token, None, filenames=list(files))
+      ok = await self._upload_folder(seg_dir, upload_device_id(meta), name, base_url, token, list(files))
     except Exception as e:
       error = str(e)
     if ok:
@@ -241,7 +258,7 @@ class LogSync:
     error: str | None = None
     try:
       token, meta = await self._token_for(base_url)
-      ok = await upload_folder_to_web(session_dir, upload_device_id(meta), remote, base_url, token, None, filenames=filenames)
+      ok = await self._upload_folder(session_dir, upload_device_id(meta), remote, base_url, token, filenames)
     except Exception as e:
       error = str(e)
     if ok:

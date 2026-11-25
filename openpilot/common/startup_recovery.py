@@ -78,7 +78,11 @@ def pull_current_branch(repo: Path) -> tuple[str, bool]:
 
   # Caller owns repo_lock for the complete update and reboot request.
   recover_stale_index_lock(str(repo))
-  if not git('symbolic-ref', '--quiet', '--short', 'HEAD'):
+  try:
+    branch = git('symbolic-ref', '--quiet', '--short', 'HEAD')
+  except RuntimeError:
+    branch = ''
+  if not branch:
     raise RuntimeError('Select a branch before updating.')
   if git('status', '--porcelain', '--untracked-files=no'):
     raise RuntimeError('Local changes found. Resolve them in the recovery terminal; no files were reset.')

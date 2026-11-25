@@ -106,7 +106,7 @@ def write_supported_cars_files() -> None:
     try:
       values = importlib.import_module(f"opendbc.car.{brand}.values")
       cars = sorted(doc.name for platform in values.CAR for doc in platform.config.car_docs)
-      with open(os.path.join(params_path, filename), "w") as f:
+      with atomic_write(os.path.join(params_path, filename), "w", overwrite=True) as f:
         f.write("\n".join(cars))
         if cars:
           f.write("\n")
@@ -263,7 +263,7 @@ def manager_thread(update_status: UpdateStatus) -> None:
   ensure_running(managed_processes.values(), False, params=params, CP=sm['carParams'], not_run=ignore)
   # Writing the supported-cars files can import every car brand; do it after
   # the first processes (including the early UI) are already running.
-  start_supported_cars_writer()
+  supported_cars_thread = start_supported_cars_writer()
 
   print_timer = 0
 
@@ -292,6 +292,11 @@ def manager_thread(update_status: UpdateStatus) -> None:
 
     started_prev = started
     ignition_prev = ignition
+
+    if supported_cars_thread is not None:
+      supported_cars_thread.join(timeout=5.0)
+      if not supported_cars_thread.is_alive():
+        supported_cars_thread = None
 
     xiaoge_ready = xiaoge_startup.update(started, sm, sm['carParams'], params.get_bool('ControlsReady'), now)
     not_run = ignore if xiaoge_ready else [*ignore, 'xiaoge_data']
