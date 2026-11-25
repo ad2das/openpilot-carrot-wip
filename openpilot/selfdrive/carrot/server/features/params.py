@@ -1,5 +1,6 @@
 import asyncio
 import json
+import math
 import os
 
 from aiohttp import web
@@ -102,17 +103,20 @@ async def api_param_set(request: web.Request) -> web.Response:
     pass
 
   # If value numeric -> clamp
-  try:
-    if p is not None and isinstance(p.get("min"), (int, float)) and isinstance(p.get("max"), (int, float)):
+  if p is not None and isinstance(p.get("min"), (int, float)) and isinstance(p.get("max"), (int, float)):
+    try:
       fv = float(value)
+    except (TypeError, ValueError):
+      fv = None
+    if fv is not None:
+      if not math.isfinite(fv):
+        return web.json_response({"ok": False, "error": "non-finite numeric value"}, status=400)
       fv = clamp_numeric(fv, p)
       # keep int if setting looks int-ish
       if isinstance(p.get("min"), int) and isinstance(p.get("max"), int) and isinstance(p.get("default"), int):
         value = int(round(fv))
       else:
         value = fv
-  except Exception:
-    pass
 
   try:
     set_param_value(name, value, p)

@@ -666,7 +666,7 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
       # from a power-loss mid-fetch) can't block the fetch — git rebuilds
       # origin/* fresh. --force allows non-fast-forward ref updates.
       jobs.progress(job, message="git fetch origin --prune --force", current=3, total=4)
-      await asyncio.to_thread(_clear_origin_remote_refs, repo_dir)
+      await run_locked_thread(_clear_origin_remote_refs, repo_dir)
       await jobs.capture_exec(["git", "pack-refs", "--all"], cwd=repo_dir, timeout=20)
       rc_fetch = await jobs.stream_exec(
         job, ["git", "fetch", "origin", "--prune", "--force"], cwd=repo_dir, timeout=300
@@ -1176,7 +1176,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
 
       # clear remote-tracking refs (both loose and packed) before repacking so a
       # corrupt/broken ref can't block the fetch; --force allows non-ff updates
-      await asyncio.to_thread(_clear_origin_remote_refs, REPO_DIR)
+      await run_locked_thread(_clear_origin_remote_refs, REPO_DIR)
       await run(["git", "pack-refs", "--all"], cwd=REPO_DIR, timeout=20.0)
       rc_fetch, out_fetch = await run(["git", "fetch", "origin", "--prune", "--force"], cwd=REPO_DIR, timeout=180.0)
       out_all += f"> git fetch origin --prune --force\n{out_fetch}\n\n"
@@ -1341,6 +1341,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
           capture_output=True,
           text=True,
           timeout=10,
+          **child_lock_kwargs(),
         )
         out = ""
         if p.stdout:

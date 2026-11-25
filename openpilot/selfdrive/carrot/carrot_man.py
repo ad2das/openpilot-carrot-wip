@@ -456,9 +456,9 @@ class CarrotMan:
 
             if remote_addr is None:
               #print(f"Broadcasting: {self.broadcast_ip}") #:{msg}")
-              if not self.navd_active:
-                #print("clear path_points: navd_active: ", self.navd_active)
-                with self._navi_lock():
+              with self._navi_lock():
+                if not self.navd_active:
+                  #print("clear path_points: navd_active: ", self.navd_active)
                   self.navi_points = []
                   self.navi_points_start_index = 0
                   self.navi_points_active = False
@@ -538,10 +538,10 @@ class CarrotMan:
       self.navi_points = new_points
       self.navi_points_start_index = 0
       self.navi_points_active = bool(new_points)
+      # Keep the existing route consumer alive without asking navd to calculate a
+      # different route from the app's destination.
+      self.navd_active = bool(new_points)
     self.carrot_navi_route_owned = bool(new_points)
-    # Keep the existing route consumer alive without asking navd to calculate a
-    # different route from the app's destination.
-    self.navd_active = bool(new_points)
     self.send_routes(coords)
 
   def _navi_lock(self):
@@ -1355,8 +1355,8 @@ class CarrotMan:
           self.navi_points = new_points
           self.navi_points_start_index = 0
           self.navi_points_active = True
+          self.navd_active = True
         print("Received points from navd:", len(new_points))
-        self.navd_active = True
 
         # 경로수신 -> carrotman active되고 약간의 시간지연이 발생함..
         if not from_navd:
@@ -1372,7 +1372,7 @@ class CarrotMan:
           self.navi_points = []
           self.navi_points_start_index = 0
           self.navi_points_active = False
-        self.navd_active = False
+          self.navd_active = False
 
     msg = messaging.new_message('navRoute', valid=True)
     msg.navRoute.coordinates = coords
@@ -1449,7 +1449,7 @@ class CarrotMan:
                   self.navi_points = []
                   self.navi_points_start_index = 0
                   self.navi_points_active = False
-                self.navd_active = False
+                  self.navd_active = False
                 self.params.remove("NavDestination")
 
             except Exception as e:
@@ -1606,7 +1606,7 @@ class CarrotMan:
         self.navi_points = []
         self.navi_points_start_index = 0
         self.navi_points_active = False
-      self.navd_active = False
+        self.navd_active = False
       return
 
     # valid만 필터 (필요 없으면 제거)
@@ -1617,7 +1617,7 @@ class CarrotMan:
         self.navi_points = []
         self.navi_points_start_index = 0
         self.navi_points_active = False
-      self.navd_active = False
+        self.navd_active = False
       return
 
     # x=lon, y=lat
@@ -1637,8 +1637,8 @@ class CarrotMan:
     with self._navi_lock():
       self.navi_points = navi_points
       self.navi_points_start_index = 0
-      self.navi_points_active = True
-    self.navd_active = True
+      self.navi_points_active = bool(navi_points)
+      self.navd_active = bool(navi_points)
 
     print("Received points:", len(navi_points))
 

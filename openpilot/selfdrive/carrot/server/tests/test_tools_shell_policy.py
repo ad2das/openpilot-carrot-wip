@@ -118,3 +118,23 @@ def test_tlv_rec_producer_error_does_not_call_write_eof(tmp_path):
     web.StreamResponse.write_eof = orig_write_eof
 
   assert eof_called == []
+
+
+def test_sync_shell_cmd_passes_child_lock_kwargs(monkeypatch):
+  import subprocess
+  from openpilot.selfdrive.carrot.server.features.tools import dispatcher
+
+  captured = {}
+
+  def fake_run(argv, **kwargs):
+    captured["argv"] = argv
+    captured["kwargs"] = kwargs
+    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+
+  monkeypatch.setattr(dispatcher, "child_lock_kwargs", lambda: {"pass_fds": (42,)})
+  monkeypatch.setattr(dispatcher.subprocess, "run", fake_run)
+
+  resp = asyncio.run(dispatcher._dispatch_sync(None, {"action": "shell_cmd", "cmd": "git status"}))
+  assert resp.status == 200
+  assert captured["argv"] == ["git", "status"]
+  assert captured["kwargs"]["pass_fds"] == (42,)

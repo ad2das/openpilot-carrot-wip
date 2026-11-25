@@ -391,3 +391,63 @@ def test_restore_param_values_from_backup_rejects_non_finite_float(monkeypatch):
   assert res["ok_cnt"] == 0
   assert res["fail_cnt"] == 1
   assert writes == []
+
+
+def test_set_param_value_and_api_reject_non_finite_float(monkeypatch):
+  import asyncio
+  import pytest
+  from aiohttp import web
+  from aiohttp.test_utils import TestClient, TestServer
+  from openpilot.selfdrive.carrot.server.features import params as params_feature
+
+  class FakeParamKeyType:
+    BOOL = "bool"
+    INT = "int"
+    FLOAT = "float"
+    TIME = "time"
+    STRING = "string"
+    JSON = "json"
+    BYTES = "bytes"
+
+  written = []
+
+  class FloatParams:
+    def get_type(self, key):
+      return FakeParamKeyType.FLOAT
+
+    def put_float(self, key, val):
+      written.append((key, val))
+
+  monkeypatch.setattr(params_service, "HAS_PARAMS", True)
+  monkeypatch.setattr(params_service, "ParamKeyType", FakeParamKeyType)
+  monkeypatch.setattr(params_service, "Params", FloatParams)
+
+  for bad in ("nan", "inf", "-inf", float("nan"), float("inf")):
+    with pytest.raises(ValueError):
+      params_service.set_param_value("CustomFloat", bad)
+    with pytest.raises(ValueError):
+      params_service.clamp_numeric(float(bad), {"min": 0.0, "max": 10.0})
+
+  assert params_service._clamp_param_value(FakeParamKeyType.FLOAT, -5.0, {"min": 0.0}) == 0.0
+  assert params_service._clamp_param_value(FakeParamKeyType.FLOAT, 50.0, {"max": 10.0}) == 10.0
+  assert params_service._clamp_param_value(FakeParamKeyType.INT, 5, {"min": False, "max": True}) == 5
+  assert written == []
+
+  monkeypatch.setattr(
+    params_feature,
+    "get_settings_cached",
+    lambda: ({}, [], {"CustomFloat": {"min": 0.0, "max": 10.0, "default": 1.0}}, []),
+  )
+  monkeypatch.setattr(params_feature, "get_param_values", lambda names, defaults: {"CustomFloat": 1.0})
+
+  async def scenario():
+    app = web.Application()
+    app.router.add_post("/api/param_set", params_feature.api_param_set)
+    async with TestClient(TestServer(app)) as client:
+      resp = await client.post("/api/param_set", json={"name": "CustomFloat", "value": "nan"})
+      assert resp.status == 400
+      data = await resp.json()
+      assert data["ok"] is False
+
+  asyncio.run(scenario())
+  assert written == []

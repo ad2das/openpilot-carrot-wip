@@ -96,15 +96,27 @@ def infer_type_from_setting(p: Optional[Dict[str, Any]]) -> str:
   return "string"
 
 
+def _is_numeric_bound(value: Any) -> bool:
+  return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _to_float(value: Any) -> float:
+  fv = float(value)
+  if not math.isfinite(fv):
+    raise ValueError(f"non-finite float value: {value!r}")
+  return fv
+
+
 def clamp_numeric(value: float, p: Optional[Dict[str, Any]]) -> float:
+  value = _to_float(value)
   if not p:
     return value
   mn = p.get("min")
   mx = p.get("max")
   try:
-    if mn is not None:
+    if _is_numeric_bound(mn):
       value = max(value, float(mn))
-    if mx is not None:
+    if _is_numeric_bound(mx):
       value = min(value, float(mx))
   except Exception:
     pass
@@ -254,7 +266,7 @@ def _coerce_inferred_value(value: Any, p: Optional[Dict[str, Any]]) -> tuple[str
   if kind == "int":
     return kind, _to_int(value)
   if kind == "float":
-    return kind, float(value)
+    return kind, _to_float(value)
   if kind == "json":
     return kind, json.loads(value) if isinstance(value, str) else value
   return kind, str(value)
@@ -358,7 +370,7 @@ def put_typed(params: "Params", key: str, value: Any, p: Optional[Dict[str, Any]
   elif t == ParamKeyType.INT:
     params.put_int(key, _to_int(value))
   elif t == ParamKeyType.FLOAT:
-    params.put_float(key, float(value))
+    params.put_float(key, _to_float(value))
   elif t == ParamKeyType.TIME:
     params.put(key, str(value))
   elif t == ParamKeyType.STRING:
@@ -514,8 +526,8 @@ def _backup_param_type_map(names: Optional[List[str]] = None) -> Dict[str, Any]:
 
 def _clamp_param_value(t: Any, value: Any, meta: Optional[Dict[str, Any]]) -> Any:
   if (meta is not None and ParamKeyType is not None and t in (ParamKeyType.INT, ParamKeyType.FLOAT)
-      and isinstance(meta.get("min"), (int, float)) and isinstance(meta.get("max"), (int, float))):
-    clamped = clamp_numeric(float(value), meta)
+      and (_is_numeric_bound(meta.get("min")) or _is_numeric_bound(meta.get("max")))):
+    clamped = clamp_numeric(_to_float(value), meta)
     return _to_int(clamped) if t == ParamKeyType.INT else float(clamped)
   return value
 
@@ -1262,10 +1274,7 @@ def _normalize_param_value(t: Any, value: Any) -> Any:
     return _to_int(value)
 
   if ParamKeyType is not None and t == ParamKeyType.FLOAT:
-    fv = float(value)
-    if not math.isfinite(fv):
-      raise ValueError(f"non-finite float value: {value!r}")
-    return fv
+    return _to_float(value)
 
   return str(value)
 
