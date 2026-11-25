@@ -144,31 +144,51 @@ async def api_tlv_rec_download(request: web.Request) -> web.StreamResponse:
   loop = asyncio.get_running_loop()
   queue_: asyncio.Queue = asyncio.Queue(maxsize=STREAM_QUEUE_MAX)
   abort = threading.Event()
+  error_sentinel = object()
 
   def _produce() -> None:
+    sent_error = False
     try:
       for chunk in iter_zip_chunks(session_dir):
         if abort.is_set():
           return
         asyncio.run_coroutine_threadsafe(queue_.put(chunk), loop).result()
-    except Exception:
-      pass
-    finally:
+    except Exception as exc:
+      sent_error = True
       try:
-        asyncio.run_coroutine_threadsafe(queue_.put(None), loop).result()
+        asyncio.run_coroutine_threadsafe(queue_.put((error_sentinel, exc)), loop).result()
       except Exception:
         pass
+    finally:
+      if not sent_error:
+        try:
+          asyncio.run_coroutine_threadsafe(queue_.put(None), loop).result()
+        except Exception:
+          pass
 
   producer = loop.run_in_executor(None, _produce)
+  stream_ok = True
   try:
     while True:
       chunk = await queue_.get()
       if chunk is None:
         break
+      if isinstance(chunk, tuple) and len(chunk) == 2 and chunk[0] is error_sentinel:
+        stream_ok = False
+        print(f"tlv_rec: stream error for {name}: {chunk[1]!r}", flush=True)
+        break
       await response.write(chunk)
-    await response.write_eof()
+    if stream_ok:
+      await response.write_eof()
+    else:
+      response.force_close()
+      if request.transport is not None:
+        request.transport.close()
+      raise ConnectionResetError(f"tlv_rec stream error for {name}")
   except ConnectionResetError:
     abort.set()
+    if not stream_ok:
+      raise
   finally:
     abort.set()
     # Unblock a producer stuck on a full queue so its thread can exit.

@@ -5,6 +5,7 @@ free-form shell command policy in one small module.
 """
 from __future__ import annotations
 
+import posixpath
 from typing import Iterable, List, Optional, Tuple
 
 
@@ -41,6 +42,115 @@ READ_ONLY_GIT_COMMANDS = {
   "show-ref",
   "status",
 }
+_DISALLOWED_GIT_FLAGS = (
+  "-c",
+  "-o",
+  "--config",
+  "--git-dir",
+  "--work-tree",
+  "--exec-path",
+  "--upload-pack",
+  "--output",
+  "--ext-diff",
+  "--textconv",
+  "--filter",
+)
+_READ_ONLY_BRANCH_FLAGS = {
+  "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",
+  "-l", "--list", "--show-current", "-q", "--quiet",
+  "--contains", "--no-contains", "--merged", "--no-merged", "--points-at",
+  "--sort", "--format", "--color", "--no-color", "--abbrev", "--no-abbrev",
+  "--column", "--no-column",
+}
+_BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color", "--abbrev", "--column"}
+_READ_ONLY_CAT_FLAGS = {"-n", "-b", "-s", "-v", "-E", "-T"}
+_ALLOWED_CAT_ABS_PREFIXES = ("/data/openpilot/", "/data/media/", "/tmp/", "/proc/", "/sys/", "/var/log/")
+_BLOCKED_CAT_SEGMENTS = {"..", ".ssh", "GithubSshKeys", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "gshadow", ".netrc", ".git-credentials"}
+
+
+def _is_disallowed_git_flag(arg: str) -> bool:
+  if not arg.startswith("-"):
+    return False
+  for flag in _DISALLOWED_GIT_FLAGS:
+    if arg == flag or arg.startswith(f"{flag}="):
+      return True
+    if len(flag) == 2 and arg.startswith(flag) and len(arg) > 2:
+      return True
+  return False
+
+
+def _validate_cat_args(args: List[str]) -> Optional[Tuple[str, str, str]]:
+  paths: List[str] = []
+  for arg in args:
+    if arg == "-":
+      return "cat stdin not allowed", "CMD_NOT_ALLOWED", arg
+    if arg.startswith("-"):
+      if arg not in _READ_ONLY_CAT_FLAGS:
+        return f"cat flag not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+      continue
+    if arg.startswith("~") or "\x00" in arg:
+      return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+    raw_parts = [p for p in arg.replace("\\", "/").split("/") if p]
+    if any(p in _BLOCKED_CAT_SEGMENTS for p in raw_parts):
+      return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+    norm = posixpath.normpath(arg.replace("\\", "/"))
+    norm_parts = [p for p in norm.split("/") if p]
+    if any(p in _BLOCKED_CAT_SEGMENTS for p in norm_parts):
+      return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+    if norm.startswith("/"):
+      if not any(norm == p.rstrip("/") or norm.startswith(p) for p in _ALLOWED_CAT_ABS_PREFIXES):
+        return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+    elif norm == ".." or norm.startswith("../"):
+      return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+    paths.append(arg)
+  if not paths:
+    return "cat requires a file path", "CMD_NOT_ALLOWED", "cat"
+  return None
+
+
+def _validate_git_args(subcommand: str, args: List[str]) -> Optional[Tuple[str, str, str]]:
+  for arg in args:
+    if _is_disallowed_git_flag(arg):
+      return f"git flag not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+
+  if subcommand == "branch":
+    allow_positional = False
+    expect_value = False
+    for arg in args:
+      if expect_value:
+        expect_value = False
+        continue
+      if arg.startswith("-"):
+        base = arg.split("=", 1)[0]
+        if base not in _READ_ONLY_BRANCH_FLAGS:
+          return f"git branch flag not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+        if base in ("-l", "--list"):
+          allow_positional = True
+        elif base in _BRANCH_VALUE_FLAGS and "=" not in arg:
+          expect_value = True
+      elif not allow_positional:
+        return f"git branch mutation not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+    return None
+
+  if subcommand == "remote":
+    if not args:
+      return None
+    first = args[0]
+    if first in ("-v", "--verbose") and len(args) == 1:
+      return None
+    if first == "show":
+      for extra in args[1:]:
+        if extra.startswith("-") and extra != "-n":
+          return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+      return None
+    if first == "get-url":
+      for extra in args[1:]:
+        if extra.startswith("-") and extra not in ("--push", "--all"):
+          return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+      return None
+    return f"git remote action not allowed: {first}", "GIT_CMD_NOT_ALLOWED", first
+
+  return None
 
 
 def normalize_action(action: object) -> str:
@@ -69,6 +179,9 @@ def validate_shell_argv(argv: Iterable[str]) -> Optional[Tuple[str, str, str]]:
   if top not in READ_ONLY_SHELL_COMMANDS:
     return f"not allowed: {top}", "CMD_NOT_ALLOWED", top
 
+  if top == "cat":
+    return _validate_cat_args(parts[1:])
+
   if top != "git":
     return None
 
@@ -79,4 +192,4 @@ def validate_shell_argv(argv: Iterable[str]) -> Optional[Tuple[str, str, str]]:
   if subcommand not in READ_ONLY_GIT_COMMANDS:
     return f"git subcommand not allowed: {subcommand}", "GIT_CMD_NOT_ALLOWED", subcommand
 
-  return None
+  return _validate_git_args(subcommand, parts[2:])

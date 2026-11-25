@@ -508,7 +508,16 @@ async def api_dashcam_download(request: web.Request) -> web.StreamResponse:
   path, name = found
   if kind in CAMERA_DOWNLOADS:
     out = download_tmp_path(".mp4")
-    if await asyncio.to_thread(remux_camera_mp4, path, out):
+    remuxed = False
+    try:
+      remuxed = await asyncio.to_thread(remux_camera_mp4, path, out)
+    except BaseException:
+      try:
+        os.remove(out)
+      except OSError:
+        pass
+      raise
+    if remuxed:
       return await send_file_then_delete(request, out, f"{segment}--{kind}.mp4", "video/mp4")
     try:
       os.remove(out)

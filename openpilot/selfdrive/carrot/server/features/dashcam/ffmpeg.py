@@ -25,6 +25,31 @@ def run_ffmpeg(args: list[str], timeout: float = 90.0) -> subprocess.CompletedPr
   )
 
 
+def _atomic_tmp_path(out: str) -> str:
+  stem, ext = os.path.splitext(out)
+  return f"{stem}.{uuid.uuid4().hex}.tmp{ext}"
+
+
+def _safe_unlink(path: str) -> None:
+  try:
+    if os.path.exists(path):
+      os.remove(path)
+  except OSError:
+    pass
+
+
+def _run_ffmpeg_atomic(args_without_out: list[str], out: str, timeout: float = 90.0) -> bool:
+  tmp = _atomic_tmp_path(out)
+  try:
+    result = run_ffmpeg([*args_without_out, tmp], timeout=timeout)
+    if result.returncode == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+      os.replace(tmp, out)
+      return True
+    return False
+  finally:
+    _safe_unlink(tmp)
+
+
 def placeholder_svg(token: str = "dashcam") -> str:
   out = cache_path("placeholder", token, ".svg")
   if os.path.isfile(out) and os.path.getsize(out) > 0:
@@ -37,8 +62,13 @@ def placeholder_svg(token: str = "dashcam") -> str:
 <path d="M306 188v44l38-22z" fill="#ffb268"/>
 <text x="320" y="306" text-anchor="middle" fill="#9aa6b2" font-family="Arial, sans-serif" font-size="24" font-weight="700">NO THUMBNAIL</text>
 </svg>"""
-  with open(out, "w", encoding="utf-8") as f:
-    f.write(svg)
+  tmp = _atomic_tmp_path(out)
+  try:
+    with open(tmp, "w", encoding="utf-8") as f:
+      f.write(svg)
+    os.replace(tmp, out)
+  finally:
+    _safe_unlink(tmp)
   return out
 
 
@@ -49,18 +79,12 @@ def ensure_thumbnail(segment: str) -> str:
   if os.path.isfile(out) and os.path.getsize(out) > 0:
     return out
   attempts = (
-    ["-ss", "2", "-i", source, "-vframes", "1", "-vf", "scale=640:-1", out],
-    ["-ss", "0.2", "-i", source, "-vframes", "1", "-vf", "scale=640:-1", out],
+    ["-ss", "2", "-i", source, "-vframes", "1", "-vf", "scale=640:-1"],
+    ["-ss", "0.2", "-i", source, "-vframes", "1", "-vf", "scale=640:-1"],
   )
   for args in attempts:
-    result = run_ffmpeg(args)
-    if result.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+    if _run_ffmpeg_atomic(args, out):
       return out
-    try:
-      if os.path.exists(out):
-        os.remove(out)
-    except OSError:
-      pass
   return placeholder_svg(segment)
 
 
@@ -70,22 +94,15 @@ def ensure_preview(segment: str) -> str:
   out = cache_path("preview", segment, ".gif")
   if os.path.isfile(out) and os.path.getsize(out) > 0:
     return out
-  result = run_ffmpeg([
+  if _run_ffmpeg_atomic([
     "-ss", "1",
     "-t", "2.4",
     "-i", source,
     "-vf", "fps=4,scale=360:-1:flags=lanczos",
     "-loop", "0",
-    out,
-  ], timeout=120.0)
-  if result.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) <= 0:
-    try:
-      if os.path.exists(out):
-        os.remove(out)
-    except OSError:
-      pass
-    return ensure_thumbnail(segment)
-  return out
+  ], out, timeout=120.0):
+    return out
+  return ensure_thumbnail(segment)
 
 
 def browser_video(segment: str) -> tuple[str, str]:
@@ -102,23 +119,11 @@ def browser_video(segment: str) -> tuple[str, str]:
 
   # qcamera.ts의 오디오는 loggerd가 AAC로 먹싱하므로(RecordAudio) mp4에 그대로
   # 복사해도 브라우저에서 재생된다 — 오디오 트랙을 보존한다
-  result = run_ffmpeg(["-i", source, "-c", "copy", "-movflags", "+faststart", out], timeout=180.0)
-  if result.returncode != 0 or not os.path.isfile(out) or os.path.getsize(out) <= 0:
-    try:
-      if os.path.exists(out):
-        os.remove(out)
-    except OSError:
-      pass
-    # 오디오 스트림이 mp4와 호환되지 않는 예외적인 경우엔 기존처럼 오디오 제거로 폴백
-    result = run_ffmpeg(["-i", source, "-c", "copy", "-an", "-movflags", "+faststart", out], timeout=180.0)
-
-  if result.returncode == 0 and os.path.isfile(out) and os.path.getsize(out) > 0:
+  if _run_ffmpeg_atomic(["-i", source, "-c", "copy", "-movflags", "+faststart"], out, timeout=180.0):
     return out, "video/mp4"
-  try:
-    if os.path.exists(out):
-      os.remove(out)
-  except OSError:
-    pass
+  # 오디오 스트림이 mp4와 호환되지 않는 예외적인 경우엔 기존처럼 오디오 제거로 폴백
+  if _run_ffmpeg_atomic(["-i", source, "-c", "copy", "-an", "-movflags", "+faststart"], out, timeout=180.0):
+    return out, "video/mp4"
 
   # Last-resort fallback: some browsers can still handle TS, and this preserves access.
   return source, "video/mp2t"

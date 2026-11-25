@@ -42,6 +42,38 @@ from .actions import normalize_action, validate_action, validate_shell_argv
 TMUX_LOG_PATH = "/data/media/tmux.log"
 GIT_UPDATE_COMMIT_LIMIT = 20
 GIT_UPDATE_DISPLAY_LIMIT = 3
+_SYNC_NETWORK_GIT_SUBCMDS = {"fetch", "pull", "push", "clone", "ls-remote"}
+
+
+def _clear_origin_remote_refs(repo_dir: str) -> None:
+  """Delete both loose and packed refs/remotes/origin/* before repacking/fetching."""
+  git_dir = os.path.join(repo_dir, ".git")
+  shutil.rmtree(os.path.join(git_dir, "refs", "remotes", "origin"), ignore_errors=True)
+  packed_path = os.path.join(git_dir, "packed-refs")
+  if not os.path.isfile(packed_path):
+    return
+  try:
+    with open(packed_path, "r", encoding="utf-8", errors="replace") as f:
+      lines = f.readlines()
+    kept: List[str] = []
+    skip_peeled = False
+    for line in lines:
+      if line.startswith("^"):
+        if not skip_peeled:
+          kept.append(line)
+        continue
+      skip_peeled = False
+      parts = line.strip().split(None, 1)
+      if len(parts) == 2 and parts[1].startswith("refs/remotes/origin/"):
+        skip_peeled = True
+        continue
+      kept.append(line)
+    tmp_path = f"{packed_path}.tmp.{os.getpid()}"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+      f.writelines(kept)
+    os.replace(tmp_path, packed_path)
+  except OSError:
+    pass
 
 
 def capture_tmux_log_sync() -> Tuple[int, str]:
@@ -626,8 +658,8 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
       # from a power-loss mid-fetch) can't block the fetch — git rebuilds
       # origin/* fresh. --force allows non-fast-forward ref updates.
       jobs.progress(job, message="git fetch origin --prune --force", current=3, total=4)
+      await asyncio.to_thread(_clear_origin_remote_refs, repo_dir)
       await jobs.capture_exec(["git", "pack-refs", "--all"], cwd=repo_dir, timeout=20)
-      await jobs.capture_exec(["rm", "-rf", ".git/refs/remotes/origin"], cwd=repo_dir, timeout=10)
       rc_fetch = await jobs.stream_exec(
         job, ["git", "fetch", "origin", "--prune", "--force"], cwd=repo_dir, timeout=300
       )
@@ -793,7 +825,7 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
     if action == "rebuild_all":
       jobs.progress(job, message="rebuild all", current=1, total=1)
       cmd = "cd /data/openpilot && scons -c && rm -rf prebuilt && python3 -m openpilot.common.reboot"
-      subprocess.Popen(["bash", "-lc", cmd])
+      subprocess.Popen(["bash", "-lc", cmd], **child_lock_kwargs())
       jobs.finish(job, ok=True, result={"ok": True, "out": "rebuild_all requested (clean + remove prebuilt + reboot)"})
       return
 
@@ -891,10 +923,19 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
     error, error_code = action_error
     return web.json_response({"ok": False, "error": error, "error_code": error_code}, status=400)
 
-  def run(cmd: List[str], cwd: Optional[str] = None) -> Tuple[int, str]:
-    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, **child_lock_kwargs())
+  def _run_sync(cmd: List[str], cwd: Optional[str], timeout: float) -> Tuple[int, str]:
+    try:
+      p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, **child_lock_kwargs())
+    except subprocess.TimeoutExpired:
+      return 124, f"command timed out after {int(timeout)}s"
     out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
     return p.returncode, out.strip()
+
+  async def run(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
+    if timeout is None:
+      is_net_git = len(cmd) >= 2 and cmd[0] == "git" and cmd[1] in _SYNC_NETWORK_GIT_SUBCMDS
+      timeout = 60.0 if is_net_git else 15.0
+    return await asyncio.to_thread(_run_sync, cmd, cwd, timeout)
 
   try:
     REPO_DIR = "/data/openpilot"
@@ -906,29 +947,29 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         return web.json_response({"ok": False, "rc": rc_config, "out": out_config})
       # Best-effort warm of the build-artifact cache for the target commit.
       await fetch_build_artifact_async(REPO_DIR, target_head)
-      rc_before, before_out = run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR)
+      rc_before, before_out = await run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR)
       before_head = before_out.strip() if rc_before == 0 else ""
-      rc, out = run(["git", "merge", "--ff-only", target_head], cwd=REPO_DIR)
+      rc, out = await run(["git", "merge", "--ff-only", target_head], cwd=REPO_DIR)
       out = (out_config + "\n" + out).strip()
-      rc_after, after_out = run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR)
+      rc_after, after_out = await run(["git", "rev-parse", "HEAD"], cwd=REPO_DIR)
       after_head = after_out.strip() if rc_after == 0 else ""
       clear_git_status_cache()
       if rc == 0:
         clear_recovered_git_ref_error()
       if rc == 0 and did_git_pull_update(out):
         write_git_pull_time()
-      update_summary = _build_git_update_summary_sync(REPO_DIR, before_head, after_head, out) if rc == 0 else None
+      update_summary = await _build_git_update_summary_async(REPO_DIR, before_head, after_head, out) if rc == 0 else None
       payload = {"ok": rc == 0, "rc": rc, "out": out, "summary_key": "git_result_pull_done"}
       if update_summary:
         payload["update_summary"] = update_summary
       return web.json_response(payload)
 
     if action == "git_sync":
-      rc1, out1 = run(["bash", "-lc", "git branch | grep -v '^\\*' | xargs -r git branch -D"], cwd=REPO_DIR)
+      rc1, out1 = await run(["bash", "-lc", "git branch | grep -v '^\\*' | xargs -r git branch -D"], cwd=REPO_DIR)
       if rc1 != 0:
         return web.json_response({"ok": False, "rc": rc1, "out": out1})
 
-      rc2, out2 = run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
+      rc2, out2 = await run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
       out = (out1 + "\n\n" + out2).strip()
       return web.json_response({"ok": rc2 == 0, "rc": rc2, "out": out, "summary_key": "git_result_sync_done", "empty_output": not out})
 
@@ -941,7 +982,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       clear_git_status_cache()
       if rc_config != 0:
         return web.json_response({"ok": False, "rc": rc_config, "out": out_config})
-      rc, out = run(["git", "reset", f"--{mode}", target], cwd=REPO_DIR)
+      rc, out = await run(["git", "reset", f"--{mode}", target], cwd=REPO_DIR)
       clear_git_status_cache()
       out = (out_config + "\n" + out).strip()
       return web.json_response({"ok": rc == 0, "rc": rc, "out": out, "summary_key": "git_result_reset_done", "summary_vars": {"mode": mode, "target": target}, "empty_output": not out})
@@ -954,11 +995,11 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       if not branch and not item_name:
         return web.json_response({"ok": False, "error": "missing branch"}, status=400)
 
-      rc_fetch, out_fetch = run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
+      rc_fetch, out_fetch = await run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
       if rc_fetch != 0:
         return web.json_response({"ok": False, "rc": rc_fetch, "out": out_fetch})
 
-      rc_remotes, out_remotes = run(["git", "remote"], cwd=REPO_DIR)
+      rc_remotes, out_remotes = await run(["git", "remote"], cwd=REPO_DIR)
       known_remotes = out_remotes.split() if rc_remotes == 0 else ["origin"]
       remote_prefix = None
       for remote in known_remotes:
@@ -969,7 +1010,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       try:
         if kind == "local":
           local_branch = item_name or branch
-          rc, out = run(["git", "switch", local_branch], cwd=REPO_DIR)
+          rc, out = await run(["git", "switch", local_branch], cwd=REPO_DIR)
           summary_branch = local_branch
         elif kind == "remote":
           if not item_remote or not item_name:
@@ -979,30 +1020,30 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
           branch = f"{item_remote}/{item_name}"
           local_branch = item_name
           summary_branch = local_branch
-          rc_check, _ = run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_branch}"], cwd=REPO_DIR)
+          rc_check, _ = await run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_branch}"], cwd=REPO_DIR)
           if rc_check == 0:
-            rc, out = run(["git", "switch", local_branch], cwd=REPO_DIR)
+            rc, out = await run(["git", "switch", local_branch], cwd=REPO_DIR)
           else:
-            rc, out = run(
+            rc, out = await run(
               ["git", "switch", "-c", local_branch, "--track", branch],
               cwd=REPO_DIR
             )
         elif remote_prefix is not None:
           local_branch = branch[len(remote_prefix) + 1:]
           summary_branch = local_branch
-          rc_check, _ = run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_branch}"], cwd=REPO_DIR)
+          rc_check, _ = await run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{local_branch}"], cwd=REPO_DIR)
           if rc_check == 0:
-            rc, out = run(["git", "switch", local_branch], cwd=REPO_DIR)
+            rc, out = await run(["git", "switch", local_branch], cwd=REPO_DIR)
           else:
-            rc, out = run(
+            rc, out = await run(
               ["git", "switch", "-c", local_branch, "--track", branch],
               cwd=REPO_DIR
             )
         else:
           summary_branch = branch
-          rc, out = run(["git", "switch", branch], cwd=REPO_DIR)
+          rc, out = await run(["git", "switch", branch], cwd=REPO_DIR)
           if rc != 0:
-            rc2, out2 = run(
+            rc2, out2 = await run(
               ["git", "switch", "-c", branch, "--track", f"origin/{branch}"],
               cwd=REPO_DIR
             )
@@ -1012,15 +1053,15 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         return web.json_response({"ok": False, "error": str(e)}, status=500)
 
     if action == "git_branch_list":
-      rc0, out0 = run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
+      rc0, out0 = await run(["git", "fetch", "--all", "--prune"], cwd=REPO_DIR)
       if rc0 != 0:
         return web.json_response({"ok": False, "rc": rc0, "out": out0})
 
-      rc_local, out_local = run(
+      rc_local, out_local = await run(
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"],
         cwd=REPO_DIR
       )
-      rc_remote, out_remote = run(
+      rc_remote, out_remote = await run(
         ["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes"],
         cwd=REPO_DIR
       )
@@ -1028,12 +1069,12 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         merged = (out0 + "\n\n" + out_local + "\n" + out_remote).strip()
         return web.json_response({"ok": False, "rc": rc_local if rc_local != 0 else rc_remote, "out": merged})
 
-      rc_current, out_current = run(["git", "branch", "--show-current"], cwd=REPO_DIR)
+      rc_current, out_current = await run(["git", "branch", "--show-current"], cwd=REPO_DIR)
       current_branch = out_current.strip() if rc_current == 0 else ""
 
-      rc_remotes, out_remotes = run(["git", "remote"], cwd=REPO_DIR)
+      rc_remotes, out_remotes = await run(["git", "remote"], cwd=REPO_DIR)
       remotes = out_remotes.split() if rc_remotes == 0 else ["origin"]
-      rc_remote_urls, out_remote_urls = run(["git", "remote", "-v"], cwd=REPO_DIR)
+      rc_remote_urls, out_remote_urls = await run(["git", "remote", "-v"], cwd=REPO_DIR)
       remote_urls = jobs.parse_remote_urls(out_remote_urls) if rc_remote_urls == 0 else {}
       branch_items = jobs.build_branch_items(out_local, out_remote, remotes)
       branches = sorted({str(item.get("ref") or "") for item in branch_items if item.get("ref")})
@@ -1056,7 +1097,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       url = str(body.get("url") or "").strip()
       if not url:
         return web.json_response({"ok": False, "error": "missing url"}, status=400)
-      rc, out = run(["git", "remote", "set-url", "origin", url], cwd=REPO_DIR)
+      rc, out = await run(["git", "remote", "set-url", "origin", url], cwd=REPO_DIR)
       if rc != 0:
         return web.json_response({"ok": False, "rc": rc, "out": out})
       rc, out = await run_locked_thread(repair_git_config, REPO_DIR, remote="origin", repair_upstream=False)
@@ -1069,24 +1110,24 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       if not name or not url:
         return web.json_response({"ok": False, "error": "missing name or url"}, status=400)
 
-      rc_remotes, out_remotes = run(["git", "remote"], cwd=REPO_DIR)
+      rc_remotes, out_remotes = await run(["git", "remote"], cwd=REPO_DIR)
       remotes = out_remotes.split() if rc_remotes == 0 else []
       remote_exists = name in remotes
       setup_cmd = ["git", "remote", "set-url", name, url] if remote_exists else ["git", "remote", "add", name, url]
-      rc_setup, out_setup = run(setup_cmd, cwd=REPO_DIR)
+      rc_setup, out_setup = await run(setup_cmd, cwd=REPO_DIR)
       if rc_setup != 0:
         return web.json_response({"ok": False, "rc": rc_setup, "out": out_setup})
 
       rc_fetch, out_fetch = await run_locked_thread(repair_git_config, REPO_DIR, remote=name, repair_upstream=False)
       clear_git_status_cache()
-      rc_remote_urls, out_remote_urls = run(["git", "remote", "-v"], cwd=REPO_DIR)
+      rc_remote_urls, out_remote_urls = await run(["git", "remote", "-v"], cwd=REPO_DIR)
       out = (out_setup + "\n" + out_fetch + "\n\n> git remote -v\n" + (out_remote_urls if rc_remote_urls == 0 else "")).strip()
       return web.json_response({"ok": rc_fetch == 0, "rc": rc_fetch, "out": out, "summary_key": "git_result_remote_add_done", "summary_vars": {"name": name}, "empty_output": not out})
 
     if action == "git_log":
       count = min(int(body.get("count") or 20), 50)
-      rc, out = run(["git", "log", "--oneline", f"-{count}"], cwd=REPO_DIR)
-      rc_head, out_head = run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_DIR)
+      rc, out = await run(["git", "log", "--oneline", f"-{count}"], cwd=REPO_DIR)
+      rc_head, out_head = await run(["git", "rev-parse", "--short", "HEAD"], cwd=REPO_DIR)
       current_commit = out_head.strip() if rc_head == 0 else ""
       commits = []
       for line in (out or "").splitlines():
@@ -1102,39 +1143,39 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       out_all = ""
 
       # clear stale git locks so the remote/config/fetch steps aren't blocked
-      run(["find", ".git", "-type", "f", "-name", "*.lock", "-delete"], cwd=REPO_DIR)
-      rc_set, out_set = run(["git", "remote", "set-url", "origin", url], cwd=REPO_DIR)
+      await run(["find", ".git", "-type", "f", "-name", "*.lock", "-delete"], cwd=REPO_DIR)
+      rc_set, out_set = await run(["git", "remote", "set-url", "origin", url], cwd=REPO_DIR)
       if rc_set != 0:
-        run(["git", "remote", "remove", "origin"], cwd=REPO_DIR)
-        rc_add, out_add = run(["git", "remote", "add", "origin", url], cwd=REPO_DIR)
+        await run(["git", "remote", "remove", "origin"], cwd=REPO_DIR)
+        rc_add, out_add = await run(["git", "remote", "add", "origin", url], cwd=REPO_DIR)
         out_all += f"> git remote add origin {url}\n{out_add}\n\n"
         if rc_add != 0:
           return web.json_response({"ok": False, "error": f"failed to configure remote: {out_add}"})
       else:
         out_all += f"> git remote set-url origin {url}\n{out_set}\n\n"
 
-      rc_branches, out_branches = run(["git", "remote", "set-branches", "origin", "*"], cwd=REPO_DIR)
+      rc_branches, out_branches = await run(["git", "remote", "set-branches", "origin", "*"], cwd=REPO_DIR)
       out_all += f"> git remote set-branches origin '*'\n{out_branches}\n\n"
       if rc_branches != 0:
         return web.json_response({"ok": False, "rc": rc_branches, "out": out_all.strip()})
 
-      rc_rem, out_rem = run(["git", "remote"], cwd=REPO_DIR)
+      rc_rem, out_rem = await run(["git", "remote"], cwd=REPO_DIR)
       for rname in (out_rem or "").splitlines():
         rname = rname.strip()
         if rname and rname != "origin":
-          run(["git", "remote", "remove", rname], cwd=REPO_DIR)
+          await run(["git", "remote", "remove", rname], cwd=REPO_DIR)
           out_all += f"> removed remote: {rname}\n"
 
-      # clear remote-tracking refs + repack so a corrupt/broken ref can't block
-      # the fetch (git rebuilds origin/* fresh); --force allows non-ff updates
-      run(["git", "pack-refs", "--all"], cwd=REPO_DIR)
-      run(["rm", "-rf", ".git/refs/remotes/origin"], cwd=REPO_DIR)
-      rc_fetch, out_fetch = run(["git", "fetch", "origin", "--prune", "--force"], cwd=REPO_DIR)
+      # clear remote-tracking refs (both loose and packed) before repacking so a
+      # corrupt/broken ref can't block the fetch; --force allows non-ff updates
+      await asyncio.to_thread(_clear_origin_remote_refs, REPO_DIR)
+      await run(["git", "pack-refs", "--all"], cwd=REPO_DIR, timeout=20.0)
+      rc_fetch, out_fetch = await run(["git", "fetch", "origin", "--prune", "--force"], cwd=REPO_DIR, timeout=180.0)
       out_all += f"> git fetch origin --prune --force\n{out_fetch}\n\n"
       if rc_fetch != 0:
         return web.json_response({"ok": False, "rc": rc_fetch, "out": out_all.strip()})
 
-      rc_br, out_br = run(["git", "branch", "-r"], cwd=REPO_DIR)
+      rc_br, out_br = await run(["git", "branch", "-r"], cwd=REPO_DIR)
       branches = []
       for line in (out_br or "").splitlines():
         line = line.strip()
@@ -1165,7 +1206,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       ]
       out_all = ""
       for c, allow_fail in commands:
-        rc, out = run(c, cwd=REPO_DIR)
+        rc, out = await run(c, cwd=REPO_DIR, timeout=60.0)
         out_all += f"> {' '.join(c)}\n{out}\n\n"
         if rc != 0 and not allow_fail:
           return web.json_response({"ok": False, "rc": rc, "out": out_all.strip()})
@@ -1207,7 +1248,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       return web.json_response({"ok": True, "out": f"deleted entries: {deleted}"})
 
     if action == "send_tmux_log":
-      rc, out = capture_tmux_log_sync()
+      rc, out = await asyncio.to_thread(capture_tmux_log_sync)
       if rc != 0:
         return web.json_response({"ok": False, "error": "tmux capture failed", "error_code": "TMUX_CAPTURE_FAIL", "out": out})
 
@@ -1254,7 +1295,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
 
     if action == "rebuild_all":
       cmd = "cd /data/openpilot && scons -c && rm -rf prebuilt && python3 -m openpilot.common.reboot"
-      subprocess.Popen(["bash", "-lc", cmd])
+      subprocess.Popen(["bash", "-lc", cmd], **child_lock_kwargs())
       return web.json_response({"ok": True, "out": "rebuild_all requested (clean + remove prebuilt + reboot)"})
 
     if action == "shell_cmd":
@@ -1285,7 +1326,8 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         return web.json_response({"ok": False, "error": error, "error_code": error_code, "error_detail": detail}, status=403)
 
       try:
-        p = subprocess.run(
+        p = await asyncio.to_thread(
+          subprocess.run,
           argv,
           cwd="/data/openpilot",
           capture_output=True,
@@ -1298,7 +1340,7 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         if p.stderr:
           out += ("\n" + p.stderr if out else p.stderr)
         out = out.strip() or "(no output)"
-        return web.json_response({"ok": True, "out": out, "returncode": p.returncode})
+        return web.json_response({"ok": p.returncode == 0, "out": out, "returncode": p.returncode})
       except subprocess.TimeoutExpired:
         return web.json_response({"ok": False, "error": "timeout"}, status=504)
       except Exception as e:
