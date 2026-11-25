@@ -582,8 +582,131 @@ def test_late_isg_status_registration_recovers_after_startup_window():
   cs._discover_canfd_isg_status(parser)
   assert cs.isg_status is not None
   assert 181 in parser.addresses
+  assert parser.message_states[181].ignore_alive is True
+  # Before the first parsed 0x0B5 frame (ts == 0), read_isg must report unknown even at low timestamps.
+  assert read_isg(parser, cs.isg_status) == (-1, False)
   parser.update([t + 20_000_000, [(181, auto, 0)]])
   assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
+
+
+def test_isg_status_dropout_does_not_invalidate_can_valid():
+  """A >100 ms 0x0B5 dropout (e.g. cranking brownout) must not trip can_valid; read_isg handles staleness at 500 ms."""
+  from opendbc.car.hyundai.carstate import CarState
+
+  # Use a 50 Hz message without checksum/counter (CRUISE_BUTTONS_ALT2 or valid ESP_STATUS via packer) to keep bus alive.
+  packer = CANPacker("hyundai_canfd_generated")
+  parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  parser.controls_ready = True
+  cs = CarState.__new__(CarState)
+  cs.isg_status = None
+  cs.controls_ready_count = 126
+
+  auto = bytes.fromhex(ISG_HEX_AUTO_STOP)
+  t = 10_000_000_000
+  esp_frame = packer.make_can_msg("ESP_STATUS", 0, {})[1]
+  parser.update([t, [(96, esp_frame, 0), (181, auto, 0)]])
+  cs._discover_canfd_isg_status(parser)
+  assert parser.message_states[181].ignore_alive is True
+
+  # 1.2 s of 100 Hz 0x0B5 + 50 Hz valid ESP_STATUS
+  for i in range(1, 121):
+    t += 10_000_000
+    frames = [(181, auto, 0)]
+    if i % 2 == 0:
+      frames.append((96, packer.make_can_msg("ESP_STATUS", 0, {})[1], 0))
+    parser.update([t, frames])
+  assert parser.can_valid is True
+  assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
+
+  # Drop ONLY 0x0B5 for 600 ms while ESP_STATUS stays healthy: can_valid must stay True throughout,
+  # while read_isg stays fresh <= 500 ms (relative to bus traffic) and cleanly falls back to (-1, False) past 500 ms.
+  ts_last_isg = parser.ts_nanos["ISG_STATUS"]["ISG_STATE"]
+  for i in range(1, 61):
+    t += 10_000_000
+    frames = [(96, packer.make_can_msg("ESP_STATUS", 0, {})[1], 0)] if i % 2 == 0 else []
+    parser.update([t, frames])
+    assert parser.can_valid is True, f"0x0B5 dropout tripped can_valid at {i * 10} ms"
+    if parser.last_nonempty_nanos - ts_last_isg <= 500_000_000:
+      assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
+    else:
+      assert read_isg(parser, cs.isg_status) == (-1, False)
+  assert read_isg(parser, cs.isg_status) == (-1, False)
+
+
+def test_monitor_fingerprint_frame_126_registers_isg_status_with_ignore_alive(monkeypatch):
+  """Initial registration at controls_ready_count == 126 must also pass freq=nan so 0x0B5 never trips can_valid."""
+  from opendbc.car import Bus
+  from opendbc.car.hyundai import carstate as carstate_mod
+  from opendbc.car.hyundai.carstate import CarState
+  from opendbc.car.hyundai.values import HyundaiFlags
+
+  class DummyParams:
+    def get_bool(self, key):
+      return key == "ControlsReady"
+
+  monkeypatch.setattr(carstate_mod, "Params", DummyParams)
+
+  pt_parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  cam_parser = CANParser("hyundai_canfd_generated", [], 2)
+  pt_parser.controls_ready = True
+  pt_parser.update([1_000_000_000, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP), 0)]])
+
+  cs = CarState.__new__(CarState)
+  cs.CP = SimpleNamespace(flags=HyundaiFlags.CANFD.value, openpilotLongitudinalControl=True)
+  cs.controls_ready_count = 125
+  cs.isg_status = None
+  cs.cruise_buttons_alt2 = None
+  cs.trailer_status = None
+  cs._update_camera_scc_hint = lambda *args, **kwargs: None
+  cs._discover_canfd_camera_tx_messages = lambda *args, **kwargs: None
+
+  cs.monitor_fingerprint({Bus.pt: pt_parser, Bus.cam: cam_parser}, canfd=True)
+  assert cs.controls_ready_count == 126
+  assert cs.isg_status is pt_parser.vl["ISG_STATUS"]
+  assert pt_parser.message_states[181].ignore_alive is True
+  assert pt_parser.message_states[181].ignore_counter is True
+
+
+def test_read_isg_before_first_frame_is_unknown_even_at_low_timestamp():
+  """ts == 0 (registered, never parsed) must read (-1, False) even when last_nonempty_nanos <= ISG_STALE_NS."""
+  parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  parser._add_message("ISG_STATUS", float("nan"), ignore_counter=True)
+  parser.update([100_000_000, [(96, bytes(24), 0)]])
+  assert read_isg(parser, parser.vl["ISG_STATUS"]) == (-1, False)
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_direct_gas_from_post_mode_resets_post_window(camera):
+  """A direct gas release from an active post window with a re-stopped engine must get a full 2 s post window."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  send(camera, controller, cs, stopping=False, accel=0.5)
+  assert controller.isg_mode == "depart"
+
+  # Engine restarts -> post runs for ISG_POST_FRAMES - 1 ticks at standstill while still holding StopReq=1.
+  cs.isgAutoStop = False
+  for _ in range(ISG_POST_FRAMES - 1):
+    send(camera, controller, cs, stopping=True, accel=-0.5)
+  assert controller.isg_mode == "post"
+  assert controller.isg_frames == ISG_POST_FRAMES - 1
+
+  # Engine re-enters auto-stop while StopReq=1, then driver presses gas directly.
+  cs.isgAutoStop = True
+  send(camera, controller, cs, stopping=True, accel=-0.5)
+  cs.out.gasPressed = True
+  values = send(camera, controller, cs, stopping=True, accel=-0.5, override=True)
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+  assert controller.isg_frames == 0
+
+  # After the second restart, CIS2 must remain 2 for the full ISG_POST_FRAMES window (not 1 frame).
+  cs.out.gasPressed = False
+  cs.isgAutoStop = False
+  for frame in range(ISG_POST_FRAMES):
+    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"post frame {frame}"
+  assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == base_cis2(camera)
+  assert controller.isg_mode == ""
 
 
 if __name__ == "__main__":

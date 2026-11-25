@@ -373,14 +373,16 @@ class CarState(CarStateBase):
   def _discover_canfd_isg_status(self, parser):
     # Startup CAN dropouts must not permanently disable ISG_STATUS (0x0B5) tracking.
     # Absent platforms (e.g. Palisade/EVs) never put 0x0B5 in seen_addresses, so this
-    # adds no CAN validity checks there.
+    # adds no CAN validity checks there. Register with freq=math.nan (ignore_alive)
+    # so read_isg()'s 500 ms freshness check governs staleness without a 100 ms dropout
+    # during cranking brownout or an intermittent 0x0B5 on another platform tripping canValid.
     if self.isg_status is not None or self.controls_ready_count < 126:
       return
     msg = parser.dbc.name_to_msg.get("ISG_STATUS")
     if msg is None or msg.address not in parser.seen_addresses:
       return
     if msg.address not in parser.addresses:
-      parser._add_message("ISG_STATUS", ignore_counter=True)
+      parser._add_message("ISG_STATUS", math.nan, ignore_counter=True)
     if "ISG_STATUS" in parser.vl:
       self.isg_status = parser.vl["ISG_STATUS"]
 
@@ -396,7 +398,7 @@ class CarState(CarStateBase):
       self.cp_cam = can_parsers[Bus.cam]
       self.cp_alt = can_parsers[Bus.alt] if Bus.alt in can_parsers else None
 
-      def add_if_seen(parser, name, ignore_counter = False):
+      def add_if_seen(parser, name, ignore_counter = False, freq = None):
         msg = parser.dbc.name_to_msg.get(name)
         if not msg:
           print(f"{name} not in DBC")
@@ -405,10 +407,10 @@ class CarState(CarStateBase):
           return
         if msg.address in parser.addresses:
           return
-        parser._add_message(name, ignore_counter = ignore_counter)   # ← 이름으로 등록
+        parser._add_message(name, freq = freq, ignore_counter = ignore_counter)   # ← 이름으로 등록
 
-      def add_and_cache(parser, name: str, attr: str, ignore_counter: bool = False):
-        add_if_seen(parser, name, ignore_counter)
+      def add_and_cache(parser, name: str, attr: str, ignore_counter: bool = False, freq = None):
+        add_if_seen(parser, name, ignore_counter, freq = freq)
         if name in parser.vl:   # 등록 성공했을 때만
           setattr(self, attr, parser.vl[name])
           return True
@@ -480,7 +482,7 @@ class CarState(CarStateBase):
         elif self.controls_ready_count == 126:
           add_and_cache(self.cp, "CRUISE_BUTTONS_ALT2", "cruise_buttons_alt2", ignore_counter = True)
           add_and_cache(self.cp, "TRAILER_STATUS", "trailer_status", ignore_counter = True)
-          add_and_cache(self.cp, "ISG_STATUS", "isg_status", ignore_counter = True)
+          add_and_cache(self.cp, "ISG_STATUS", "isg_status", ignore_counter = True, freq = math.nan)
 
     if canfd and self.CP.flags & HyundaiFlags.CANFD:
       self._discover_canfd_camera_tx_messages(can_parsers[Bus.cam])

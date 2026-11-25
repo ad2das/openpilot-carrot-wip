@@ -74,7 +74,8 @@ def read_isg(cp, isg_status) -> tuple[int, bool]:
   """ISG state from the pt parser; isg_status is the parser.vl["ISG_STATUS"] dict or None when never seen."""
   if isg_status is None:
     return -1, False
-  fresh = cp.last_nonempty_nanos - cp.ts_nanos["ISG_STATUS"]["ISG_STATE"] <= ISG_STALE_NS
+  ts = cp.ts_nanos["ISG_STATUS"]["ISG_STATE"]
+  fresh = ts > 0 and cp.last_nonempty_nanos - ts <= ISG_STALE_NS
   return parse_isg_state(isg_status["ISG_STATE"], fresh)
 
 
@@ -265,7 +266,7 @@ class CanfdStopping:
       elif self.isg_mode == "depart" and leaving:
         self.isg_mode = "brake"
         event = "isg_wait_brake"
-    elif isg_auto_stop and ok and speed <= MOVING_SPEED and released and self.isg_mode == "":
+    elif isg_auto_stop and ok and speed <= MOVING_SPEED and released and self.isg_mode in ("", "post"):
       # Direct driver takeover (gas or gear change) from an openpilot hold while still ISG-stopped:
       # hand StopReq back immediately, but still emit CRUSE_INFO_SET_2 = 2 on the release frame.
       self.isg_mode = "post"
