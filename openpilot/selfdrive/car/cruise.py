@@ -964,8 +964,6 @@ class VCruiseCarrot:
       elif self.params.get_bool("ActivateCruiseAfterBrake"):
         self.params.put_bool_nonblocking("ActivateCruiseAfterBrake", False)
         self._cruise_control(1, -1, "Cruise on (brake)")
-      elif v_cruise_kph < self.v_ego_kph_set:
-        v_cruise_kph = self.v_ego_kph_set
 
     if self._soft_hold_active > 0:
       #self.events.append(EventName.softHold)

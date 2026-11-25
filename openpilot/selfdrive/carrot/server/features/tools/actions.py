@@ -67,6 +67,7 @@ _BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged",
 _READ_ONLY_CAT_FLAGS = {"-n", "-b", "-s", "-v", "-E", "-T"}
 _ALLOWED_CAT_ABS_PREFIXES = ("/data/openpilot/", "/data/media/", "/tmp/", "/proc/", "/sys/", "/var/log/")
 _BLOCKED_CAT_SEGMENTS = {"..", ".ssh", "GithubSshKeys", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "gshadow", ".netrc", ".git-credentials"}
+_BLOCKED_PROC_SEGMENTS = {"root", "cwd", "exe", "fd", "fdinfo", "map_files", "environ", "mem", "maps", "smaps"}
 
 
 def _is_disallowed_git_flag(arg: str) -> bool:
@@ -101,6 +102,8 @@ def _validate_cat_args(args: List[str]) -> Optional[Tuple[str, str, str]]:
     if norm.startswith("/"):
       if not any(norm == p.rstrip("/") or norm.startswith(p) for p in _ALLOWED_CAT_ABS_PREFIXES):
         return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
+      if norm.startswith("/proc/") and any(p in _BLOCKED_PROC_SEGMENTS for p in norm_parts[1:]):
+        return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
     elif norm == ".." or norm.startswith("../"):
       return f"cat path not allowed: {arg}", "CMD_NOT_ALLOWED", arg
     paths.append(arg)
@@ -113,6 +116,17 @@ def _validate_git_args(subcommand: str, args: List[str]) -> Optional[Tuple[str, 
   for arg in args:
     if _is_disallowed_git_flag(arg):
       return f"git flag not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+
+  if subcommand == "diff":
+    for arg in args:
+      if arg == "--" or arg.startswith("-"):
+        continue
+      if arg.startswith(("/", "~")) or "\x00" in arg:
+        return f"git diff path not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+      parts = arg.replace("\\", "/").split("/")
+      if ".." in parts:
+        return f"git diff path not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
+    return None
 
   if subcommand == "branch":
     allow_positional = False

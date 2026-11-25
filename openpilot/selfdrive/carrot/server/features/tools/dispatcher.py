@@ -19,6 +19,7 @@ import shlex
 import shutil
 import subprocess
 import traceback
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from aiohttp import web
@@ -68,10 +69,17 @@ def _clear_origin_remote_refs(repo_dir: str) -> None:
         skip_peeled = True
         continue
       kept.append(line)
-    tmp_path = f"{packed_path}.tmp.{os.getpid()}"
-    with open(tmp_path, "w", encoding="utf-8") as f:
-      f.writelines(kept)
-    os.replace(tmp_path, packed_path)
+    tmp_path = f"{packed_path}.tmp.{uuid.uuid4().hex}"
+    try:
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        f.writelines(kept)
+      os.replace(tmp_path, packed_path)
+    finally:
+      try:
+        if os.path.exists(tmp_path):
+          os.remove(tmp_path)
+      except OSError:
+        pass
   except OSError:
     pass
 

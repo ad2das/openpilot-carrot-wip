@@ -19,7 +19,9 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   assert validate_shell_argv(["git", "remote", "-v"]) is None
   assert validate_shell_argv(["git", "remote", "get-url", "origin"]) is None
   assert validate_shell_argv(["git", "log", "--oneline", "-5"]) is None
+  assert validate_shell_argv(["git", "diff", "--stat", "HEAD~1..HEAD", "--", "openpilot/selfdrive/carrot/carrot_man.py"]) is None
   assert validate_shell_argv(["cat", "/tmp/launch_log"]) is None
+  assert validate_shell_argv(["cat", "/proc/meminfo"]) is None
   assert validate_shell_argv(["cat", "README.md"]) is None
 
   # Dangerous git flags and mutations are rejected.
@@ -28,6 +30,8 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   assert validate_shell_argv(["git", "diff", "--ext-diff"]) is not None
   assert validate_shell_argv(["git", "diff", "--no-index", "/etc/shadow", "/dev/null"]) is not None
   assert validate_shell_argv(["git", "diff", "--no-index", "/data/params/d/GithubSshKeys", "/dev/null"]) is not None
+  assert validate_shell_argv(["git", "diff", "/etc/hosts", "/dev/null"]) is not None
+  assert validate_shell_argv(["git", "diff", "../../etc/passwd", "/dev/null"]) is not None
   assert validate_shell_argv(["git", "log", "--textconv"]) is not None
   assert validate_shell_argv(["git", "status", "-c", "core.pager=sh"]) is not None
   assert validate_shell_argv(["git", "branch", "-D", "main"]) is not None
@@ -42,6 +46,9 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   assert validate_shell_argv(["cat", "/data/params/d/GithubSshKeys"]) is not None
   assert validate_shell_argv(["cat", "/etc/shadow"]) is not None
   assert validate_shell_argv(["cat", "../../.ssh/id_rsa"]) is not None
+  assert validate_shell_argv(["cat", "/proc/self/root/etc/passwd"]) is not None
+  assert validate_shell_argv(["cat", "/proc/self/environ"]) is not None
+  assert validate_shell_argv(["cat", "/proc/1/fd/0"]) is not None
 
 
 def test_clear_origin_remote_refs_removes_loose_and_packed_origin_refs(tmp_path):

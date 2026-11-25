@@ -743,6 +743,69 @@ def test_dashcam_web_upload_refreshes_token_on_403(tmp_path: Path, monkeypatch):
   assert RefreshSession.instances[-1].auth_headers == ["Bearer old-token", "Bearer fresh-token"]
 
 
+def test_dashcam_web_upload_refreshes_403_after_transient_error(tmp_path: Path, monkeypatch):
+  (tmp_path / "qlog.zst").write_bytes(b"retry-403")
+
+  class FlakyResp:
+    def __init__(self, status: int, body: dict):
+      self.status = status
+      self._body = body
+
+    async def text(self):
+      return json.dumps(self._body)
+
+  class FlakyCtx:
+    def __init__(self, session, headers, data):
+      self._session = session
+      self._headers = headers
+      self._data = data
+
+    async def __aenter__(self):
+      payload = b""
+      async for chunk in self._data:
+        payload += chunk
+      self._session.calls += 1
+      self._session.auth_headers.append(self._headers.get("Authorization"))
+      if self._session.calls == 1:
+        raise RuntimeError("transient network drop")
+      if self._session.calls == 2:
+        return FlakyResp(403, {"ok": False, "error": "expired"})
+      return FlakyResp(200, {"ok": True, "size": len(payload)})
+
+    async def __aexit__(self, *args):
+      return False
+
+  class FlakySession:
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+      self.calls = 0
+      self.auth_headers = []
+      type(self).instances.append(self)
+
+    async def __aenter__(self):
+      return self
+
+    async def __aexit__(self, *args):
+      return False
+
+    def put(self, url, data, headers=None):
+      return FlakyCtx(self, headers or {}, data)
+
+  monkeypatch.setattr(web_upload, "ClientSession", FlakySession)
+  refreshes = []
+
+  async def refresh():
+    refreshes.append(True)
+    return "fresh-token-2"
+
+  assert asyncio.run(web_upload.upload_folder_to_web(
+    str(tmp_path), "device", "route|0", "https://upload.example", "old-token", refresh_token=refresh,
+  ))
+  assert refreshes == [True]
+  assert FlakySession.instances[-1].auth_headers == ["Bearer old-token", "Bearer old-token", "Bearer fresh-token-2"]
+
+
 def test_dashcam_upload_summary_selects_only_original_qcamera_and_rlog(tmp_path: Path):
   (tmp_path / "qcamera.ts").write_bytes(b"original-video")
   (tmp_path / "qcamera.mp4").write_bytes(b"converted-video")

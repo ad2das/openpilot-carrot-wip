@@ -252,8 +252,9 @@ class Controls:
         actual_curvature_vm = actual_curvature_vm_no_roll + roll_compensation
         actual_curvature = actual_curvature_vm
         if self.calibrated_pose is not None and CS.vEgo > 2.0:
-          actual_curvature_pose = self.calibrated_pose.angular_velocity.yaw / max(CS.vEgo, 0.1)
-          actual_curvature = float(np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose]))
+          actual_curvature_pose = float(self.calibrated_pose.angular_velocity.yaw / max(CS.vEgo, 0.1))
+          if math.isfinite(actual_curvature_pose):
+            actual_curvature = float(np.interp(CS.vEgo, [2.0, 5.0], [actual_curvature_vm, actual_curvature_pose]))
         feedforward = self.desired_curvature - roll_compensation
         error = self.desired_curvature - actual_curvature
         freeze_integrator = self.steer_limited_by_safety or CS.vEgo < 5 or CS.steeringPressed
@@ -267,8 +268,10 @@ class Controls:
     CC.currentCurvature = self.curvature
     pose = getattr(self, 'calibrated_pose', None)
     if pose is not None:
-      CC.orientationNED = pose.orientation.xyz.tolist()
-      CC.angularVelocity = pose.angular_velocity.xyz.tolist()
+      if np.all(np.isfinite(pose.orientation.xyz)):
+        CC.orientationNED = pose.orientation.xyz.tolist()
+      if np.all(np.isfinite(pose.angular_velocity.xyz)):
+        CC.angularVelocity = pose.angular_velocity.xyz.tolist()
 
     # 주의: MEB는 위 곡률 PID가 실제 조향을 만들고, 아래 LaC(LatControlAngle)와 lac_log는
     # 파이프라인 형식 유지를 위한 더미임 (로그의 angleState는 실제 제어 상태가 아님).
@@ -298,8 +301,10 @@ class Controls:
     CC.currentCurvature = self.curvature
     pose = getattr(self, 'calibrated_pose', None)
     if pose is not None:
-      CC.orientationNED = pose.orientation.xyz.tolist()
-      CC.angularVelocity = pose.angular_velocity.xyz.tolist()
+      if np.all(np.isfinite(pose.orientation.xyz)):
+        CC.orientationNED = pose.orientation.xyz.tolist()
+      if np.all(np.isfinite(pose.angular_velocity.xyz)):
+        CC.angularVelocity = pose.angular_velocity.xyz.tolist()
 
     #acceleration_value = list(self.sm['liveLocationKalman'].accelerationCalibrated.value)
     #if len(acceleration_value) > 2:

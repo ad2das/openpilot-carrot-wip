@@ -366,3 +366,14 @@ def test_u8_enabled_release_with_blinker_does_not_latch():
 
   frame(helper, CS, CC, rec, steer=10.0)
   assert helper._resume_pending is None
+
+
+def test_disengaged_does_not_unconditionally_raise_v_cruise_kph():
+  helper, CS, CC, rec = make_helper()
+  helper.autoGasSyncSpeed = 0
+  helper.v_cruise_kph = 60.0
+  helper.v_ego_kph_set = 90
+  CS.vEgo = 90 / 3.6
+  CS.vEgoCluster = 90 / 3.6
+  out = helper._update_cruise_state(CS, CC, helper.v_cruise_kph)
+  assert out == 60.0

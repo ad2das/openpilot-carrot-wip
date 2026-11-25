@@ -261,7 +261,8 @@ async def upload_folder_to_web(
 
       last_error: Exception | None = None
       refreshed = False
-      for _attempt in range(2):
+      attempt = 0
+      while attempt < 2:
         check_cancel()
         try:
           req_headers = {
@@ -294,6 +295,7 @@ async def upload_folder_to_web(
         except Exception as e:
           check_cancel()
           last_error = e
+          attempt += 1
       if last_error is not None:
         raise RuntimeError(f"{filename}: {last_error}") from last_error
       check_cancel()
