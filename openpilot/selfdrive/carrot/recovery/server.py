@@ -1399,6 +1399,16 @@ class Tunnel:
         pass
 
 
+def _drain_pipe(stream) -> None:
+  if stream is None:
+    return
+  try:
+    for _ in iter(stream.readline, ""):
+      pass
+  except Exception:
+    pass
+
+
 def _start_quick_tunnel(local_url: str, timeout_s: float = 25.0) -> Tunnel:
   fake = os.environ.get("CARROT_SUPPORT_FAKE_TUNNEL_URL", "").strip()
   if fake:
@@ -1409,8 +1419,21 @@ def _start_quick_tunnel(local_url: str, timeout_s: float = 25.0) -> Tunnel:
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1,
   )
   url = ""
-  deadline = time.time() + timeout_s
-  while time.time() < deadline:
+  deadline = time.monotonic() + timeout_s
+  use_select = os.name != "nt" and proc.stdout is not None
+  if use_select:
+    import select
+  while True:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0.0:
+      break
+    if use_select:
+      try:
+        ready, _, _ = select.select([proc.stdout], [], [], remaining)
+      except (OSError, ValueError):
+        break
+      if not ready:
+        break
     line = proc.stdout.readline() if proc.stdout else ""
     if not line:
       if proc.poll() is not None:
@@ -1423,8 +1446,8 @@ def _start_quick_tunnel(local_url: str, timeout_s: float = 25.0) -> Tunnel:
   if not url:
     Tunnel(url="", proc=proc).stop()
     raise RuntimeError("cloudflared did not provide a trycloudflare URL")
-  # Keep draining stdout so the OS pipe buffer can't fill and stall cloudflared.
-  threading.Thread(target=lambda: [None for _ in iter(proc.stdout.readline, "")], daemon=True).start()
+  # Keep draining stdout in O(1) memory so the OS pipe buffer can't fill and stall cloudflared.
+  threading.Thread(target=_drain_pipe, args=(proc.stdout,), daemon=True).start()
   return Tunnel(url=url, proc=proc)
 
 

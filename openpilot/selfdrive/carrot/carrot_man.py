@@ -551,13 +551,23 @@ class CarrotMan:
       self._navi_points_lock = lock
     return lock
 
+  def _is_onroad(self) -> bool:
+    now = time.monotonic()
+    cached_t = getattr(self, "_is_onroad_cache_t", None)
+    if cached_t is not None and now - cached_t < 0.5:
+      return bool(getattr(self, "_is_onroad_cache_val", False))
+    val = bool(self.params.get_bool("IsOnroad"))
+    self._is_onroad_cache_val = val
+    self._is_onroad_cache_t = now
+    return val
+
   def carrot_navi_route(self):
 
     if self.carrot_serv.active_carrot > 1:
       if False and self.navd_active:  # mabox always active
         self.navd_active = False
         self.params.remove("NavDestination")
-    is_onroad = self.params.get_bool("IsOnroad")
+    is_onroad = self._is_onroad()
     with self._navi_lock():
       active = self.navi_points_active
       if not is_onroad or not active or not SHAPELY_AVAILABLE or (self.carrot_serv.active_carrot <= 1 and not self.navd_active):
@@ -1381,88 +1391,84 @@ class CarrotMan:
   def carrot_route(self):
     host = '0.0.0.0'  # 혹은 다른 호스트 주소
     port = 7709  # 포트 번호
+    max_payload_bytes = 16 * 1024 * 1024
 
-    try:
-      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind((host, port))
-        s.listen()
+    while self.is_running:
+      try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+          s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          s.bind((host, port))
+          s.listen(5)
 
-        while True:
-          print("################# waiting connection from CarrotMan route #####################")
-          conn, addr = s.accept()
-          with conn:
-            print(f"Connected by {addr}")
-            #self.clear_route()
+          while self.is_running:
+            print("################# waiting connection from CarrotMan route #####################")
+            conn, addr = s.accept()
+            with conn:
+              conn.settimeout(10.0)
+              print(f"Connected by {addr}")
+              #self.clear_route()
 
-            # 전체 데이터 크기 수신
-            total_size_bytes = self.recvall(conn, 4)
-            if not total_size_bytes:
-              print("Connection closed or error occurred")
-              continue
-            try:
-              total_size = struct.unpack('!I', total_size_bytes)[0]
-              # 전체 데이터를 한 번에 수신
-              all_data = self.recvall(conn, total_size)
-              if all_data is None:
+              try:
+                # 전체 데이터 크기 수신
+                total_size_bytes = self.recvall(conn, 4)
+                if not total_size_bytes:
+                  print("Connection closed or error occurred")
+                  continue
+                total_size = struct.unpack('!I', total_size_bytes)[0]
+                if total_size > max_payload_bytes or (total_size % 8) != 0:
+                  print(f"Rejected invalid route payload size: {total_size}")
+                  continue
+                # 전체 데이터를 한 번에 수신
+                all_data = self.recvall(conn, total_size)
+                if all_data is None:
                   print("Connection closed or incomplete data received")
                   continue
 
-              new_navi_points = []
-              points = []
-              for i in range(0, len(all_data), 8):
-                x, y = struct.unpack('!ff', all_data[i:i+8])
-                new_navi_points.append((x, y))
-                coord = Coordinate.from_mapbox_tuple((x, y))
-                points.append(coord)
-              coords = [c.as_dict() for c in points]
-              with self._navi_lock():
-                self.navi_points = new_navi_points
-                self.navi_points_start_index = 0
-                self.navi_points_active = len(coords) > 0
-              print("Received points:", len(new_navi_points))
-              #print("Received points:", self.navi_points)
-
-              self.send_routes(coords)
-              """
-              try:
-                module_name = "route_engine"
-                class_name = "RouteEngine"
-                moduel = importlib.import_module(module_name)
-                cls = getattr(moduel, class_name)
-                route_engine_instance = cls(name="Loaded at Runtime")
-
-                route_engine_instance.send_route_coords(coords, True)
-              except Exception as e:
-                print(f"route_engine error: {e}")
-
-              #msg = messaging.new_message('navRoute', valid=True)
-              #msg.navRoute.coordinates = coords
-              #self.pm.send('navRoute', msg)
-              """
-
-              if len(coords):
-                dest = coords[-1]
-                dest['place_name'] = "External Navi"
-                self.params.put("NavDestination", json.dumps(dest))
-              else:
+                new_navi_points = []
+                points = []
+                for i in range(0, len(all_data), 8):
+                  x, y = struct.unpack('!ff', all_data[i:i+8])
+                  new_navi_points.append((x, y))
+                  coord = Coordinate.from_mapbox_tuple((x, y))
+                  points.append(coord)
+                coords = [c.as_dict() for c in points]
                 with self._navi_lock():
-                  self.navi_points = []
+                  self.navi_points = new_navi_points
                   self.navi_points_start_index = 0
-                  self.navi_points_active = False
-                  self.navd_active = False
-                self.params.remove("NavDestination")
+                  self.navi_points_active = len(coords) > 0
+                print("Received points:", len(new_navi_points))
+                #print("Received points:", self.navi_points)
 
-            except Exception as e:
-              print(e)
-    except Exception as e:
-      print("################# CarrotMan route server error #####################")
-      print(e)
+                self.send_routes(coords)
 
-  def carrot_curve_speed_params(self):
+                if len(coords):
+                  dest = coords[-1]
+                  dest['place_name'] = "External Navi"
+                  self.params.put("NavDestination", json.dumps(dest))
+                else:
+                  with self._navi_lock():
+                    self.navi_points = []
+                    self.navi_points_start_index = 0
+                    self.navi_points_active = False
+                    self.navd_active = False
+                  self.params.remove("NavDestination")
+
+              except Exception as e:
+                print(e)
+      except Exception as e:
+        print("################# CarrotMan route server error #####################")
+        print(e)
+        time.sleep(2)
+
+  def carrot_curve_speed_params(self, *, force: bool = True):
+    now = time.monotonic()
+    if not force and now - getattr(self, "_curve_speed_params_t", -1e9) < 1.0:
+      return
+    self._curve_speed_params_t = now
     self.autoCurveSpeedFactor = self.params.get_int("AutoCurveSpeedFactor")*0.01
 
   def carrot_curve_speed(self, sm):
-    self.carrot_curve_speed_params()
+    self.carrot_curve_speed_params(force=False)
     if not all(sm.alive[name] and sm.valid[name] for name in ('carState', 'modelV2')):
       return self.vision_curve_speed.update(None, time.monotonic())
     return self.vturn_speed(sm['carState'], sm)
@@ -2208,52 +2214,58 @@ class CarrotMan:
         time.sleep(2)
 
   def carrot_navi_tcp_server(self, port: int = 7712):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("0.0.0.0", port))
-    server.listen(5)
-    print("TCP server listening", port)
-
-    while True:
-      conn, addr = server.accept()
-      self.remote_addr = addr
-      print("Connected:", addr)
-      conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    while self.is_running:
       try:
-        f = conn.makefile("r", encoding="utf-8", errors="ignore")
-        while True:
-          try:
-            line = f.readline()
-          except socket.timeout:
-            print("TCP timeout: closing connection", addr)
-            break
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+          server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          server.bind(("0.0.0.0", port))
+          server.listen(5)
+          print("TCP server listening", port)
 
-          if not line:
-            break
+          while self.is_running:
+            conn, addr = server.accept()
+            self.remote_addr = addr
+            print("Connected:", addr)
+            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            conn.settimeout(60.0)
+            try:
+              with conn.makefile("r", encoding="utf-8", errors="ignore") as f:
+                while True:
+                  try:
+                    line = f.readline()
+                  except socket.timeout:
+                    print("TCP timeout: closing connection", addr)
+                    break
 
-          s = line.strip()
-          if not s:
-            continue
+                  if not line:
+                    break
 
-          try:
-            obj = json.loads(s)
-          except Exception:
-            obj = s
+                  s = line.strip()
+                  if not s:
+                    continue
 
-          try:
-            self._dispatch_obj(obj)
-          except Exception as e:
-            print("dispatch error:", e, "raw:", repr(s[:200]))
+                  try:
+                    obj = json.loads(s)
+                  except Exception:
+                    obj = s
 
+                  try:
+                    self._dispatch_obj(obj)
+                  except Exception as e:
+                    print("dispatch error:", e, "raw:", repr(s[:200]))
+
+            except Exception as e:
+              print("TCP error:", e)
+
+            finally:
+              try:
+                conn.close()
+              except Exception:
+                pass
+              self.remote_addr = None
       except Exception as e:
-        print("TCP error:", e)
-
-      finally:
-        try:
-          conn.close()
-        except Exception:
-          pass
-        self.remote_addr = None
+        print("TCP server error:", e)
+        time.sleep(2)
 
   async def carrot_http_post(self, request: web.Request):
     tmap_version = request.match_info.get("tmap_version", "")
@@ -2332,14 +2344,16 @@ class CarrotMan:
 
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
+    try:
+      site = web.TCPSite(runner, "0.0.0.0", port)
+      await site.start()
 
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+      print("HTTP server listening", port)
 
-    print("HTTP server listening", port)
-
-    while True:
-      await asyncio.sleep(3600)
+      while True:
+        await asyncio.sleep(3600)
+    finally:
+      await runner.cleanup()
 
 def main():
   try:

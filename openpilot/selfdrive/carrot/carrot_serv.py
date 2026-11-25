@@ -363,10 +363,15 @@ class CarrotServ:
     # 默认语言，稍后在 update_params 中从 Params 读取覆盖，
     # 规则：main_ko -> 韩语；main_zh-CHS -> 中文；其他 -> 英文
     self.lang = "en"
+    self._params_poll_t = -1e9
 
-    self.update_params()
+    self.update_params(force=True)
 
-  def update_params(self):
+  def update_params(self, *, force: bool = True):
+    now = time.monotonic()
+    if not force and now - getattr(self, "_params_poll_t", -1e9) < 1.0:
+      return
+    self._params_poll_t = now
     self.autoNaviSpeedBumpSpeed = float(self.params.get_int("AutoNaviSpeedBumpSpeed"))
     self.autoNaviSpeedBumpTime = float(self.params.get_int("AutoNaviSpeedBumpTime"))
     self.autoNaviSpeedBumpEndDistance = float(min(5000, max(0, self.params.get_int("AutoNaviSpeedBumpEndDistance")))) * 0.01
@@ -1856,7 +1861,7 @@ class CarrotServ:
   def update_navi(self, remote_ip, sm, pm, vturn_speed, coords, distances, route_speed, gps_service):
 
     self.debugText = ""
-    self.update_params()
+    self.update_params(force=False)
     carrot_navi_active = self._update_carrot_navi(sm)
     if sm.alive['carState'] and sm.alive['selfdriveState']:
       CS = sm['carState']
@@ -2356,7 +2361,7 @@ def main():
   carrot_man = CarrotMan()
 
   print(f"CarrotMan {carrot_man}")
-  threading.Thread(target=carrot_man.kisa_app_thread).start()
+  threading.Thread(target=carrot_man.kisa_app_thread, daemon=True).start()
   while True:
     try:
       carrot_man.carrot_man_thread()

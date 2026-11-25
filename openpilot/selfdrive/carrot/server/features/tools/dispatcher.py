@@ -729,40 +729,56 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
 
     if action == "delete_all_videos":
       jobs.progress(job, message="delete videos", current=1, total=1)
-      deleted = 0
-      for path in ["/data/media/0/videos"]:
-        if not os.path.isdir(path):
-          continue
-        for fn in glob.glob(os.path.join(path, "*")):
-          try:
-            os.remove(fn)
-            deleted += 1
-            jobs.append(job, f"deleted: {os.path.basename(fn)}")
-          except Exception as e:
-            jobs.append(job, f"delete error: {e}")
+
+      def _delete_videos() -> tuple[int, list[str]]:
+        count = 0
+        lines: list[str] = []
+        for path in ["/data/media/0/videos"]:
+          if not os.path.isdir(path):
+            continue
+          for fn in glob.glob(os.path.join(path, "*")):
+            try:
+              os.remove(fn)
+              count += 1
+              lines.append(f"deleted: {os.path.basename(fn)}")
+            except Exception as e:
+              lines.append(f"delete error: {e}")
+        return count, lines
+
+      deleted, lines = await asyncio.to_thread(_delete_videos)
+      if lines:
+        jobs.append(job, "\n".join(lines))
       result = {"ok": True, "out": f"deleted files: {deleted}"}
       jobs.finish(job, ok=True, result=result)
       return
 
     if action == "delete_all_logs":
       jobs.progress(job, message="delete logs", current=1, total=1)
-      deleted = 0
-      for path in ["/data/media/0/realdata"]:
-        if not os.path.isdir(path):
-          continue
-        for name in os.listdir(path):
-          full_path = os.path.join(path, name)
-          try:
-            if os.path.isfile(full_path) or os.path.islink(full_path):
-              os.remove(full_path)
-            elif os.path.isdir(full_path):
-              shutil.rmtree(full_path)
-            else:
-              continue
-            deleted += 1
-            jobs.append(job, f"deleted: {name}")
-          except Exception as e:
-            jobs.append(job, f"delete error: {e}")
+
+      def _delete_logs() -> tuple[int, list[str]]:
+        count = 0
+        lines: list[str] = []
+        for path in ["/data/media/0/realdata"]:
+          if not os.path.isdir(path):
+            continue
+          for name in os.listdir(path):
+            full_path = os.path.join(path, name)
+            try:
+              if os.path.isfile(full_path) or os.path.islink(full_path):
+                os.remove(full_path)
+              elif os.path.isdir(full_path):
+                shutil.rmtree(full_path)
+              else:
+                continue
+              count += 1
+              lines.append(f"deleted: {name}")
+            except Exception as e:
+              lines.append(f"delete error: {e}")
+        return count, lines
+
+      deleted, lines = await asyncio.to_thread(_delete_logs)
+      if lines:
+        jobs.append(job, "\n".join(lines))
       result = {"ok": True, "out": f"deleted entries: {deleted}"}
       jobs.finish(job, ok=True, result=result)
       return
@@ -1221,38 +1237,42 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
       return web.json_response({"ok": True, "out": out_all.strip(), "summary_key": "git_result_reset_repo_checkout_done", "summary_vars": {"branch": branch}, "empty_output": not out_all.strip()})
 
     if action == "delete_all_videos":
-      paths = ["/data/media/0/videos"]
-      deleted = 0
-      for pth in paths:
-        if not os.path.isdir(pth):
-          continue
-        for fn in glob.glob(os.path.join(pth, "*")):
-          try:
-            os.remove(fn)
-            deleted += 1
-          except Exception:
-            pass
+      def _delete_videos_sync() -> int:
+        count = 0
+        for pth in ["/data/media/0/videos"]:
+          if not os.path.isdir(pth):
+            continue
+          for fn in glob.glob(os.path.join(pth, "*")):
+            try:
+              os.remove(fn)
+              count += 1
+            except Exception:
+              pass
+        return count
+
+      deleted = await asyncio.to_thread(_delete_videos_sync)
       return web.json_response({"ok": True, "out": f"deleted files: {deleted}"})
 
     if action == "delete_all_logs":
-      paths = ["/data/media/0/realdata"]
-      deleted = 0
-      for pth in paths:
-        if not os.path.isdir(pth):
-          continue
+      def _delete_logs_sync() -> int:
+        count = 0
+        for pth in ["/data/media/0/realdata"]:
+          if not os.path.isdir(pth):
+            continue
+          for name in os.listdir(pth):
+            full_path = os.path.join(pth, name)
+            try:
+              if os.path.isfile(full_path) or os.path.islink(full_path):
+                os.remove(full_path)
+                count += 1
+              elif os.path.isdir(full_path):
+                shutil.rmtree(full_path)
+                count += 1
+            except Exception as e:
+              print("delete error:", e)
+        return count
 
-        for name in os.listdir(pth):
-          full_path = os.path.join(pth, name)
-          try:
-            if os.path.isfile(full_path) or os.path.islink(full_path):
-              os.remove(full_path)
-              deleted += 1
-            elif os.path.isdir(full_path):
-              shutil.rmtree(full_path)
-              deleted += 1
-          except Exception as e:
-            print("delete error:", e)
-
+      deleted = await asyncio.to_thread(_delete_logs_sync)
       return web.json_response({"ok": True, "out": f"deleted entries: {deleted}"})
 
     if action == "send_tmux_log":

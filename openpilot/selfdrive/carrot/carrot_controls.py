@@ -8,9 +8,15 @@ class CarrotControls:
     self.lat_suspend_active = False
     self.lat_suspend_enter_t = 0.0
     self.lat_suspend_hold_t = 0.0
+    self._suspend_angle = float(self.params.get_int("LatSuspendAngleDeg"))
+    self._param_frame = 0
 
   def lat_suspend_control(self, CS, latActive):
-    suspend_angle = float(self.params.get_int("LatSuspendAngleDeg"))
+    self._param_frame += 1
+    if self._param_frame >= 100:
+      self._param_frame = 0
+      self._suspend_angle = float(self.params.get_int("LatSuspendAngleDeg"))
+    suspend_angle = self._suspend_angle
     resume_angle  = 15
     delay_sec     = 1.0
     hold_sec      = 0.5

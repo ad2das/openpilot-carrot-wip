@@ -487,7 +487,7 @@ class LateralPlanner:
     global LATERAL_ACCEL_COST, LATERAL_JERK_COST, STEERING_RATE_COST
     self.readParams -= 1
     if self.readParams <= 0:
-      self.readParams = 10
+      self.readParams = 20
       self.useLaneLineSpeedApply = sm['carState'].useLaneLineSpeed
       self.pathOffset = float(self.params.get_int("PathOffset")) * 0.01
       self.lateralPathCost = self.params.get_float("LatMpcPathCost") * 0.01
@@ -500,10 +500,10 @@ class LateralPlanner:
         self.lane_center_blend.reset()
       self.lane_center_blend_enabled = blend_enabled
       self.lane_recenter_assist_enabled = self.params.get_int("LaneRecenterAssist") > 0
-      self.hybrid_path_cost = self.params.get_float("LatMpcPathCost") * 0.01
-      self.hybrid_motion_cost = self.params.get_float("LatMpcMotionCost") * 0.01
-      self.hybrid_jerk_cost = self.params.get_float("LatMpcJerkCost") * 0.01
-      self.hybrid_srate_cost = self.params.get_float("LatMpcSteeringRateCost")
+      self.hybrid_path_cost = self.lateralPathCost
+      self.hybrid_motion_cost = self.lateralMotionCost
+      self.hybrid_jerk_cost = LATERAL_JERK_COST
+      self.hybrid_srate_cost = STEERING_RATE_COST
       self.hybrid_steer_delay = self.params.get_float("SteerActuatorDelay") * 0.01
       self.hybrid_smooth_sec = self.params.get_float("LatSmoothSec") * 0.01
 

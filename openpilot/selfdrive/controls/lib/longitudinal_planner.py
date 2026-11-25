@@ -88,6 +88,8 @@ class LongitudinalPlanner:
     self.coasting_percent = 0
     self.coasting_param_time = 1.0
     self.coasting_target = 0.0
+    self.longitudinal_actuator_delay = self.params.get_float("LongActuatorDelay") * 0.01
+    self.v_ego_stopping = get_stopping_speed(self.params)
 
   def update_lead_tracks(self, radar_state):
     for index, lead in enumerate((radar_state.leadOne, radar_state.leadTwo)):
@@ -127,6 +129,8 @@ class LongitudinalPlanner:
     if self.coasting_param_time >= 1.0:
       self.coasting_param_time = 0.0
       self.coasting_percent = coasting_percent(self.params.get_int('CruiseCoastingPercent'))
+      self.longitudinal_actuator_delay = self.params.get_float("LongActuatorDelay") * 0.01
+      self.v_ego_stopping = get_stopping_speed(self.params)
     self.mpc.mode = 'blended' if sm['selfdriveState'].experimentalMode else 'acc'
 
     if len(sm['carControl'].orientationNED) == 3:
@@ -283,8 +287,8 @@ class LongitudinalPlanner:
     self.a_desired = float(np.interp(self.dt, CONTROL_N_T_IDX, self.a_desired_trajectory))
     self.v_desired_filter.x = self.v_desired_filter.x + self.dt * (self.a_desired + a_prev) / 2.0
 
-    longitudinalActuatorDelay = self.params.get_float("LongActuatorDelay")*0.01
-    vEgoStopping = get_stopping_speed(self.params)
+    longitudinalActuatorDelay = self.longitudinal_actuator_delay
+    vEgoStopping = self.v_ego_stopping
     action_t =  longitudinalActuatorDelay + DT_MDL
 
     output_a_target_base, output_should_stop_mpc, output_v_target_mpc, _ = get_accel_from_plan(

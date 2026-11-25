@@ -82,14 +82,19 @@ async def heartbeat_loop(app: web.Application):
 
   params = Params()
   interval_s = 30.0  # 기존: frame%(20*30) = 30초
+
+  def _heartbeat_tick() -> tuple[bool, str, str]:
+    ok, msg = register_my_ip_sync(params)
+    return ok, msg, get_local_ip()
+
   while True:
     try:
-      ok, msg = await asyncio.to_thread(register_my_ip_sync, params)
+      ok, msg, local_ip = await asyncio.to_thread(_heartbeat_tick)
       app["hb_last"] = {
         "ok": bool(ok),
         "msg": str(msg)[:800],
         "ts": time.time(),
-        "local_ip": get_local_ip(),
+        "local_ip": local_ip,
       }
     except asyncio.CancelledError:
       break

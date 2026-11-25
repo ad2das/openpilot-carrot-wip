@@ -573,7 +573,14 @@ class DspBackend:
     server = self.server_cmd or ensure_dsp_server()
     cmd = [*self.command_prefix, server, "--dlc", DSP_DLC, "--runtime", self.runtime,
            "--in", self._in_path, "--out", self._out_path]
-    log = open(self._log_path(), "ab")
+    log_path = self._log_path()
+    try:
+      if os.path.exists(log_path) and os.path.getsize(log_path) > 1_000_000:
+        with open(log_path, "wb"):
+          pass
+    except OSError:
+      pass
+    log = open(log_path, "ab")
     try:
       self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                     stderr=log, env=dsp_server_env())

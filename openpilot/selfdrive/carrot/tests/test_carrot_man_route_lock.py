@@ -46,3 +46,113 @@ def test_handle_route_updates_navd_active_atomically_under_navi_lock():
 
   cm.handle_route([])
   assert observed_inside_lock[-1] == (False, False, 0)
+
+
+def test_carrot_serv_and_carrot_man_throttle_periodic_param_reads(monkeypatch):
+  from openpilot.selfdrive.carrot.carrot_serv import CarrotServ
+
+  clock = [100.0]
+  monkeypatch.setattr("openpilot.selfdrive.carrot.carrot_serv.time.monotonic", lambda: clock[0])
+  monkeypatch.setattr("openpilot.selfdrive.carrot.carrot_man.time.monotonic", lambda: clock[0])
+
+  reads = []
+
+  class FakeParams:
+    def get_int(self, key):
+      reads.append(key)
+      return 10
+
+    def get_float(self, key):
+      reads.append(key)
+      return 100.0
+
+    def get_bool(self, key):
+      reads.append(key)
+      return False
+
+    def get(self, key):
+      reads.append(key)
+      return "30" if key == "AutoCurveSpeedLowerLimit" else "main_ko"
+
+  serv = CarrotServ.__new__(CarrotServ)
+  serv.params = FakeParams()
+  serv._params_poll_t = -1e9
+  serv.lang = "en"
+
+  serv.update_params(force=False)
+  first_count = len(reads)
+  assert first_count > 10
+  # Repeated calls within 1.0s must not touch flash params
+  serv.update_params(force=False)
+  clock[0] += 0.5
+  serv.update_params(force=False)
+  assert len(reads) == first_count
+  # After 1.0s, refresh happens once
+  clock[0] += 0.6
+  serv.update_params(force=False)
+  assert len(reads) == first_count * 2
+  # force=True always reloads immediately
+  serv.update_params(force=True)
+  assert len(reads) == first_count * 3
+
+  cm = CarrotMan.__new__(CarrotMan)
+  cm.params = FakeParams()
+  reads.clear()
+  cm.carrot_curve_speed_params(force=False)
+  assert reads == ["AutoCurveSpeedFactor"]
+  cm.carrot_curve_speed_params(force=False)
+  assert reads == ["AutoCurveSpeedFactor"]
+  clock[0] += 1.1
+  cm.carrot_curve_speed_params(force=False)
+  assert reads == ["AutoCurveSpeedFactor", "AutoCurveSpeedFactor"]
+
+
+def test_xiaoge_broadcaster_caps_clients_and_drops_dead_client():
+  from openpilot.selfdrive.carrot.xiaoge_data import MAX_CLIENTS, XiaogeDataBroadcaster
+
+  b = XiaogeDataBroadcaster.__new__(XiaogeDataBroadcaster)
+  b.clients = {}
+  b.client_send_locks = {}
+  b.clients_lock = threading.Lock()
+  b.server_running = True
+
+  closed = []
+
+  class FakeSock:
+    def __init__(self, fail_send=False):
+      self.fail_send = fail_send
+      self.timeout = None
+
+    def settimeout(self, t):
+      self.timeout = t
+
+    def setsockopt(self, *args):
+      pass
+
+    def sendall(self, data):
+      if self.fail_send:
+        raise OSError("broken pipe")
+
+    def close(self):
+      closed.append(self)
+
+  dead = FakeSock(fail_send=True)
+  alive = FakeSock(fail_send=False)
+  b.clients[("127.0.0.1", 1)] = dead
+  b.client_send_locks[("127.0.0.1", 1)] = threading.Lock()
+  b.clients[("127.0.0.1", 2)] = alive
+  b.client_send_locks[("127.0.0.1", 2)] = threading.Lock()
+
+  b.broadcast_to_clients(b"hello")
+  assert ("127.0.0.1", 1) not in b.clients
+  assert ("127.0.0.1", 1) not in b.client_send_locks
+  assert ("127.0.0.1", 2) in b.clients
+  assert dead in closed
+
+  # Fill to MAX_CLIENTS and verify overflow client is rejected and closed.
+  for i in range(3, MAX_CLIENTS + 2):
+    b.clients[("127.0.0.1", i)] = FakeSock()
+  overflow = FakeSock()
+  b.handle_client(overflow, ("127.0.0.1", 9999))
+  assert overflow in closed
+  assert ("127.0.0.1", 9999) not in b.clients

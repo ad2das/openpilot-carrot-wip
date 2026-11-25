@@ -104,9 +104,26 @@ class Controls:
     elif self.CP.lateralTuning.which() == 'torque':
       self.LaC = LatControlTorque(self.CP, self.CI)
     self.carrot_controls = CarrotControls(self.CP)
+    self._control_params_cache: dict[str, float | int | bool] = {}
+    self._control_params_frame = -100
+    self._refresh_control_params()
+
+  def _refresh_control_params(self) -> None:
+    self._control_params_cache = {
+      "SteerRatioRate": self.params.get_float("SteerRatioRate"),
+      "CustomSR": self.params.get_float("CustomSR"),
+      "AlwaysLateral": self.params.get_bool("AlwaysLateral"),
+      "UseLaneLineCurveSpeed": self.params.get_int("UseLaneLineCurveSpeed"),
+      "LatSmoothSec": self.params.get_float("LatSmoothSec"),
+      "SteerActuatorDelay": self.params.get_float("SteerActuatorDelay"),
+      "SpeedFromPCM": self.params.get_int("SpeedFromPCM"),
+    }
+    self._control_params_frame = self.sm.frame
 
   def update(self):
     self.sm.update(15)
+    if self.sm.frame - self._control_params_frame >= 100 or self.sm.frame < self._control_params_frame:
+      self._refresh_control_params()
     if self.sm.updated["liveCalibration"]:
       self.pose_calibrator.feed_live_calib(self.sm['liveCalibration'])
     if self.sm.updated["livePose"]:
@@ -122,9 +139,10 @@ class Controls:
     x = max(lp.stiffnessFactor, 0.1)
     # All platforms, including VW MEB, honor the manual ratio and live scaling.
     # Invalid persisted rates still fall back to the unscaled learned ratio.
-    sr = resolve_vehicle_model_steer_ratio(lp.steerRatio,
-                                           self.params.get_float("SteerRatioRate"),
-                                           self.params.get_float("CustomSR"))
+    cache = getattr(self, "_control_params_cache", None)
+    steer_ratio_rate = cache["SteerRatioRate"] if cache is not None else self.params.get_float("SteerRatioRate")
+    custom_sr = cache["CustomSR"] if cache is not None else self.params.get_float("CustomSR")
+    sr = resolve_vehicle_model_steer_ratio(lp.steerRatio, steer_ratio_rate, custom_sr)
     self.VM.update_params(x, sr)
 
     steer_angle_without_offset = math.radians(CS.steeringAngleDeg - lp.angleOffsetDeg)
@@ -146,7 +164,8 @@ class Controls:
     # carrot
     gear = car.CarState.GearShifter
     driving_gear = CS.gearShifter not in (gear.neutral, gear.park, gear.reverse, gear.unknown)
-    lateral_enabled = driving_gear and self.params.get_bool("AlwaysLateral")
+    always_lateral = cache["AlwaysLateral"] if cache is not None else self.params.get_bool("AlwaysLateral")
+    lateral_enabled = driving_gear and always_lateral
     #self.soft_hold_active = CS.softHoldActive #car.OnroadEvent.EventName.softHold in [e.name for e in self.sm['onroadEvents']]
 
     # Check which actuators can be enabled
@@ -192,15 +211,18 @@ class Controls:
     # Steering PID loop and lateral MPC
     lat_plan = self.sm['lateralPlan']
     curve_speed_abs = abs(self.sm['carrotMan'].vTurnSpeed)
-    self.lanefull_mode_enabled = (lat_plan.useLaneLines and curve_speed_abs > self.params.get_int("UseLaneLineCurveSpeed"))
-    lat_smooth_seconds = self.params.get_float("LatSmoothSec") * 0.01
-    steer_actuator_delay = self.params.get_float("SteerActuatorDelay") * 0.01
+    use_lane_line_curve_speed = cache["UseLaneLineCurveSpeed"] if cache is not None else self.params.get_int("UseLaneLineCurveSpeed")
+    lat_smooth_raw = cache["LatSmoothSec"] if cache is not None else self.params.get_float("LatSmoothSec")
+    steer_delay_raw = cache["SteerActuatorDelay"] if cache is not None else self.params.get_float("SteerActuatorDelay")
+    self.lanefull_mode_enabled = (lat_plan.useLaneLines and curve_speed_abs > use_lane_line_curve_speed)
+    lat_smooth_seconds = lat_smooth_raw * 0.01
+    steer_actuator_delay = steer_delay_raw * 0.01
     if steer_actuator_delay == 0.0:
       steer_actuator_delay = self.sm['liveDelay'].lateralDelay 
     
     def smooth_value(val, prev_val, tau):
-      alpha = 1 - np.exp(-DT_CTRL / tau) if tau > 0 else 1
-      return alpha * val + (1 - alpha) * prev_val
+      alpha = 1.0 - math.exp(-DT_CTRL / tau) if tau > 0 else 1.0
+      return alpha * val + (1.0 - alpha) * prev_val
 
     if not CC.latActive:
       new_desired_curvature = self.curvature
@@ -374,7 +396,8 @@ class Controls:
 
     lp = self.sm['longitudinalPlan']
     if self.CP.pcmCruise:
-      speed_from_pcm = self.params.get_int("SpeedFromPCM")
+      cache = getattr(self, "_control_params_cache", None)
+      speed_from_pcm = cache["SpeedFromPCM"] if cache is not None else self.params.get_int("SpeedFromPCM")
       if speed_from_pcm == 1: #toyota
         hudControl.setSpeed = float(CS.vCruiseCluster * CV.KPH_TO_MS)
       elif speed_from_pcm == 2:

@@ -78,10 +78,15 @@ class LatControlTorque(LatControl):
     # carrot
     self.frame = 0
     self.params = Params()
-    self.lateralTorqueCustom = self.params.get_int("LateralTorqueCustom")
+    self.lateralTorqueCustom = 0
     self.latAccelFactor_default = self.torque_params.latAccelFactor
     self.latAccelOffset_default = self.torque_params.latAccelOffset
     self.friction_default = self.torque_params.friction
+    self.kp_default = self.torque_params.kp
+    self.ki_default = self.torque_params.ki
+    self.kf_default = self.torque_params.kf
+    self.kd_default = 0.0
+    self._refresh_custom_torque_params()
 
     # Twilsonco's Lateral Neural Network Feedforward
     self.use_nnff = CI.use_nnff
@@ -139,27 +144,34 @@ class LatControlTorque(LatControl):
     self.torque_params.latAccelOffset = latAccelOffset
     self.torque_params.friction = friction
 
+  def _refresh_custom_torque_params(self) -> None:
+    lateralTorqueCustom = self.params.get_int("LateralTorqueCustom")
+    if lateralTorqueCustom > 0:
+      self.torque_params.latAccelFactor = self.params.get_float("LateralTorqueAccelFactor")*0.001
+      self.torque_params.friction = self.params.get_float("LateralTorqueFriction")*0.001
+      lateralTorqueKp = self.params.get_float("LateralTorqueKpV")*0.01
+      lateralTorqueKi = self.params.get_float("LateralTorqueKiV")*0.01
+      lateralTorqueKf = self.params.get_float("LateralTorqueKf")*0.01
+      lateralTorqueKd = self.params.get_float("LateralTorqueKd")*0.01
+      self.pid._k_p = [[0], [lateralTorqueKp]]
+      self.pid._k_i = [[0], [lateralTorqueKi]]
+      self.pid.k_f = lateralTorqueKf
+      self.pid._k_d = [[0], [lateralTorqueKd]]
+      self.torque_params.latAccelOffset = self.latAccelOffset_default
+    elif self.lateralTorqueCustom > 0:  # custom -> default
+      self.torque_params.latAccelFactor = self.latAccelFactor_default
+      self.torque_params.friction = self.friction_default
+      self.torque_params.latAccelOffset = self.latAccelOffset_default
+      self.pid._k_p = [[0], [self.kp_default]]
+      self.pid._k_i = [[0], [self.ki_default]]
+      self.pid.k_f = self.kf_default
+      self.pid._k_d = [[0], [self.kd_default]]
+    self.lateralTorqueCustom = lateralTorqueCustom
+
   def update(self, active, CS, VM, params, steer_limited_by_controls, desired_curvature, CC, curvature_limited, model_data=None):
     self.frame += 1
-    if self.frame % 10 == 0:
-      lateralTorqueCustom = self.params.get_int("LateralTorqueCustom")
-      if lateralTorqueCustom > 0:
-        self.torque_params.latAccelFactor = self.params.get_float("LateralTorqueAccelFactor")*0.001
-        self.torque_params.friction = self.params.get_float("LateralTorqueFriction")*0.001
-        lateralTorqueKp = self.params.get_float("LateralTorqueKpV")*0.01
-        lateralTorqueKi = self.params.get_float("LateralTorqueKiV")*0.01
-        lateralTorqueKf = self.params.get_float("LateralTorqueKf")*0.01
-        lateralTorqueKd = self.params.get_float("LateralTorqueKd")*0.01
-        self.pid._k_p = [[0], [lateralTorqueKp]]
-        self.pid._k_i = [[0], [lateralTorqueKi]]
-        self.pid.k_f = lateralTorqueKf
-        self.pid._k_d = [[0], [lateralTorqueKd]]
-        self.torque_params.latAccelOffset = self.latAccelOffset_default
-      elif self.lateralTorqueCustom > 1:  # 1 -> 0, reset to default
-        self.torque_params.latAccelFactor = self.latAccelFactor_default
-        self.torque_params.friction = self.friction_default
-        self.torque_params.latAccelOffset = self.latAccelOffset_default
-      self.lateralTorqueCustom = lateralTorqueCustom
+    if self.frame % 100 == 0:
+      self._refresh_custom_torque_params()
 
     pid_log = log.ControlsState.LateralTorqueState.new_message()
     nn_log = None

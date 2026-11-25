@@ -252,8 +252,9 @@ class CarController(CarControllerBase):
     self.activeCarrot = 0
     self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
     self.is_ldws_car = Params().get_bool("IsLdwsCar")
+    self._params_reader = Params()
     self.enable_corner_radar = 0
-    self.paddle_mode = Params().get_int("PaddleMode")
+    self.paddle_mode = self._params_reader.get_int("PaddleMode")
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -272,7 +273,10 @@ class CarController(CarControllerBase):
         CC = CC.as_reader()
 
     if self.frame % 50 == 0:
-      params = Params()
+      params = getattr(self, "_params_reader", None)
+      if params is None:
+        params = Params()
+        self._params_reader = params
       self.max_angle_frames = params.get_int("MaxAngleFrames")
       steerMax = params.get_int("CustomSteerMax")
       steerDeltaUp = params.get_int("CustomSteerDeltaUp")

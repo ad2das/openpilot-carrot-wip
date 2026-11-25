@@ -273,7 +273,7 @@ class VCruiseCarrot:
 
   def update_params(self, is_metric):
     unit_factor = 1.0 if is_metric else CV.MPH_TO_KPH
-    if self.frame % 10 == 0:
+    if self.frame % 50 == 0:
       self.autoCruiseControl = self.params.get_int("AutoCruiseControl") * unit_factor
       self.soft_hold_on_cancel = self.params.get_bool("SoftHoldOnCancel")
       self.autoGasTokSpeed = self.params.get_int("AutoGasTokSpeed") * unit_factor
@@ -961,7 +961,7 @@ class VCruiseCarrot:
         #self.autoCruiseControl_cancel_timer = 0
         self._engage_soft_hold()
       # GM: autoResume
-      elif self.params.get_bool("ActivateCruiseAfterBrake"):
+      elif self.CP.brand == "gm" and self.params.get_bool("ActivateCruiseAfterBrake"):
         self.params.put_bool_nonblocking("ActivateCruiseAfterBrake", False)
         self._cruise_control(1, -1, "Cruise on (brake)")
 

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Xiaoge data and vision service entry point."""
+from __future__ import annotations
 
 import json
 import socket
@@ -20,6 +21,9 @@ from openpilot.common.realtime import Ratekeeper
 TESLA_DAS_ROAD_ADDRESS = 605
 TESLA_AUTOPILOT_PARTY_BUS = 2
 TESLA_DAS_ROAD_TIMEOUT_S = 1.0
+MAX_CLIENTS = 32
+CLIENT_SEND_TIMEOUT_S = 2.0
+CLIENT_RECV_TIMEOUT_S = 5.0
 
 
 def capnp_items(values, limit: int) -> list[Any]:
@@ -33,6 +37,7 @@ class XiaogeDataBroadcaster:
     self.sequence = 0
     self.device_ip = self.get_ip_address()
     self.clients: dict[tuple[str, int], socket.socket] = {}
+    self.client_send_locks: dict[tuple[str, int], Any] = {}
     self.clients_lock = threading.Lock()
     self.server_socket: socket.socket | None = None
     self.server_running = False
@@ -66,31 +71,66 @@ class XiaogeDataBroadcaster:
       data.extend(packet)
     return bytes(data)
 
-  def send_packet_to_client(self, conn: socket.socket, packet: bytes) -> bool:
+  @staticmethod
+  def _configure_client_socket(conn: socket.socket) -> None:
+    conn.settimeout(CLIENT_RECV_TIMEOUT_S)
     try:
-      conn.sendall(struct.pack("!I", len(packet)))
-      conn.sendall(packet)
+      conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+      pass
+    if hasattr(socket, "SO_SNDTIMEO"):
+      try:
+        sec = int(CLIENT_SEND_TIMEOUT_S)
+        usec = int((CLIENT_SEND_TIMEOUT_S - sec) * 1_000_000)
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDTIMEO, struct.pack("ll", sec, usec))
+      except OSError:
+        pass
+
+  def send_packet_to_client(self, conn: socket.socket, packet: bytes, send_lock: Any = None) -> bool:
+    try:
+      if send_lock is not None:
+        with send_lock:
+          conn.sendall(struct.pack("!I", len(packet)))
+          conn.sendall(packet)
+      else:
+        conn.sendall(struct.pack("!I", len(packet)))
+        conn.sendall(packet)
       return True
     except OSError:
       return False
 
   def handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
     print(f"Client connected from {addr}")
+    self._configure_client_socket(conn)
+    send_lock = threading.Lock()
     with self.clients_lock:
+      if len(self.clients) >= MAX_CLIENTS:
+        print(f"Rejecting client {addr}: max clients ({MAX_CLIENTS}) reached")
+        conn.close()
+        return
       self.clients[addr] = conn
+      self.client_send_locks[addr] = send_lock
     try:
       while self.server_running:
-        command = self.recvall(conn, 4)
+        try:
+          command = self.recvall(conn, 4)
+        except socket.timeout:
+          continue
         if not command:
           break
         if struct.unpack("!I", command)[0] == 2:
-          conn.sendall(struct.pack("!I", 0))
+          with send_lock:
+            conn.sendall(struct.pack("!I", 0))
     except OSError:
       pass
     finally:
       with self.clients_lock:
         self.clients.pop(addr, None)
-      conn.close()
+        self.client_send_locks.pop(addr, None)
+      try:
+        conn.close()
+      except OSError:
+        pass
       print(f"Client {addr} disconnected")
 
   def start_tcp_server(self) -> None:
@@ -124,12 +164,16 @@ class XiaogeDataBroadcaster:
 
   def broadcast_to_clients(self, packet: bytes) -> None:
     with self.clients_lock:
-      clients = dict(self.clients)
-    for addr, conn in clients.items():
-      if not self.send_packet_to_client(conn, packet):
+      clients = [(addr, conn, self.client_send_locks.get(addr)) for addr, conn in self.clients.items()]
+    for addr, conn, send_lock in clients:
+      if not self.send_packet_to_client(conn, packet, send_lock):
         with self.clients_lock:
           self.clients.pop(addr, None)
-        conn.close()
+          self.client_send_locks.pop(addr, None)
+        try:
+          conn.close()
+        except OSError:
+          pass
 
   def shutdown(self) -> None:
     self.server_running = False
@@ -142,8 +186,12 @@ class XiaogeDataBroadcaster:
       self.server_socket.close()
     with self.clients_lock:
       for conn in self.clients.values():
-        conn.close()
+        try:
+          conn.close()
+        except OSError:
+          pass
       self.clients.clear()
+      self.client_send_locks.clear()
 
   def collect_car_state(self, car_state) -> dict[str, Any]:
     return {

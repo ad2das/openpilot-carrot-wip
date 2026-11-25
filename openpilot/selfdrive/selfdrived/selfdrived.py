@@ -426,7 +426,7 @@ class SelfdriveD:
           self.events.add(EventName.cameraFrameRate)
     if not REPLAY and self.rk.lagging:
       self.events.add(EventName.selfdrivedLagging)
-    big_model_settling = self._big_model_settling()
+    big_model_settling = False if self.model_startup_complete else self._big_model_settling()
     pose = self.sm['livePose']
     radar_errors = self.sm['radarState'].radarErrors
     model_inputs_ready = (self.sm.all_checks(['modelV2', 'radarState', 'livePose', 'liveCalibration',
