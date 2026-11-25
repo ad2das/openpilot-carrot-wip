@@ -908,9 +908,10 @@ class TlvRunner:
 
       status, reason = self._status()
       is_running = status == STATUS_RUNNING
-      if is_running != getattr(self, "_was_running", False):
+      was_running = getattr(self, "_was_running", False)
+      if was_running and not is_running:
         self.pipeline.reset()
-        self._was_running = is_running
+      self._was_running = is_running
       self._publish(status, reason)
       self._maybe_log_stats(now)
       rk.keep_time()

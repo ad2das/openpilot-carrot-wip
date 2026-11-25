@@ -54,6 +54,7 @@ _DISALLOWED_GIT_FLAGS = (
   "--ext-diff",
   "--textconv",
   "--filter",
+  "--no-index",
 )
 _READ_ONLY_BRANCH_FLAGS = {
   "-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose",

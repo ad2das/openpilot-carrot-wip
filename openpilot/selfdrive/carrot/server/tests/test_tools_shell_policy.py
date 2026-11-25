@@ -26,6 +26,8 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   assert validate_shell_argv(["git", "diff", "--output=/tmp/x"]) is not None
   assert validate_shell_argv(["git", "diff", "-o", "/tmp/x"]) is not None
   assert validate_shell_argv(["git", "diff", "--ext-diff"]) is not None
+  assert validate_shell_argv(["git", "diff", "--no-index", "/etc/shadow", "/dev/null"]) is not None
+  assert validate_shell_argv(["git", "diff", "--no-index", "/data/params/d/GithubSshKeys", "/dev/null"]) is not None
   assert validate_shell_argv(["git", "log", "--textconv"]) is not None
   assert validate_shell_argv(["git", "status", "-c", "core.pager=sh"]) is not None
   assert validate_shell_argv(["git", "branch", "-D", "main"]) is not None

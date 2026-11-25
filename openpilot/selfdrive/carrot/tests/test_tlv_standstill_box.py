@@ -23,7 +23,7 @@ RED = int(tracker.LampClass.RED)
 GREEN = int(tracker.LampClass.GREEN)
 GREEN_LEFT = int(tracker.LampClass.GREEN_LEFT)
 OFF = int(tracker.LampClass.OFF)
-BOX = (900.0, 100.0, 940.0, 120.0)
+BOX = (900.0, 420.0, 940.0, 440.0)
 
 
 class _NoDetBackend:
@@ -111,7 +111,7 @@ def test_unknown_speed_gets_no_stale_box_vote():
 
 
 def test_non_relevant_track_gets_no_stale_box_vote():
-  other = _track(2, box=(1200.0, 100.0, 1240.0, 120.0))
+  other = _track(2, box=(1200.0, 420.0, 1240.0, 440.0))
   other.last_verified_s = 0.0
   pipe, tr = _pipe(GREEN_LEFT, 0.99, track_id=1, relevant_id=1,
                    verified_at=0.0, extra_tracks=(other,))

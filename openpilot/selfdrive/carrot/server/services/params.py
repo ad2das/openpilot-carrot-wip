@@ -511,6 +511,14 @@ def _backup_param_type_map(names: Optional[List[str]] = None) -> Dict[str, Any]:
   return type_map
 
 
+def _clamp_param_value(t: Any, value: Any, meta: Optional[Dict[str, Any]]) -> Any:
+  if (meta is not None and ParamKeyType is not None and t in (ParamKeyType.INT, ParamKeyType.FLOAT)
+      and isinstance(meta.get("min"), (int, float)) and isinstance(meta.get("max"), (int, float))):
+    clamped = clamp_numeric(float(value), meta)
+    return _to_int(clamped) if t == ParamKeyType.INT else float(clamped)
+  return value
+
+
 def restore_param_values_from_backup(values: Dict[str, Any], source: str = "restore") -> Dict[str, Any]:
   if not HAS_PARAMS or ParamKeyType is None:
     raise RuntimeError("Params/ParamKeyType not available")
@@ -539,10 +547,11 @@ def restore_param_values_from_backup(values: Dict[str, Any], source: str = "rest
         continue
 
       previous = _read_param_value(params, key, None)
+      clamped_value = _clamp_param_value(t, _normalize_param_value(t, value), definition)
       # The single write path: same clamping, inference and unregistered-key
       # fallback the settings screen uses, so a profile cannot fail on a key a
       # single write would have saved.
-      set_param_value(key, value, definition)
+      set_param_value(key, clamped_value, definition)
       ok_cnt += 1
 
       # Recording each write individually — bulk writes are the hardest changes
@@ -1312,12 +1321,7 @@ def preview_param_restore_values(values: Dict[str, Any], selected_keys: Optional
             reason = "unsupported type"
             can_apply = False
           else:
-            normalized_value = _normalize_param_value(t, raw_value)
-            meta = definitions.get(key)
-            if (meta is not None and ParamKeyType is not None and t in (ParamKeyType.INT, ParamKeyType.FLOAT)
-                and isinstance(meta.get("min"), (int, float)) and isinstance(meta.get("max"), (int, float))):
-              clamped = clamp_numeric(float(normalized_value), meta)
-              normalized_value = _to_int(clamped) if t == ParamKeyType.INT else float(clamped)
+            normalized_value = _clamp_param_value(t, _normalize_param_value(t, raw_value), definitions.get(key))
             current_value = current_values.get(key, "")
             if _values_equal(t, current_value, normalized_value):
               status = "same"

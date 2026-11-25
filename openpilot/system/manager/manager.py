@@ -294,7 +294,13 @@ def manager_thread(update_status: UpdateStatus) -> None:
     ignition_prev = ignition
 
     if supported_cars_thread is not None:
-      supported_cars_thread.join(timeout=5.0)
+      if started:
+        # Drain the brand-import thread before forking onroad processes, kicking
+        # the stall watchdog in short slices so startup never trips a false stall.
+        deadline = time.monotonic() + 5.0
+        while supported_cars_thread.is_alive() and time.monotonic() < deadline:
+          stall_watchdog.kick()
+          supported_cars_thread.join(timeout=0.2)
       if not supported_cars_thread.is_alive():
         supported_cars_thread = None
 

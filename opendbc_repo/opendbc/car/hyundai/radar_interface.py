@@ -493,7 +493,7 @@ class RadarInterface(RadarInterfaceBase):
     if self.rcp_scc is not None:
       self._update_scc(self.updated_scc)
     if self.rcp_corner_objects is not None:
-      if self.corner_object_seen_since_publish or self.updated_corner_objects:
+      if self.corner_object_seen_since_publish:
         self.corner_object_missed_updates = 0
         self.corner_object_seen_since_publish = False
       else:
@@ -501,7 +501,7 @@ class RadarInterface(RadarInterfaceBase):
         if self.corner_object_missed_updates > 10:
           self._clear_corner_objects()
     if self.rcp_corner_objects_180 is not None:
-      if self.corner_object_180_seen_since_publish or self.updated_corner_objects_180:
+      if self.corner_object_180_seen_since_publish:
         self.corner_object_180_missed_updates = 0
         self.corner_object_180_seen_since_publish = False
       else:
@@ -509,7 +509,7 @@ class RadarInterface(RadarInterfaceBase):
         if self.corner_object_180_missed_updates > 10:
           self._clear_corner_objects_180()
     if self.rcp_corner_objects_430 is not None:
-      if self.corner_object_430_seen_since_publish or self.updated_corner_objects_430:
+      if self.corner_object_430_seen_since_publish:
         self.corner_object_430_missed_updates = 0
         self.corner_object_430_seen_since_publish = False
       else:
@@ -976,11 +976,13 @@ class RadarInterface(RadarInterfaceBase):
     for slot in range(CORNER_OBJECT_235_MSG_COUNT):
       self._clear_point(CORNER_OBJECT_235_TRACK_ID_OFFSET + slot)
     self.corner_object_track_ids.clear_source("corner235")
+    self.updated_corner_objects.clear()
 
   def _clear_corner_objects_180(self):
     for slot in range(CORNER_OBJECT_180_MSG_COUNT * CORNER_OBJECT_180_SLOTS_PER_MSG):
       self._clear_point(CORNER_OBJECT_180_TRACK_ID_OFFSET + slot)
     self.corner_object_track_ids.clear_source("corner180")
+    self.updated_corner_objects_180.clear()
 
   def _clear_corner_objects_430(self):
     self.corner_object_430_prev_d_rel.clear()
@@ -992,6 +994,7 @@ class RadarInterface(RadarInterfaceBase):
     self.corner_object_430_noncenter_inward_frames.clear()
     for slot in range(CORNER_OBJECT_430_MSG_COUNT_PER_SIDE * 2 * CORNER_OBJECT_430_SLOTS_PER_MSG):
       self._clear_point(CORNER_OBJECT_430_TRACK_ID_OFFSET + slot)
+    self.updated_corner_objects_430.clear()
 
   def _update_scc(self, updated_messages):
     cpt = self.rcp_scc.vl

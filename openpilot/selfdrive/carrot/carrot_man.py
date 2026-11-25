@@ -458,7 +458,7 @@ class CarrotMan:
               #print(f"Broadcasting: {self.broadcast_ip}") #:{msg}")
               if not self.navd_active:
                 #print("clear path_points: navd_active: ", self.navd_active)
-                with self._navi_points_lock:
+                with self._navi_lock():
                   self.navi_points = []
                   self.navi_points_start_index = 0
                   self.navi_points_active = False
@@ -534,7 +534,7 @@ class CarrotMan:
       for latitude, longitude in points
     ]
     new_points = [(point["longitude"], point["latitude"]) for point in coords]
-    with self._navi_points_lock:
+    with self._navi_lock():
       self.navi_points = new_points
       self.navi_points_start_index = 0
       self.navi_points_active = bool(new_points)
@@ -544,6 +544,13 @@ class CarrotMan:
     self.navd_active = bool(new_points)
     self.send_routes(coords)
 
+  def _navi_lock(self):
+    lock = getattr(self, "_navi_points_lock", None)
+    if lock is None:
+      lock = threading.Lock()
+      self._navi_points_lock = lock
+    return lock
+
   def carrot_navi_route(self):
 
     if self.carrot_serv.active_carrot > 1:
@@ -551,7 +558,7 @@ class CarrotMan:
         self.navd_active = False
         self.params.remove("NavDestination")
     is_onroad = self.params.get_bool("IsOnroad")
-    with self._navi_points_lock:
+    with self._navi_lock():
       active = self.navi_points_active
       if not is_onroad or not active or not SHAPELY_AVAILABLE or (self.carrot_serv.active_carrot <= 1 and not self.navd_active):
         if active:
@@ -570,7 +577,7 @@ class CarrotMan:
     distance_interval = 10.0
     out_speed = 300
     path, new_start_index, start_point = get_path_after_distance(start_index, navi_points, current_position, 300)
-    with self._navi_points_lock:
+    with self._navi_lock():
       if self.navi_points is navi_points:
         self.navi_points_start_index = new_start_index
     relative_coords = []
@@ -1344,7 +1351,7 @@ class CarrotMan:
     if from_navd:
       if len(coords) > 0:
         new_points = [(c.longitude, c.latitude) for c in coords]
-        with self._navi_points_lock:
+        with self._navi_lock():
           self.navi_points = new_points
           self.navi_points_start_index = 0
           self.navi_points_active = True
@@ -1361,7 +1368,7 @@ class CarrotMan:
         #print("navdNaviPoints=", self.navi_points)
       else:
         print("Received points from navd: 0")
-        with self._navi_points_lock:
+        with self._navi_lock():
           self.navi_points = []
           self.navi_points_start_index = 0
           self.navi_points_active = False
@@ -1408,7 +1415,7 @@ class CarrotMan:
                 coord = Coordinate.from_mapbox_tuple((x, y))
                 points.append(coord)
               coords = [c.as_dict() for c in points]
-              with self._navi_points_lock:
+              with self._navi_lock():
                 self.navi_points = new_navi_points
                 self.navi_points_start_index = 0
                 self.navi_points_active = len(coords) > 0
@@ -1438,7 +1445,7 @@ class CarrotMan:
                 dest['place_name'] = "External Navi"
                 self.params.put("NavDestination", json.dumps(dest))
               else:
-                with self._navi_points_lock:
+                with self._navi_lock():
                   self.navi_points = []
                   self.navi_points_start_index = 0
                   self.navi_points_active = False
@@ -1595,7 +1602,7 @@ class CarrotMan:
     if not arr:
       print("Received route: 0")
       # navd route가 비어오면 비활성 처리
-      with self._navi_points_lock:
+      with self._navi_lock():
         self.navi_points = []
         self.navi_points_start_index = 0
         self.navi_points_active = False
@@ -1606,7 +1613,7 @@ class CarrotMan:
     valid_pts = [p for p in arr if isinstance(p, dict) and p.get("valid", True)]
     if not valid_pts:
       print("Received route: 0 valid")
-      with self._navi_points_lock:
+      with self._navi_lock():
         self.navi_points = []
         self.navi_points_start_index = 0
         self.navi_points_active = False
@@ -1627,7 +1634,7 @@ class CarrotMan:
       navi_points.append((lon, lat))
       coords.append({"latitude": lat, "longitude": lon})
 
-    with self._navi_points_lock:
+    with self._navi_lock():
       self.navi_points = navi_points
       self.navi_points_start_index = 0
       self.navi_points_active = True

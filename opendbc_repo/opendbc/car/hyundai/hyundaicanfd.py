@@ -61,7 +61,7 @@ def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, 
 
   isg_event = controller.isg_restart_order(
     values, isg_auto_stop=bool(getattr(CS, "isgAutoStop", False)), speed=speed,
-    ok=finite and CS.out.canValid and not CS.out.parkingBrake and not CS.out.brakeHoldActive,
+    ok=finite and CS.out.canValid and not CS.out.parkingBrake,
     gas=CS.out.gasPressed, brake=CS.out.brakePressed,
     drive=str(CS.out.gearShifter) == "drive", releasing=controller.release_frames > 0)
   if isg_event:

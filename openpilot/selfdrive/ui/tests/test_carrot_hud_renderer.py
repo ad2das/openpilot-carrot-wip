@@ -352,7 +352,7 @@ def test_personality_failure_uses_gap_eight_and_retries_next_frame(hud_module):
 
 def test_speed_limit_snapshot_reads_submaster_once(hud_module):
   module, fake_ui_state = hud_module
-  carrot_man = SimpleNamespace(xSpdLimit="80", xSignType=2.0, nRoadLimitSpeed=90)
+  carrot_man = SimpleNamespace(xSpdLimit="80", xSpdType=2.0, nRoadLimitSpeed=90)
 
   class CountingSubMaster:
     def __init__(self):
@@ -1069,7 +1069,10 @@ def _system_card_probe(module, fake_ui_state, monkeypatch, *, active_carrot=0, g
   size-proportional metrics, so the sizes are the values under test rather than a render.
   """
   fake_ui_state.sm = {
-    "carrotMan": SimpleNamespace(activeCarrot=active_carrot, navPathVertexCount=vertices),
+    "carrotMan": SimpleNamespace(
+      activeCarrot=active_carrot,
+      naviPaths=";".join(f"{i},0,0" for i in range(vertices)),
+    ),
     "gpsLocationExternal": SimpleNamespace(hasFix=gps_fix),
   }
   renderer = object.__new__(module.HudRenderer)

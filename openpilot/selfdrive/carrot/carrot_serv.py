@@ -626,19 +626,17 @@ class CarrotServ:
     # is no longer a fallback (it may be an unrelated light).
     if int(msg.relevantTrackId) < 0:
       self.tlv_range_m = 0.0
-      hold_before = self.tlv_hold_until
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
-      if self.tlv_hold_until <= hold_before:
+      if not (self.traffic_state_src == 1 and now < self.tlv_hold_until):
         self.tlv_det_support = 0
       return
     rb = msg.relevantBox
     if not (float(rb.x2) > float(rb.x1) and float(rb.y2) > float(rb.y1)):
       self.tlv_range_m = 0.0
-      hold_before = self.tlv_hold_until
       self._tlv_rel_loss_hold(sm, msg, now)
       self._tlv_top_exit_hold(sm, now)
-      if self.tlv_hold_until <= hold_before:
+      if not (self.traffic_state_src == 1 and now < self.tlv_hold_until):
         self.tlv_det_support = 0
       return
     self.tlv_rel_lost_since = None

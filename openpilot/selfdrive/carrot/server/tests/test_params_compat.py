@@ -324,3 +324,36 @@ def test_map_param_reader_reads_map_fps_file_while_native_registry_is_stale(tmp_
   reader = carrot_navi.ClusterNaviMapParamReader(stale_params)
 
   assert reader._read_int("ClusterNaviMapFps", 1) == 3
+
+
+def test_restore_param_values_from_backup_clamps_numeric_bounds(monkeypatch):
+  class FakeParamKeyType:
+    BOOL = "bool"
+    INT = "int"
+    FLOAT = "float"
+    TIME = "time"
+    STRING = "string"
+    JSON = "json"
+    BYTES = "bytes"
+
+  class RestoreParams:
+    def get_type(self, key):
+      return FakeParamKeyType.INT
+
+    def get_int(self, key):
+      return 100
+
+  writes = []
+  monkeypatch.setattr(params_service, "HAS_PARAMS", True)
+  monkeypatch.setattr(params_service, "ParamKeyType", FakeParamKeyType)
+  monkeypatch.setattr(params_service, "Params", RestoreParams)
+  monkeypatch.setattr(
+    params_service,
+    "_catalog_definitions",
+    lambda: {"SoundVolumeAdjust": {"min": 5, "max": 200, "default": 100}},
+  )
+  monkeypatch.setattr(params_service, "set_param_value", lambda key, value, definition=None: writes.append((key, value)))
+
+  res = params_service.restore_param_values_from_backup({"SoundVolumeAdjust": "0"})
+  assert res == {"ok_cnt": 1, "fail_cnt": 0, "fails": []}
+  assert writes == [("SoundVolumeAdjust", 5)]

@@ -478,5 +478,35 @@ def test_read_isg_on_the_logged_frames():
   assert read_isg(parser, None) == (-1, False)
 
 
+@pytest.mark.parametrize("camera", [True, False])
+def test_oem_autohold_after_openpilot_isg_hold_still_requests_restart(camera):
+  """OEM AutoHold latching on driver brake during an openpilot ISG hold must not drop StopReq before CIS2=2."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  cs.out.brakeHoldActive = True
+  for frame in range(1, 21):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} dropped StopReq while engine off"
+  assert controller.isg_mode == "brake"
+
+  cs.isgAutoStop = False
+  values = send(camera, controller, cs, enabled=False)
+  assert values["ACCMode"] == 0
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_oem_autohold_without_prior_openpilot_hold_is_untouched(camera):
+  """If OEM AutoHold was already holding (no prior StopReq=1), ISG order must not override the packet."""
+  live, reference = isg_cs(brakeHoldActive=True), isg_cs(brakeHoldActive=True)
+  a, b = CanfdStopping(), isg_off(CanfdStopping())
+  for frame in range(10):
+    assert payload(camera, a, live, stopping=True, accel=-0.5) == \
+           payload(camera, b, reference, stopping=True, accel=-0.5), f"frame {frame}"
+  assert a.isg_mode == ""
+
+
 if __name__ == "__main__":
   raise SystemExit(pytest.main([__file__, "-q"]))
