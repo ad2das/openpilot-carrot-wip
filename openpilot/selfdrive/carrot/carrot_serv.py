@@ -2176,7 +2176,10 @@ class CarrotServ:
 
   def set_time(self, epoch_time, timezone):
     import datetime
-    new_time = datetime.datetime.utcfromtimestamp(epoch_time)
+    try:
+      new_time = datetime.datetime.fromtimestamp(epoch_time, tz=datetime.timezone.utc)
+    except (OSError, OverflowError, TypeError, ValueError):
+      return
     localtime_path = "/data/etc/localtime"
 
     no_timezone = False
@@ -2186,34 +2189,47 @@ class CarrotServ:
     except (FileNotFoundError, OSError):
       no_timezone = True
 
-    diff = datetime.datetime.utcnow() - new_time
+    diff = datetime.datetime.now(datetime.timezone.utc) - new_time
     if abs(diff) < datetime.timedelta(seconds=10) and not no_timezone:
       #print(f"Time diff too small: {diff}")
       return
 
     print(f"Setting time to {new_time}, diff={diff}")
-    zoneinfo_path = f"/usr/share/zoneinfo/{timezone}"
-    if os.path.exists(localtime_path) or os.path.islink(localtime_path):
+    tz_clean = str(timezone or "").strip()
+    zoneinfo_root = os.path.realpath("/usr/share/zoneinfo")
+    zoneinfo_path = None
+    if tz_clean and "\x00" not in tz_clean and not tz_clean.startswith("/") and "\\" not in tz_clean:
+      if not any(part in ("", ".", "..") for part in tz_clean.split("/")):
+        candidate = os.path.realpath(os.path.join(zoneinfo_root, tz_clean))
         try:
-            subprocess.run(["sudo", "rm", "-f", localtime_path], check=True)
-            print(f"Removed existing file or link: {localtime_path}")
-        except subprocess.CalledProcessError as e:
-            print(f"Error removing {localtime_path}: {e}")
-            return
-    try:
-        subprocess.run(["sudo", "ln", "-s", zoneinfo_path, localtime_path], check=True)
-        print(f"Timezone successfully set to: {timezone}")
+          if os.path.commonpath([zoneinfo_root, candidate]) == zoneinfo_root and candidate != zoneinfo_root and os.path.isfile(candidate):
+            zoneinfo_path = candidate
+        except ValueError:
+          zoneinfo_path = None
+
+    if zoneinfo_path is not None:
+      if os.path.exists(localtime_path) or os.path.islink(localtime_path):
+        try:
+          subprocess.run(["sudo", "rm", "-f", localtime_path], check=True, timeout=10)
+          print(f"Removed existing file or link: {localtime_path}")
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+          print(f"Error removing {localtime_path}: {e}")
+          return
+      try:
+        subprocess.run(["sudo", "ln", "-s", zoneinfo_path, localtime_path], check=True, timeout=10)
+        print(f"Timezone successfully set to: {tz_clean}")
         # 앱이 보낸 타임존은 최고 우선순위로 기록 -> timed.py의 wifi/gps 추정이 덮어쓰지 않음
-        self.params.put("TimezoneName", timezone)
+        self.params.put("TimezoneName", tz_clean)
         self.params.put("TimezoneSource", "app")
-    except subprocess.CalledProcessError as e:
-        print(f"Failed to set timezone to {timezone}: {e}")
+      except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        print(f"Failed to set timezone to {tz_clean}: {e}")
+    else:
+      print(f"Skipping invalid timezone: {timezone!r}")
 
-
+    formatted_time = new_time.strftime("%Y-%m-%d %H:%M:%S")
     try:
-      subprocess.run(f"TZ=UTC date -s '{new_time}'", shell=True, check=True)
-      #subprocess.run()
-    except subprocess.CalledProcessError:
+      subprocess.run(["date", "-s", formatted_time], env={**os.environ, "TZ": "UTC"}, check=True, timeout=10)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
       print("timed.failed_setting_time")
 
   def update(self, json):

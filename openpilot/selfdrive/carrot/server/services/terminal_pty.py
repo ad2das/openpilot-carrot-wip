@@ -45,6 +45,35 @@ def _write_all(fd: int, data: bytes) -> None:
     view = view[written:]
 
 
+def _signal_proc(proc: subprocess.Popen, sig: int) -> None:
+  try:
+    os.killpg(proc.pid, sig)
+  except Exception:
+    try:
+      if sig == signal.SIGKILL:
+        proc.kill()
+      else:
+        proc.terminate()
+    except Exception:
+      pass
+
+
+def _reap_proc(proc: subprocess.Popen, timeout_s: float = 2.0) -> Optional[int]:
+  rc = proc.poll()
+  if rc is not None:
+    return rc
+  try:
+    return proc.wait(timeout=timeout_s)
+  except subprocess.TimeoutExpired:
+    _signal_proc(proc, signal.SIGKILL)
+    try:
+      return proc.wait(timeout=1.0)
+    except Exception:
+      return proc.poll()
+  except Exception:
+    return proc.poll()
+
+
 class PersistentPtySession:
   """One persistent login PTY shared by the local and support terminals."""
 
@@ -80,28 +109,50 @@ class PersistentPtySession:
     async with self.lock:
       return self._snapshot_locked()
 
-  def _terminate_proc_locked(self) -> None:
+  def _detach_proc_locked(self) -> tuple[Optional[subprocess.Popen], asyncio.Task | None, int]:
     proc = self.proc
+    reader_task = self.reader_task
+    fd = self.master_fd
     self.proc = None
-    if self.reader_task:
-      self.reader_task.cancel()
-      self.reader_task = None
+    self.reader_task = None
+    self.master_fd = -1
     if proc is not None and proc.poll() is None:
-      try:
-        os.killpg(proc.pid, signal.SIGHUP)
-      except Exception:
+      _signal_proc(proc, signal.SIGHUP)
+    return proc, reader_task, fd
+
+  @staticmethod
+  async def _finish_detached(proc: Optional[subprocess.Popen], reader_task: asyncio.Task | None, fd: int) -> None:
+    try:
+      if proc is not None:
+        await asyncio.to_thread(_reap_proc, proc)
+      if reader_task is not None and reader_task is not asyncio.current_task():
+        reader_task.cancel()
+        await asyncio.gather(reader_task, return_exceptions=True)
+    finally:
+      if fd >= 0:
         try:
-          proc.terminate()
-        except Exception:
+          os.close(fd)
+        except OSError:
           pass
 
   async def terminate(self) -> None:
     async with self.lock:
-      self._terminate_proc_locked()
-      self._close_fds_locked()
+      proc, reader_task, fd = self._detach_proc_locked()
       self.history.clear()
+    await self._finish_detached(proc, reader_task, fd)
 
   async def ensure(self, rows: int = PTY_FIXED_ROWS, cols: int = PTY_FIXED_COLS) -> bool:
+    stale_proc: Optional[subprocess.Popen] = None
+    stale_reader: asyncio.Task | None = None
+    stale_fd = -1
+    async with self.lock:
+      if self._alive_locked():
+        return False
+      if self.proc is not None or self.reader_task is not None or self.master_fd >= 0:
+        stale_proc, stale_reader, stale_fd = self._detach_proc_locked()
+    if stale_proc is not None or stale_reader is not None or stale_fd >= 0:
+      await self._finish_detached(stale_proc, stale_reader, stale_fd)
+
     async with self.lock:
       if self._alive_locked():
         return False
@@ -145,7 +196,7 @@ class PersistentPtySession:
 
       self.master_fd = master_fd
       self.proc = proc
-      self.reader_task = asyncio.create_task(self._read_loop())
+      self.reader_task = asyncio.create_task(self._read_loop(proc, master_fd))
       return True
 
   async def attach(
@@ -255,15 +306,17 @@ class PersistentPtySession:
           if self.primary_client is client:
             self.primary_client = None
 
-  async def _read_loop(self) -> None:
+  async def _read_loop(self, proc: Optional[subprocess.Popen] = None, fd: int = -1) -> None:
     try:
       while True:
         async with self.lock:
           if not self._alive_locked():
             break
-          fd = self.master_fd
+          if proc is not None and self.proc is not proc:
+            break
+          read_fd = fd if fd >= 0 else self.master_fd
         try:
-          chunk = await asyncio.to_thread(os.read, fd, 4096)
+          chunk = await asyncio.to_thread(os.read, read_fd, 4096)
         except asyncio.CancelledError:
           raise
         except OSError:
@@ -271,6 +324,8 @@ class PersistentPtySession:
         if not chunk:
           break
         async with self.lock:
+          if proc is not None and self.proc is not proc:
+            break
           self._append_history(chunk)
           session = self.session
         await self._broadcast({
@@ -279,28 +334,35 @@ class PersistentPtySession:
           "b64": base64.b64encode(chunk).decode("ascii"),
         })
     finally:
+      owned_proc: Optional[subprocess.Popen] = None
+      session = self.session
+      clients: list[web.WebSocketResponse] = []
       async with self.lock:
-        exit_code = self.proc.poll() if self.proc else None
-        session = self.session
-        clients = list(self.clients)
-        self.clients.clear()
-        self.primary_client = None
-        self._close_fds_locked()
-        self.proc = None
-        self.reader_task = None
-      payload = json.dumps({
-        "type": "pty_exit",
-        "session": session,
-        "exit_code": exit_code,
-      })
-      for client in clients:
-        if client.closed:
-          continue
-        try:
-          await client.send_str(payload)
-          await client.close()
-        except Exception:
-          pass
+        if proc is None or self.proc is proc:
+          owned_proc = self.proc
+          session = self.session
+          clients = list(self.clients)
+          self.clients.clear()
+          self.primary_client = None
+          self._close_fds_locked()
+          self.proc = None
+          if self.reader_task is asyncio.current_task():
+            self.reader_task = None
+      if owned_proc is not None:
+        exit_code = await asyncio.to_thread(_reap_proc, owned_proc)
+        payload = json.dumps({
+          "type": "pty_exit",
+          "session": session,
+          "exit_code": exit_code,
+        })
+        for client in clients:
+          if client.closed:
+            continue
+          try:
+            await client.send_str(payload)
+            await client.close()
+          except Exception:
+            pass
 
   def _close_fds_locked(self) -> None:
     if self.master_fd >= 0:

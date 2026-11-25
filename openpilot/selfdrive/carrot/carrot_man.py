@@ -397,106 +397,106 @@ class CarrotMan:
 
   # 브로드캐스트 메시지 전송
   def broadcast_version_info(self):
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    frame = 0
-    next_broadcast_time = 0.0
-    last_network_error_log_time = 0.0
-    self.save_toggle_values()
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+      frame = 0
+      next_broadcast_time = 0.0
+      last_network_error_log_time = 0.0
+      self.save_toggle_values()
 
-    rk = Ratekeeper(20, print_delay_threshold=None)
+      rk = Ratekeeper(20, print_delay_threshold=None)
 
-    while self.is_running:
-      try:
-        self.sm.update(0)
-        navd_route_updated = self.sm.updated['navRouteNavd']
-        if navd_route_updated:
-          self.send_routes(self.sm['navRouteNavd'].coordinates, True)
-        carrot_navi_service_active = self.sm.alive['carrotNavi'] and self.sm.valid['carrotNavi']
-        if (
-          self.sm.updated['carrotNavi'] or navd_route_updated
-          or (self.carrot_navi_route_session_id and not carrot_navi_service_active)
-        ):
-          carrot_navi = parse_carrot_navi_control(self.sm['carrotNavi']) if carrot_navi_service_active else None
-          self._update_carrot_navi_route(carrot_navi, force=navd_route_updated)
-        remote_addr = self.remote_addr
-        remote_ip = remote_addr[0] if remote_addr is not None else ""
-        vturn_speed = self.carrot_curve_speed(self.sm)
-        coords, distances, route_speed = self.carrot_navi_route()
+      while self.is_running:
+        try:
+          self.sm.update(0)
+          navd_route_updated = self.sm.updated['navRouteNavd']
+          if navd_route_updated:
+            self.send_routes(self.sm['navRouteNavd'].coordinates, True)
+          carrot_navi_service_active = self.sm.alive['carrotNavi'] and self.sm.valid['carrotNavi']
+          if (
+            self.sm.updated['carrotNavi'] or navd_route_updated
+            or (self.carrot_navi_route_session_id and not carrot_navi_service_active)
+          ):
+            carrot_navi = parse_carrot_navi_control(self.sm['carrotNavi']) if carrot_navi_service_active else None
+            self._update_carrot_navi_route(carrot_navi, force=navd_route_updated)
+          remote_addr = self.remote_addr
+          remote_ip = remote_addr[0] if remote_addr is not None else ""
+          vturn_speed = self.carrot_curve_speed(self.sm)
+          coords, distances, route_speed = self.carrot_navi_route()
 
-        #print("coords=", coords)
-        #print("curvatures=", curvatures)
-        self.carrot_serv.update_navi(remote_ip, self.sm, self.pm, vturn_speed, coords, distances, route_speed, self.gps_location_service)
+          #print("coords=", coords)
+          #print("curvatures=", curvatures)
+          self.carrot_serv.update_navi(remote_ip, self.sm, self.pm, vturn_speed, coords, distances, route_speed, self.gps_location_service)
 
-        now = time.monotonic()
-        if now >= next_broadcast_time:
-          next_broadcast_time = now + (BROADCAST_REMOTE_INTERVAL if remote_addr is not None else BROADCAST_INTERVAL)
-          try:
-            self.broadcast_ip = self.get_broadcast_address() if remote_addr is None else remote_addr[0]
-            if not PC:
-              ip_address = socket.gethostbyname(socket.gethostname())
-            else:
-              ip_address = self.get_local_ip()
-            if ip_address is None:
-              raise OSError(errno.ENETUNREACH, "Network is unreachable")
-            if ip_address != self.ip_address:
-              self.ip_address = ip_address
-              self.remote_addr = None
-            self.params_memory.put_nonblocking("NetworkAddress", self.ip_address)
-
-            msg = self.make_send_message()
-            if self.broadcast_ip is not None:
-              dat = msg.encode('utf-8')
-              sock.sendto(dat, (self.broadcast_ip, self.broadcast_port))
-            #for i in range(1, 255):
-            #  ip_tuple = socket.inet_aton(self.broadcast_ip)
-            #  new_ip = ip_tuple[:-1] + bytes([i])
-            #  address = (socket.inet_ntoa(new_ip), self.broadcast_port)
-            #  sock.sendto(dat, address)
-
-            if remote_addr is None:
-              #print(f"Broadcasting: {self.broadcast_ip}") #:{msg}")
-              with self._navi_lock():
-                if not self.navd_active:
-                  #print("clear path_points: navd_active: ", self.navd_active)
-                  self.navi_points = []
-                  self.navi_points_start_index = 0
-                  self.navi_points_active = False
-
-          except OSError as e:
-            if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
-              if self.connection:
-                self.connection.close()
-              self.connection = None
-              self.remote_addr = None
-              self.ip_address = "0.0.0.0"
+          now = time.monotonic()
+          if now >= next_broadcast_time:
+            next_broadcast_time = now + (BROADCAST_REMOTE_INTERVAL if remote_addr is not None else BROADCAST_INTERVAL)
+            try:
+              self.broadcast_ip = self.get_broadcast_address() if remote_addr is None else remote_addr[0]
+              if not PC:
+                ip_address = socket.gethostbyname(socket.gethostname())
+              else:
+                ip_address = self.get_local_ip()
+              if ip_address is None:
+                raise OSError(errno.ENETUNREACH, "Network is unreachable")
+              if ip_address != self.ip_address:
+                self.ip_address = ip_address
+                self.remote_addr = None
               self.params_memory.put_nonblocking("NetworkAddress", self.ip_address)
-              next_broadcast_time = now + BROADCAST_NETWORK_ERROR_RETRY_INTERVAL
-              if now - last_network_error_log_time >= BROADCAST_NETWORK_ERROR_LOG_INTERVAL:
-                print(f"[carrot_man] broadcast skipped: {e}")
-                last_network_error_log_time = now
-            else:
+
+              msg = self.make_send_message()
+              if self.broadcast_ip is not None:
+                dat = msg.encode('utf-8')
+                sock.sendto(dat, (self.broadcast_ip, self.broadcast_port))
+              #for i in range(1, 255):
+              #  ip_tuple = socket.inet_aton(self.broadcast_ip)
+              #  new_ip = ip_tuple[:-1] + bytes([i])
+              #  address = (socket.inet_ntoa(new_ip), self.broadcast_port)
+              #  sock.sendto(dat, address)
+
+              if remote_addr is None:
+                #print(f"Broadcasting: {self.broadcast_ip}") #:{msg}")
+                with self._navi_lock():
+                  if not self.navd_active:
+                    #print("clear path_points: navd_active: ", self.navd_active)
+                    self.navi_points = []
+                    self.navi_points_start_index = 0
+                    self.navi_points_active = False
+
+            except OSError as e:
+              if e.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN):
+                if self.connection:
+                  self.connection.close()
+                self.connection = None
+                self.remote_addr = None
+                self.ip_address = "0.0.0.0"
+                self.params_memory.put_nonblocking("NetworkAddress", self.ip_address)
+                next_broadcast_time = now + BROADCAST_NETWORK_ERROR_RETRY_INTERVAL
+                if now - last_network_error_log_time >= BROADCAST_NETWORK_ERROR_LOG_INTERVAL:
+                  print(f"[carrot_man] broadcast skipped: {e}")
+                  last_network_error_log_time = now
+              else:
+                if self.connection:
+                  self.connection.close()
+                self.connection = None
+                print(f"##### broadcast_error...: {e}")
+                traceback.print_exc()
+                queue_carrot_exception_tmux_send("broadcast_version_info")
+            except Exception as e:
               if self.connection:
                 self.connection.close()
               self.connection = None
               print(f"##### broadcast_error...: {e}")
               traceback.print_exc()
               queue_carrot_exception_tmux_send("broadcast_version_info")
-          except Exception as e:
-            if self.connection:
-              self.connection.close()
-            self.connection = None
-            print(f"##### broadcast_error...: {e}")
-            traceback.print_exc()
-            queue_carrot_exception_tmux_send("broadcast_version_info")
 
-        rk.keep_time()
-        frame += 1
-      except Exception as e:
-        print(f"broadcast_version_info error...: {e}")
-        traceback.print_exc()
-        queue_carrot_exception_tmux_send("broadcast_version_info")
-        time.sleep(1)
+          rk.keep_time()
+          frame += 1
+        except Exception as e:
+          print(f"broadcast_version_info error...: {e}")
+          traceback.print_exc()
+          queue_carrot_exception_tmux_send("broadcast_version_info")
+          time.sleep(1)
 
 
   def _update_carrot_navi_route(self, navi: CarrotNaviControl | None, force: bool = False):
@@ -860,8 +860,8 @@ class CarrotMan:
 
   def make_tmux_data(self):
     try:
-      subprocess.run("rm -f /data/media/tmux.log; tmux capture-pane -pq -S-1000 > /data/media/tmux.log", shell=True, capture_output=True, text=False, check=True)
-      subprocess.run("/data/openpilot/openpilot/selfdrive/apilot.py", shell=True, capture_output=True, text=False)
+      subprocess.run("rm -f /data/media/tmux.log; tmux capture-pane -pq -S-1000 > /data/media/tmux.log", shell=True, capture_output=True, text=False, check=True, timeout=15)
+      subprocess.run("/data/openpilot/openpilot/selfdrive/apilot.py", shell=True, capture_output=True, text=False, timeout=15)
       from openpilot.common.egpu_diagnostics import append_report
       append_report('/data/media/tmux.log')
       return True
@@ -1303,7 +1303,7 @@ class CarrotMan:
         elif 'echo_cmd' in json_obj:
           exitStatus = -1
           try:
-            result = subprocess.run(json_obj['echo_cmd'], shell=True, capture_output=True, text=False)
+            result = subprocess.run(json_obj['echo_cmd'], shell=True, capture_output=True, text=False, timeout=30)
             exitStatus = result.returncode
             try:
               stdout = result.stdout.decode('utf-8')

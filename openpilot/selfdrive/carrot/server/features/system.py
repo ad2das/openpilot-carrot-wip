@@ -1,4 +1,5 @@
 import asyncio
+import math
 import os
 from typing import Any
 
@@ -208,7 +209,7 @@ async def api_time_sync(request: web.Request) -> web.Response:
   debug = bool(body.get("debug", False))
   client_iso = body.get("client_iso")
 
-  if not isinstance(epoch_ms, (int, float)):
+  if isinstance(epoch_ms, bool) or not isinstance(epoch_ms, (int, float)) or not math.isfinite(epoch_ms):
     return web.json_response({"ok": False, "error": "epoch_ms required"}, status=400)
 
   if not timezone_name:

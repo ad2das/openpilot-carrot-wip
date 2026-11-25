@@ -5,6 +5,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import stat
 import urllib.request
 from dataclasses import dataclass, field
@@ -22,6 +23,24 @@ CLOUDFLARED_DOWNLOADS = {
 }
 
 
+def _signal_tunnel_process(process: asyncio.subprocess.Process, sig: int) -> None:
+  if os.name != "nt" and process.pid:
+    try:
+      os.killpg(process.pid, sig)
+      return
+    except ProcessLookupError:
+      return
+    except OSError:
+      pass
+  try:
+    if sig == getattr(signal, "SIGKILL", signal.SIGTERM):
+      process.kill()
+    else:
+      process.terminate()
+  except ProcessLookupError:
+    pass
+
+
 @dataclass
 class TunnelHandle:
   url: str
@@ -30,24 +49,30 @@ class TunnelHandle:
   drain_tasks: list[asyncio.Task] = field(default_factory=list)
 
   async def stop(self) -> None:
-    for task in self.drain_tasks:
+    tasks = list(self.drain_tasks)
+    self.drain_tasks.clear()
+    for task in tasks:
       task.cancel()
-    if self.process is None:
-      return
-    if self.process.returncode is not None:
-      return
-    self.process.terminate()
-    try:
-      await asyncio.wait_for(self.process.wait(), timeout=4.0)
-    except Exception:
-      try:
-        self.process.kill()
-      except Exception:
-        pass
-      try:
-        await asyncio.wait_for(self.process.wait(), timeout=2.0)
-      except Exception:
-        pass
+    if self.process is not None:
+      if self.process.returncode is None:
+        _signal_tunnel_process(self.process, signal.SIGTERM)
+        try:
+          await asyncio.wait_for(self.process.wait(), timeout=4.0)
+        except Exception:
+          _signal_tunnel_process(self.process, getattr(signal, "SIGKILL", signal.SIGTERM))
+          try:
+            await asyncio.wait_for(self.process.wait(), timeout=2.0)
+          except Exception:
+            pass
+      transport = getattr(self.process, "_transport", None)
+      if transport is not None:
+        try:
+          transport.close()
+        except Exception:
+          pass
+    if tasks:
+      await asyncio.gather(*tasks, return_exceptions=True)
+    await asyncio.sleep(0)
 
 
 def cloudflared_path() -> str:
@@ -123,10 +148,10 @@ async def resolve_cloudflared_path() -> str:
   return await asyncio.to_thread(_download_cloudflared)
 
 
-async def _read_line(stream: asyncio.StreamReader, label: str) -> tuple[str, str]:
+async def _read_line(stream: asyncio.StreamReader, label: str) -> tuple[str, str | None]:
   raw = await stream.readline()
   if not raw:
-    return label, ""
+    return label, None
   return label, raw.decode("utf-8", errors="replace").rstrip()
 
 
@@ -148,6 +173,7 @@ async def start_quick_tunnel(local_url: str, timeout_s: float = 20.0) -> TunnelH
 
   binary = await resolve_cloudflared_path()
 
+  proc_kwargs = {"start_new_session": True} if os.name != "nt" else {}
   process = await asyncio.create_subprocess_exec(
     binary,
     "tunnel",
@@ -155,6 +181,7 @@ async def start_quick_tunnel(local_url: str, timeout_s: float = 20.0) -> TunnelH
     local_url,
     stdout=asyncio.subprocess.PIPE,
     stderr=asyncio.subprocess.PIPE,
+    **proc_kwargs,
   )
   log: list[str] = []
   streams = []
@@ -163,43 +190,51 @@ async def start_quick_tunnel(local_url: str, timeout_s: float = 20.0) -> TunnelH
   if process.stderr is not None:
     streams.append(_read_line(process.stderr, "stderr"))
 
-  deadline = asyncio.get_running_loop().time() + timeout_s
+  loop = asyncio.get_running_loop()
+  deadline = loop.time() + timeout_s
   pending = {asyncio.create_task(coro) for coro in streams}
   url = ""
   try:
-    while pending and asyncio.get_running_loop().time() < deadline:
-      timeout = max(0.1, deadline - asyncio.get_running_loop().time())
-      done, pending = await asyncio.wait(pending, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+    while pending:
+      remaining = deadline - loop.time()
+      if remaining <= 0.0:
+        break
+      done, pending = await asyncio.wait(pending, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
       if not done:
         break
       for task in done:
         label, line = task.result()
+        if url or line is None:
+          continue
         if line:
           log.append(f"{label}: {line}")
+          del log[:-80]
           match = TRYCLOUDFLARE_RE.search(line)
           if match:
             url = match.group(0)
-            break
+            continue
         stream = process.stdout if label == "stdout" else process.stderr
         if stream is not None:
           pending.add(asyncio.create_task(_read_line(stream, label)))
       if url:
         break
-      if process.returncode is not None:
-        break
     if not url:
       detail = "; ".join(log[-6:])
       suffix = f": {detail}" if detail else ""
       raise RuntimeError(f"cloudflared did not provide a trycloudflare URL{suffix}")
-  except Exception:
+  except BaseException:
     for task in pending:
       task.cancel()
+    if pending:
+      await asyncio.gather(*pending, return_exceptions=True)
     handle = TunnelHandle(url="", process=process, log=log)
     await handle.stop()
     raise
 
   for task in pending:
     task.cancel()
+  if pending:
+    await asyncio.gather(*pending, return_exceptions=True)
   handle = TunnelHandle(url=url, process=process, log=log)
   if process.stdout is not None:
     handle.drain_tasks.append(asyncio.create_task(_drain_stream(process.stdout, "stdout", handle.log)))

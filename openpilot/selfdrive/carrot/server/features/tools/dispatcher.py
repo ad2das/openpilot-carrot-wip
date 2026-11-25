@@ -92,11 +92,17 @@ def capture_tmux_log_sync() -> Tuple[int, str]:
   except OSError as e:
     return 1, str(e)
 
-  proc = subprocess.run(
-    ["tmux", "capture-pane", "-pq", "-S-1000"],
-    capture_output=True,
-    text=True,
-  )
+  try:
+    proc = subprocess.run(
+      ["tmux", "capture-pane", "-pq", "-S-1000"],
+      capture_output=True,
+      text=True,
+      timeout=15,
+    )
+  except subprocess.TimeoutExpired:
+    return 124, "tmux capture timed out"
+  except OSError as e:
+    return 1, str(e)
   if proc.returncode != 0:
     return proc.returncode, (proc.stderr or proc.stdout or "").strip()
 

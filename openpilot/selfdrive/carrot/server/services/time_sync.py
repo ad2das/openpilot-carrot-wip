@@ -7,11 +7,32 @@ from typing import Any
 
 TIME_SYNC_THRESHOLD_SEC = 10
 TIME_SYNC_DEBUG_DEFAULT = True
+ZONEINFO_ROOT = "/usr/share/zoneinfo"
+SUBPROCESS_TIMEOUT_SEC = 10
+
+
+def resolve_zoneinfo_path(timezone_name: str, zoneinfo_root: str | None = None) -> str | None:
+  tz = str(timezone_name or "").strip()
+  if not tz or "\x00" in tz or tz.startswith("/") or "\\" in tz:
+    return None
+  parts = tz.split("/")
+  if any(part in ("", ".", "..") for part in parts):
+    return None
+  root_real = os.path.realpath(ZONEINFO_ROOT if zoneinfo_root is None else zoneinfo_root)
+  target_real = os.path.realpath(os.path.join(root_real, tz))
+  try:
+    if os.path.commonpath([root_real, target_real]) != root_real or target_real == root_real:
+      return None
+  except ValueError:
+    return None
+  if not os.path.isfile(target_real):
+    return None
+  return target_real
 
 
 def run_cmd_debug(cmd: list[str]) -> dict:
   try:
-    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT_SEC)
     return {
       "cmd": cmd,
       "returncode": proc.returncode,
@@ -34,7 +55,7 @@ def sync_system_time_from_browser(epoch_ms: int, timezone_name: str, debug: bool
 
   localtime_path = "/data/etc/localtime"
   timezone_name = (timezone_name or "").strip() or "UTC"
-  zoneinfo_path = f"/usr/share/zoneinfo/{timezone_name}"
+  zoneinfo_path = resolve_zoneinfo_path(timezone_name)
 
   result: dict[str, Any] = {
     "ok": True,
@@ -55,9 +76,9 @@ def sync_system_time_from_browser(epoch_ms: int, timezone_name: str, debug: bool
 
   # 1) timezone 링크 설정
   if timezone_name:
-    if not os.path.exists(zoneinfo_path):
+    if zoneinfo_path is None:
       result["ok"] = False
-      result["message"] = f"zoneinfo not found: {zoneinfo_path}"
+      result["message"] = f"invalid or missing zoneinfo: {timezone_name}"
       log(result["message"])
       return result
 
@@ -74,14 +95,14 @@ def sync_system_time_from_browser(epoch_ms: int, timezone_name: str, debug: bool
     else:
       try:
         if os.path.exists(localtime_path) or os.path.islink(localtime_path):
-          subprocess.run(["sudo", "rm", "-f", localtime_path], check=True)
+          subprocess.run(["sudo", "rm", "-f", localtime_path], check=True, timeout=SUBPROCESS_TIMEOUT_SEC)
           result["steps"].append({"remove_localtime": localtime_path})
           log(f"removed existing localtime: {localtime_path}")
 
-        subprocess.run(["sudo", "ln", "-s", zoneinfo_path, localtime_path], check=True)
+        subprocess.run(["sudo", "ln", "-s", zoneinfo_path, localtime_path], check=True, timeout=SUBPROCESS_TIMEOUT_SEC)
         result["steps"].append({"set_timezone_link": zoneinfo_path})
         log(f"timezone set to: {timezone_name}")
-      except subprocess.CalledProcessError as e:
+      except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
         result["ok"] = False
         result["message"] = f"failed to set timezone: {e}"
         log(result["message"])
@@ -103,20 +124,26 @@ def sync_system_time_from_browser(epoch_ms: int, timezone_name: str, debug: bool
 
   # 4) 시간 세팅 시도
   # epoch는 UTC 기준이므로 UTC로 해석해서 넣는 것이 안전
-  new_time_utc = datetime.datetime.utcfromtimestamp(target_epoch)
+  try:
+    new_time_utc = datetime.datetime.fromtimestamp(target_epoch, tz=datetime.timezone.utc)
+  except (OSError, OverflowError, ValueError) as e:
+    result["ok"] = False
+    result["message"] = f"invalid target epoch: {e}"
+    log(result["message"])
+    return result
   formatted_time = new_time_utc.strftime("%Y-%m-%d %H:%M:%S")
 
   try:
-    cmd = f"TZ=UTC sudo date -s '{formatted_time}'"
-    result["steps"].append({"date_cmd": cmd})
-    log(f"run: {cmd}")
-    subprocess.run(cmd, shell=True, check=True)
+    cmd = ["sudo", "env", "TZ=UTC", "date", "-s", formatted_time]
+    result["steps"].append({"date_cmd": " ".join(cmd)})
+    log(f"run: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, timeout=SUBPROCESS_TIMEOUT_SEC)
     result["applied"] = True
     result["message"] = "time updated"
     result["server_epoch_after"] = int(time.time())
     log(f"time set success: {formatted_time} UTC")
     return result
-  except subprocess.CalledProcessError as e:
+  except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
     result["ok"] = False
     result["message"] = f"failed to set date: {e}"
     log(result["message"])
