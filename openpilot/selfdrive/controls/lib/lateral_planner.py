@@ -102,7 +102,6 @@ class HybridLanePath:
 
     self.LP = LanePlanner()
     self.LP.params = self.params
-    self.LP.std_mod_range = None
     self.speed_guard = LaneModelSpeedGuard(recovery_frames=int(1 / DT_MDL))
     self.mpc = LateralMpc()
     self.x0 = np.zeros(4)

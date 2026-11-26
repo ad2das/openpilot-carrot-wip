@@ -71,7 +71,6 @@ class LanePlanner:
 
     self.lanefull_mode = False
     self.d_prob_count = 0
-    self.std_mod_range = (0.15, 0.3)
 
     self.params = Params()
 
@@ -125,12 +124,10 @@ class LanePlanner:
     r_prob *= mod
 
     # Reduce reliance on uncertain lanelines
-    if self.std_mod_range is not None:
-      std_lo, std_hi = self.std_mod_range
-      l_std_mod = np.interp(self.lll_std, [std_lo, std_hi], [1.0, 0.0])
-      r_std_mod = np.interp(self.rll_std, [std_lo, std_hi], [1.0, 0.0])
-      l_prob *= l_std_mod
-      r_prob *= r_std_mod
+    l_std_mod = np.interp(self.lll_std, [.15, .3], [1.0, 0.0])
+    r_std_mod = np.interp(self.rll_std, [.15, .3], [1.0, 0.0])
+    l_prob *= l_std_mod
+    r_prob *= r_std_mod
 
     self.l_prob, self.r_prob = l_prob, r_prob
 

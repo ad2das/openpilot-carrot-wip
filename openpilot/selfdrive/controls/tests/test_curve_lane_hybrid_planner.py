@@ -601,16 +601,16 @@ def test_hybrid_uses_raw_lane_probs_and_std_hysteresis():
   assert planner.curve_hybrid.on is False
 
 
-def test_real_lane_planner_with_std_mod_range_none_keeps_hybrid_d_prob_at_strict_std_hold():
-  """Regression for #3: HybridLanePath sets LP.std_mod_range=None so real LanePlanner does not zero d_prob at std=0.34."""
+def test_lane_planner_attenuates_uncertain_lines():
+  """LanePlanner always attenuates laneline probability by its own uncertainty ramp:
+  a 0.225 m std halves it, and at 0.34 m (the hybrid's STRICT_STD_HOLD) it zeroes it."""
   from openpilot.selfdrive.controls.lib.lane_planner_2 import LanePlanner
   lp = LanePlanner()
   lp.params = SimpleNamespace(get_int=lambda _k: 0, get_float=lambda _k: 0.0, get_bool=lambda _k: False)
-  lp.std_mod_range = None
   lp.lll_prob = 0.90
   lp.rll_prob = 0.90
-  lp.lll_std = 0.34
-  lp.rll_std = 0.34
+  lp.lll_std = 0.225
+  lp.rll_std = 0.225
   lp.lll_y = np.full(33, -1.6)
   lp.rll_y = np.full(33, 1.6)
   lp.le_y = np.full(33, -4.0)
@@ -620,6 +620,12 @@ def test_real_lane_planner_with_std_mod_range_none_keeps_hybrid_d_prob_at_strict
   cs = SimpleNamespace(leftBlinker=False, rightBlinker=False)
   path_xyz = np.column_stack([np.linspace(0.0, 100.0, 33), np.zeros(33), np.zeros(33)])
   lp.get_d_path(cs, 20.0, np.linspace(0.0, 5.0, 33), path_xyz, 100.0)
-  assert lp.l_prob == pytest.approx(0.90)
-  assert lp.r_prob == pytest.approx(0.90)
-  assert lp.d_prob == pytest.approx(1.0)
+  assert lp.l_prob == pytest.approx(0.45)
+  assert lp.r_prob == pytest.approx(0.45)
+
+  lp.lll_std = 0.34
+  lp.rll_std = 0.34
+  lp.get_d_path(cs, 20.0, np.linspace(0.0, 5.0, 33), path_xyz, 100.0)
+  assert lp.l_prob == pytest.approx(0.0)
+  assert lp.r_prob == pytest.approx(0.0)
+  assert not hasattr(lp, "std_mod_range")
