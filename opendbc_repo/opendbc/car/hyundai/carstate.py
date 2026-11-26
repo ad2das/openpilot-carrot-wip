@@ -372,18 +372,23 @@ class CarState(CarStateBase):
 
   def _discover_canfd_isg_status(self, parser):
     # Startup CAN dropouts must not permanently disable ISG_STATUS (0x0B5) tracking.
-    # Absent platforms (e.g. Palisade/EVs) never put 0x0B5 in seen_addresses, so this
-    # adds no CAN validity checks there. Register with freq=math.nan (ignore_alive)
-    # so read_isg()'s 500 ms freshness check governs staleness without a 100 ms dropout
-    # during cranking brownout or an intermittent 0x0B5 on another platform tripping canValid.
+    # Only the K5 DL3 ICE is tracked: absent platforms (e.g. Palisade/EVs) never put 0x0B5
+    # in seen_addresses, so this adds no CAN validity checks there. Register with
+    # freq=math.nan (ignore_alive) so read_isg()'s 500 ms freshness check governs staleness
+    # without a 100 ms dropout during cranking brownout tripping canValid.
     if self.isg_status is not None or self.controls_ready_count < 126:
+      return
+    # Only the K5 DL3 ICE has a verified ISG_STATUS layout; another car's 0x0B5 could hold every departure (R4 N-R7).
+    if getattr(self.CP, "carFingerprint", None) != CAR.KIA_K5_DL3_24:
       return
     msg = parser.dbc.name_to_msg.get("ISG_STATUS")
     if msg is None or msg.address not in parser.seen_addresses:
       return
     if msg.address not in parser.addresses:
       parser._add_message("ISG_STATUS", math.nan, ignore_counter=True)
-    if "ISG_STATUS" in parser.vl:
+    # parser.dat is only written for registered addresses, so a short or foreign 0x0B5 never binds:
+    # expose only the 32-byte K5 layout the DBC decodes.
+    if "ISG_STATUS" in parser.vl and len(parser.dat.get(msg.address, b"")) == msg.size:
       self.isg_status = parser.vl["ISG_STATUS"]
 
   def monitor_fingerprint(self, can_parsers, canfd):
@@ -482,7 +487,6 @@ class CarState(CarStateBase):
         elif self.controls_ready_count == 126:
           add_and_cache(self.cp, "CRUISE_BUTTONS_ALT2", "cruise_buttons_alt2", ignore_counter = True)
           add_and_cache(self.cp, "TRAILER_STATUS", "trailer_status", ignore_counter = True)
-          add_and_cache(self.cp, "ISG_STATUS", "isg_status", ignore_counter = True, freq = math.nan)
 
     if canfd and self.CP.flags & HyundaiFlags.CANFD:
       self._discover_canfd_camera_tx_messages(can_parsers[Bus.cam])

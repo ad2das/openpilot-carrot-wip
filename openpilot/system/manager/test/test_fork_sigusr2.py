@@ -51,6 +51,37 @@ def test_fork_blocks_sigusr2_in_parent_and_unblocks_in_python_child(tmp_path):
 
 @pytest.mark.skipif(not (hasattr(signal, "SIGUSR2") and hasattr(signal, "pthread_sigmask") and os.path.exists("/proc/self/status")),
                     reason="Linux pthread_sigmask and /proc/self/status required")
+def test_python_process_start_child_unblocks_sigusr2(tmp_path, monkeypatch):
+  """PythonProcess.start goes through the same fork block: the daemon child must unblock SIGUSR2 before it runs."""
+  assert multiprocessing.get_start_method() == "fork", "child mask is only inherited across fork"
+  out_file = tmp_path / "pyproc_sigblk.txt"
+  module = "sigblk_py_module"
+  lines = [
+    "from pathlib import Path",
+    "",
+    "",
+    "def main():",
+    f"  out = Path({str(out_file)!r})",
+    "  line = next(l for l in open('/proc/self/status') if l.startswith('SigBlk:'))",
+    "  out.write_text(line)",
+  ]
+  (tmp_path / f"{module}.py").write_text("\n".join(lines) + "\n", encoding="utf-8")
+  monkeypatch.syspath_prepend(str(tmp_path))
+  prev = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})
+  try:
+    p = proc_mod.PythonProcess("sigblk_py", module, lambda *_: True, preimport=False)
+    p.start()
+    proc_mod.join_process(p.proc, 5.0)
+    assert p.proc.exitcode == 0, f"PythonProcess child did not exit cleanly: {p.proc.exitcode}"
+    assert signal.SIGUSR2 not in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    child_sigblk = int(out_file.read_text(encoding="utf-8").strip().split()[1], 16)
+    assert (child_sigblk & SIGUSR2_BIT) == 0, f"PythonProcess child inherited blocked SIGUSR2: {child_sigblk:#x}"
+  finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, prev)
+
+
+@pytest.mark.skipif(not (hasattr(signal, "SIGUSR2") and hasattr(signal, "pthread_sigmask") and os.path.exists("/proc/self/status")),
+                    reason="Linux pthread_sigmask and /proc/self/status required")
 def test_native_exec_child_inherits_unblocked_sigusr2(tmp_path):
   out_file = tmp_path / "native_sigblk.txt"
   prev = signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})

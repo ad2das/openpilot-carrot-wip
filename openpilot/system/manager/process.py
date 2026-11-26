@@ -62,7 +62,10 @@ def _unblock_sigusr2_in_child() -> None:
     try:
       signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})
     except OSError:
-      pass
+      try:
+        os.write(2, b"manager: failed to unblock SIGUSR2 in child\n")
+      except OSError:
+        pass
 
 
 @contextmanager

@@ -52,16 +52,20 @@ STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back
 # crank made the ISG give up ~0.65 s later and demand a manual restart. The stock SCC requests the restart
 # (CRUSE_INFO_SET_2 = 2) while it still holds and lets go when the engine leaves auto-stop (W-ISG4 census, 60 K5 routes).
 # Under the driver's brake the engine stays off even with CRUSE_INFO_SET_2 = 2 and restarts at the brake release
-# (route 722 392-399 s, 6.7 s held, outcome normal), so a brake wait has no time limit. After any wait ends (restart,
-# gas, gear change) the restart request stays 2 while the engine is still auto-stopped: a release with the request
-# already 2 is accepted (722 393.174, 21/21 ordered releases).
+# (route 722 392-399 s, 6.7 s held, outcome normal), so a brake wait has no time limit while the foot stays on the
+# brake. After any wait ends (restart, gas, gear change) the restart request stays 2 while the engine is still
+# auto-stopped: a release with the request already 2 is accepted (722 393.174, 21/21 ordered releases).
 # Gas pressed straight from a plain or soft hold (no wait running) enters the same post window, so the release always
 # carries the restart request.
+# Under the brake the wait has no time limit, but once OEM AutoHold holds the car alone (foot off the brake) for 0.2 s of
+# the request, the stop is handed to AutoHold: StopReq is released and CRUSE_INFO_SET_2 stays 2 (route 737 1055-1169 s:
+# 113 s of that state under auto-stop, no fault).
 ISG_STATE_AUTO_STOP = 8       # ISG_STATUS (0x0B5) byte 15 while the engine is auto-stopped (16 = restarting)
 ISG_STALE_NS = 500_000_000    # ISG_STATUS older than this reads as unknown
 CIS2_RESTART = 2              # SCC_CONTROL CRUSE_INFO_SET_2: stock engine restart request
 ISG_WAIT_LOG_FRAMES = 150     # 3.0 s: log once when a wait still holds
 ISG_POST_FRAMES = 100         # 2.0 s: keep the restart request this long after the engine runs, unless the car moves first
+ISG_AVH_HANDOFF_FRAMES = 10   # 0.2 s of CIS2 2 in a brake wait before OEM AutoHold alone may take the car (route 737 1055-1169 s)
 
 
 def parse_isg_state(state, fresh: bool = True) -> tuple[int, bool]:
@@ -238,11 +242,12 @@ class CanfdStopping:
     return StopCommand(0, raw, value, 0.0)
 
   def isg_restart_order(self, values: dict, *, isg_auto_stop: bool, speed: float, ok: bool,
-                        gas: bool, brake: bool, drive: bool, releasing: bool) -> str:
+                        gas: bool, brake: bool, drive: bool, releasing: bool, hold: bool = False) -> str:
     """Hold a standstill release until the ISG-stopped engine restarts, like the stock SCC.
 
     values: the final SCC_CONTROL signals, changed in place. ok: finite speeds, CAN valid, no parking brake.
-    releasing: the stop controller is debouncing a release. Returns a log event name, or "".
+    releasing: the stop controller is debouncing a release. hold: OEM AutoHold (brakeHoldActive) is holding the car.
+    Returns a log event name, or "".
     """
     event = ""
     leaving = brake or values["ACCMode"] != 1
@@ -250,8 +255,14 @@ class CanfdStopping:
     released = self.isg_out_stop_req == 1 and values["StopReq"] == 0
 
     # 1) end a wait when the engine left auto-stop or the driver / sensors took over; keep the request in "post"
-    if self.isg_mode in ("depart", "brake") and not (isg_auto_stop and at_rest):
-      event = "isg_restarted" if not isg_auto_stop else "isg_released"
+    # OEM AutoHold holds the car alone (foot off the brake): hand the stop to it, keep the restart request (737 1055 s)
+    avh_handoff = (self.isg_mode == "brake" and hold and not brake and isg_auto_stop and at_rest
+                   and self.isg_frames >= ISG_AVH_HANDOFF_FRAMES)
+    if self.isg_mode in ("depart", "brake") and (avh_handoff or not (isg_auto_stop and at_rest)):
+      if avh_handoff:
+        event = "isg_avh_handoff"
+      else:
+        event = "isg_restarted" if not isg_auto_stop else "isg_released"
       self.isg_mode = "post" if ok else ""
       self.isg_frames = 0
     elif self.isg_mode == "post" and (not ok or speed > MOVING_SPEED
@@ -260,7 +271,7 @@ class CanfdStopping:
       self.isg_frames = 0
 
     # 2) start or switch a wait
-    if isg_auto_stop and at_rest:
+    if isg_auto_stop and at_rest and not avh_handoff:
       if self.isg_mode in ("", "post") and (released or (releasing and values["StopReq"] == 1)):
         self.isg_mode = "brake" if leaving else "depart"
         self.isg_frames = 0

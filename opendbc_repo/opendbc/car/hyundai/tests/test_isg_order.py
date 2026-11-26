@@ -15,9 +15,10 @@ import pytest
 from opendbc.can.packer import CANPacker
 from opendbc.can.parser import CANParser
 from opendbc.car.hyundai import hyundaicanfd
-from opendbc.car.hyundai.stopping import (CIS2_RESTART, ISG_POST_FRAMES, STOP_LOWER_BAND, CanfdStopping,
-                                          parse_isg_state, read_isg)
+from opendbc.car.hyundai.stopping import (CIS2_RESTART, ISG_AVH_HANDOFF_FRAMES, ISG_POST_FRAMES, STOP_LOWER_BAND,
+                                          CanfdStopping, parse_isg_state, read_isg)
 from opendbc.car.hyundai.tests.test_stopping import make_cs, send
+from opendbc.car.hyundai.values import CAR
 
 CIS2_OFF = 1
 ISG_AUTO_STOP = 8
@@ -499,6 +500,79 @@ def test_oem_autohold_after_openpilot_isg_hold_still_requests_restart(camera):
 
 
 @pytest.mark.parametrize("camera", [True, False])
+def test_autohold_alone_takes_over_after_a_brake_wait(camera):
+  """Foot off the brake under OEM AutoHold after 0.2 s of a brake wait: the stop is handed to AutoHold,
+  StopReq is released and the restart request stays (route 737 1055-1169 s, 113 s under auto-stop)."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  cs.out.brakeHoldActive = True
+  for frame in range(1, 13):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} dropped StopReq under the brake"
+  assert controller.isg_mode == "brake"
+  assert controller.isg_frames >= ISG_AVH_HANDOFF_FRAMES
+
+  cs.out.brakePressed = False
+  values = send(camera, controller, cs, enabled=False)
+  assert values["StopReq"] == 0, "the first foot-off frame must hand the stop to AutoHold"
+  assert values["ACCMode"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART, "the restart request must survive the hand-off"
+  assert controller.isg_mode == "post"
+
+  for frame in range(20):
+    values = send(camera, controller, cs, enabled=False)
+    assert values["StopReq"] == 0, f"frame {frame} re-entered the wait under AutoHold"
+    assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"frame {frame} dropped the restart request"
+    assert controller.isg_mode == "post"
+
+  # The engine restarts under AutoHold: the request outlives it by its own window, then the batch ends.
+  cs.isgAutoStop = False
+  for _ in range(ISG_POST_FRAMES):
+    values = send(camera, controller, cs, enabled=False)
+    assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+    assert values["StopReq"] == 0
+  values = send(camera, controller, cs, enabled=False)
+  assert values["CRUSE_INFO_SET_2"] == base_cis2(camera)
+  assert controller.isg_mode == ""
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_autohold_handoff_waits_for_the_request(camera):
+  """A foot-off before 0.2 s of brake wait keeps asking for the restart until the request has held that long."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  cs.out.brakeHoldActive = True
+  for frame in range(1, 4):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} dropped StopReq under the brake"
+  assert controller.isg_mode == "brake"
+  assert controller.isg_frames == 3
+
+  cs.out.brakePressed = False
+  for frame in range(1, ISG_AVH_HANDOFF_FRAMES - 3 + 1):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} handed off before 0.2 s"
+  assert controller.isg_frames == ISG_AVH_HANDOFF_FRAMES
+  assert controller.isg_mode == "brake"
+
+  values = send(camera, controller, cs, enabled=False)
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_autohold_with_foot_on_brake_keeps_the_hold(camera):
+  """As long as the foot stays on the brake, the wait has no time limit: 4 s of brake + AutoHold still holds."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.brakePressed = True
+  cs.out.brakeHoldActive = True
+  for frame in range(1, 201):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame} dropped StopReq under the brake"
+  assert controller.isg_mode == "brake"
+
+
+@pytest.mark.parametrize("camera", [True, False])
 def test_oem_autohold_without_prior_openpilot_hold_is_untouched(camera):
   """If OEM AutoHold was already holding (no prior StopReq=1), ISG order must not override the packet."""
   live, reference = isg_cs(brakeHoldActive=True), isg_cs(brakeHoldActive=True)
@@ -531,6 +605,7 @@ def test_late_isg_status_registration_recovers_after_startup_window():
   parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
   parser.controls_ready = True
   cs = CarState.__new__(CarState)
+  cs.CP = SimpleNamespace(carFingerprint=CAR.KIA_K5_DL3_24)
   cs.isg_status = None
   cs.controls_ready_count = 200
 
@@ -541,17 +616,43 @@ def test_late_isg_status_registration_recovers_after_startup_window():
   assert cs.isg_status is None
   assert 181 not in parser.addresses
 
-  # Once 0x0B5 appears on bus 0, discovery registers it and subsequent frames decode ISG_STATE=8.
+  # Once 0x0B5 appears on bus 0, discovery registers it; the first size-correct frame then binds it.
   auto = bytes.fromhex(ISG_HEX_AUTO_STOP)
   parser.update([t + 10_000_000, [(181, auto, 0)]])
   cs._discover_canfd_isg_status(parser)
-  assert cs.isg_status is not None
   assert 181 in parser.addresses
   assert parser.message_states[181].ignore_alive is True
-  # Before the first parsed 0x0B5 frame (ts == 0), read_isg must report unknown even at low timestamps.
-  assert read_isg(parser, cs.isg_status) == (-1, False)
+  # The frame that registered 0x0B5 arrived before it was tracked (ts == 0), so read_isg must report unknown.
+  assert read_isg(parser, parser.vl["ISG_STATUS"]) == (-1, False)
+
   parser.update([t + 20_000_000, [(181, auto, 0)]])
+  cs._discover_canfd_isg_status(parser)
+  assert cs.isg_status is not None
   assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
+
+
+@pytest.mark.parametrize(("fingerprint", "size"), [
+  (CAR.KIA_K5_DL3_24, 32),
+  (CAR.KIA_EV6, 32),
+  (CAR.KIA_K5_DL3_24, 24),
+])
+def test_isg_status_only_on_k5(fingerprint, size):
+  """Only the K5 DL3 ICE has a verified ISG_STATUS layout: another car's 0x0B5, or a short payload, stays untracked."""
+  from opendbc.car.hyundai.carstate import CarState
+
+  parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  parser.controls_ready = True
+  cs = CarState.__new__(CarState)
+  cs.CP = SimpleNamespace(carFingerprint=fingerprint)
+  cs.isg_status = None
+  cs.controls_ready_count = 200
+
+  parser.update([1_000_000_000, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP)[:size], 0)]])
+  cs._discover_canfd_isg_status(parser)
+  parser.update([1_010_000_000, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP)[:size], 0)]])
+  cs._discover_canfd_isg_status(parser)
+  expected = fingerprint == CAR.KIA_K5_DL3_24 and size == 32
+  assert (cs.isg_status is not None) == expected
 
 
 def test_isg_status_dropout_does_not_invalidate_can_valid():
@@ -563,6 +664,7 @@ def test_isg_status_dropout_does_not_invalidate_can_valid():
   parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
   parser.controls_ready = True
   cs = CarState.__new__(CarState)
+  cs.CP = SimpleNamespace(carFingerprint=CAR.KIA_K5_DL3_24)
   cs.isg_status = None
   cs.controls_ready_count = 126
 
@@ -572,6 +674,10 @@ def test_isg_status_dropout_does_not_invalidate_can_valid():
   parser.update([t, [(96, esp_frame, 0), (181, auto, 0)]])
   cs._discover_canfd_isg_status(parser)
   assert parser.message_states[181].ignore_alive is True
+  # The registering frame predates tracking: bind on the next size-correct 0x0B5 frame.
+  parser.update([t + 5_000_000, [(181, auto, 0)]])
+  cs._discover_canfd_isg_status(parser)
+  assert cs.isg_status is not None
 
   # 1.2 s of 100 Hz 0x0B5 + 50 Hz valid ESP_STATUS
   for i in range(1, 121):
@@ -617,7 +723,8 @@ def test_monitor_fingerprint_frame_126_registers_isg_status_with_ignore_alive(mo
   pt_parser.update([1_000_000_000, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP), 0)]])
 
   cs = CarState.__new__(CarState)
-  cs.CP = SimpleNamespace(flags=HyundaiFlags.CANFD.value, openpilotLongitudinalControl=True)
+  cs.CP = SimpleNamespace(carFingerprint=CAR.KIA_K5_DL3_24, flags=HyundaiFlags.CANFD.value,
+                          openpilotLongitudinalControl=True)
   cs.controls_ready_count = 125
   cs.isg_status = None
   cs.cruise_buttons_alt2 = None
@@ -627,9 +734,13 @@ def test_monitor_fingerprint_frame_126_registers_isg_status_with_ignore_alive(mo
 
   cs.monitor_fingerprint({Bus.pt: pt_parser, Bus.cam: cam_parser}, canfd=True)
   assert cs.controls_ready_count == 126
-  assert cs.isg_status is pt_parser.vl["ISG_STATUS"]
   assert pt_parser.message_states[181].ignore_alive is True
   assert pt_parser.message_states[181].ignore_counter is True
+
+  # The 126 registration lands after the frame it must read: the first size-correct 0x0B5 frame binds it.
+  pt_parser.update([1_010_000_000, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP), 0)]])
+  cs._discover_canfd_isg_status(pt_parser)
+  assert cs.isg_status is pt_parser.vl["ISG_STATUS"]
 
 
 def test_read_isg_before_first_frame_is_unknown_even_at_low_timestamp():
