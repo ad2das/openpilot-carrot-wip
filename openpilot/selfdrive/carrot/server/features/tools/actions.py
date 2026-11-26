@@ -63,7 +63,10 @@ _READ_ONLY_BRANCH_FLAGS = {
   "--sort", "--format", "--color", "--no-color", "--abbrev", "--no-abbrev",
   "--column", "--no-column",
 }
-_BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format", "--color", "--abbrev", "--column"}
+# Flags whose value git may take from the NEXT argument. --color/--abbrev/--column
+# only accept an attached "--flag=value", so they must not be listed here: git would
+# read the following argument as a branch operation (`--color -m --color x` renames).
+_BRANCH_VALUE_FLAGS = {"--contains", "--no-contains", "--merged", "--no-merged", "--points-at", "--sort", "--format"}
 _READ_ONLY_CAT_FLAGS = {"-n", "-b", "-s", "-v", "-E", "-T"}
 _ALLOWED_CAT_ABS_PREFIXES = ("/data/openpilot/", "/data/media/", "/tmp/", "/proc/", "/sys/", "/var/log/")
 _BLOCKED_CAT_SEGMENTS = {"..", ".ssh", "GithubSshKeys", "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "gshadow", ".netrc", ".git-credentials"}

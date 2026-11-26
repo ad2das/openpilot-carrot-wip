@@ -46,13 +46,96 @@ GIT_UPDATE_DISPLAY_LIMIT = 3
 _SYNC_NETWORK_GIT_SUBCMDS = {"fetch", "pull", "push", "clone", "ls-remote"}
 
 
-def _clear_origin_remote_refs(repo_dir: str) -> None:
-  """Delete both loose and packed refs/remotes/origin/* before repacking/fetching."""
+_ORIGIN_REF_PREFIX = "refs/remotes/origin/"
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _is_safe_origin_refname(refname: str) -> bool:
+  if not refname.startswith(_ORIGIN_REF_PREFIX) or "\\" in refname or "\x00" in refname:
+    return False
+  parts = refname.split("/")
+  return all(part not in ("", ".", "..") for part in parts)
+
+
+def _is_valid_ref_content(content: str) -> bool:
+  value = content.strip()
+  if value.startswith("ref: "):
+    target = value[5:].strip()
+    return (target.startswith("refs/") and "\x00" not in target
+            and all(part not in ("", ".", "..") for part in target.split("/")))
+  return len(value) in (40, 64) and set(value) <= _HEX_DIGITS
+
+
+def _snapshot_origin_remote_refs(repo_dir: str) -> dict[str, str]:
+  """Return {refname: loose-file content} for readable, well-formed origin refs."""
+  git_dir = os.path.join(repo_dir, ".git")
+  refs: dict[str, str] = {}
+  packed_path = os.path.join(git_dir, "packed-refs")
+  try:
+    with open(packed_path, encoding="utf-8", errors="replace") as f:
+      for line in f:
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and _is_safe_origin_refname(parts[1]) and _is_valid_ref_content(parts[0]):
+          refs[parts[1]] = parts[0] + "\n"
+  except OSError:
+    pass
+  loose_root = os.path.join(git_dir, "refs", "remotes", "origin")
+  for root, _dirs, files in os.walk(loose_root):
+    for name in files:
+      path = os.path.join(root, name)
+      refname = os.path.relpath(path, git_dir).replace(os.sep, "/")
+      try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+          content = f.read(512)
+      except OSError:
+        continue
+      # A loose ref overrides its packed copy; corrupt ones are not kept.
+      if _is_safe_origin_refname(refname) and _is_valid_ref_content(content):
+        refs[refname] = content.strip() + "\n"
+  return refs
+
+
+def _restore_missing_origin_remote_refs(repo_dir: str, refs: dict[str, str]) -> int:
+  """After a failed fetch, put back origin refs from the snapshot that are now missing.
+
+  Refs a partial fetch already rewrote are left alone. Restored refs are written as
+  loose files, which git reads ahead of packed-refs.
+  """
+  git_dir = os.path.join(repo_dir, ".git")
+  restored = 0
+  for refname, content in sorted(refs.items()):
+    if not _is_safe_origin_refname(refname):
+      continue
+    path = os.path.join(git_dir, *refname.split("/"))
+    if os.path.lexists(path):
+      continue
+    tmp_path = f"{path}.tmp.{uuid.uuid4().hex}"
+    try:
+      os.makedirs(os.path.dirname(path), exist_ok=True)
+      with open(tmp_path, "w", encoding="utf-8") as f:
+        f.write(content)
+      os.replace(tmp_path, path)
+      restored += 1
+    except OSError:
+      try:
+        os.remove(tmp_path)
+      except OSError:
+        pass
+  return restored
+
+
+def _clear_origin_remote_refs(repo_dir: str) -> dict[str, str]:
+  """Delete both loose and packed refs/remotes/origin/* before repacking/fetching.
+
+  Returns a snapshot of the well-formed refs so a failed fetch can restore them
+  instead of leaving the checkout without any origin/* refs.
+  """
+  snapshot = _snapshot_origin_remote_refs(repo_dir)
   git_dir = os.path.join(repo_dir, ".git")
   shutil.rmtree(os.path.join(git_dir, "refs", "remotes", "origin"), ignore_errors=True)
   packed_path = os.path.join(git_dir, "packed-refs")
   if not os.path.isfile(packed_path):
-    return
+    return snapshot
   try:
     with open(packed_path, "r", encoding="utf-8", errors="replace") as f:
       lines = f.readlines()
@@ -82,6 +165,7 @@ def _clear_origin_remote_refs(repo_dir: str) -> None:
         pass
   except OSError:
     pass
+  return snapshot
 
 
 def capture_tmux_log_sync() -> Tuple[int, str]:
@@ -672,12 +756,15 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
       # from a power-loss mid-fetch) can't block the fetch — git rebuilds
       # origin/* fresh. --force allows non-fast-forward ref updates.
       jobs.progress(job, message="git fetch origin --prune --force", current=3, total=4)
-      await run_locked_thread(_clear_origin_remote_refs, repo_dir)
+      origin_refs = await run_locked_thread(_clear_origin_remote_refs, repo_dir)
       await jobs.capture_exec(["git", "pack-refs", "--all"], cwd=repo_dir, timeout=20)
       rc_fetch = await jobs.stream_exec(
         job, ["git", "fetch", "origin", "--prune", "--force"], cwd=repo_dir, timeout=300
       )
       if rc_fetch != 0:
+        restored = await run_locked_thread(_restore_missing_origin_remote_refs, repo_dir, origin_refs or {})
+        if restored:
+          jobs.append(job, f"fetch failed: restored {restored} previous origin refs\n")
         jobs.finish(job, ok=False, result=jobs.result_from_log(job, rc_fetch))
         return
 
@@ -1198,11 +1285,14 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
 
       # clear remote-tracking refs (both loose and packed) before repacking so a
       # corrupt/broken ref can't block the fetch; --force allows non-ff updates
-      await run_locked_thread(_clear_origin_remote_refs, REPO_DIR)
+      origin_refs = await run_locked_thread(_clear_origin_remote_refs, REPO_DIR)
       await run(["git", "pack-refs", "--all"], cwd=REPO_DIR, timeout=20.0)
       rc_fetch, out_fetch = await run(["git", "fetch", "origin", "--prune", "--force"], cwd=REPO_DIR, timeout=180.0)
       out_all += f"> git fetch origin --prune --force\n{out_fetch}\n\n"
       if rc_fetch != 0:
+        restored = await run_locked_thread(_restore_missing_origin_remote_refs, REPO_DIR, origin_refs or {})
+        if restored:
+          out_all += f"fetch failed: restored {restored} previous origin refs\n"
         return web.json_response({"ok": False, "rc": rc_fetch, "out": out_all.strip()})
 
       rc_br, out_br = await run(["git", "branch", "-r"], cwd=REPO_DIR)
