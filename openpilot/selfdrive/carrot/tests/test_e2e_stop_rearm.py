@@ -38,10 +38,12 @@ def test_latched_stays_latched():
 def _replay(frames, use_rearm):
   """Replay the real e2eStop stop-distance path on a logged 20 Hz plan series.
 
-  Mirrors carrot_functions.py:370-390 (_stop_x_rl limiter), 510-512 (filters),
-  1512-1521 (stop_dist + update) and 1564 (travel decay). Only frames whose logged
-  xState is 3 run the stop branch; the first such frame seeds actual_stop_distance
-  from the rate-limited reading, as the e2eStop entry does.
+  Mirrors carrot_functions.py:370-390 (_stop_x_rl limiter; it reseeds to the raw
+  reading while xState is e2eStop(3)/e2eStopped(5), as
+  carrot_functions.py does), 510-512 (filters), 1512-1521 (stop_dist + update)
+  and 1564 (travel decay). Only frames whose logged xState is 3 run the stop
+  branch; the first such frame seeds actual_stop_distance from the rate-limited
+  reading, as the e2eStop entry does.
   """
   f1 = MyMovingAverage(3)
   f2 = MyMovingAverage(15)
@@ -75,6 +77,7 @@ def _replay(frames, use_rearm):
       asd = max(0.0, asd - v_ego * DT_MDL)
     else:
       asd = 0.0
+    if fr["xstate"] in (3, 5):
       rl = xstop
     out.append(dict(t=fr["t_rel"], v_ego=v_ego, asd=asd))
   return out

@@ -1201,13 +1201,8 @@ class CarrotPlanner:
     if (getattr(self, 'tlvStopGo', 0) != 1 and not getattr(self, 'tlv_stop_committed', False)
         and not getattr(self, 'tlv_soft_active', False)):
       return  # toggle off: touch nothing (byte-identical behaviour)
-    try:
-      sd = sm['selfdriveState']
-      engaged = bool(sd.enabled) if hasattr(sd, 'enabled') else True
-    except Exception:
-      engaged = False
     enabled = (getattr(self, 'tlvStopGo', 0) == 1 and self.trafficLightDetectMode >= 1
-               and self.myDrivingMode != DrivingMode.High and engaged)
+               and self.myDrivingMode != DrivingMode.High)
     tiers = self.tlv_tiers
     stop_x = float(stop_x)
     tiers.update(self._tlv_tier_in(
@@ -1608,8 +1603,7 @@ class CarrotPlanner:
     elif self.actual_stop_distance > 0:  # e2eStop 또는 e2eStopped 상태
       stop_model_x = 0.0
 
-    stopping_active = self.xState in [XState.e2eStop, XState.e2eStopped]
-    if not stopping_active:
+    if self.xState in [XState.e2eStop, XState.e2eStopped]:
       self._stop_x_rl = stop_model_x_raw
 
     # self.debugLongText = (
