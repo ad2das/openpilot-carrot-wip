@@ -954,14 +954,14 @@ def test_camera_distance_is_latched_for_a_second_and_refreshes_at_once_for_a_new
   assert renderer._camera_display_dist(("camera", 3), 260, 1.3) == 260  # rising distance (new camera) at once
 
 
-def held_camera_renderer(module, fake_ui_state):
+def held_camera_renderer(module, fake_ui_state, *, spd_type=2):
   renderer = object.__new__(module.HudRenderer)
   renderer._camera_dist_held = None
   renderer._progress_key = None
   renderer._progress_start = module.NAV_PROGRESS_SPAN
   renderer._progress_last = 0
   renderer._guide_turn = None
-  fake_ui_state.sm = {"carrotMan": SimpleNamespace(xSpdLimit=80, xSignType=2, nRoadLimitSpeed=90)}
+  fake_ui_state.sm = {"carrotMan": SimpleNamespace(xSpdLimit=80, xSpdType=spd_type, nRoadLimitSpeed=90)}
   return renderer
 
 
@@ -1010,6 +1010,17 @@ def test_camera_card_resets_the_latch_when_the_camera_comes_back(hud_module, mon
   assert camera_card_draws(renderer, module, monkeypatch, 0, 0.4) is None  # camera gone: nothing drawn
   assert renderer._camera_dist_held is None
   assert camera_card_draws(renderer, module, monkeypatch, 250, 0.6) == "250"  # new camera shows at once
+
+
+def test_camera_card_hides_speed_bump_xspdtype_22(hud_module, monkeypatch):
+  """xSpdType 22 (speed bump) is never an enforcement-camera card: the card and its distance latch are dropped."""
+  module, fake_ui_state = hud_module
+  renderer = held_camera_renderer(module, fake_ui_state, spd_type=2)
+
+  assert camera_card_draws(renderer, module, monkeypatch, 300, 0.0) == "300"
+  fake_ui_state.sm["carrotMan"].xSpdType = 22
+  assert camera_card_draws(renderer, module, monkeypatch, 180, 0.3) is None
+  assert renderer._camera_dist_held is None
 
 
 def _drive_card_probe(module, monkeypatch, *, limit, light):
