@@ -213,7 +213,7 @@ procs = [
   PythonProcess("carrot_log_sync", "openpilot.selfdrive.carrot.log_sync", always_run, enabled=not PC, restart_if_crash=True),
   PythonProcess("carrot_bluetooth", "openpilot.selfdrive.carrot.bluetooth.daemon", always_run, enabled=TICI, restart_if_crash=True),
   PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", always_run, enabled=not PC),
-  PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True, preimport=False),
+  PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True),
 
   #Xiaoge data broadcaster (conditional on ShareData param)
   # Starts after onroad readiness, when manager already has live IPC mappings.

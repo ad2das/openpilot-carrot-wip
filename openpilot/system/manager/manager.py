@@ -131,15 +131,18 @@ _SUPPORTED_CARS_BRANDS = (
 )
 
 
-def write_supported_cars_files() -> None:
+_boot_build_metadata = None
+
+
+def write_supported_cars_files(build_metadata=None) -> None:
   params_path = Params().get_param_path()
   stamp_path = os.path.join(params_path, ".supported_cars_commit")
   commit = ""
   clean_checkout = False
   try:
-    build_metadata = get_build_metadata()
-    commit = build_metadata.openpilot.git_commit or ""
-    clean_checkout = bool(commit) and not build_metadata.openpilot.is_dirty
+    meta = build_metadata if build_metadata is not None else (_boot_build_metadata or get_build_metadata())
+    commit = meta.openpilot.git_commit or ""
+    clean_checkout = bool(commit) and not meta.openpilot.is_dirty
   except Exception:
     pass
 
@@ -177,9 +180,11 @@ def write_supported_cars_files() -> None:
       pass
 
 def manager_init() -> UpdateStatus:
+  global _boot_build_metadata
   save_bootlog()
 
   build_metadata = get_build_metadata()
+  _boot_build_metadata = build_metadata
   update_status = UpdateStatus(BASEDIR)
 
   params = Params()

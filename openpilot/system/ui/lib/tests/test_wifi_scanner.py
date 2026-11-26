@@ -122,3 +122,75 @@ def test_initialize_starts_monitor_before_scanner_and_refreshes_active_ui(mocker
   assert order.index("start_state") < order.index("init_wifi_state") < order.index("start_scan")
   assert ("update_networks", {"block": False}) in order
   wm._exit = True
+
+
+def _make_init_state_wm(mocker: MockerFixture):
+  wm = WifiManager.__new__(WifiManager)
+  wm._exit = True
+  wm._active = False
+  wm._wifi_device = "/org/freedesktop/NetworkManager/Devices/1"
+  wm._device_state = NMDeviceState.UNKNOWN
+  wm._device_state_seq = 0
+  wm._wifi_state = WifiState()
+  wm._user_epoch = 0
+  wm._connections = {"Home": "/conn/home"}
+  wm._callback_queue = []
+  wm._activated = []
+  wm._need_auth = []
+  wm._scan_event = threading.Event()
+  wm._conn_monitor = mocker.MagicMock()
+  wm._router_main = mocker.MagicMock()
+  wm._update_networks = mocker.MagicMock()
+  wm._update_active_connection_info = mocker.MagicMock()
+  wm._get_active_wifi_connection = mocker.MagicMock(return_value=(None, None))
+  return wm
+
+
+def test_init_wifi_state_applies_device_state_when_uncontested(mocker):
+  wm = _make_init_state_wm(mocker)
+  reply = mocker.MagicMock()
+  reply.body = [("u", NMDeviceState.UNAVAILABLE)]
+  wm._router_main.send_and_get_reply.return_value = reply
+
+  wm._init_wifi_state(block=True)
+
+  assert wm._device_state == NMDeviceState.UNAVAILABLE
+  assert wm.is_device_unavailable is True
+
+
+def test_init_wifi_state_does_not_clobber_newer_state_change_during_get_state(mocker):
+  wm = _make_init_state_wm(mocker)
+  stale_reply = mocker.MagicMock()
+  stale_reply.body = [("u", NMDeviceState.UNAVAILABLE)]
+
+  def race_state_change(_msg):
+    wm._handle_state_change(NMDeviceState.DISCONNECTED, NMDeviceState.UNAVAILABLE, NMDeviceStateReason.NONE)
+    return stale_reply
+
+  wm._router_main.send_and_get_reply.side_effect = race_state_change
+
+  wm._init_wifi_state(block=True)
+
+  assert wm._device_state == NMDeviceState.DISCONNECTED
+  assert wm.is_device_unavailable is False
+  assert wm._scan_event.is_set() is True
+
+
+def test_init_wifi_state_does_not_clobber_activated_during_active_conn_lookup(mocker):
+  wm = _make_init_state_wm(mocker)
+  reply = mocker.MagicMock()
+  reply.body = [("u", NMDeviceState.DISCONNECTED)]
+  wm._router_main.send_and_get_reply.return_value = reply
+
+  def race_activated(router=None):
+    if router is wm._conn_monitor:
+      return ("/conn/home", {})
+    wm._handle_state_change(NMDeviceState.ACTIVATED, NMDeviceState.SECONDARIES, NMDeviceStateReason.NONE)
+    return (None, None)
+
+  wm._get_active_wifi_connection.side_effect = race_activated
+
+  wm._init_wifi_state(block=True)
+
+  assert wm._device_state == NMDeviceState.ACTIVATED
+  assert wm._wifi_state == WifiState(ssid="Home", status=ConnectStatus.CONNECTED)

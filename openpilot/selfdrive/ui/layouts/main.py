@@ -27,13 +27,8 @@ class MainLayout(Widget):
     self._current_mode = MainState.HOME
     self._prev_onroad = False
 
-    # Initialize layouts (SettingsLayout is created lazily on first open so
-    # boot does not instantiate 7 settings panels and WifiManager upfront)
-    self._layouts: dict[MainState, Widget | None] = {
-      MainState.HOME: HomeLayout(),
-      MainState.SETTINGS: None,
-      MainState.ONROAD: AugmentedRoadView(),
-    }
+    # Initialize layouts
+    self._layouts = {MainState.HOME: HomeLayout(), MainState.SETTINGS: SettingsLayout(), MainState.ONROAD: AugmentedRoadView()}
 
     self._sidebar_rect = rl.Rectangle(0, 0, 0, 0)
     self._content_rect = rl.Rectangle(0, 0, 0, 0)
@@ -112,20 +107,13 @@ class MainLayout(Widget):
     self._render_main_content()
     self._handle_carrot_record_cmd(ui_state.sm)
 
-  def _ensure_settings_layout(self) -> SettingsLayout:
-    settings = self._layouts[MainState.SETTINGS]
-    if settings is None:
-      settings = SettingsLayout()
-      settings.set_callbacks(on_close=self._set_mode_for_state)
-      self._layouts[MainState.SETTINGS] = settings
-    return settings
-
   def _setup_callbacks(self):
     self._sidebar.set_callbacks(on_settings=self._on_settings_clicked,
                                 on_carrot_web=lambda: gui_app.push_widget(CarrotWebDialog()),
                                 open_settings=lambda: self.open_settings(PanelType.TOGGLES))
     self._layouts[MainState.HOME]._setup_widget.set_open_settings_callback(lambda: self.open_settings(PanelType.FIREHOSE))
     self._layouts[MainState.HOME].set_settings_callback(lambda: self.open_settings(PanelType.TOGGLES))
+    self._layouts[MainState.SETTINGS].set_callbacks(on_close=self._set_mode_for_state)
     self._layouts[MainState.ONROAD].set_click_callback(self._on_onroad_clicked)
     device.add_interactive_timeout_callback(self._set_mode_for_state)
 
@@ -158,7 +146,7 @@ class MainLayout(Widget):
       self._layouts[self._current_mode].show_event()
 
   def open_settings(self, panel_type: PanelType):
-    self._ensure_settings_layout().set_current_panel(panel_type)
+    self._layouts[MainState.SETTINGS].set_current_panel(panel_type)
     self._set_current_layout(MainState.SETTINGS)
     self._sidebar.set_visible(False)
 

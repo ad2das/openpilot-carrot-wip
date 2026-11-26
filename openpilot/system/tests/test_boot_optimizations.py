@@ -68,7 +68,7 @@ def test_sudo_write_batch_preserves_order_and_batches_single_sudo(tmp_path: Path
   recorded = []
   monkeypatch.setattr("builtins.open", fake_open)
   monkeypatch.setattr(utils.os, "access", fake_access)
-  monkeypatch.setattr(utils.subprocess, "run", lambda cmd, **kw: recorded.append(cmd))
+  monkeypatch.setattr(utils.subprocess, "run", lambda cmd, **kw: recorded.append(cmd) or SimpleNamespace(stderr=""))
 
   utils.sudo_write_batch([("first", str(p1)), ("second", str(p2)), ("third", str(p3))], chmod_paths=[str(c1)])
 
@@ -78,6 +78,27 @@ def test_sudo_write_batch_preserves_order_and_batches_single_sudo(tmp_path: Path
   assert cmd[:3] == ["sudo", "sh", "-c"]
   assert "su " not in cmd[3]
   assert cmd[4:] == ["_", "1", str(c1), "second", str(p2), "third", str(p3)]
+
+
+def test_sudo_write_batch_surfaces_failed_paths_to_stderr(tmp_path: Path, monkeypatch, capsys) -> None:
+  p1 = tmp_path / "p1"
+  p1.write_text("", encoding="utf-8")
+
+  def deny_open(*_a, **_k):
+    raise PermissionError("root only")
+
+  monkeypatch.setattr("builtins.open", deny_open)
+  monkeypatch.setattr(
+    utils.subprocess,
+    "run",
+    lambda cmd, **kw: SimpleNamespace(stderr=f"{p1}\n/sys/missing/node\n"),
+  )
+
+  utils.sudo_write_batch([("1", str(p1))])
+  captured = capsys.readouterr()
+  assert "sudo_write_batch failed for:" in captured.err
+  assert str(p1) in captured.err
+  assert "/sys/missing/node" in captured.err
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="POSIX sh/chmod execution test")
@@ -99,7 +120,10 @@ def test_sudo_batch_script_executes_cleanly_with_edge_values(tmp_path: Path) -> 
     "1\n", str(w2),
   ]
   res = subprocess.run(["sh", "-c", utils._SUDO_BATCH_SCRIPT, "_", *args], check=False, capture_output=True, text=True)
-  assert res.returncode == 0, res.stderr
+  assert res.returncode == 0
+  assert str(missing_write) in res.stderr
+  assert str(w1) not in res.stderr
+  assert str(w2) not in res.stderr
   assert stat.S_IMODE(c1.stat().st_mode) & 0o222 == 0o222
   assert w1.read_text(encoding="utf-8") == "-n"
   assert w2.read_text(encoding="utf-8") == "1\n"
@@ -221,12 +245,19 @@ def test_process_config_prioritizes_driving_critical_path() -> None:
   path = ROOT / "openpilot/system/manager/process_config.py"
   tree = ast.parse(path.read_text(encoding="utf-8"))
   names = []
+  carrot_cluster_preimport = None
   for node in ast.walk(tree):
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("PythonProcess", "NativeProcess", "DaemonProcess"):
-      names.append(ast.literal_eval(node.args[0]))
+      proc_name = ast.literal_eval(node.args[0])
+      names.append(proc_name)
+      if proc_name == "carrot_cluster":
+        for kw in node.keywords:
+          if kw.arg == "preimport":
+            carrot_cluster_preimport = ast.literal_eval(kw.value)
   for critical in ("camerad", "modeld", "card", "selfdrived", "controlsd"):
     for low_prio in ("proclogd", "journald", "micd"):
       assert names.index(critical) < names.index(low_prio), f"{critical} must start before {low_prio}"
+  assert carrot_cluster_preimport is not False
 
 
 def test_manager_early_hardware_overlap_cleanup_and_prepare_skip(monkeypatch, tmp_path) -> None:
@@ -325,6 +356,7 @@ def test_write_supported_cars_caches_clean_commit(monkeypatch, tmp_path: Path) -
   import openpilot.system.manager.manager as manager
 
   imports = []
+  meta_calls = 0
 
   def fake_import(name):
     imports.append(name)
@@ -333,18 +365,28 @@ def test_write_supported_cars_caches_clean_commit(monkeypatch, tmp_path: Path) -
     return SimpleNamespace(CAR=[SimpleNamespace(config=SimpleNamespace(car_docs=[doc]))])
 
   meta = SimpleNamespace(openpilot=SimpleNamespace(git_commit="abc123", is_dirty=False))
+
+  def fake_get_build_metadata():
+    nonlocal meta_calls
+    meta_calls += 1
+    return meta
+
+  monkeypatch.setattr(manager, "_boot_build_metadata", None)
   monkeypatch.setattr(manager, "Params", lambda: SimpleNamespace(get_param_path=lambda: str(tmp_path)))
-  monkeypatch.setattr(manager, "get_build_metadata", lambda: meta)
+  monkeypatch.setattr(manager, "get_build_metadata", fake_get_build_metadata)
   monkeypatch.setattr(manager.importlib, "import_module", fake_import)
 
   manager.write_supported_cars_files()
   assert len(imports) == 7
+  assert meta_calls == 1
   assert (tmp_path / ".supported_cars_commit").read_text().strip() == "abc123"
 
-  # Same clean commit + all files intact -> 0 imports.
+  # Cached boot metadata avoids redundant get_build_metadata() git subprocesses.
   imports.clear()
+  monkeypatch.setattr(manager, "_boot_build_metadata", meta)
   manager.write_supported_cars_files()
   assert imports == []
+  assert meta_calls == 1
 
   # Missing one file -> rebuilds.
   (tmp_path / "SupportedCars_tesla").unlink()
@@ -399,7 +441,10 @@ bootstrap_runtime_dependencies
   assert "ENSURE:serial" in res_miss.stdout
 
 
-def test_main_layout_defers_settings_layout_until_opened(monkeypatch) -> None:
+def test_main_layout_initializes_settings_layout_eagerly(monkeypatch) -> None:
+  # SettingsLayout owns the main UI WifiManager and toggle/developer/device transition callbacks;
+  # it must be constructed during MainLayout.__init__ so background Wi-Fi scanning and param
+  # transition hooks are live from boot even when the user never opens Settings.
   settings_created = []
   settings_callbacks = []
   settings_panels = []
@@ -454,28 +499,19 @@ def test_main_layout_defers_settings_layout_until_opened(monkeypatch) -> None:
   for name, stub in stubs.items():
     monkeypatch.setitem(sys.modules, name, stub)
 
-  spec = importlib.util.spec_from_file_location("_test_lazy_main_layout", ROOT / "openpilot/selfdrive/ui/layouts/main.py")
+  spec = importlib.util.spec_from_file_location("_test_eager_main_layout", ROOT / "openpilot/selfdrive/ui/layouts/main.py")
   mod = importlib.util.module_from_spec(spec)
   spec.loader.exec_module(mod)
 
   layout = mod.MainLayout()
-  assert settings_created == []
-
-  # Home <-> Onroad transitions never construct SettingsLayout.
-  fake_ui_state.started = True
-  layout._handle_onroad_transition()
-  fake_ui_state.started = False
-  layout._handle_onroad_transition()
-  assert settings_created == []
-
-  # First open creates SettingsLayout once and wires on_close + panel.
-  layout.open_settings(panel_type.TOGGLES)
   assert len(settings_created) == 1
   assert len(settings_callbacks) == 1
+
+  layout.open_settings(panel_type.TOGGLES)
+  assert len(settings_created) == 1
   assert settings_panels == [panel_type.TOGGLES]
   assert settings_events == ["show"]
 
-  # Closing hides settings; reopening reuses the same instance.
   settings_callbacks[0]()
   assert settings_events == ["show", "hide"]
   layout.open_settings(panel_type.DEVICE)
@@ -483,14 +519,63 @@ def test_main_layout_defers_settings_layout_until_opened(monkeypatch) -> None:
   assert settings_panels == [panel_type.TOGGLES, panel_type.DEVICE]
 
 
-def test_modeld_first_frame_does_not_force_prepare_only() -> None:
+def test_modeld_preloads_pkl_and_preserves_vipc_drop_accounting() -> None:
   source = (ROOT / "openpilot/selfdrive/modeld/modeld.py").read_text(encoding="utf-8")
-  assert "if run_count > 0 else 0" in source
   assert "preloaded_internal_jits = load_oob(open_file_chunked(modeld_pkl_path(False)))" in source
-  # First frame after startup (run_count == 0) must not count prior camerad frames as dropped.
-  def compute(meta_fid: int, last_fid: int, run_count: int) -> int:
-    return max(0, meta_fid - last_fid - 1) if run_count > 0 else 0
+  assert "vipc_dropped_frames = max(0, meta_main.frame_id - last_vipc_frame_id - 1)" in source
+  assert "if run_count > 0 else 0" not in source
 
-  assert compute(47, 0, 0) == 0
-  assert compute(80, 47, 1) == 32
-  assert compute(81, 80, 2) == 0
+
+def test_hardwared_bounds_fast_offline_poll_to_boot_window() -> None:
+  path = ROOT / "openpilot/system/hardware/hardwared.py"
+  tree = ast.parse(path.read_text(encoding="utf-8"))
+  fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "hw_state_thread")
+
+  def run_ticks(monotonic_val: float, network_type: str, ticks: int) -> list[int]:
+    polled_at: list[int] = []
+    tick_idx = 0
+
+    class FakeEndEvent:
+      def is_set(self) -> bool:
+        return tick_idx >= ticks
+
+    class FakeQueue:
+      def put_nowait(self, _item) -> None:
+        pass
+
+    def fake_sleep(_dt: float) -> None:
+      nonlocal tick_idx
+      tick_idx += 1
+
+    def get_network_type() -> str:
+      polled_at.append(tick_idx)
+      return network_type
+
+    ns = {
+      "DT_HW": 0.5,
+      "AGNOS": False,
+      "NetworkType": SimpleNamespace(none="none", wifi="wifi"),
+      "HardwareState": lambda **kw: SimpleNamespace(**kw),
+      "HARDWARE": SimpleNamespace(
+        get_network_type=get_network_type,
+        get_modem_temperatures=list,
+        get_modem_version=lambda: None,
+        get_modem_data_usage=lambda: (0, 0),
+        get_network_info=lambda: None,
+        get_network_strength=lambda _nt: 0,
+        get_network_metered=lambda _nt: False,
+      ),
+      "time": SimpleNamespace(monotonic=lambda: monotonic_val, sleep=fake_sleep),
+      "queue": SimpleNamespace(Full=RuntimeError),
+      "cloudlog": SimpleNamespace(event=lambda *a, **k: None, exception=lambda *a, **k: None),
+    }
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), str(path), "exec"), ns)
+    ns["hw_state_thread"](FakeEndEvent(), FakeQueue())
+    return polled_at
+
+  # Boot window (< 120s) while offline: polls every 2s (every 4 ticks at DT_HW=0.5).
+  assert run_ticks(monotonic_val=15.0, network_type="none", ticks=10) == [0, 4, 8]
+  # After 120s while still offline: falls back to normal 10s cadence (every 20 ticks).
+  assert run_ticks(monotonic_val=130.0, network_type="none", ticks=21) == [0, 20]
+  # Connected during boot window: switches immediately to 10s cadence after first poll.
+  assert run_ticks(monotonic_val=15.0, network_type="wifi", ticks=21) == [0, 20]

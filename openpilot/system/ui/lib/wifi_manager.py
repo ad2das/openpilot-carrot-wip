@@ -154,6 +154,7 @@ class WifiState:
 
 class WifiManager:
   _device_state: int = NMDeviceState.UNKNOWN
+  _device_state_seq: int = 0
   _active: bool = True
   _last_network_scan: float = 0.0
   _scan_event: threading.Event | None = None
@@ -249,6 +250,7 @@ class WifiManager:
         return
 
       epoch = self._user_epoch
+      state_seq = self._device_state_seq
 
       dev_addr = DBusAddress(self._wifi_device, bus_name=NM, interface=NM_DEVICE_IFACE)
       state_reply = self._router_main.send_and_get_reply(Properties(dev_addr).get('State'))
@@ -256,6 +258,9 @@ class WifiManager:
         cloudlog.warning(f"Failed to get WiFi device state: {state_reply}")
         return
       dev_state = state_reply.body[0][1]
+      # Do not overwrite a newer StateChanged observed on the monitor thread.
+      if self._device_state_seq != state_seq:
+        return
       self._device_state = dev_state
 
       ssid: str | None = None
@@ -269,8 +274,8 @@ class WifiManager:
       if conn_path:
         ssid = next((s for s, p in self._connections.items() if p == conn_path), None)
 
-      # Discard if user acted during DBus calls
-      if self._user_epoch != epoch:
+      # Discard if user acted or a newer StateChanged arrived during DBus calls
+      if self._user_epoch != epoch or self._device_state_seq != state_seq:
         return
 
       self._wifi_state = WifiState(ssid=ssid, status=status)
@@ -427,6 +432,7 @@ class WifiManager:
           self._handle_state_change(new_state, previous_state, change_reason)
 
   def _handle_state_change(self, new_state: int, prev_state: int, change_reason: int):
+    self._device_state_seq += 1
     self._device_state = new_state
 
     # Thread safety: _wifi_state is read/written by both the monitor thread (this handler)

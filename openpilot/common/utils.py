@@ -1,5 +1,6 @@
 import io
 import os
+import sys
 import tempfile
 import contextlib
 import subprocess
@@ -42,7 +43,9 @@ while [ "$n" -gt 0 ]; do
 done
 while [ "$#" -ge 2 ]; do
   [ -e "$2" ] && chmod a+w "$2" 2>/dev/null || true
-  printf '%s' "$1" > "$2" 2>/dev/null || true
+  if ! printf '%s' "$1" > "$2" 2>/dev/null; then
+    printf '%s\n' "$2" >&2
+  fi
   shift 2
 done
 """.strip()
@@ -71,7 +74,11 @@ def sudo_write_batch(writes: Iterable[tuple[str, str]], chmod_paths: Iterable[st
   for val, path in pending:
     args.append(val)
     args.append(path)
-  subprocess.run(["sudo", "sh", "-c", _SUDO_BATCH_SCRIPT, "_", *args], check=False)
+  res = subprocess.run(["sudo", "sh", "-c", _SUDO_BATCH_SCRIPT, "_", *args],
+                       capture_output=True, text=True, check=False)
+  failed = [line.strip() for line in (res.stderr or "").splitlines() if line.strip()]
+  if failed:
+    sys.stderr.write(f"sudo_write_batch failed for: {', '.join(failed)}\n")
 
 
 def sudo_write(val: str, path: str) -> None:

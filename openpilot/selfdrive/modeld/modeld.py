@@ -461,10 +461,8 @@ def main(demo=False):
     if desire >= 0 and desire < ModelConstants.DESIRE_LEN:
       vec_desire[desire] = 1
 
-    # tracked dropped frames (the first frame received after startup has no prior
-    # frame in modeld; do not force an extra prepare_only cycle just because camerad
-    # started advancing frame_id while the model was loading)
-    vipc_dropped_frames = max(0, meta_main.frame_id - last_vipc_frame_id - 1) if run_count > 0 else 0
+    # tracked dropped frames
+    vipc_dropped_frames = max(0, meta_main.frame_id - last_vipc_frame_id - 1)
     frames_dropped = frame_dropped_filter.update(min(vipc_dropped_frames, 10))
     if run_count < 10: # let frame drops warm up
       frame_dropped_filter.x = 0.
