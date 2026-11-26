@@ -149,28 +149,36 @@ procs = [
   NativeProcess("carrot_vision_encoderd", "openpilot/system/loggerd", ["./encoderd", "--carrot-vision-road"], and_(iscar, enable_webrtc)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
 
+  # Driving critical path starts first on ignition so camera, model and controls
+  # do not wait behind non-critical logging/audio daemons.
   NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.tools.webcam.camerad", driverview, enabled=WEBCAM),
+  PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", only_onroad),
+  PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
+  PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
+  PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
+  PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
+  PythonProcess("radard", "openpilot.selfdrive.carrot.radar.radard_dpath", only_onroad),
+  PythonProcess("radarcan", "openpilot.selfdrive.carrot.radar.radarcan", only_onroad),
+  PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
+  PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
+  PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
+  PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
+  PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
+  PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),
+
   PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
   PythonProcess("micd", "openpilot.system.micd", iscar),
   PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC),
 
-  PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", only_onroad),
   PythonProcess("signalcolord", "openpilot.selfdrive.modeld.signal_color_shadow", signal_color_observer, spawn=True),
   PythonProcess("jetlinkd", "openpilot.selfdrive.modeld.jetlink.daemon", always_run, enabled=TICI, restart_if_crash=True),
   PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", enable_dm_model, enabled=(WEBCAM or not PC)),
-  PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run, restart_if_crash=True),
   PythonProcess("soundd", "openpilot.selfdrive.ui.soundd", driverview),
-  PythonProcess("locationd", "openpilot.selfdrive.locationd.locationd", only_onroad),
   NativeProcess("_pandad", "openpilot/selfdrive/pandad", ["./pandad"], always_run, enabled=False),
-  PythonProcess("calibrationd", "openpilot.selfdrive.locationd.calibrationd", only_onroad),
-  PythonProcess("torqued", "openpilot.selfdrive.locationd.torqued", only_onroad),
-  PythonProcess("controlsd", "openpilot.selfdrive.controls.controlsd", and_(not_joystick, iscar)),
-  PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar)),
-  PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
-  PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
+  PythonProcess("joystickd", "openpilot.tools.joystick.joystickd", or_(joystick, notcar), preimport=False),
   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
   PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dm2d", enable_dm, enabled=(WEBCAM or not PC)),
   # qcomgpsd crashes and is restarted onroad when the modem port fails; a fork restart
@@ -178,29 +186,24 @@ procs = [
   PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=TICI, spawn=True),
   PythonProcess("navd", "openpilot.selfdrive.navd.navd", only_onroad),
   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
-  PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
-  PythonProcess("lagd", "openpilot.selfdrive.locationd.lagd", only_onroad),
-  PythonProcess("ubloxd", "openpilot.system.ubloxd.ubloxd", ublox, enabled=TICI),
-  PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=TICI),
-  PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
-  PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
-  PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
-  PythonProcess("radard", "openpilot.selfdrive.carrot.radar.radard_dpath", only_onroad),
-  PythonProcess("radarcan", "openpilot.selfdrive.carrot.radar.radarcan", only_onroad),
+  PythonProcess("ubloxd", "openpilot.system.ubloxd.ubloxd", ublox, enabled=TICI, preimport=ublox_available()),
+  PythonProcess("pigeond", "openpilot.system.ubloxd.pigeond", ublox, enabled=TICI, preimport=ublox_available()),
+  PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver, preimport=False),
+  PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver, preimport=False),
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.system.hardware.tici.modem", always_run, enabled=TICI),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
-  PythonProcess("updated", "openpilot.system.updated.updated", enable_updated, enabled=not PC),
+  PythonProcess("updated", "openpilot.system.updated.updated", enable_updated, enabled=not PC, preimport=False),
   #PythonProcess("uploader", "openpilot.system.loggerd.uploader", enable_connect),
   PythonProcess("statsd", "openpilot.system.statsd", always_run),
   PythonProcess("feedbackd", "openpilot.selfdrive.ui.feedback.feedbackd", only_onroad),
 
   # debug procs
   NativeProcess("bridge", "openpilot/cereal/messaging", ["./bridge"], notcar),
-  PythonProcess("webrtcd", "openpilot.system.webrtc.webrtcd", notcar),
-  PythonProcess("carrot_webrtcd", "openpilot.system.webrtc.carrot_webrtcd", and_(iscar, enable_webrtc)),
-  PythonProcess("webjoystick", "openpilot.tools.bodyteleop.web", notcar, enabled=BODYTELEOP_AVAILABLE),
-  PythonProcess("joystick", "openpilot.tools.joystick.joystick_control", and_(joystick, iscar)),
+  PythonProcess("webrtcd", "openpilot.system.webrtc.webrtcd", notcar, preimport=False),
+  PythonProcess("carrot_webrtcd", "openpilot.system.webrtc.carrot_webrtcd", and_(iscar, enable_webrtc), preimport=False),
+  PythonProcess("webjoystick", "openpilot.tools.bodyteleop.web", notcar, enabled=BODYTELEOP_AVAILABLE, preimport=False),
+  PythonProcess("joystick", "openpilot.tools.joystick.joystick_control", and_(joystick, iscar), preimport=False),
 
   PythonProcess("carrot_man", "openpilot.selfdrive.carrot.carrot_man", always_run, restart_if_crash=True),#, enabled=not PC),
   # carrot_navi permanently owns TCP 7714 and publishes navigation data over cereal.
@@ -210,7 +213,7 @@ procs = [
   PythonProcess("carrot_log_sync", "openpilot.selfdrive.carrot.log_sync", always_run, enabled=not PC, restart_if_crash=True),
   PythonProcess("carrot_bluetooth", "openpilot.selfdrive.carrot.bluetooth.daemon", always_run, enabled=TICI, restart_if_crash=True),
   PythonProcess("cweb_push", "openpilot.selfdrive.carrot.cweb_push", always_run, enabled=not PC),
-  PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True),
+  PythonProcess("carrot_cluster", "openpilot.selfdrive.carrot.cluster_autorun", enable_cluster_hud, restart_if_crash=True, preimport=False),
 
   #Xiaoge data broadcaster (conditional on ShareData param)
   # Starts after onroad readiness, when manager already has live IPC mappings.
@@ -223,7 +226,7 @@ procs = [
   PythonProcess("tlvd", "openpilot.selfdrive.carrot.tlv.tlvd_launch", enable_tlvd, restart_if_crash=True, spawn=True),
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
-  PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),
+  PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI, preimport=False),
 ]
 
 managed_processes = {p.name: p for p in procs}

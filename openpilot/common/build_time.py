@@ -11,7 +11,7 @@ def _utc(epoch: float) -> str:
 
 def ensure_build_time(repo: Path) -> None:
   # Use the checked-out commit, not an upstream ref or author date. No network.
-  result = subprocess.run(['git', '-C', str(repo), 'show', '-s', '--format=%ct', 'HEAD'],
+  result = subprocess.run(['git', '--no-optional-locks', '-C', str(repo), 'show', '-s', '--format=%ct', 'HEAD'],
                           check=True, capture_output=True, text=True, timeout=10)
   commit_time = int(result.stdout.strip())
   if commit_time <= 0:

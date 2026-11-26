@@ -65,6 +65,14 @@ def boot_timing(phase: str) -> None:
     pass
 
 
+def _ignored_startup_processes() -> set[str]:
+  ignored: set[str] = set()
+  if os.getenv("NOBOARD") is not None:
+    ignored.add("pandad")
+  ignored.update(x for x in os.getenv("BLOCK", "").split(",") if len(x) > 0)
+  return ignored
+
+
 def start_early_ui() -> bool:
   # Bring the display up while the manager is still initializing. The launcher
   # keeps its recovery screen for later failures, so a failed manager_init
@@ -72,11 +80,31 @@ def start_early_ui() -> bool:
   if os.getenv("PREPAREONLY") is not None:
     return False
   ui = managed_processes.get("ui")
-  if ui is None or not ui.enabled:
+  if ui is None or not ui.enabled or "ui" in _ignored_startup_processes():
     return False
   ui.start()
   boot_timing("ui_started")
   return True
+
+
+def start_early_hardware() -> list[str]:
+  # Start pandad and hardwared right after logging/registration init so Panda
+  # connection and hardware setup overlap with process preimports.
+  if os.getenv("PREPAREONLY") is not None:
+    return []
+  ignored = _ignored_startup_processes()
+  started: list[str] = []
+  for name in ("pandad", "hardwared"):
+    if name in ignored:
+      continue
+    proc = managed_processes.get(name)
+    if proc is None or not proc.enabled:
+      continue
+    proc.start()
+    started.append(name)
+  if started:
+    boot_timing("hardware_started")
+  return started
 
 
 def start_supported_cars_writer() -> threading.Thread:
@@ -92,17 +120,44 @@ def start_supported_cars_writer() -> threading.Thread:
   return thread
 
 
+_SUPPORTED_CARS_BRANDS = (
+  ("hyundai", "SupportedCars"),
+  ("gm", "SupportedCars_gm"),
+  ("toyota", "SupportedCars_toyota"),
+  ("mazda", "SupportedCars_mazda"),
+  ("ford", "SupportedCars_ford"),
+  ("volkswagen", "SupportedCars_vw"),
+  ("tesla", "SupportedCars_tesla"),
+)
+
+
 def write_supported_cars_files() -> None:
   params_path = Params().get_param_path()
-  for brand, filename in (
-    ("hyundai", "SupportedCars"),
-    ("gm", "SupportedCars_gm"),
-    ("toyota", "SupportedCars_toyota"),
-    ("mazda", "SupportedCars_mazda"),
-    ("ford", "SupportedCars_ford"),
-    ("volkswagen", "SupportedCars_vw"),
-    ("tesla", "SupportedCars_tesla"),
-  ):
+  stamp_path = os.path.join(params_path, ".supported_cars_commit")
+  commit = ""
+  clean_checkout = False
+  try:
+    build_metadata = get_build_metadata()
+    commit = build_metadata.openpilot.git_commit or ""
+    clean_checkout = bool(commit) and not build_metadata.openpilot.is_dirty
+  except Exception:
+    pass
+
+  if clean_checkout:
+    try:
+      with open(stamp_path) as f:
+        cached_commit = f.read().strip()
+      if cached_commit == commit and all(
+        os.path.isfile(os.path.join(params_path, filename))
+        and os.path.getsize(os.path.join(params_path, filename)) > 0
+        for _, filename in _SUPPORTED_CARS_BRANDS
+      ):
+        return
+    except OSError:
+      pass
+
+  all_ok = True
+  for brand, filename in _SUPPORTED_CARS_BRANDS:
     try:
       values = importlib.import_module(f"opendbc.car.{brand}.values")
       cars = sorted(doc.name for platform in values.CAR for doc in platform.config.car_docs)
@@ -111,7 +166,15 @@ def write_supported_cars_files() -> None:
         if cars:
           f.write("\n")
     except Exception:
+      all_ok = False
       cloudlog.exception(f"failed to write {filename} from opendbc.car.{brand}.values")
+
+  if all_ok and clean_checkout:
+    try:
+      with atomic_write(stamp_path, "w", overwrite=True) as f:
+        f.write(commit + "\n")
+    except OSError:
+      pass
 
 def manager_init() -> UpdateStatus:
   save_bootlog()
@@ -142,9 +205,11 @@ def manager_init() -> UpdateStatus:
   configure_wide_camera(params)
 
   # Start the UI before registration and preimports so the display comes up
-  # while the manager is still initializing. If initialization fails, stop it
-  # again so the launcher's recovery screen can take the display.
-  early_ui_started = start_early_ui()
+  # while the manager is still initializing. If initialization fails, stop any
+  # early children again so the launcher's recovery screen can take the display.
+  early_started: list[str] = []
+  if start_early_ui():
+    early_started.append("ui")
   try:
     # Create folders needed for msgq
     try:
@@ -190,14 +255,21 @@ def manager_init() -> UpdateStatus:
                          dirty=build_metadata.openpilot.is_dirty,
                          device=HARDWARE.get_device_type())
 
-    # preimport all processes
+    # Ensure IsOnroad is reset before pandad can read it, then bring up pandad
+    # and hardwared so they overlap with the remaining preimports below.
+    write_onroad_params(False, params)
+    early_started.extend(start_early_hardware())
+
+    # preimport all processes not already running early
     boot_timing("prepare")
-    for p in managed_processes.values():
-      p.prepare()
+    early_started_set = set(early_started)
+    for name, p in managed_processes.items():
+      if name not in early_started_set:
+        p.prepare()
   except BaseException:
-    if early_ui_started:
+    for name in reversed(early_started):
       try:
-        managed_processes["ui"].stop()
+        managed_processes[name].stop()
       except Exception:
         pass
     raise

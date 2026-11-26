@@ -13,14 +13,19 @@ import hashlib
 import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SEP = b"\x1e"
 
 
+USBGPU_USB_IDS = ((0xADD1, 0x0001), (0x3801, 0x0001))
+USBGPU_MIN_SPEED_MBPS = 5000
+
+
 def _git(root: Path, *args: str) -> str:
   try:
-    proc = subprocess.run(["git", "-C", str(root), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    proc = subprocess.run(["git", "--no-optional-locks", "-C", str(root), *args], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                           text=True, timeout=30)
     return proc.stdout.strip()
   except Exception as exc:
@@ -54,7 +59,29 @@ def _pydeps_state(pydeps: Path) -> str:
   return ";".join(f"{name}:{mtime}" for name, mtime in entries)
 
 
+def _usbgpu_present_fast() -> bool:
+  usb_root = Path("/sys/bus/usb/devices")
+  if not usb_root.is_dir():
+    return False
+  for d in usb_root.iterdir():
+    try:
+      vid = int((d / "idVendor").read_text(), 16)
+      pid = int((d / "idProduct").read_text(), 16)
+      if (vid, pid) in USBGPU_USB_IDS and float((d / "speed").read_text()) >= USBGPU_MIN_SPEED_MBPS:
+        return True
+    except Exception:
+      pass
+  return False
+
+
 def _model_probe(root: Path, pydeps: Path, parts: list):
+  # Avoid importing openpilot.selfdrive.modeld.* on the common no-eGPU path.
+  if not _usbgpu_present_fast():
+    parts.append(("egpu_present", "0"))
+    parts.append(("big_model_sha", ""))
+    parts.append(("big_model_ready", "0"))
+    return
+
   for path in (str(pydeps), str(root)):
     if path not in sys.path:
       sys.path.insert(0, path)
@@ -88,9 +115,13 @@ def main() -> int:
   models = root / "openpilot" / "selfdrive" / "modeld" / "models"
 
   parts: list[tuple[str, str]] = []
-  parts.append(("head", _git(root, "rev-parse", "HEAD")))
-  parts.append(("status", _git(root, "status", "--porcelain=v1", "--untracked-files=no")))
-  parts.append(("submodules", _git(root, "submodule", "status")))
+  with ThreadPoolExecutor(max_workers=3) as pool:
+    f_head = pool.submit(_git, root, "rev-parse", "HEAD")
+    f_status = pool.submit(_git, root, "status", "--porcelain=v1", "--untracked-files=no", "--no-renames")
+    f_submodules = pool.submit(_git, root, "submodule", "status")
+    parts.append(("head", f_head.result()))
+    parts.append(("status", f_status.result()))
+    parts.append(("submodules", f_submodules.result()))
 
   try:
     version = Path(args.version_file).read_text(encoding="utf-8", errors="replace").strip()

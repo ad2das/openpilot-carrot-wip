@@ -1,24 +1,4 @@
-import os
-import subprocess
-
-def sudo_write(val: str, path: str) -> None:
-  try:
-    with open(path, 'w') as f:
-      f.write(str(val))
-  except PermissionError:
-    os.system(f"sudo chmod a+w {path}")
-    try:
-      with open(path, 'w') as f:
-        f.write(str(val))
-    except PermissionError:
-      # fallback for debugfs files
-      os.system(f"sudo su -c 'echo {val} > {path}'")
-
-def sudo_read(path: str) -> str:
-  try:
-    return subprocess.check_output(f"sudo cat {path}", shell=True, encoding='utf8').strip()
-  except Exception:
-    return ""
+from openpilot.common.utils import sudo_read, sudo_write, sudo_write_batch  # noqa: F401
 
 class MovingAverage:
   def __init__(self, window_size: int):

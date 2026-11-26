@@ -8,7 +8,7 @@ from functools import cached_property, lru_cache
 from pathlib import Path
 
 from openpilot.cereal import log
-from openpilot.common.utils import sudo_read, sudo_write
+from openpilot.common.utils import sudo_read, sudo_write, sudo_write_batch
 from openpilot.common.gpio import gpio_set, gpio_init, get_irqs_for_action
 from openpilot.system.hardware.base import HardwareBase, LPABase, ThermalConfig, ThermalZone
 from openpilot.system.hardware.tici import iwlist
@@ -306,9 +306,12 @@ class Tici(HardwareBase):
   def set_power_save(self, powersave_enabled):
     # amplifier, 100mW at idle
     if self.amplifier is not None:
-      self.amplifier.set_global_shutdown(amp_disabled=powersave_enabled)
-      if not powersave_enabled:
-        self.amplifier.initialize_configuration(self.get_device_type())
+      if powersave_enabled:
+        self.amplifier.set_global_shutdown(amp_disabled=True)
+        self._amp_initialized = False
+      elif not getattr(self, "_amp_initialized", False):
+        self.amplifier.set_global_shutdown(amp_disabled=False)
+        self._amp_initialized = bool(self.amplifier.initialize_configuration(self.get_device_type()))
 
     # *** CPU config ***
 
@@ -346,52 +349,74 @@ class Tici(HardwareBase):
 
   def initialize_hardware(self):
     if self.amplifier is not None:
-      self.amplifier.initialize_configuration(self.get_device_type())
-
-    # Allow hardwared to write engagement status to kmsg
-    os.system("sudo chmod a+w /dev/kmsg")
+      self._amp_initialized = bool(self.amplifier.initialize_configuration(self.get_device_type()))
 
     # Ensure fan gpio is enabled so fan runs until shutdown, also turned on at boot by the ABL
     gpio_init(GPIO.SOM_ST_IO, True)
     gpio_set(GPIO.SOM_ST_IO, 1)
 
-    # *** IRQ config ***
+    # Batch every privileged sysfs/proc/debugfs write and pre-unlock paths
+    # touched immediately after by set_power_save() in a single sudo call.
+    writes: list[tuple[str, str]] = [
+      # mask off big cluster from default affinity
+      ("f", "/proc/irq/default_smp_affinity"),
+    ]
 
-    # mask off big cluster from default affinity
-    sudo_write("f", "/proc/irq/default_smp_affinity")
+    def _queue_irq(val: int, action: str) -> None:
+      irqs = get_irqs_for_action(action)
+      if len(irqs) == 0:
+        print(f"No IRQs found for '{action}'")
+        return
+      for i in irqs:
+        writes.append((str(val), f"/proc/irq/{i}/smp_affinity_list"))
 
     # move these off the default core
-    affine_irq(1, "msm_vidc")  # encoders
-    affine_irq(1, "i2c_geni")  # sensors
+    _queue_irq(1, "msm_vidc")  # encoders
+    _queue_irq(1, "i2c_geni")  # sensors
 
     # *** GPU config ***
     # https://github.com/commaai/agnos-kernel-sdm845/blob/master/arch/arm64/boot/dts/qcom/sdm845-gpu.dtsi#L216
-    affine_irq(5, "fts_ts")    # touch
-    affine_irq(5, "msm_drm")   # display
-    sudo_write("1", "/sys/class/kgsl/kgsl-3d0/min_pwrlevel")
-    sudo_write("1", "/sys/class/kgsl/kgsl-3d0/max_pwrlevel")
-    sudo_write("1", "/sys/class/kgsl/kgsl-3d0/force_bus_on")
-    sudo_write("1", "/sys/class/kgsl/kgsl-3d0/force_clk_on")
-    sudo_write("1", "/sys/class/kgsl/kgsl-3d0/force_rail_on")
-    sudo_write("1000", "/sys/class/kgsl/kgsl-3d0/idle_timer")
-    sudo_write("performance", "/sys/class/kgsl/kgsl-3d0/devfreq/governor")
-    sudo_write("710", "/sys/class/kgsl/kgsl-3d0/max_clock_mhz")
-
-    # setup governors
-    sudo_write("performance", "/sys/class/devfreq/soc:qcom,cpubw/governor")
-    sudo_write("performance", "/sys/class/devfreq/soc:qcom,memlat-cpu0/governor")
-    sudo_write("performance", "/sys/class/devfreq/soc:qcom,memlat-cpu4/governor")
-
-    # *** VIDC (encoder) config ***
-    sudo_write("N", "/sys/kernel/debug/msm_vidc/clock_scaling")
-    sudo_write("Y", "/sys/kernel/debug/msm_vidc/disable_thermal_mitigation")
+    _queue_irq(5, "fts_ts")    # touch
+    _queue_irq(5, "msm_drm")   # display
+    writes.extend([
+      ("1", "/sys/class/kgsl/kgsl-3d0/min_pwrlevel"),
+      ("1", "/sys/class/kgsl/kgsl-3d0/max_pwrlevel"),
+      ("1", "/sys/class/kgsl/kgsl-3d0/force_bus_on"),
+      ("1", "/sys/class/kgsl/kgsl-3d0/force_clk_on"),
+      ("1", "/sys/class/kgsl/kgsl-3d0/force_rail_on"),
+      ("1000", "/sys/class/kgsl/kgsl-3d0/idle_timer"),
+      ("performance", "/sys/class/kgsl/kgsl-3d0/devfreq/governor"),
+      ("710", "/sys/class/kgsl/kgsl-3d0/max_clock_mhz"),
+      # setup governors
+      ("performance", "/sys/class/devfreq/soc:qcom,cpubw/governor"),
+      ("performance", "/sys/class/devfreq/soc:qcom,memlat-cpu0/governor"),
+      ("performance", "/sys/class/devfreq/soc:qcom,memlat-cpu4/governor"),
+      # *** VIDC (encoder) config ***
+      ("N", "/sys/kernel/debug/msm_vidc/clock_scaling"),
+      ("Y", "/sys/kernel/debug/msm_vidc/disable_thermal_mitigation"),
+    ])
 
     # pandad core
-    affine_irq(3, "spi_geni")         # SPI
+    _queue_irq(3, "spi_geni")  # SPI
+
+    # Pre-unlock /dev/kmsg and all set_power_save() sysfs/IRQ paths so the
+    # subsequent set_power_save() writes directly in Python without extra sudos.
+    chmod_paths: list[str] = [
+      "/dev/kmsg",
+      *(f"/sys/devices/system/cpu/cpu{i}/online" for i in range(4, 8)),
+      *(f"/sys/devices/system/cpu/cpufreq/policy{n}/scaling_governor" for n in ("0", "4")),
+      *(f"/sys/devices/system/cpu/cpufreq/policy{n}/scaling_max_freq" for n in ("0", "4")),
+    ]
+    for action in ("kgsl-3d0", "a5", "cci", "cpas_camnoc", "cpas-cdm", "csid", "ife", "csid-lite", "ife-lite"):
+      for i in get_irqs_for_action(action):
+        chmod_paths.append(f"/proc/irq/{i}/smp_affinity_list")
+
+    sudo_write_batch(writes, chmod_paths=chmod_paths)
+
     try:
-      pid = subprocess.check_output(["pgrep", "-f", "spi0"], encoding='utf8').strip()
-      subprocess.call(["sudo", "chrt", "-f", "-p", "1", pid])
-      subprocess.call(["sudo", "taskset", "-pc", "3", pid])
+      pids = subprocess.check_output(["pgrep", "-f", "spi0"], encoding='utf8').split()
+      if pids:
+        subprocess.call(["sudo", "sh", "-c", 'for p in "$@"; do chrt -f -p 1 "$p"; taskset -pc 3 "$p"; done', "_", *pids])
     except subprocess.CalledProcessError as e:
       print(str(e))
 

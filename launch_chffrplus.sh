@@ -235,6 +235,43 @@ function ensure_python_package {
 }
 
 function bootstrap_runtime_dependencies {
+  # Fast single-interpreter check: when every wheel is already installed, skip
+  # spawning ~17 sequential python3 subshells (saves ~8-10s on first post-update boot).
+  local check_agnos=0
+  local check_catch2=0
+  if [ -f /TICI ] || [ -f /AGNOS ]; then
+    check_agnos=1
+  fi
+  if [ -f "$DIR/.gitattributes" ]; then
+    check_catch2=1
+  fi
+  if python3 - "$check_agnos" "$check_catch2" > /dev/null 2>&1 <<'PY'
+import sys
+
+check_agnos = sys.argv[1] == "1"
+check_catch2 = sys.argv[2] == "1"
+
+import serial, msgpack, aiohttp, aiortc, av, pylibsrtp, psutil, crcmod, jsonrpc, qrcode
+import brotli, usb
+import cv2
+assert cv2.__version__ == "4.13.0" and hasattr(cv2.dnn, "readNetFromONNX")
+import onnxruntime
+assert onnxruntime.__version__ == "1.31.0"
+if check_agnos:
+  import eigen, libjpeg
+import acados
+from acados.acados_template import AcadosOcpSolver
+from casadi import SX
+import json11
+if check_catch2:
+  import catch2
+import shapely
+PY
+  then
+    echo "Runtime Python dependencies already installed."
+    return 0
+  fi
+
   if ! ensure_python_package serial pyserial 1 || \
      ! ensure_python_package msgpack msgpack 1 || \
      ! ensure_python_package aiohttp aiohttp 1 1 || \
@@ -297,15 +334,10 @@ function show_agnos_update_failure {
 
 function agnos_init {
   # TODO: move this to agnos
-  sudo rm -f /data/etc/NetworkManager/system-connections/*.nmmeta
   rm -f /data/scons_cache/config.lock
 
-  sudo abctl --set_success
-
-  # TODO: do this without udev in AGNOS
-  # udev does this, but sometimes we startup faster
-  sudo chgrp gpu /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
-  sudo chmod 660 /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0
+  # Batch all root boot fixups into a single sudo call instead of 4 sequential sudos.
+  sudo sh -c 'rm -f /data/etc/NetworkManager/system-connections/*.nmmeta; abctl --set_success; chgrp gpu /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0; chmod 660 /dev/adsprpc-smd /dev/ion /dev/kgsl-3d0'
 
   export AGNOS_UPDATE_CONFIRMATION_FILE="${AGNOS_UPDATE_CONFIRMATION_FILE:-/data/agnos-update-confirmed}"
 
@@ -374,7 +406,11 @@ function start_carrot_recovery {
   fi
 
   echo "Starting carrot recovery server on 6999."
-  (cd "$DIR" && "$py_bin" "$recovery_script" --port 6999 >> /tmp/carrot_recovery.log 2>&1 &)
+  if command -v nice >/dev/null 2>&1; then
+    (cd "$DIR" && nice -n 5 "$py_bin" "$recovery_script" --port 6999 >> /tmp/carrot_recovery.log 2>&1 &)
+  else
+    (cd "$DIR" && "$py_bin" "$recovery_script" --port 6999 >> /tmp/carrot_recovery.log 2>&1 &)
+  fi
 }
 
 function start_carrot_web {

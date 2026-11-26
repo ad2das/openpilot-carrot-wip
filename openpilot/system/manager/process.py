@@ -168,18 +168,21 @@ class NativeProcess(ManagerProcess):
 
 
 class PythonProcess(ManagerProcess):
-  def __init__(self, name, module, should_run, enabled=True, sigkill=False, restart_if_crash=False, spawn=False):
+  def __init__(self, name, module, should_run, enabled=True, sigkill=False, restart_if_crash=False, spawn=False, preimport=True):
     self.name = name
     self.module = module
     self.should_run = should_run
     self.enabled = enabled
     self.sigkill = sigkill
     self.launcher = launcher
+    self.spawn = spawn
+    # Spawned children start a fresh interpreter and cannot inherit forked modules.
+    self.preimport = preimport and not spawn
     self.process_factory = get_context('spawn').Process if spawn else Process
     self.restart_if_crash = restart_if_crash
 
   def prepare(self) -> None:
-    if self.enabled:
+    if self.enabled and self.preimport:
       cloudlog.info(f"preimporting {self.module}")
       try:
         importlib.import_module(self.module)

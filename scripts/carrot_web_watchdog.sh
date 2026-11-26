@@ -52,7 +52,11 @@ while true; do
   fi
 
   echo "[carrot_web] starting external carrot_server on port ${PORT}"
-  "$PY_BIN" -m openpilot.selfdrive.carrot.carrot_server --host 0.0.0.0 --port "$PORT"
+  if command -v nice >/dev/null 2>&1; then
+    nice -n 5 "$PY_BIN" -m openpilot.selfdrive.carrot.carrot_server --host 0.0.0.0 --port "$PORT"
+  else
+    "$PY_BIN" -m openpilot.selfdrive.carrot.carrot_server --host 0.0.0.0 --port "$PORT"
+  fi
   rc=$?
   echo "[carrot_web] carrot_server exited rc=${rc}; restarting in ${RESTART_DELAY}s"
   sleep "$RESTART_DELAY"

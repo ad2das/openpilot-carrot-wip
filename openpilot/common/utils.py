@@ -5,6 +5,7 @@ import contextlib
 import subprocess
 import time
 import functools
+from collections.abc import Iterable
 from subprocess import Popen, PIPE, TimeoutExpired
 import zstandard as zstd
 
@@ -32,23 +33,61 @@ class Timer:
     realtime = f"{duration/total:.1f}x realtime" if total > 0 else "N/A"
     return f"{duration}s in {total:.1f}s ({realtime}) | {parts}"
 
-def sudo_write(val: str, path: str) -> None:
-  try:
-    with open(path, 'w') as f:
-      f.write(str(val))
-  except PermissionError:
-    os.system(f"sudo chmod a+w {path}")
+_SUDO_BATCH_SCRIPT = """
+n=$1; shift
+while [ "$n" -gt 0 ]; do
+  [ -e "$1" ] && chmod a+w "$1" 2>/dev/null || true
+  shift
+  n=$((n - 1))
+done
+while [ "$#" -ge 2 ]; do
+  [ -e "$2" ] && chmod a+w "$2" 2>/dev/null || true
+  printf '%s' "$1" > "$2" 2>/dev/null || true
+  shift 2
+done
+""".strip()
+
+
+def sudo_write_batch(writes: Iterable[tuple[str, str]], chmod_paths: Iterable[str] = ()) -> None:
+  """Write multiple privileged sysfs/proc/debugfs paths in exact order using at most one sudo call."""
+  writes_list = [(str(val), str(path)) for val, path in writes]
+  need_chmod = [str(p) for p in chmod_paths if os.path.exists(p) and not os.access(p, os.W_OK)]
+
+  pending: list[tuple[str, str]] = []
+  for val, path in writes_list:
+    if pending:
+      pending.append((val, path))
+      continue
     try:
       with open(path, 'w') as f:
-        f.write(str(val))
+        f.write(val)
     except PermissionError:
-      # fallback for debugfs files
-      os.system(f"sudo su -c 'echo {val} > {path}'")
+      pending.append((val, path))
+
+  if not pending and not need_chmod:
+    return
+
+  args: list[str] = [str(len(need_chmod)), *need_chmod]
+  for val, path in pending:
+    args.append(val)
+    args.append(path)
+  subprocess.run(["sudo", "sh", "-c", _SUDO_BATCH_SCRIPT, "_", *args], check=False)
+
+
+def sudo_write(val: str, path: str) -> None:
+  sudo_write_batch(((val, path),))
 
 
 def sudo_read(path: str) -> str:
   try:
-    return subprocess.check_output(f"sudo cat {path}", shell=True, encoding='utf8').strip()
+    with open(path, encoding='utf8') as f:
+      return f.read().strip()
+  except PermissionError:
+    pass
+  except Exception:
+    return ""
+  try:
+    return subprocess.check_output(["sudo", "cat", path], encoding='utf8').strip()
   except Exception:
     return ""
 
