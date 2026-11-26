@@ -53,25 +53,39 @@ class TunnelHandle:
     self.drain_tasks.clear()
     for task in tasks:
       task.cancel()
-    if self.process is not None:
-      if self.process.returncode is None:
+    try:
+      if self.process is not None and self.process.returncode is None:
         _signal_tunnel_process(self.process, signal.SIGTERM)
         try:
           await asyncio.wait_for(self.process.wait(), timeout=4.0)
+        except asyncio.CancelledError:
+          _signal_tunnel_process(self.process, getattr(signal, "SIGKILL", signal.SIGTERM))
+          raise
         except Exception:
           _signal_tunnel_process(self.process, getattr(signal, "SIGKILL", signal.SIGTERM))
           try:
             await asyncio.wait_for(self.process.wait(), timeout=2.0)
           except Exception:
             pass
-      transport = getattr(self.process, "_transport", None)
-      if transport is not None:
+    finally:
+      if self.process is not None:
+        if self.process.returncode is None:
+          _signal_tunnel_process(self.process, getattr(signal, "SIGKILL", signal.SIGTERM))
+          try:
+            await asyncio.wait_for(self.process.wait(), timeout=1.0)
+          except BaseException:
+            pass
+        transport = getattr(self.process, "_transport", None)
+        if transport is not None:
+          try:
+            transport.close()
+          except Exception:
+            pass
+      if tasks:
         try:
-          transport.close()
-        except Exception:
+          await asyncio.gather(*tasks, return_exceptions=True)
+        except BaseException:
           pass
-    if tasks:
-      await asyncio.gather(*tasks, return_exceptions=True)
     await asyncio.sleep(0)
 
 

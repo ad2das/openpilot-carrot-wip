@@ -15,8 +15,12 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   # Allowed read-only commands stay allowed.
   assert validate_shell_argv(["git", "status"]) is None
   assert validate_shell_argv(["git", "branch", "-a"]) is None
+  assert validate_shell_argv(["git", "branch", "-av"]) is None
+  assert validate_shell_argv(["git", "branch", "-avv"]) is None
+  assert validate_shell_argv(["git", "branch", "-rv"]) is None
   assert validate_shell_argv(["git", "branch", "--show-current"]) is None
   assert validate_shell_argv(["git", "remote", "-v"]) is None
+  assert validate_shell_argv(["git", "remote", "show", "-n", "origin"]) is None
   assert validate_shell_argv(["git", "remote", "get-url", "origin"]) is None
   assert validate_shell_argv(["git", "log", "--oneline", "-5"]) is None
   assert validate_shell_argv(["git", "diff", "--stat", "HEAD~1..HEAD", "--", "openpilot/selfdrive/carrot/carrot_man.py"]) is None
@@ -35,7 +39,11 @@ def test_validate_shell_argv_blocks_mutating_git_and_secret_cat_paths():
   assert validate_shell_argv(["git", "log", "--textconv"]) is not None
   assert validate_shell_argv(["git", "status", "-c", "core.pager=sh"]) is not None
   assert validate_shell_argv(["git", "branch", "-D", "main"]) is not None
+  assert validate_shell_argv(["git", "branch", "-aD", "main"]) is not None
   assert validate_shell_argv(["git", "branch", "new-branch"]) is not None
+  assert validate_shell_argv(["git", "remote", "show", "https://evil.example/x.git"]) is not None
+  assert validate_shell_argv(["git", "remote", "show", "/tmp/local-repo"]) is not None
+  assert validate_shell_argv(["git", "remote", "get-url", "ssh://evil.example/x.git"]) is not None
   assert validate_shell_argv(["git", "remote", "set-url", "origin", "https://evil.example/x.git"]) is not None
   assert validate_shell_argv(["git", "remote", "remove", "origin"]) is not None
 
@@ -211,21 +219,138 @@ def test_tlv_rec_producer_error_does_not_call_write_eof(tmp_path):
   assert eof_called == []
 
 
-def test_sync_shell_cmd_passes_child_lock_kwargs(monkeypatch):
-  import subprocess
+def test_sync_shell_cmd_uses_async_process_group_and_lock_kwargs(monkeypatch):
+  import os
+  from openpilot.common import async_process
   from openpilot.selfdrive.carrot.server.features.tools import dispatcher
+
+  if os.name != "nt":
+    monkeypatch.setattr(async_process, "child_lock_kwargs", lambda: {"pass_fds": (42,)})
+    pg_kwargs = async_process.process_group_kwargs()
+    assert pg_kwargs["start_new_session"] is True
+    assert pg_kwargs["pass_fds"] == (42,)
 
   captured = {}
 
-  def fake_run(argv, **kwargs):
+  async def fake_capture_exec(argv, *, cwd=None, timeout=None):
     captured["argv"] = argv
-    captured["kwargs"] = kwargs
-    return subprocess.CompletedProcess(argv, 0, stdout="ok\n", stderr="")
+    captured["cwd"] = cwd
+    captured["timeout"] = timeout
+    return 0, "ok"
 
-  monkeypatch.setattr(dispatcher, "child_lock_kwargs", lambda: {"pass_fds": (42,)})
-  monkeypatch.setattr(dispatcher.subprocess, "run", fake_run)
+  monkeypatch.setattr(dispatcher.jobs, "capture_exec", fake_capture_exec)
 
   resp = asyncio.run(dispatcher._dispatch_sync(None, {"action": "shell_cmd", "cmd": "git status"}))
   assert resp.status == 200
-  assert captured["argv"] == ["git", "status"]
-  assert captured["kwargs"]["pass_fds"] == (42,)
+  assert captured == {"argv": ["git", "status"], "cwd": "/data/openpilot", "timeout": 10.0}
+
+
+def test_build_git_update_summary_async_survives_capture_timeout(monkeypatch):
+  from openpilot.selfdrive.carrot.server.features.tools import dispatcher
+
+  async def slow_capture(_cmd, *, cwd=None, timeout=None):
+    raise TimeoutError("timed out")
+
+  monkeypatch.setattr(dispatcher.jobs, "capture_exec", slow_capture)
+
+  summary = asyncio.run(dispatcher._build_git_update_summary_async("/tmp", "aaa", "bbb", "Updating aaa..bbb"))
+  assert summary["before"] == "aaa"
+  assert summary["after"] == "bbb"
+  assert summary["commits"] == []
+
+
+def test_sync_dispatch_cancellation_kills_process_group_and_releases_repo_lock(tmp_path, monkeypatch):
+  import os
+  import time
+  import pytest
+  from openpilot.common import async_process, repo_update
+  from openpilot.selfdrive.carrot.server.features.tools import dispatcher
+
+  if os.name == "nt":
+    pytest.skip("POSIX process-group test")
+
+  lock_path = tmp_path / "repo.lock"
+  pid_file = tmp_path / "grandchild.pid"
+  monkeypatch.setattr(repo_update, "LOCK_PATH", str(lock_path))
+
+  async def fake_prepare(_repo_dir):
+    return False
+
+  monkeypatch.setattr(dispatcher, "prepare_repo", fake_prepare)
+
+  orig_capture = dispatcher.jobs.capture_exec
+
+  async def hijacked_capture(_cmd, *, cwd=None, timeout=None):
+    # Spawn a grandchild process in the same session so only killpg kills both.
+    script = f"sleep 30 & echo $! > {pid_file}; wait"
+    return await orig_capture(["bash", "-c", script], cwd=str(tmp_path), timeout=timeout)
+
+  monkeypatch.setattr(dispatcher.jobs, "capture_exec", hijacked_capture)
+
+  async def scenario():
+    task = asyncio.create_task(dispatcher.dispatch_sync(None, {"action": "git_sync"}))
+    deadline = time.monotonic() + 3.0
+    while not pid_file.exists() and time.monotonic() < deadline:
+      await asyncio.sleep(0.02)
+    assert pid_file.exists()
+    grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await task
+
+    # Grandchild must be dead AND repo_lock must be immediately acquirable (no leaked flock).
+    try:
+      os.kill(grandchild_pid, 0)
+      alive = True
+    except ProcessLookupError:
+      alive = False
+    assert not alive, f"grandchild pid {grandchild_pid} survived cancellation"
+
+    with repo_update.repo_lock():
+      assert async_process.process_group_kwargs().get("start_new_session") is True
+
+  asyncio.run(scenario())
+
+
+def test_reset_repo_fetch_timeout_restores_origin_refs(monkeypatch):
+  # stream_exec kills git and re-raises on timeout; the refs cleared before the
+  # fetch must still be put back, and the job must finish as CMD_TIMEOUT.
+  from openpilot.selfdrive.carrot.server.features.tools import dispatcher
+
+  monkeypatch.setattr(dispatcher.jobs, "persist_now", lambda: None)
+  monkeypatch.setattr(dispatcher.jobs, "persist_changed", lambda *a, **k: None)
+
+  async def fake_capture_exec(_cmd, **_kwargs):
+    return 0, ""
+
+  monkeypatch.setattr(dispatcher.jobs, "capture_exec", fake_capture_exec)
+
+  snapshot = {"refs/remotes/origin/carrot-wip": "abc\n"}
+  monkeypatch.setattr(dispatcher, "_clear_origin_remote_refs", lambda repo_dir: dict(snapshot))
+
+  restores = []
+
+  def fake_restore(repo_dir, refs):
+    restores.append((repo_dir, refs))
+    return 1
+
+  monkeypatch.setattr(dispatcher, "_restore_missing_origin_remote_refs", fake_restore)
+
+  async def timing_out_stream_exec(_job, _cmd, **_kwargs):
+    raise TimeoutError
+
+  monkeypatch.setattr(dispatcher.jobs, "stream_exec", timing_out_stream_exec)
+
+  job = {
+    "id": "w-fix2-reset-fetch",
+    "action": "git_reset_repo_fetch",
+    "payload": {},
+    "status": "running",
+    "log": "",
+  }
+  asyncio.run(dispatcher._run_tool_job(job))
+
+  assert restores == [("/data/openpilot", snapshot)]
+  assert job["status"] == "failed"
+  assert job["error_code"] == "CMD_TIMEOUT"
+  assert "fetch aborted: restored 1 previous origin refs" in job["log"]

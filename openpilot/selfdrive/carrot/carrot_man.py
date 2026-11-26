@@ -1418,6 +1418,7 @@ class CarrotMan:
                 if total_size > max_payload_bytes or (total_size % 8) != 0:
                   print(f"Rejected invalid route payload size: {total_size}")
                   continue
+                conn.settimeout(60.0)  # body: tolerate a long Wi-Fi stall but still bound it
                 # 전체 데이터를 한 번에 수신
                 all_data = self.recvall(conn, total_size)
                 if all_data is None:
@@ -2224,20 +2225,23 @@ class CarrotMan:
 
           while self.is_running:
             conn, addr = server.accept()
-            self.remote_addr = addr
-            print("Connected:", addr)
-            conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-            for opt, val in (
-              ("TCP_KEEPIDLE", 30),
-              ("TCP_KEEPINTVL", 10),
-              ("TCP_KEEPCNT", 3),
-            ):
-              if hasattr(socket, opt):
-                try:
-                  conn.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
-                except OSError:
-                  pass
             try:
+              self.remote_addr = addr
+              print("Connected:", addr)
+              try:
+                conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+              except OSError:
+                pass
+              for opt, val in (
+                ("TCP_KEEPIDLE", 30),
+                ("TCP_KEEPINTVL", 10),
+                ("TCP_KEEPCNT", 3),
+              ):
+                if hasattr(socket, opt):
+                  try:
+                    conn.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+                  except OSError:
+                    pass
               with conn.makefile("r", encoding="utf-8", errors="ignore") as f:
                 while True:
                   try:

@@ -106,6 +106,8 @@ async def api_param_set(request: web.Request) -> web.Response:
   if p is not None and isinstance(p.get("min"), (int, float)) and isinstance(p.get("max"), (int, float)):
     try:
       fv = float(value)
+    except OverflowError:
+      return web.json_response({"ok": False, "error": "non-finite numeric value"}, status=400)
     except (TypeError, ValueError):
       fv = None
     if fv is not None:

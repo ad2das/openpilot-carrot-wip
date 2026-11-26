@@ -36,13 +36,70 @@ def _set_pty_size(fd: int, rows: int, cols: int) -> None:
   fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
 
 
-def _write_all(fd: int, data: bytes) -> None:
+async def _read_fd(fd: int) -> bytes:
+  loop = asyncio.get_running_loop()
+  while True:
+    try:
+      return os.read(fd, 4096)
+    except BlockingIOError:
+      fut: asyncio.Future[None] = loop.create_future()
+
+      def _on_readable() -> None:
+        if not fut.done():
+          fut.set_result(None)
+
+      loop.add_reader(fd, _on_readable)
+      try:
+        await fut
+      finally:
+        try:
+          loop.remove_reader(fd)
+        except Exception:
+          pass
+
+
+async def _write_fd(fd: int, data: bytes) -> None:
+  loop = asyncio.get_running_loop()
   view = memoryview(data)
   while view:
-    written = os.write(fd, view)
+    try:
+      written = os.write(fd, view)
+    except BlockingIOError:
+      fut: asyncio.Future[None] = loop.create_future()
+
+      def _on_writable() -> None:
+        if not fut.done():
+          fut.set_result(None)
+
+      loop.add_writer(fd, _on_writable)
+      try:
+        await fut
+      finally:
+        try:
+          loop.remove_writer(fd)
+        except Exception:
+          pass
+      continue
     if written <= 0:
       raise OSError("pty write failed")
     view = view[written:]
+
+
+def _unregister_fd(fd: int) -> None:
+  if fd < 0:
+    return
+  try:
+    loop = asyncio.get_running_loop()
+  except RuntimeError:
+    return
+  try:
+    loop.remove_reader(fd)
+  except Exception:
+    pass
+  try:
+    loop.remove_writer(fd)
+  except Exception:
+    pass
 
 
 def _signal_proc(proc: subprocess.Popen, sig: int) -> None:
@@ -82,6 +139,7 @@ class PersistentPtySession:
     self.master_fd = -1
     self.proc: Optional[subprocess.Popen] = None
     self.reader_task: asyncio.Task | None = None
+    self._write_tasks: set[asyncio.Task] = set()
     self.clients: set[web.WebSocketResponse] = set()
     self.primary_client: web.WebSocketResponse | None = None
     self.history = bytearray()
@@ -109,95 +167,112 @@ class PersistentPtySession:
     async with self.lock:
       return self._snapshot_locked()
 
-  def _detach_proc_locked(self) -> tuple[Optional[subprocess.Popen], asyncio.Task | None, int]:
+  def _detach_proc_locked(self) -> tuple[Optional[subprocess.Popen], asyncio.Task | None, list[asyncio.Task], int]:
     proc = self.proc
     reader_task = self.reader_task
+    write_tasks = list(self._write_tasks)
     fd = self.master_fd
     self.proc = None
     self.reader_task = None
+    self._write_tasks.clear()
     self.master_fd = -1
     if proc is not None and proc.poll() is None:
       _signal_proc(proc, signal.SIGHUP)
-    return proc, reader_task, fd
+    return proc, reader_task, write_tasks, fd
 
   @staticmethod
-  async def _finish_detached(proc: Optional[subprocess.Popen], reader_task: asyncio.Task | None, fd: int) -> None:
+  async def _finish_detached(
+    proc: Optional[subprocess.Popen],
+    reader_task: asyncio.Task | None,
+    write_tasks: list[asyncio.Task],
+    fd: int,
+  ) -> None:
+    current = asyncio.current_task()
+    io_tasks: list[asyncio.Task] = []
+    if reader_task is not None and reader_task is not current:
+      reader_task.cancel()
+      io_tasks.append(reader_task)
+    for task in write_tasks:
+      if task is not current:
+        task.cancel()
+        io_tasks.append(task)
     try:
-      if proc is not None:
-        await asyncio.to_thread(_reap_proc, proc)
-      if reader_task is not None and reader_task is not asyncio.current_task():
-        reader_task.cancel()
-        await asyncio.gather(reader_task, return_exceptions=True)
+      if io_tasks:
+        await asyncio.gather(*io_tasks, return_exceptions=True)
     finally:
       if fd >= 0:
+        _unregister_fd(fd)
         try:
           os.close(fd)
         except OSError:
           pass
+    if proc is not None:
+      try:
+        await asyncio.to_thread(_reap_proc, proc)
+      except asyncio.CancelledError:
+        _signal_proc(proc, signal.SIGKILL)
+        raise
 
   async def terminate(self) -> None:
     async with self.lock:
-      proc, reader_task, fd = self._detach_proc_locked()
+      proc, reader_task, write_tasks, fd = self._detach_proc_locked()
       self.history.clear()
-    await self._finish_detached(proc, reader_task, fd)
+    await self._finish_detached(proc, reader_task, write_tasks, fd)
 
   async def ensure(self, rows: int = PTY_FIXED_ROWS, cols: int = PTY_FIXED_COLS) -> bool:
-    stale_proc: Optional[subprocess.Popen] = None
-    stale_reader: asyncio.Task | None = None
-    stale_fd = -1
-    async with self.lock:
-      if self._alive_locked():
-        return False
-      if self.proc is not None or self.reader_task is not None or self.master_fd >= 0:
-        stale_proc, stale_reader, stale_fd = self._detach_proc_locked()
-    if stale_proc is not None or stale_reader is not None or stale_fd >= 0:
-      await self._finish_detached(stale_proc, stale_reader, stale_fd)
+    while True:
+      stale_proc: Optional[subprocess.Popen] = None
+      stale_reader: asyncio.Task | None = None
+      stale_writes: list[asyncio.Task] = []
+      stale_fd = -1
+      async with self.lock:
+        if self._alive_locked():
+          return False
+        if self.proc is not None or self.reader_task is not None or self._write_tasks or self.master_fd >= 0:
+          stale_proc, stale_reader, stale_writes, stale_fd = self._detach_proc_locked()
+        else:
+          self.rows = PTY_FIXED_ROWS
+          self.cols = PTY_FIXED_COLS
+          self.history.clear()
+          if pty is None:
+            raise RuntimeError("PTY terminal is only available on POSIX devices")
 
-    async with self.lock:
-      if self._alive_locked():
-        return False
+          master_fd, slave_fd = pty.openpty()
+          try:
+            if hasattr(os, "set_blocking"):
+              os.set_blocking(master_fd, False)
+            _set_pty_size(master_fd, self.rows, self.cols)
+            env = os.environ.copy()
+            env.pop("TMUX", None)
+            env.setdefault("TERM", "xterm-256color")
+            env.setdefault("COLORTERM", "truecolor")
+            shell = os.environ.get("SHELL") or "/bin/bash"
+            proc = subprocess.Popen(
+              [shell, "-lc", tmux.start_command()],
+              stdin=slave_fd,
+              stdout=slave_fd,
+              stderr=slave_fd,
+              close_fds=True,
+              env=env,
+              start_new_session=True,
+            )
+          except Exception:
+            try:
+              os.close(master_fd)
+            except Exception:
+              pass
+            raise
+          finally:
+            try:
+              os.close(slave_fd)
+            except Exception:
+              pass
 
-      self.rows = PTY_FIXED_ROWS
-      self.cols = PTY_FIXED_COLS
-
-      self._close_fds_locked()
-      self.history.clear()
-      if pty is None:
-        raise RuntimeError("PTY terminal is only available on POSIX devices")
-
-      master_fd, slave_fd = pty.openpty()
-      try:
-        _set_pty_size(master_fd, self.rows, self.cols)
-        env = os.environ.copy()
-        env.pop("TMUX", None)
-        env.setdefault("TERM", "xterm-256color")
-        env.setdefault("COLORTERM", "truecolor")
-        shell = os.environ.get("SHELL") or "/bin/bash"
-        proc = subprocess.Popen(
-          [shell, "-lc", tmux.start_command()],
-          stdin=slave_fd,
-          stdout=slave_fd,
-          stderr=slave_fd,
-          close_fds=True,
-          env=env,
-          start_new_session=True,
-        )
-      except Exception:
-        try:
-          os.close(master_fd)
-        except Exception:
-          pass
-        raise
-      finally:
-        try:
-          os.close(slave_fd)
-        except Exception:
-          pass
-
-      self.master_fd = master_fd
-      self.proc = proc
-      self.reader_task = asyncio.create_task(self._read_loop(proc, master_fd))
-      return True
+          self.master_fd = master_fd
+          self.proc = proc
+          self.reader_task = asyncio.create_task(self._read_loop(proc, master_fd))
+          return True
+      await self._finish_detached(stale_proc, stale_reader, stale_writes, stale_fd)
 
   async def attach(
     self,
@@ -253,7 +328,19 @@ class PersistentPtySession:
       if not self._alive_locked():
         raise RuntimeError("terminal session is not running")
       fd = self.master_fd
-    await asyncio.to_thread(_write_all, fd, data)
+      writer = asyncio.create_task(_write_fd(fd, data))
+      self._write_tasks.add(writer)
+    try:
+      await writer
+    except asyncio.CancelledError:
+      current = asyncio.current_task()
+      if writer.cancelled() and (current is None or not current.cancelling()):
+        raise RuntimeError("terminal session is not running") from None
+      writer.cancel()
+      await asyncio.gather(writer, return_exceptions=True)
+      raise
+    finally:
+      self._write_tasks.discard(writer)
 
   async def clear_history(self) -> None:
     async with self.lock:
@@ -316,7 +403,7 @@ class PersistentPtySession:
             break
           read_fd = fd if fd >= 0 else self.master_fd
         try:
-          chunk = await asyncio.to_thread(os.read, read_fd, 4096)
+          chunk = await _read_fd(read_fd)
         except asyncio.CancelledError:
           raise
         except OSError:
@@ -335,19 +422,26 @@ class PersistentPtySession:
         })
     finally:
       owned_proc: Optional[subprocess.Popen] = None
+      owned_writes: list[asyncio.Task] = []
+      owned_fd = -1
       session = self.session
       clients: list[web.WebSocketResponse] = []
       async with self.lock:
         if proc is None or self.proc is proc:
           owned_proc = self.proc
+          owned_writes = list(self._write_tasks)
+          owned_fd = self.master_fd
           session = self.session
           clients = list(self.clients)
           self.clients.clear()
           self.primary_client = None
-          self._close_fds_locked()
+          self._write_tasks.clear()
+          self.master_fd = -1
           self.proc = None
           if self.reader_task is asyncio.current_task():
             self.reader_task = None
+      if owned_writes or owned_fd >= 0:
+        await self._finish_detached(None, None, owned_writes, owned_fd)
       if owned_proc is not None:
         exit_code = await asyncio.to_thread(_reap_proc, owned_proc)
         payload = json.dumps({
@@ -366,6 +460,7 @@ class PersistentPtySession:
 
   def _close_fds_locked(self) -> None:
     if self.master_fd >= 0:
+      _unregister_fd(self.master_fd)
       try:
         os.close(self.master_fd)
       except Exception:

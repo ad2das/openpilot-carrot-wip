@@ -63,6 +63,7 @@ _READ_ONLY_BRANCH_FLAGS = {
   "--sort", "--format", "--color", "--no-color", "--abbrev", "--no-abbrev",
   "--column", "--no-column",
 }
+_READ_ONLY_BRANCH_SHORT_CHARS = frozenset("arvlq")
 # Flags whose value git may take from the NEXT argument. --color/--abbrev/--column
 # only accept an attached "--flag=value", so they must not be listed here: git would
 # read the following argument as a branch operation (`--color -m --color x` renames).
@@ -140,12 +141,16 @@ def _validate_git_args(subcommand: str, args: List[str]) -> Optional[Tuple[str, 
         continue
       if arg.startswith("-"):
         base = arg.split("=", 1)[0]
-        if base not in _READ_ONLY_BRANCH_FLAGS:
+        if base in _READ_ONLY_BRANCH_FLAGS:
+          if base in ("-l", "--list"):
+            allow_positional = True
+          elif base in _BRANCH_VALUE_FLAGS and "=" not in arg:
+            expect_value = True
+        elif len(arg) > 2 and not arg.startswith("--") and set(arg[1:]) <= _READ_ONLY_BRANCH_SHORT_CHARS:
+          if "l" in arg[1:]:
+            allow_positional = True
+        else:
           return f"git branch flag not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
-        if base in ("-l", "--list"):
-          allow_positional = True
-        elif base in _BRANCH_VALUE_FLAGS and "=" not in arg:
-          expect_value = True
       elif not allow_positional:
         return f"git branch mutation not allowed: {arg}", "GIT_CMD_NOT_ALLOWED", arg
     return None
@@ -158,13 +163,19 @@ def _validate_git_args(subcommand: str, args: List[str]) -> Optional[Tuple[str, 
       return None
     if first == "show":
       for extra in args[1:]:
-        if extra.startswith("-") and extra != "-n":
-          return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+        if extra.startswith("-"):
+          if extra != "-n":
+            return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+        elif any(ch in extra for ch in ("/", "\\", ":", "@", "\x00")) or extra in (".", "..") or ".." in extra:
+          return f"git remote target not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
       return None
     if first == "get-url":
       for extra in args[1:]:
-        if extra.startswith("-") and extra not in ("--push", "--all"):
-          return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+        if extra.startswith("-"):
+          if extra not in ("--push", "--all"):
+            return f"git remote flag not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
+        elif any(ch in extra for ch in ("/", "\\", ":", "@", "\x00")) or extra in (".", "..") or ".." in extra:
+          return f"git remote target not allowed: {extra}", "GIT_CMD_NOT_ALLOWED", extra
       return None
     return f"git remote action not allowed: {first}", "GIT_CMD_NOT_ALLOWED", first
 

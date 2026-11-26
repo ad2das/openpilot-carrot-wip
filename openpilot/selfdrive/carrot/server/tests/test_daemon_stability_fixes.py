@@ -247,3 +247,140 @@ def test_carrot_man_make_tmux_data_uses_timeout(monkeypatch):
   assert cm.make_tmux_data() is False
   assert seen == [15]
 
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess test")
+def test_support_tunnel_stop_cancellation_still_kills_process(tmp_path, monkeypatch):
+  # Ignore SIGTERM so stop() waits in wait_for(wait(), 4.0) until cancelled.
+  script = _make_script(
+    tmp_path,
+    "ignore_term.sh",
+    "trap '' TERM\n"
+    "echo 'https://cancel-safe-123.trycloudflare.com' >&2\n"
+    "while true; do sleep 1; done",
+  )
+  monkeypatch.delenv("CARROT_SUPPORT_FAKE_TUNNEL_URL", raising=False)
+  monkeypatch.setattr(support_tunnel, "cloudflared_path", lambda: script)
+
+  async def run():
+    handle = await support_tunnel.start_quick_tunnel("http://127.0.0.1:9999", timeout_s=5.0)
+    pid = handle.process.pid
+    stop_task = asyncio.create_task(handle.stop())
+    await asyncio.sleep(0.15)
+    stop_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+      await stop_task
+    assert handle.process.returncode is not None
+    try:
+      os.kill(pid, 0)
+      alive = True
+    except ProcessLookupError:
+      alive = False
+    assert not alive, f"tunnel process {pid} survived cancelled stop()"
+
+  asyncio.run(run())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX PTY test")
+def test_terminal_pty_nonblocking_rapid_restart_no_fd_leak_and_reaps_dead_proc(monkeypatch):
+  monkeypatch.setattr(
+    terminal_pty.tmux,
+    "start_command",
+    lambda: f"{sys.executable} -u -c 'import sys, time; print(\"pty-ok\", flush=True); line = sys.stdin.readline(); print(\"echo:\" + line.strip(), flush=True); time.sleep(30)'",
+  )
+
+  async def run():
+    session = terminal_pty.PersistentPtySession()
+    fd_dir = "/proc/self/fd"
+    before_fds = len(os.listdir(fd_dir)) if os.path.isdir(fd_dir) else None
+
+    for i in range(6):
+      assert await session.ensure() is True
+      await session.write_text(f"ping-{i}\n")
+      deadline = time.monotonic() + 2.0
+      while f"echo:ping-{i}".encode() not in session.history and time.monotonic() < deadline:
+        await asyncio.sleep(0.02)
+      assert f"echo:ping-{i}".encode() in session.history
+      await session.terminate()
+      assert session.proc is None
+      assert session.master_fd == -1
+
+    # Simulate an already-exited proc sitting in session.proc before ensure() runs.
+    monkeypatch.setattr(terminal_pty.tmux, "start_command", lambda: f"{sys.executable} -c 'pass'")
+    assert await session.ensure() is True
+    dead_proc = session.proc
+    assert dead_proc is not None
+    deadline = time.monotonic() + 2.0
+    while dead_proc.poll() is None and time.monotonic() < deadline:
+      await asyncio.sleep(0.02)
+    monkeypatch.setattr(terminal_pty.tmux, "start_command", lambda: f"{sys.executable} -u -c 'import time; time.sleep(30)'")
+    assert await session.ensure() is True
+    assert dead_proc.poll() is not None
+    assert session.proc is not None and session.proc.pid != dead_proc.pid
+    await session.terminate()
+
+    if before_fds is not None:
+      after_fds = len(os.listdir(fd_dir))
+      assert after_fds <= before_fds + 2, f"PTY fd leak: before={before_fds}, after={after_fds}"
+
+  asyncio.run(run())
+
+
+def test_carrot_man_tcp_keepalive_oserror_closes_conn_and_clears_remote_addr(monkeypatch):
+  import socket
+  from openpilot.selfdrive.carrot import carrot_man
+
+  closed = []
+  cm = carrot_man.CarrotMan.__new__(carrot_man.CarrotMan)
+  cm.is_running = True
+  cm.remote_addr = None
+
+  class _FakeConn:
+    def setsockopt(self, *args):
+      raise OSError("ECONNRESET")
+
+    def close(self):
+      closed.append(True)
+      cm.is_running = False
+
+  class _FakeServer:
+    def __enter__(self):
+      return self
+
+    def __exit__(self, *args):
+      return False
+
+    def setsockopt(self, *args):
+      pass
+
+    def bind(self, *args):
+      pass
+
+    def listen(self, *args):
+      pass
+
+    def accept(self):
+      return _FakeConn(), ("127.0.0.1", 55555)
+
+  monkeypatch.setattr(socket, "socket", lambda *a, **kw: _FakeServer())
+  cm.carrot_navi_tcp_server(port=0)
+  assert closed == [True]
+  assert cm.remote_addr is None
+
+
+def test_api_param_set_rejects_huge_int_overflow_with_400(monkeypatch):
+  from openpilot.selfdrive.carrot.server.features import params as params_feature
+
+  by_name = {"CruiseSpeed": {"name": "CruiseSpeed", "min": 0, "max": 200, "default": 60}}
+  monkeypatch.setattr(params_feature, "get_settings_cached", lambda: ([], [], by_name, {}))
+  monkeypatch.setattr(params_feature, "get_param_values", lambda names, defaults: {"CruiseSpeed": 60})
+
+  async def run():
+    req = SimpleNamespace(
+      json=lambda: asyncio.sleep(0, result={"name": "CruiseSpeed", "value": 10 ** 400}),
+    )
+    resp = await params_feature.api_param_set(req)
+    assert resp.status == 400
+    assert json.loads(resp.text)["ok"] is False
+
+  asyncio.run(run())
+

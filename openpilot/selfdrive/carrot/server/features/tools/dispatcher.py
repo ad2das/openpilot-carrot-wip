@@ -44,6 +44,7 @@ TMUX_LOG_PATH = "/data/media/tmux.log"
 GIT_UPDATE_COMMIT_LIMIT = 20
 GIT_UPDATE_DISPLAY_LIMIT = 3
 _SYNC_NETWORK_GIT_SUBCMDS = {"fetch", "pull", "push", "clone", "ls-remote"}
+_SYNC_SLOW_GIT_SUBCMDS = {"merge", "reset", "checkout", "switch", "clean", "pack-refs", "gc", "repack"}
 
 
 _ORIGIN_REF_PREFIX = "refs/remotes/origin/"
@@ -321,15 +322,21 @@ async def _build_git_update_summary_async(repo_dir: str, before: str, after: str
     )
 
   range_spec = f"{before}..{after}"
-  rc_count, count_out = await jobs.capture_exec(["git", "rev-list", "--count", range_spec], cwd=repo_dir, timeout=15)
+
+  async def _capture(cmd: List[str], timeout: float) -> Tuple[int, str]:
+    try:
+      return await jobs.capture_exec(cmd, cwd=repo_dir, timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError, OSError):
+      return 1, ""
+
+  rc_count, count_out = await _capture(["git", "rev-list", "--count", range_spec], timeout=15)
   commit_count = _safe_int(count_out) if rc_count == 0 else 0
-  rc_log, log_out = await jobs.capture_exec(
+  rc_log, log_out = await _capture(
     ["git", "log", "--format=%h%x09%s", f"-{GIT_UPDATE_COMMIT_LIMIT}", range_spec],
-    cwd=repo_dir,
     timeout=15,
   )
   commits = _parse_git_commit_lines(log_out if rc_log == 0 else "")
-  rc_stat, stat_out = await jobs.capture_exec(["git", "diff", "--shortstat", before, after], cwd=repo_dir, timeout=20)
+  rc_stat, stat_out = await _capture(["git", "diff", "--shortstat", before, after], timeout=20)
   shortstat = _parse_git_shortstat(stat_out if rc_stat == 0 else "")
   return _format_git_update_summary(
     before=before,
@@ -758,9 +765,19 @@ async def _run_tool_job(job: Dict[str, Any]) -> None:
       jobs.progress(job, message="git fetch origin --prune --force", current=3, total=4)
       origin_refs = await run_locked_thread(_clear_origin_remote_refs, repo_dir)
       await jobs.capture_exec(["git", "pack-refs", "--all"], cwd=repo_dir, timeout=20)
-      rc_fetch = await jobs.stream_exec(
-        job, ["git", "fetch", "origin", "--prune", "--force"], cwd=repo_dir, timeout=300
-      )
+      try:
+        rc_fetch = await jobs.stream_exec(
+          job, ["git", "fetch", "origin", "--prune", "--force"], cwd=repo_dir, timeout=300
+        )
+      except BaseException:
+        # stream_exec already stopped git; put back the refs cleared above before propagating
+        try:
+          restored = await run_locked_thread(_restore_missing_origin_remote_refs, repo_dir, origin_refs or {})
+          if restored:
+            jobs.append(job, f"fetch aborted: restored {restored} previous origin refs\n")
+        except Exception:
+          pass
+        raise
       if rc_fetch != 0:
         restored = await run_locked_thread(_restore_missing_origin_remote_refs, repo_dir, origin_refs or {})
         if restored:
@@ -1040,19 +1057,15 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
     error, error_code = action_error
     return web.json_response({"ok": False, "error": error, "error_code": error_code}, status=400)
 
-  def _run_sync(cmd: List[str], cwd: Optional[str], timeout: float) -> Tuple[int, str]:
-    try:
-      p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, **child_lock_kwargs())
-    except subprocess.TimeoutExpired:
-      return 124, f"command timed out after {int(timeout)}s"
-    out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
-    return p.returncode, out.strip()
-
   async def run(cmd: List[str], cwd: Optional[str] = None, timeout: Optional[float] = None) -> Tuple[int, str]:
     if timeout is None:
       is_net_git = len(cmd) >= 2 and cmd[0] == "git" and cmd[1] in _SYNC_NETWORK_GIT_SUBCMDS
-      timeout = 60.0 if is_net_git else 15.0
-    return await asyncio.to_thread(_run_sync, cmd, cwd, timeout)
+      is_slow_git = len(cmd) >= 2 and cmd[0] == "git" and cmd[1] in _SYNC_SLOW_GIT_SUBCMDS
+      timeout = 180.0 if is_net_git else (120.0 if is_slow_git else 30.0)
+    try:
+      return await jobs.capture_exec(cmd, cwd=cwd, timeout=timeout)
+    except (asyncio.TimeoutError, TimeoutError):
+      return 124, f"command timed out after {int(timeout)}s"
 
   try:
     REPO_DIR = "/data/openpilot"
@@ -1450,23 +1463,10 @@ async def _dispatch_sync(request: web.Request, body: Dict[str, Any]) -> web.Resp
         return web.json_response({"ok": False, "error": error, "error_code": error_code, "error_detail": detail}, status=403)
 
       try:
-        p = await asyncio.to_thread(
-          subprocess.run,
-          argv,
-          cwd="/data/openpilot",
-          capture_output=True,
-          text=True,
-          timeout=10,
-          **child_lock_kwargs(),
-        )
-        out = ""
-        if p.stdout:
-          out += p.stdout
-        if p.stderr:
-          out += ("\n" + p.stderr if out else p.stderr)
+        rc, out = await jobs.capture_exec(argv, cwd="/data/openpilot", timeout=10.0)
         out = out.strip() or "(no output)"
-        return web.json_response({"ok": p.returncode == 0, "out": out, "returncode": p.returncode})
-      except subprocess.TimeoutExpired:
+        return web.json_response({"ok": rc == 0, "out": out, "returncode": rc})
+      except (asyncio.TimeoutError, TimeoutError):
         return web.json_response({"ok": False, "error": "timeout"}, status=504)
       except Exception as e:
         return web.json_response({"ok": False, "error": str(e)}, status=500)
