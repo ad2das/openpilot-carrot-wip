@@ -66,6 +66,33 @@ def test_manager_loop_kicks_first():
   assert ast.unparse(fn).count("StallWatchdog(") == 1
 
 
+def _forked_child_noop():
+  pass
+
+
+def test_forked_child_after_kick_does_not_hang(tmp_path):
+  # The manager forks onroad processes after kick() has armed faulthandler's later-dump.
+  # Cancelling that dump in the child waited forever for the parent's helper thread,
+  # so camerad/card/selfdrived never ran (black camera, "Waiting to start").
+  import faulthandler
+  import multiprocessing
+  wd = StallWatchdog(stall_s=30, check_s=10.0, repeat_s=100.0, log=lambda _m: None, fault_path=str(tmp_path / "fh.log"))
+  wd.start()
+  wd.kick()
+  try:
+    p = multiprocessing.get_context("fork").Process(target=_forked_child_noop)
+    p.start()
+    p.join(5.0)
+    hung = p.is_alive()
+    if hung:
+      p.kill()
+      p.join()
+    assert not hung, "forked child hung in the stall watchdog after-fork hook"
+    assert p.exitcode == 0
+  finally:
+    faulthandler.cancel_dump_traceback_later()
+
+
 def test_stacks_respects_stack_cap_without_zero_slice_overflow(monkeypatch):
   import openpilot.system.manager.stall_watchdog as sw
   monkeypatch.setattr(sw, "STACK_CAP", 20)

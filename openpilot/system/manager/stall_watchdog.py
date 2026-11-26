@@ -24,10 +24,13 @@ _AT_FORK_REGISTERED = False
 
 
 def _after_fork_child() -> None:
-  try:
-    faulthandler.cancel_dump_traceback_later()
-  except Exception:
-    pass
+  # Never call faulthandler.cancel_dump_traceback_later() here. kick() keeps the
+  # later-dump armed, so its helper thread holds faulthandler's internal "running"
+  # lock at every fork. That thread does not exist in the child, so cancelling waits
+  # for it forever: every fork-started onroad process (camerad, card, selfdrived, ...)
+  # hung before running, leaving a black camera and "openpilot Unavailable /
+  # Waiting to start". The armed timer cannot fire in the child anyway, because only
+  # the parent has the helper thread. Only drop the child's copy of the fault file.
   for wd in list(_ACTIVE_WATCHDOGS):
     fh = wd._fh
     wd._fh = None
