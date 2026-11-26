@@ -162,7 +162,8 @@ def next_segment(base_url: str, now: float) -> tuple[str, dict[str, int]] | None
   best_key: tuple[int, int, str, str, int, str] | None = None
   try:
     names = os.listdir(DASHCAM_ROOT)
-  except OSError:
+  except OSError as e:
+    cloudlog.event("carrot_log_sync_listdir_fail", root=DASHCAM_ROOT, error=repr(e))
     return None
   for name in names:
     try:

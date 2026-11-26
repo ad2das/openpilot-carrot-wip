@@ -489,3 +489,17 @@ def test_tlvrec_rotated_session_when_drive_segments_absent(tmp_path, monkeypatch
   assert asyncio.run(sync.run_once()) == 0.5
   assert [u["remote_path"] for u in uploads] == [f"tlvrec--{TLV_SESSION}"]
   assert not os.path.exists(session_dir)
+
+
+def test_next_segment_logs_listdir_failure(tmp_path, monkeypatch):
+  events = []
+  monkeypatch.setattr(log_sync, "DASHCAM_ROOT", os.path.join(str(tmp_path), "missing-root"))
+  monkeypatch.setattr(log_sync, "cloudlog", SimpleNamespace(
+    event=lambda *args, **kwargs: events.append((args, kwargs)),
+  ))
+  assert log_sync.next_segment(BASE_URL, time.time()) is None  # noqa: TID251
+  assert len(events) == 1
+  args, kwargs = events[0]
+  assert args[0] == "carrot_log_sync_listdir_fail"
+  assert kwargs["root"] == os.path.join(str(tmp_path), "missing-root")
+  assert kwargs["error"]
