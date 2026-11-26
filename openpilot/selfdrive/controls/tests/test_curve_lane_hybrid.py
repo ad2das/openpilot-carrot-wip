@@ -13,10 +13,10 @@ import math
 import numpy as np
 
 from openpilot.selfdrive.controls.lib.curve_lane_hybrid import (
-  CAP_A, CausalMedian, CurveLaneHybrid, GATE_HOLD_A, GATE_REENTRY_A, GATE_REENTRY_CS,
+  A_ADD_CAP, CAP_A, CausalMedian, CurveLaneHybrid, GATE_HOLD_A, GATE_REENTRY_A, GATE_REENTRY_CS,
   GATE_ROAD_A, GUARD_BAD, GUARD_LW, GUARD_SHAPE, GUARD_W45, GUARD_REARM_S, HOLD_RELEASE_CS,
-  HOLD_S, J_DOWN, J_UP, JUMP_C, SPIKE_OK_RUN, STRICT_STD, STRICT_STD_HOLD, V_MIN, W_C_LO,
-  W_C_SPAN, HybridFrame,
+  HOLD_S, J_DOWN, J_DOWN_RELEASE, J_UP, JUMP_C, SPIKE_OK_RUN, STRICT_STD, STRICT_STD_HOLD, V_MIN,
+  W_C_LO, W_C_SPAN, HybridFrame,
 )
 
 DT = 0.05          # 20 Hz modelV2
@@ -94,8 +94,9 @@ def test_zero_c_s_contributes_nothing():
 # --- cap / weights --------------------------------------------------------------------------
 def test_cap_scales_with_v2():
   _a, m = run([frame(0.0), frame(DT, k_lane=-1.0)])
-  # dk clipped to +-CAP_A / v^2 = 0.00128, one-sided and leftward -> |tgt| = CAP_A exactly.
-  assert abs(m.tgt + CAP_A) < 1e-9
+  # dk clip is CAP_A / v^2 = 0.00128, so |tgt| = CAP_A before the target cap; the target cap
+  # A_ADD_CAP then binds, and it too is in m/s^2.
+  assert abs(m.tgt + min(CAP_A, A_ADD_CAP)) < 1e-9
 
 
 def test_cap_is_in_m_per_s2_not_curvature():
@@ -103,7 +104,8 @@ def test_cap_is_in_m_per_s2_not_curvature():
   _a, m = run([frame(0.0, v=20.0, kappa=0.004, dc=0.004),
                frame(DT, v=20.0, kappa=0.004, dc=0.004, k_lane=-1.0)])
   assert m.on
-  assert abs(m.tgt + CAP_A) < 1e-9
+  # dk clip is CAP_A / v^2 = 0.002 here, so the raw target is 0.8; the A_ADD_CAP cap binds at 0.30.
+  assert abs(m.tgt + min(CAP_A, A_ADD_CAP)) < 1e-9
   assert m.curvature == m.a_add / 20.0 ** 2
 
 
@@ -111,8 +113,8 @@ def test_w_c_ramp():
   for c_s in (0.05, 0.10, 0.175, 0.25, 0.5):
     _a, m = run([frame(0.0), frame(DT, c_s=c_s)])
     w_c = min(max((abs(c_s) - W_C_LO) / W_C_SPAN, 0.0), 1.0)
-    got = m.tgt / (-0.001 * V2)
-    assert abs(got - w_c) <= 1e-12, (c_s, got, w_c)
+    want = -min(w_c * 0.001 * V2, A_ADD_CAP)
+    assert abs(m.tgt - want) <= 1e-12, (c_s, m.tgt, want)
 
 
 # --- slew -----------------------------------------------------------------------------------
@@ -155,7 +157,7 @@ def test_hold_s_zero_releases_frame_after_latch():
   states, mod = on_states(seq)
   assert HOLD_S == 0.0
   assert states == [True, True, False, False]
-  assert GATE_HOLD_A == 0.45
+  assert GATE_HOLD_A == 0.5
   assert mod.on is False
 
 
@@ -332,29 +334,18 @@ def test_road_strength_exact_boundary():
 
 
 def test_reentry_clause_needs_cs():
-  # curve_a = a_road = 0.625 in [GATE_REENTRY_A (0.45), GATE_ON_A (0.65))
+  # curve_a = a_road = 0.625 in [0.5, 0.8)
   lo = dict(kappa=0.001, dc=0.001)
-  _a, m = run([frame(0.0, c_s=0.15, **lo)])
+  _a, m = run([frame(0.0, c_s=0.20, **lo)])
   assert m.on is False
   _a, m = run([frame(0.0, c_s=GATE_REENTRY_CS, **lo)])
   assert m.on is True
-  assert GATE_REENTRY_A == 0.45
+  assert GATE_REENTRY_A == 0.5
 
 
 def test_below_reentry_strength_never_enters():
   _a, m = run([frame(0.0, c_s=0.9, kappa=0.0007, dc=0.0007)])   # curve_a 0.4375
   assert m.on is False
-
-
-def test_midspeed_narrow_right_curve_restores_left():
-  """Regression for 000004e5 seg 10/12: 50 km/h right curve on 2.50 m narrow lane activates and pulls left."""
-  v = 50.0 / 3.6
-  kw = dict(v=v, c_s=0.22, w0=2.50, w15=2.54, w30=2.58, w0_g=2.50, w45=2.65,
-            kappa=0.0045, dc=0.0045, k_model=0.0045, k_lane=0.0038)
-  a, m = run([frame(0.0, **kw), frame(DT, **kw)])
-  assert m.eligible is True
-  assert m.on is True
-  assert m.tgt < 0.0 and a[1] < 0.0
 
 
 # --- masks ----------------------------------------------------------------------------------
@@ -367,7 +358,7 @@ def test_base_mask_fields():
 
 def test_strict_mask_fields():
   for kw in (dict(lprob=0.69), dict(rprob=0.69), dict(std1=0.26), dict(std2=0.26),
-             dict(w0=2.44), dict(w0=4.21), dict(w15=2.4), dict(w30=4.3),
+             dict(w0=2.59), dict(w0=4.21), dict(w15=2.5), dict(w30=4.3),
              dict(w30=3.7, w0=3.2)):          # |w30 - w0| = 0.5 > W_TAPER
     _a, m = run([frame(0.0, **kw)])
     assert m.eligible is False, kw
@@ -486,3 +477,28 @@ def test_reset_clears_state():
   m.reset()
   assert m.a_add == 0.0 and m.on is False and m.guard is False and m.cont is False
   assert m._spike_run == SPIKE_OK_RUN and m._guard_last_t is None
+
+
+# --- lane-fix: release rate, cap ------------------------------------------------------------
+def test_release_rate_when_gate_turns_off():
+  """Gate off (not eligible, no drop): |a_add| falls by J_DOWN_RELEASE * dt."""
+  assert (J_DOWN_RELEASE, A_ADD_CAP) == (0.60, 0.30)
+  m = CurveLaneHybrid()
+  m.update(frame(0.0))
+  assert m.on is True
+  m._a = -0.30
+  m.a_add = -0.30
+  m.update(frame(DT, lprob=0.69))
+  assert m.on is False and m.drop is False
+  assert abs(abs(m.a_add) - (0.30 - 0.60 * DT)) < 1e-9
+
+
+def test_tgt_capped_at_a_add_cap():
+  """A -0.40 m/s^2 target settles exactly at the -0.30 cap."""
+  assert (J_DOWN_RELEASE, A_ADD_CAP) == (0.60, 0.30)
+  # w_c 1 (c_s 0.5), dk_rest -0.00064 -> raw tgt -0.40 before the cap
+  fr = lambda t: frame(t, k_lane=0.00136, k_model=0.002)
+  a, m = run([fr(DT * i) for i in range(30)])
+  assert abs(m.tgt + 0.30) < 1e-12
+  assert m.on is True
+  assert abs(a[-1] + 0.30) <= 1e-9, a[-1]

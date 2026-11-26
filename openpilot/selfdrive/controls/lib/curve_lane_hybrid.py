@@ -23,12 +23,12 @@ STEP_MAX_DT = 0.1
 STRICT_PROB = 0.7
 STRICT_STD = 0.25
 STRICT_STD_HOLD = 0.35
-W_LO, W_HI = 2.45, 4.2
+W_LO, W_HI = 2.6, 4.2
 W_TAPER = 0.45
 JUMP_C = 0.25
 JUMP_W = 0.35
 SPIKE_OK_RUN = 10
-V_MIN = 40.0 / 3.6
+V_MIN = 60.0 / 3.6
 
 # --- guards (report_hybrid5.py:41-49) -------------------------------------------------------
 G_SHAPE_BAR = 0.45
@@ -39,11 +39,11 @@ GUARD_REARM_S = 0.5
 
 # --- gate (report_hybrid5.py:50-58) ---------------------------------------------------------
 CAP_A = 0.8
-GATE_ON_A = 0.65
-GATE_REENTRY_A = 0.45
-GATE_REENTRY_CS = 0.20
+GATE_ON_A = 0.8
+GATE_REENTRY_A = 0.5
+GATE_REENTRY_CS = 0.30
 GATE_ROAD_A = 0.3
-GATE_HOLD_A = 0.45
+GATE_HOLD_A = 0.5
 HOLD_LATCH_CS = 0.20
 HOLD_RELEASE_CS = 0.15
 HOLD_S = 0.0
@@ -52,12 +52,14 @@ W_C_SPAN = 0.15
 ALPHA_MAX = 1.0
 J_UP = 0.27
 J_DOWN = 0.27
+J_DOWN_RELEASE = 0.60  # slew-down rate once the gate is off or the target is 0 (field 501--3 overshoot)
+A_ADD_CAP = 0.30       # |tgt| cap, m/s^2
 
 # --- module (SPEC_2B section 1) -------------------------------------------------------------
 CS_MEDIAN_N = 3
 PREWARM_ROAD_A = 0.20
 PREWARM_CURVE_A = 0.40
-RUN_V_MIN = 35.0 / 3.6
+RUN_V_MIN = 60.0 / 3.6
 
 GUARD_SHAPE = 1
 GUARD_W45 = 2
@@ -281,7 +283,8 @@ class CurveLaneHybrid:
       else:
         a += (1.0 if g > 0 else -1.0) * step
     else:
-      step = J_DOWN * dt
+      jd = J_DOWN_RELEASE if (not self.on or g == 0.0) else J_DOWN
+      step = jd * dt
       if step >= abs(g - a):
         a = g
       else:
@@ -325,6 +328,7 @@ class CurveLaneHybrid:
 
     tgt = w_c * dk_rest * v2 if self.on else 0.0
     self.tgt = tgt if _finite(tgt) else 0.0
+    self.tgt = _clip(self.tgt, -A_ADD_CAP, A_ADD_CAP)
 
     if self.drop:
       self._a = 0.0
