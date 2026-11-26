@@ -771,6 +771,55 @@ def test_banner_alert_still_wins_over_top_exit_prompt(hud_module, monkeypatch):
   assert "topexit" not in calls
 
 
+def test_nav_route_path_needs_two_points_without_splitting_every_frame(hud_module):
+  module, fake_ui_state = hud_module
+  renderer = object.__new__(module.HudRenderer)
+
+  def has_route(paths):
+    fake_ui_state.sm = {"carrotMan": SimpleNamespace(naviPaths=paths)}
+    return renderer._has_nav_route_path()
+
+  def old_rule(paths):
+    # The previous per-frame rule: count non-empty ';' items and require more than one.
+    text = str(paths or "").strip()
+    return bool(text) and sum(1 for item in text.split(";") if item) > 1
+
+  for paths, expected in (("", False), ("  ", False), ("1,0,0", False), ("1,0,0;", False), (";1,0,0;;", False),
+                          ("1,0,0;2,0,0", True), (";;1,0,0;;2,0,0;;", True), ("1,0,0; ;", True), (None, False)):
+    assert has_route(paths) is expected, paths
+    assert old_rule(paths) is expected, paths
+
+  fake_ui_state.sm = None
+  assert renderer._has_nav_route_path() is False
+
+  class CountingCarrotMan:
+    def __init__(self):
+      self.reads = 0
+
+    @property
+    def naviPaths(self):
+      self.reads += 1
+      return "1,0,0;2,0,0"
+
+  class FakeSubMaster:
+    def __init__(self):
+      self.recv_frame = {"carrotMan": 7}
+      self.carrot_man = CountingCarrotMan()
+
+    def __getitem__(self, key):
+      assert key == "carrotMan"
+      return self.carrot_man
+
+  sm = FakeSubMaster()
+  fake_ui_state.sm = sm
+  assert renderer._has_nav_route_path() is True
+  assert renderer._has_nav_route_path() is True
+  assert sm.carrot_man.reads == 1  # same carrotMan message: no re-read of the route string
+  sm.recv_frame["carrotMan"] = 8
+  assert renderer._has_nav_route_path() is True
+  assert sm.carrot_man.reads == 2
+
+
 def test_tlv_top_exit_reads_carrot_man_and_tolerates_old_schema(hud_module):
   module, fake_ui_state = hud_module
   renderer = object.__new__(module.HudRenderer)

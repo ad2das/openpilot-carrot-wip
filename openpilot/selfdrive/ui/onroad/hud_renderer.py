@@ -652,14 +652,28 @@ class HudRenderer(Widget):
       return 0
 
 
-  def _get_nav_path_vertex_count(self) -> int:
+  def _has_nav_route_path(self) -> bool:
+    """True when carrotMan.naviPaths holds at least two non-empty route points.
+
+    Splitting the whole route allocated one string per point on every frame. Two
+    non-empty points exist exactly when the path, trimmed of outer ';', still has a
+    separator. The answer is cached per carrotMan message when the frame is known.
+    """
+    sm = ui_state.sm
     try:
-      navi_paths = str(ui_state.sm["carrotMan"].naviPaths or "").strip()
-      if not navi_paths:
-        return 0
-      return sum(1 for item in navi_paths.split(";") if item)
+      recv_frame = sm.recv_frame["carrotMan"]
     except Exception:
-      return 0
+      recv_frame = None
+    if recv_frame is not None and recv_frame == getattr(self, "_nav_route_recv_frame", None):
+      return bool(getattr(self, "_nav_route_cached", False))
+    try:
+      has_route = ";" in str(sm["carrotMan"].naviPaths or "").strip().strip(";")
+    except Exception:
+      has_route = False
+    if recv_frame is not None:
+      self._nav_route_recv_frame = recv_frame
+      self._nav_route_cached = has_route
+    return has_route
 
 
   def _get_traffic_state(self) -> int:
@@ -1066,7 +1080,7 @@ class HudRenderer(Widget):
       items.append(("APN", hs.LIVE_GREEN) if active_carrot >= 2 else ("APM", NAV_BLUE))
     if self._gps_has_fix():
       items.append(("GPS", hs.LIVE_GREEN))
-    if self._get_nav_path_vertex_count() > 1:
+    if self._has_nav_route_path():
       items.append(("ROUTE", hs.LIVE_GREEN))
     return items
 
