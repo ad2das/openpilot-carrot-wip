@@ -727,11 +727,9 @@ class CarController(CarControllerBase):
       # carrot.. 왜 alt_cruise_button는 값이 리스트일까?, 그리고 왜? 빈데이터가 들어오는것일까?
       if CS.cruise_buttons_msg is not None and self.CP.flags & HyundaiFlags.CANFD_ALT_BUTTONS:
         try:
-          cruise_buttons_msg_values = {
-            key: (value[0] if isinstance(value, (list, tuple)) else value)
-            for key, value in CS.cruise_buttons_msg.items()
-          }
-        except (IndexError, TypeError):
+          cruise_buttons_msg_values = {key: value[0] for key, value in CS.cruise_buttons_msg.items()}
+        except: # IndexError:  # noqa: E722
+          #print("IndexError....")
           cruise_buttons_msg_values = None
           self.cruise_buttons_msg_cnt += 1
         if cruise_buttons_msg_values is not None:
