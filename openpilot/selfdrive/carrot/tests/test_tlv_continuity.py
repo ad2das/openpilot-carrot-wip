@@ -187,3 +187,45 @@ def test_green_on_a_different_track_does_not_give_go_after_red():
   pipe.tracker.tracks = [red_track, green_track]
   pipe.infer("far", _far_geom(), image_width=W, now=1.2, detect=False)
   assert pipe.tracker.go_after_red(99, 1.2) is False
+
+
+def test_tlvd_transient_suspension_preserves_tracks_and_go_after_red():
+  from openpilot.selfdrive.carrot.tlv import tlvd
+
+  runner = object.__new__(tlvd.TlvRunner)
+  runner.pipeline = _pipe_with_confirmed_red(10.0)
+  t = tracker.Track(track_id=5, first_frame=0, last_frame=0, cls=RED,
+                    score=0.9, box=BOX, view="far", focal_px=2648.0)
+  t.red_confirmed_s = 10.0
+  runner.pipeline.tracker.tracks = [t]
+  runner.pipeline.last_state = tracker.SignalState.red
+  runner.pipeline.last_track_id = 5
+  runner._suspend_since = None
+  runner._suspend_reset_done = False
+
+  # Running at t=10.0, then transient 1.5 s cpu_contention suspension (well under 4.0 s).
+  assert runner._update_pipeline_for_status(tlvd.STATUS_RUNNING, 10.0) is False
+  assert runner._update_pipeline_for_status("suspended", 10.1) is False
+  assert runner._update_pipeline_for_status("suspended", 11.5) is False
+  assert runner.pipeline.last_track_id == 5
+  assert runner.pipeline.tracker.go_after_red(5, 11.6) is True
+
+  # Resume clears suspension timer without losing confirmed red state.
+  assert runner._update_pipeline_for_status(tlvd.STATUS_RUNNING, 11.6) is False
+  assert runner._suspend_since is None
+  assert runner.pipeline.last_state == tracker.SignalState.red
+
+  # Sustained suspension (>= SUSPEND_PIPELINE_RESET_S) resets stale tracks exactly once.
+  assert runner._update_pipeline_for_status("suspended", 20.0) is False
+  assert runner._update_pipeline_for_status("suspended", 20.0 + tlvd.SUSPEND_PIPELINE_RESET_S - 0.1) is False
+  assert runner.pipeline.last_track_id == 5
+  assert runner._update_pipeline_for_status("suspended", 20.0 + tlvd.SUSPEND_PIPELINE_RESET_S) is True
+  assert runner.pipeline.last_track_id == -1
+  assert runner.pipeline.tracker.tracks == []
+  assert runner._update_pipeline_for_status("suspended", 30.0) is False
+
+  # Error status resets immediately when transitioning from running.
+  runner.pipeline.last_track_id = 7
+  assert runner._update_pipeline_for_status(tlvd.STATUS_RUNNING, 31.0) is False
+  assert runner._update_pipeline_for_status("error", 31.1) is True
+  assert runner.pipeline.last_track_id == -1

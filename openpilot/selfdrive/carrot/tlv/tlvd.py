@@ -43,6 +43,10 @@ from openpilot.selfdrive.carrot.tlv.watchdog import STATUS_BASELINE, STATUS_RUNN
 
 CONNECT_RETRY_S = 0.5
 FRAME_STALE_S = 1.2
+# Exceeds carrot_serv.TLV_SUSPEND_HOLD_MAX_S (3.0 s) so transient CPU/memory
+# suspensions preserve tracks and red_confirmed_s across WHOLE1 / W74D resume,
+# while prolonged pauses still clear stale detections and state.
+SUSPEND_PIPELINE_RESET_S = 4.0
 PUBLISH_HZ = 10.0
 MODEL_FRESH_S = 0.5
 LIVEPOSE_MAX_AGE_S = 0.5
@@ -340,6 +344,8 @@ class TlvRunner:
     self._calib_rpy = None
     self._calib_height_m: float | None = None
     self._gate_enabled = False
+    self._suspend_since: float | None = None
+    self._suspend_reset_done = False
 
   # -- vision ---------------------------------------------------------------
 
@@ -767,6 +773,28 @@ class TlvRunner:
       return self.pipeline.last_dets
     return [relevant, *rest]
 
+  def _update_pipeline_for_status(self, status: str, now: float) -> bool:
+    if status == STATUS_RUNNING:
+      self._suspend_since = None
+      self._suspend_reset_done = False
+      return False
+    if status == "error":
+      self._suspend_since = None
+      if not getattr(self, "_suspend_reset_done", False):
+        self.pipeline.reset()
+        self._suspend_reset_done = True
+        return True
+      return False
+    since = getattr(self, "_suspend_since", None)
+    if since is None:
+      self._suspend_since = now
+      return False
+    if not getattr(self, "_suspend_reset_done", False) and now - since >= SUSPEND_PIPELINE_RESET_S:
+      self.pipeline.reset()
+      self._suspend_reset_done = True
+      return True
+    return False
+
   def _status(self) -> tuple[str, str]:
     if self.backend_error:
       return "error", self.backend_error
@@ -907,11 +935,7 @@ class TlvRunner:
           self._disconnect()
 
       status, reason = self._status()
-      is_running = status == STATUS_RUNNING
-      was_running = getattr(self, "_was_running", False)
-      if was_running and not is_running:
-        self.pipeline.reset()
-      self._was_running = is_running
+      self._update_pipeline_for_status(status, now)
       self._publish(status, reason)
       self._maybe_log_stats(now)
       rk.keep_time()

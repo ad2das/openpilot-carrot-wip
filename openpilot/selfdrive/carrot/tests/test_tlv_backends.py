@@ -613,3 +613,26 @@ def test_runner_reports_backend_error_when_both_fail_on_tici(monkeypatch):
   assert runner.backend is None
   assert "fallback failed" in runner.backend_error
   assert calls == ["onnx", "tinygrad"]
+
+
+def test_cap_server_log_keeps_tail(tmp_path):
+  rotated_path = tmp_path / "server.log"
+  payload = bytearray(b"x" * 1_200_000)
+  payload[-4:] = b"TAIL"
+  rotated_path.write_bytes(bytes(payload))
+
+  backends._cap_server_log(str(rotated_path))
+
+  rotated = rotated_path.read_bytes()
+  assert rotated.startswith(b"\n--- log rotated ---\n")
+  assert rotated.endswith(b"TAIL")
+  assert len(rotated) == 500_000 + 21
+
+  small_path = tmp_path / "small.log"
+  small_bytes = b"y" * 999_999
+  small_path.write_bytes(small_bytes)
+  backends._cap_server_log(str(small_path))
+  assert small_path.read_bytes() == small_bytes
+
+  backends._cap_server_log(str(tmp_path / "missing.log"))
+  assert not (tmp_path / "missing.log").exists()

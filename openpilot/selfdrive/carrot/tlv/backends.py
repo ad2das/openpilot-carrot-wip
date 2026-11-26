@@ -385,6 +385,22 @@ _DSP_COMPILE_FLAGS = ("-std=c++17", "-O2", "-D_GLIBCXX_USE_CXX11_ABI=0")
 _DSP_LINK_FLAGS = ("-lSNPE",)
 _POSIX = os.name == "posix"
 
+SERVER_LOG_MAX_BYTES = 1_000_000
+SERVER_LOG_KEEP_BYTES = 500_000
+
+
+def _cap_server_log(log_path: str) -> None:
+  try:
+    if os.path.getsize(log_path) <= SERVER_LOG_MAX_BYTES:
+      return
+    with open(log_path, "rb") as f:
+      f.seek(-SERVER_LOG_KEEP_BYTES, os.SEEK_END)
+      tail = f.read()
+    with open(log_path, "wb") as f:
+      f.write(b"\n--- log rotated ---\n" + tail)
+  except OSError:
+    pass
+
 
 def dsp_build_argv(clangxx: str, src: str, include: str, lib: str, out_bin: str) -> list[str]:
   return [clangxx, *_DSP_COMPILE_FLAGS, "-I", include, src, "-L", lib, *_DSP_LINK_FLAGS,
@@ -574,12 +590,7 @@ class DspBackend:
     cmd = [*self.command_prefix, server, "--dlc", DSP_DLC, "--runtime", self.runtime,
            "--in", self._in_path, "--out", self._out_path]
     log_path = self._log_path()
-    try:
-      if os.path.exists(log_path) and os.path.getsize(log_path) > 1_000_000:
-        with open(log_path, "wb"):
-          pass
-    except OSError:
-      pass
+    _cap_server_log(log_path)
     log = open(log_path, "ab")
     try:
       self._proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
