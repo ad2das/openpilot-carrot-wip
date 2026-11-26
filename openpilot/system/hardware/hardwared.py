@@ -125,8 +125,9 @@ def hw_state_thread(end_event, hw_queue):
   modem_version = None
 
   while not end_event.is_set():
-    # these are expensive calls. update every 10s
-    if (count % int(10. / DT_HW)) == 0:
+    # these are expensive calls. update every 10s (poll every 2s while offline after boot)
+    poll_period = 2. if (prev_hw_state is None or prev_hw_state.network_type == NetworkType.none) else 10.
+    if (count % int(poll_period / DT_HW)) == 0:
       try:
         network_type = HARDWARE.get_network_type()
         modem_temps = HARDWARE.get_modem_temperatures()

@@ -153,6 +153,13 @@ class WifiState:
 
 
 class WifiManager:
+  _device_state: int = NMDeviceState.UNKNOWN
+  _active: bool = True
+  _last_network_scan: float = 0.0
+  _scan_event: threading.Event | None = None
+  _monitor_ready: threading.Event | None = None
+  _wifi_device: str | None = None
+
   def __init__(self):
     self._networks: list[Network] = []  # an unsorted list of available Networks. a Network can be comprised of multiple APs
     self._active = True  # used to not run when not in settings
@@ -164,7 +171,7 @@ class WifiManager:
       _wrap_router(self._router_main)
       self._conn_monitor = open_dbus_connection_blocking(bus="SYSTEM")  # used by state monitor thread
       self._nm = DBusAddress(NM_PATH, bus_name=NM, interface=NM_IFACE)
-    except FileNotFoundError:
+    except Exception:
       cloudlog.exception("Failed to connect to system D-Bus")
       self._router_main = None
       self._conn_monitor = None
@@ -172,6 +179,7 @@ class WifiManager:
 
     # Store wifi device path
     self._wifi_device: str | None = None
+    self._device_state: int = NMDeviceState.UNKNOWN
 
     # State
     self._connections: dict[str, str] = {}  # ssid -> connection path, updated via NM signals
@@ -199,24 +207,35 @@ class WifiManager:
     self._disconnected: list[Callable[[], None]] = []
 
     self._scan_lock = threading.Lock()
+    self._scan_event = threading.Event()
+    self._monitor_ready = threading.Event()
     self._scan_thread = threading.Thread(target=self._network_scanner, daemon=True)
     self._state_thread = threading.Thread(target=self._monitor_state, daemon=True)
-    self._initialize()
+    if not self._exit:
+      self._initialize()
     atexit.register(self.stop)
 
   def _initialize(self):
     def worker():
       self._wait_for_wifi_device()
+      if self._exit:
+        return
 
-      # TODO: wait for state thread to start before adding tethering connection, tiny race currently
-      self._scan_thread.start()
+      # Subscribe to D-Bus signals before querying state or starting scans so early
+      # StateChanged / LastScan / NewConnection events are not missed on boot.
       self._state_thread.start()
+      if self._monitor_ready is not None:
+        self._monitor_ready.wait(timeout=2.0)
 
       self._init_connections()
       if Params is not None and self._tethering_ssid not in self._connections:
         self._add_tethering_connection()
 
       self._init_wifi_state()
+      self._scan_thread.start()
+
+      if self._active:
+        self._update_networks(block=False)
 
       self._tethering_password = self._get_tethering_password()
       cloudlog.debug("WifiManager initialized")
@@ -232,7 +251,12 @@ class WifiManager:
       epoch = self._user_epoch
 
       dev_addr = DBusAddress(self._wifi_device, bus_name=NM, interface=NM_DEVICE_IFACE)
-      dev_state = self._router_main.send_and_get_reply(Properties(dev_addr).get('State')).body[0][1]
+      state_reply = self._router_main.send_and_get_reply(Properties(dev_addr).get('State'))
+      if state_reply.header.message_type == MessageType.error:
+        cloudlog.warning(f"Failed to get WiFi device state: {state_reply}")
+        return
+      dev_state = state_reply.body[0][1]
+      self._device_state = dev_state
 
       ssid: str | None = None
       status = ConnectStatus.DISCONNECTED
@@ -303,6 +327,14 @@ class WifiManager:
   def tethering_password(self) -> str:
     return self._tethering_password
 
+  @property
+  def is_device_unavailable(self) -> bool:
+    return self._wifi_device is None or self._device_state in (
+      NMDeviceState.UNKNOWN,
+      NMDeviceState.UNMANAGED,
+      NMDeviceState.UNAVAILABLE,
+    )
+
   def _set_connecting(self, ssid: str | None):
     # Called by user action, or sequentially from state change handler
     self._user_epoch += 1
@@ -325,6 +357,10 @@ class WifiManager:
     if active:
       self._init_wifi_state(block=False)
       self._update_networks(block=False)
+      if not self._networks:
+        self._last_network_scan = 0.0
+        if self._scan_event is not None:
+          self._scan_event.set()
 
   def _monitor_state(self):
     # Filter for signals
@@ -362,6 +398,8 @@ class WifiManager:
           self._conn_monitor.filter(rules[1], bufsize=SIGNAL_QUEUE_SIZE) as new_conn_q,
           self._conn_monitor.filter(rules[2], bufsize=SIGNAL_QUEUE_SIZE) as removed_conn_q,
           self._conn_monitor.filter(rules[3], bufsize=SIGNAL_QUEUE_SIZE) as props_q):
+      if self._monitor_ready is not None:
+        self._monitor_ready.set()
       while not self._exit:
         try:
           self._conn_monitor.recv_messages(timeout=1)
@@ -389,6 +427,8 @@ class WifiManager:
           self._handle_state_change(new_state, previous_state, change_reason)
 
   def _handle_state_change(self, new_state: int, prev_state: int, change_reason: int):
+    self._device_state = new_state
+
     # Thread safety: _wifi_state is read/written by both the monitor thread (this handler)
     # and the main thread (_set_connecting via connect/activate). PREPARE/CONFIG and ACTIVATED
     # have a read-then-write pattern with a slow DBus call in between — if _set_connecting
@@ -416,6 +456,13 @@ class WifiManager:
         return
 
       self._set_connecting(None)
+      if prev_state in (NMDeviceState.UNAVAILABLE, NMDeviceState.UNMANAGED):
+        cloudlog.info(f"Wi-Fi device ready (state {prev_state} -> {new_state})")
+        self._last_network_scan = 0.0
+        if self._scan_event is not None:
+          self._scan_event.set()
+        if self._active:
+          self._update_networks(block=False)
 
     elif new_state in (NMDeviceState.PREPARE, NMDeviceState.CONFIG):
       epoch = self._user_epoch
@@ -497,12 +544,17 @@ class WifiManager:
   def _network_scanner(self):
     while not self._exit:
       connected = self._wifi_state.status == ConnectStatus.CONNECTED
-      if self._active or not connected:
+      available = self._device_state not in (NMDeviceState.UNAVAILABLE, NMDeviceState.UNMANAGED)
+      if available and (self._active or not connected):
         scan_period = SCAN_PERIOD_SECONDS if self._active else BACKGROUND_SCAN_PERIOD_SECONDS
         if time.monotonic() - self._last_network_scan > scan_period:
           self._request_scan()
           self._last_network_scan = time.monotonic()
-      time.sleep(1 / 2.)
+      if self._scan_event is not None:
+        self._scan_event.wait(1 / 2.)
+        self._scan_event.clear()
+      else:
+        time.sleep(1 / 2.)
 
   def _wait_for_wifi_device(self):
     while not self._exit:
@@ -515,8 +567,10 @@ class WifiManager:
   def _get_adapter(self, adapter_type: int) -> str | None:
     # Return the first NetworkManager device path matching adapter_type
     try:
-      device_paths = self._router_main.send_and_get_reply(new_method_call(self._nm, 'GetDevices')).body[0]
-      for device_path in device_paths:
+      reply = self._router_main.send_and_get_reply(new_method_call(self._nm, 'GetDevices'))
+      if reply.header.message_type == MessageType.error:
+        return None
+      for device_path in reply.body[0]:
         dev_addr = DBusAddress(device_path, bus_name=NM, interface=NM_DEVICE_IFACE)
         dev_type = self._router_main.send_and_get_reply(Properties(dev_addr).get('DeviceType')).body[0][1]
         if dev_type == adapter_type:
@@ -937,6 +991,10 @@ class WifiManager:
   def stop(self):
     if not self._exit:
       self._exit = True
+      if self._scan_event is not None:
+        self._scan_event.set()
+      if self._monitor_ready is not None:
+        self._monitor_ready.set()
       if self._scan_thread.is_alive():
         self._scan_thread.join()
       if self._state_thread.is_alive():

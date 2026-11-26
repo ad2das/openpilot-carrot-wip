@@ -960,6 +960,10 @@ msgstr "SSH Keys"
 msgid "Scanning Wi-Fi networks..."
 msgstr "Scanning Wi-Fi networks..."
 
+#: openpilot/system/ui/widgets/network.py
+msgid "Starting Wi-Fi..."
+msgstr "Starting Wi-Fi..."
+
 #: openpilot/selfdrive/selfdrived/events.py
 msgid "Seatbelt Unlatched"
 msgstr ""

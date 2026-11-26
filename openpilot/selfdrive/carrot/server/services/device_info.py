@@ -265,22 +265,21 @@ def _split_nmcli_line(line: str) -> List[str]:
   return parts
 
 
-def get_wifi_networks() -> List[Dict[str, Any]]:
-  """Read visible Wi-Fi networks without connecting, forgetting, or editing."""
+def _run_nmcli_wifi_list(rescan: str, timeout: float) -> list[dict[str, Any]] | None:
   try:
     proc = subprocess.run(
-      ["nmcli", "-t", "-f", "ACTIVE,SSID,SECURITY,SIGNAL", "dev", "wifi", "list", "--rescan", "auto"],
+      ["nmcli", "-t", "-f", "ACTIVE,SSID,SECURITY,SIGNAL", "dev", "wifi", "list", "--rescan", rescan],
       check=False,
       capture_output=True,
       encoding="utf-8",
       errors="replace",
-      timeout=3,
+      timeout=timeout,
     )
   except Exception:
-    return []
+    return None
 
   if proc.returncode != 0:
-    return []
+    return None
 
   seen: Dict[str, Dict[str, Any]] = {}
   for raw in proc.stdout.splitlines():
@@ -307,6 +306,22 @@ def get_wifi_networks() -> List[Dict[str, Any]]:
       seen[ssid] = entry
 
   return sorted(seen.values(), key=lambda n: (not n.get("connected"), -(n.get("signal") or -1), n.get("ssid") or ""))
+
+
+def _fetch_wifi_networks() -> list[dict[str, Any]] | None:
+  cached = _run_nmcli_wifi_list("no", timeout=2.0)
+  if cached:
+    return cached
+  rescanned = _run_nmcli_wifi_list("auto", timeout=6.0)
+  if rescanned is not None:
+    return rescanned
+  return cached
+
+
+def get_wifi_networks() -> List[Dict[str, Any]]:
+  """Read visible Wi-Fi networks without blocking on a radio rescan when cached APs exist."""
+  networks = _fetch_wifi_networks()
+  return networks if networks is not None else []
 
 
 def get_wifi_ip_address() -> str:
@@ -360,12 +375,19 @@ def get_device_network_snapshot() -> Dict[str, Any]:
 
 def refresh_device_network() -> Dict[str, Any]:
   """Refresh the slow NetworkManager data for future request snapshots."""
-  data = {
-    "wifi": get_wifi_networks(),
-    "ip_address": get_wifi_ip_address(),
-    **_network_param_values(),
-  }
+  wifi = _fetch_wifi_networks()
+  ip_address = get_wifi_ip_address()
   with _network_cache_lock:
+    prev = _network_cache.get("data")
+    if wifi is None and ip_address and isinstance(prev, dict) and prev.get("wifi"):
+      wifi_list = deepcopy(prev["wifi"])
+    else:
+      wifi_list = wifi if wifi is not None else []
+    data = {
+      "wifi": wifi_list,
+      "ip_address": ip_address,
+      **_network_param_values(),
+    }
     _network_cache["monotonic"] = time.monotonic()
     _network_cache["data"] = deepcopy(data)
   return deepcopy(data)

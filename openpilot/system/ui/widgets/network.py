@@ -307,7 +307,8 @@ class WifiManagerUI(Widget):
 
   def _render(self, rect: rl.Rectangle):
     if not self._networks:
-      gui_label(rect, tr("Scanning Wi-Fi networks..."), 72, alignment=TextAlignment.CENTER)
+      msg = tr("Starting Wi-Fi...") if self._wifi_manager.is_device_unavailable else tr("Scanning Wi-Fi networks...")
+      gui_label(rect, msg, 72, alignment=TextAlignment.CENTER)
       return
 
     if self.state == UIState.NEEDS_AUTH and self._state_network:

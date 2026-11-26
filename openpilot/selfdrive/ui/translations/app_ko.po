@@ -960,6 +960,10 @@ msgstr "SSH 키"
 msgid "Scanning Wi-Fi networks..."
 msgstr "Wi‑Fi 네트워크 검색 중..."
 
+#: openpilot/system/ui/widgets/network.py
+msgid "Starting Wi-Fi..."
+msgstr "Wi‑Fi 초기화 중..."
+
 #: openpilot/selfdrive/selfdrived/events.py
 msgid "Seatbelt Unlatched"
 msgstr "안전벨트를 착용해주세요"

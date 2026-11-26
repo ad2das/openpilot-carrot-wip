@@ -81,6 +81,10 @@ msgid "Scanning Wi-Fi networks..."
 msgstr ""
 
 #: openpilot/system/ui/widgets/network.py
+msgid "Starting Wi-Fi..."
+msgstr ""
+
+#: openpilot/system/ui/widgets/network.py
 msgid "CONNECTING..."
 msgstr ""
 
