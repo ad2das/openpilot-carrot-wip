@@ -55,6 +55,8 @@ STALL_RESCUE_MAX_T = 1.5    # s; a stall rescue that never reads zero hands back
 # (route 722 392-399 s, 6.7 s held, outcome normal), so a brake wait has no time limit. After any wait ends (restart,
 # gas, gear change) the restart request stays 2 while the engine is still auto-stopped: a release with the request
 # already 2 is accepted (722 393.174, 21/21 ordered releases).
+# Gas pressed straight from a plain or soft hold (no wait running) enters the same post window, so the release always
+# carries the restart request.
 ISG_STATE_AUTO_STOP = 8       # ISG_STATUS (0x0B5) byte 15 while the engine is auto-stopped (16 = restarting)
 ISG_STALE_NS = 500_000_000    # ISG_STATUS older than this reads as unknown
 CIS2_RESTART = 2              # SCC_CONTROL CRUSE_INFO_SET_2: stock engine restart request
@@ -75,7 +77,7 @@ def read_isg(cp, isg_status) -> tuple[int, bool]:
   if isg_status is None:
     return -1, False
   ts = cp.ts_nanos["ISG_STATUS"]["ISG_STATE"]
-  fresh = ts > 0 and cp.last_nonempty_nanos - ts <= ISG_STALE_NS
+  fresh = ts > 0 and 0 <= cp._last_update_nanos - ts <= ISG_STALE_NS
   return parse_isg_state(isg_status["ISG_STATE"], fresh)
 
 
@@ -239,7 +241,7 @@ class CanfdStopping:
                         gas: bool, brake: bool, drive: bool, releasing: bool) -> str:
     """Hold a standstill release until the ISG-stopped engine restarts, like the stock SCC.
 
-    values: the final SCC_CONTROL signals, changed in place. ok: finite sensors, CAN valid, no parking brake.
+    values: the final SCC_CONTROL signals, changed in place. ok: finite speeds, CAN valid, no parking brake.
     releasing: the stop controller is debouncing a release. Returns a log event name, or "".
     """
     event = ""
@@ -266,6 +268,11 @@ class CanfdStopping:
       elif self.isg_mode == "depart" and leaving:
         self.isg_mode = "brake"
         event = "isg_wait_brake"
+    elif isg_auto_stop and ok and drive and gas and speed <= MOVING_SPEED and released and self.isg_mode == "":
+      # gas straight from a plain (or soft) hold: never hold against the pedal, keep the restart request as after a wait
+      self.isg_mode = "post"
+      self.isg_frames = 0
+      event = "isg_released"
 
     # 3) apply
     if self.isg_mode in ("depart", "brake"):

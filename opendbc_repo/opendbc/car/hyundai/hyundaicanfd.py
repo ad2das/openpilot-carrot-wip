@@ -37,8 +37,9 @@ def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, 
 
   wheels = CS.out.wheelSpeeds
   speeds = [CS.out.vEgo, CS.out.vEgoRaw, wheels.fl, wheels.fr, wheels.rl, wheels.rr]
-  finite = all(math.isfinite(v) for v in (*speeds, CS.out.aEgo, accel, values["aReqValue"], previous_value, jerk_u, jerk_l))
-  speed = max(abs(v) for v in speeds) if finite else 0.0
+  speed_finite = all(math.isfinite(v) for v in speeds)
+  finite = speed_finite and all(math.isfinite(v) for v in (CS.out.aEgo, accel, values["aReqValue"], previous_value, jerk_u, jerk_l))
+  speed = max(abs(v) for v in speeds) if speed_finite else 0.0
   soft_hold = CS.softHoldActive > 0 and CS.out.cruiseState.available
   # Only an armed, stationary soft hold may remain active while the driver brakes.
   # Ordinary braking and pedal input while moving keep their existing interlock.
@@ -61,7 +62,7 @@ def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, 
 
   isg_event = controller.isg_restart_order(
     values, isg_auto_stop=bool(getattr(CS, "isgAutoStop", False)), speed=speed,
-    ok=finite and CS.out.canValid and not CS.out.parkingBrake,
+    ok=speed_finite and CS.out.canValid and not CS.out.parkingBrake,
     gas=CS.out.gasPressed, brake=CS.out.brakePressed,
     drive=str(CS.out.gearShifter) == "drive", releasing=controller.release_frames > 0)
   if isg_event:

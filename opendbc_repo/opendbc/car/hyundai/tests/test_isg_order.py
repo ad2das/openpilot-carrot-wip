@@ -7,6 +7,7 @@ up ~0.65 s later and demanded a manual restart. The stock SCC requests the resta
 Every SCC_CONTROL packet below is packed and decoded through a CANParser round-trip (test_stopping.send /
 the local packer helper), so the assertions read wire values, not the internal dict.
 """
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -590,7 +591,7 @@ def test_isg_status_dropout_does_not_invalidate_can_valid():
     frames = [(96, packer.make_can_msg("ESP_STATUS", 0, {})[1], 0)] if i % 2 == 0 else []
     parser.update([t, frames])
     assert parser.can_valid is True, f"0x0B5 dropout tripped can_valid at {i * 10} ms"
-    if parser.last_nonempty_nanos - ts_last_isg <= 500_000_000:
+    if parser._last_update_nanos - ts_last_isg <= 500_000_000:
       assert read_isg(parser, cs.isg_status) == (ISG_AUTO_STOP, True)
     else:
       assert read_isg(parser, cs.isg_status) == (-1, False)
@@ -637,6 +638,194 @@ def test_read_isg_before_first_frame_is_unknown_even_at_low_timestamp():
   parser._add_message("ISG_STATUS", float("nan"), ignore_counter=True)
   parser.update([100_000_000, [(96, bytes(24), 0)]])
   assert read_isg(parser, parser.vl["ISG_STATUS"]) == (-1, False)
+
+
+# --- W-ISG8: gas straight from a hold, non-finite planner values, a silent bus, soft-hold releases ---
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_gas_straight_from_a_hold_keeps_the_request(camera):
+  """A pedal press straight from a plain hold is a release like any other: it carries the restart request."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  cs.out.gasPressed = True
+  live = send(camera, controller, cs, stopping=False, accel=0.5, override=True)
+
+  ref_cs = isg_cs()
+  ref_controller, _ = held(camera, ref_cs)
+  ref_cs.out.gasPressed = True
+  reference = send(camera, isg_off(ref_controller), ref_cs, stopping=False, accel=0.5, override=True)
+
+  assert live["StopReq"] == 0
+  assert live["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+  # Everything but the request byte (and the checksum it feeds) is openpilot's own packet.
+  for key in ("CRUSE_INFO_SET_2", "CHECKSUM"):
+    live.pop(key)
+    reference.pop(key)
+  assert live == reference
+
+  at_rest(cs, 0.2)
+  values = send(camera, controller, cs, stopping=False, accel=0.5, override=True)
+  assert values["CRUSE_INFO_SET_2"] == base_cis2(camera)
+  assert controller.isg_mode == ""
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_gas_from_a_hold_without_auto_stop_is_untouched(camera):
+  """Without an auto-stopped engine the pedal press keeps the plain release packet, byte for byte."""
+  cs = isg_cs(auto_stop=False)
+  controller, _ = held(camera, cs)
+  cs.out.gasPressed = True
+  live = send(camera, controller, cs, stopping=False, accel=0.5, override=True)
+
+  ref_cs = isg_cs(auto_stop=False)
+  ref_controller, _ = held(camera, ref_cs)
+  ref_cs.out.gasPressed = True
+  reference = send(camera, isg_off(ref_controller), ref_cs, stopping=False, accel=0.5, override=True)
+
+  assert live == reference
+  assert controller.isg_mode == ""
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_gas_from_a_soft_hold_keeps_the_request(camera):
+  """Gas released from an armed soft hold (openpilot not enabled) also carries the restart request."""
+  cs = isg_cs()
+  cs.softHoldActive = 2
+  cs.canfdSccHoldActive = True
+  controller = CanfdStopping()
+  for _ in range(3):
+    values = send(camera, controller, cs, enabled=False, stopping=False, accel=0.0)
+  assert values["StopReq"] == 1
+
+  cs.softHoldActive = 0
+  cs.out.gasPressed = True
+  values = send(camera, controller, cs, enabled=False, stopping=False, accel=0.0)
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+@pytest.mark.parametrize("camera", [True, False])
+@pytest.mark.parametrize("what", ["accel", "aEgo", "previous_value"])
+def test_nonfinite_planner_value_keeps_the_isg_hold(camera, what):
+  """A NaN in the planner accel chain must not drop the guard while the wheels read a finite standstill."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  tick = dict(stopping=True, accel=-0.5)
+  if what == "accel":
+    tick["accel"] = float("nan")
+  elif what == "aEgo":
+    cs.out.aEgo = float("nan")
+  else:
+    tick["previous_value"] = float("nan")
+
+  values = send(camera, controller, cs, **tick)
+  assert_hold(values)
+  assert all(math.isfinite(v) for v in values.values() if isinstance(v, float))
+  assert controller.isg_mode == "brake"
+
+  cs.isgAutoStop = False
+  values = send(camera, controller, cs, **tick)
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+def test_read_isg_goes_stale_when_the_whole_bus_is_silent():
+  """Freshness follows the update clock: a silent bus cannot keep a forgotten ISG frame alive."""
+  parser = CANParser("hyundai_canfd_generated", [("ESP_STATUS", 50)], 0)
+  parser._add_message("ISG_STATUS", float("nan"), ignore_counter=True)
+  t = 10_000_000_000
+  parser.update([t, [(181, bytes.fromhex(ISG_HEX_AUTO_STOP), 0)]])
+  assert read_isg(parser, parser.vl["ISG_STATUS"]) == (ISG_AUTO_STOP, True)
+  parser.update([t + 400_000_000, []])
+  assert read_isg(parser, parser.vl["ISG_STATUS"]) == (ISG_AUTO_STOP, True)
+  parser.update([t + 600_000_000, []])
+  assert read_isg(parser, parser.vl["ISG_STATUS"]) == (-1, False)
+
+
+@pytest.mark.parametrize("camera", [True, False])
+@pytest.mark.parametrize("case", ["brake_tap", "cancel", "res_depart"])
+def test_soft_hold_release_waits_for_the_restart(camera, case):
+  """Leaving a soft hold waits for the engine restart before the packet hands back."""
+  cs = isg_cs()
+  cs.softHoldActive = 2
+  cs.canfdSccHoldActive = True
+  controller = CanfdStopping()
+  tick = dict(enabled=False, stopping=False, accel=0.0)
+  for _ in range(3):
+    values = send(camera, controller, cs, **tick)
+  assert values["StopReq"] == 1
+
+  if case == "brake_tap":
+    cs.out.brakePressed = True
+    send(camera, controller, cs, **tick)
+    cs.softHoldActive = 0
+    for _ in range(5):
+      values = send(camera, controller, cs, **tick)
+  elif case == "cancel":
+    cs.softHoldActive = 0
+    for _ in range(5):
+      values = send(camera, controller, cs, **tick)
+  else:
+    cs.softHoldActive = 0
+    tick = dict(enabled=True, stopping=False, accel=0.5)
+    for _ in range(12):
+      values = send(camera, controller, cs, **tick)
+
+  assert_hold(values)
+  assert controller.isg_mode == ("depart" if case == "res_depart" else "brake")
+
+  cs.isgAutoStop = False
+  values = send(camera, controller, cs, **tick)
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+@pytest.mark.parametrize("camera", [True, False])
+def test_cancel_from_a_hold_waits_for_the_restart(camera):
+  """Cancelling openpilot from a plain hold holds the standing car until the engine restarts."""
+  cs = isg_cs()
+  controller, _ = held(camera, cs)
+  for frame in range(1, 11):
+    assert_hold(send(camera, controller, cs, enabled=False)), f"frame {frame}"
+  assert controller.isg_mode == "brake"
+
+  cs.isgAutoStop = False
+  values = send(camera, controller, cs, enabled=False)
+  assert values["ACCMode"] == 0
+  assert values["StopReq"] == 0
+  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
+  assert controller.isg_mode == "post"
+
+
+@pytest.mark.parametrize("camera", [True, False])
+@pytest.mark.parametrize("kind", ["stall", "surge"])
+def test_rescue_under_auto_stop_keeps_the_hold(camera, kind):
+  """A stall or surge rescue under an auto-stopped engine keeps StopReq and the restart request."""
+  cs = isg_cs(speed=0.0)
+  cs.canfdSccHoldActive = False
+  controller = CanfdStopping()
+  for _ in range(20):
+    send(camera, controller, cs, stopping=True, accel=-0.5)
+  if kind == "stall":
+    at_rest(cs, 0.05)
+    frames = 70
+  else:
+    at_rest(cs, 0.08)
+    cs.out.aEgo = 0.2
+    frames = 3
+
+  rescue = None
+  for _ in range(frames):
+    values = send(camera, controller, cs, stopping=True, accel=-0.5)
+    if controller.phase == "rescue":
+      rescue = values
+      break
+  assert rescue is not None, f"{kind}: no rescue frame"
+  assert_hold(rescue)
+  assert controller.isg_mode == "depart"
 
 
 if __name__ == "__main__":
