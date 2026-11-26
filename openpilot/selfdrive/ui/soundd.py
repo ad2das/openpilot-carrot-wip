@@ -190,6 +190,7 @@ class Soundd:
     self.selfdrive_timeout_alert = False
 
     self.spl_filter_weighted = FirstOrderFilter(0, 2.5, FILTER_DT, initialized=False)
+    self._last_stream_error: str | None = None
 
   def load_sounds(self):
     self.loaded_sounds: dict[int, np.ndarray] = {}
@@ -318,9 +319,18 @@ class Soundd:
   @retry(attempts=20, delay=3)
   def get_stream(self, sd):
     # reload sounddevice to reinitialize portaudio
-    sd._terminate()
-    sd._initialize()
-    return sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    try:
+      sd._terminate()
+      sd._initialize()
+      stream = sd.OutputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    except Exception as e:
+      err = f"{type(e).__name__}: {e}"
+      if err != getattr(self, "_last_stream_error", None):
+        self._last_stream_error = err
+        cloudlog.warning(f"soundd get_stream failed: {err}")
+      raise
+    self._last_stream_error = None
+    return stream
 
   def soundd_thread(self):
     # sounddevice must be imported after forking processes

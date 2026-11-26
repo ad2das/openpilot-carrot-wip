@@ -161,3 +161,45 @@ def test_audio_daemons_have_cold_boot_retry_headroom(rel_path):
   )
   kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in retry_dec.keywords}
   assert kwargs["attempts"] * kwargs["delay"] >= 60
+
+
+@pytest.mark.parametrize(("mod_name", "cls_name", "stream_attr"), [
+  ("openpilot.system.micd", "Mic", "InputStream"),
+  ("openpilot.selfdrive.ui.soundd", "Soundd", "OutputStream"),
+])
+def test_audio_get_stream_logs_distinct_errors_without_spam(monkeypatch, mod_name, cls_name, stream_attr):
+  import importlib
+  import openpilot.common.utils as common_utils
+
+  mod = importlib.import_module(mod_name)
+  warnings = []
+  monkeypatch.setattr(common_utils.time, "sleep", lambda _s: None)
+  monkeypatch.setattr(mod.cloudlog, "warning", warnings.append)
+
+  obj = getattr(mod, cls_name).__new__(getattr(mod, cls_name))
+  obj.callback = lambda *a, **k: None
+
+  attempts = 0
+  sentinel_stream = object()
+
+  def fake_stream(**_kwargs):
+    nonlocal attempts
+    attempts += 1
+    if attempts in (1, 2):
+      raise RuntimeError("Error querying device -1")
+    if attempts == 3:
+      raise OSError("Device unavailable")
+    return sentinel_stream
+
+  fake_sd = type("FakeSD", (), {
+    "_terminate": staticmethod(lambda: None),
+    "_initialize": staticmethod(lambda: None),
+    stream_attr: staticmethod(fake_stream),
+  })()
+
+  assert obj.get_stream(fake_sd) is sentinel_stream
+  assert attempts == 4
+  assert len(warnings) == 2
+  assert "RuntimeError: Error querying device -1" in warnings[0]
+  assert "OSError: Device unavailable" in warnings[1]
+  assert obj._last_stream_error is None

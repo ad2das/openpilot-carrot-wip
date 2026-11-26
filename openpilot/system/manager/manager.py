@@ -24,7 +24,7 @@ from openpilot.system.manager.helpers import unblock_stdout, write_onroad_params
 from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
 from openpilot.system.manager.update_status import UpdateStatus
-from openpilot.system.manager.xiaoge_startup import XiaogeStartupGate
+from openpilot.system.manager.xiaoge_startup import XiaogeStartupMonitor
 from openpilot.system.manager.stall_watchdog import StallWatchdog
 from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_ID
 from openpilot.common.swaglog import cloudlog, add_file_handler
@@ -329,9 +329,9 @@ def manager_thread(update_status: UpdateStatus) -> None:
     ignore += ["micd", "soundd", "loggerd"]
     params.put_bool("RecordAudio", False)
 
-  sm = messaging.SubMaster(['deviceState', 'carParams', 'pandaStates', 'selfdriveState', 'modelV2', 'carState'], poll='deviceState')
+  sm = messaging.SubMaster(['deviceState', 'carParams', 'pandaStates'], poll='deviceState')
   pm = messaging.PubMaster(['managerState'])
-  xiaoge_startup = XiaogeStartupGate()
+  xiaoge_startup = XiaogeStartupMonitor()
   # Instrumentation only: log every thread's stack if the loop below hangs (route 46d).
   stall_watchdog = StallWatchdog(main_ident=threading.get_ident())
   stall_watchdog.start()
@@ -348,78 +348,81 @@ def manager_thread(update_status: UpdateStatus) -> None:
   started_prev = False
   ignition_prev = False
 
-  while True:
-    stall_watchdog.kick()
-    sm.update(1000)
-    now = time.monotonic()
+  try:
+    while True:
+      stall_watchdog.kick()
+      sm.update(1000)
+      now = time.monotonic()
 
-    started = sm['deviceState'].started
+      started = sm['deviceState'].started
 
-    if started and not started_prev:
-      params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
-    elif not started and started_prev:
-      params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
+      if started and not started_prev:
+        params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
+      elif not started and started_prev:
+        params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
 
-    ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
-    if ignition and not ignition_prev:
-      clear_ignition_on_params(params)
+      ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
+      if ignition and not ignition_prev:
+        clear_ignition_on_params(params)
 
-    # update onroad params, which drives pandad's safety setter thread
-    if started != started_prev:
-      write_onroad_params(started, params)
+      # update onroad params, which drives pandad's safety setter thread
+      if started != started_prev:
+        write_onroad_params(started, params)
 
-    started_prev = started
-    ignition_prev = ignition
+      started_prev = started
+      ignition_prev = ignition
 
-    if supported_cars_thread is not None:
-      if started and not supported_cars_waited:
-        # Drain the brand-import thread before forking onroad processes, kicking
-        # the stall watchdog in short slices so startup never trips a false stall.
-        # Wait once: a still-running writer must not block every later loop.
-        supported_cars_waited = True
-        deadline = time.monotonic() + 5.0
-        while supported_cars_thread.is_alive() and time.monotonic() < deadline:
-          stall_watchdog.kick()
-          supported_cars_thread.join(timeout=0.2)
-      if not supported_cars_thread.is_alive():
-        supported_cars_thread = None
+      if supported_cars_thread is not None:
+        if started and not supported_cars_waited:
+          # Drain the brand-import thread before forking onroad processes, kicking
+          # the stall watchdog in short slices so startup never trips a false stall.
+          # Wait once: a still-running writer must not block every later loop.
+          supported_cars_waited = True
+          deadline = time.monotonic() + 5.0
+          while supported_cars_thread.is_alive() and time.monotonic() < deadline:
+            stall_watchdog.kick()
+            supported_cars_thread.join(timeout=0.2)
+        if not supported_cars_thread.is_alive():
+          supported_cars_thread = None
 
-    xiaoge_ready = xiaoge_startup.update(started, sm, sm['carParams'], params.get_bool('ControlsReady'), now)
-    not_run = ignore if xiaoge_ready else [*ignore, 'xiaoge_data']
-    ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=not_run)
+      xiaoge_ready = xiaoge_startup.update(started, sm, sm['carParams'], params.get_bool('ControlsReady'), params.get_bool('ShareData'), now)
+      not_run = ignore if xiaoge_ready else [*ignore, 'xiaoge_data']
+      ensure_running(managed_processes.values(), started, params=params, CP=sm['carParams'], not_run=not_run)
 
-    running = ' '.join("{}{}\u001b[0m".format("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
-                       for p in managed_processes.values() if p.proc)
-    print_timer = (print_timer + 1)%10
-    if print_timer == 0:
-      print(running)
-    cloudlog.debug(running)
+      running = ' '.join("{}{}\u001b[0m".format("\u001b[32m" if p.proc.is_alive() else "\u001b[31m", p.name)
+                         for p in managed_processes.values() if p.proc)
+      print_timer = (print_timer + 1)%10
+      if print_timer == 0:
+        print(running)
+      cloudlog.debug(running)
 
-    # send managerState
-    msg = messaging.new_message('managerState', valid=True)
-    msg.managerState.processes = [p.get_process_state_msg() for p in managed_processes.values()]
-    # Check in the normal-priority manager, never in the 100 Hz control loop.
-    msg.managerState.rebootRequired = update_status.update(now)
-    pm.send('managerState', msg)
+      # send managerState
+      msg = messaging.new_message('managerState', valid=True)
+      msg.managerState.processes = [p.get_process_state_msg() for p in managed_processes.values()]
+      # Check in the normal-priority manager, never in the 100 Hz control loop.
+      msg.managerState.rebootRequired = update_status.update(now)
+      pm.send('managerState', msg)
 
-    # kick AGNOS power monitoring watchdog
-    try:
-      if sm.all_checks(['deviceState']):
-        with atomic_write("/var/tmp/power_watchdog", "w", overwrite=True) as f:
-          f.write(str(time.monotonic()))
-    except Exception:
-      pass
+      # kick AGNOS power monitoring watchdog
+      try:
+        if sm.all_checks(['deviceState']):
+          with atomic_write("/var/tmp/power_watchdog", "w", overwrite=True) as f:
+            f.write(str(time.monotonic()))
+      except Exception:
+        pass
 
-    # Exit main loop when uninstall/shutdown/reboot is needed
-    shutdown = False
-    for param in ("DoUninstall", "DoShutdown", "DoReboot"):
-      if params.get_bool(param):
-        shutdown = True
-        params.put("LastManagerExitReason", f"{param} {datetime.datetime.now()}")
-        cloudlog.warning(f"Shutting down manager - {param} set")
+      # Exit main loop when uninstall/shutdown/reboot is needed
+      shutdown = False
+      for param in ("DoUninstall", "DoShutdown", "DoReboot"):
+        if params.get_bool(param):
+          shutdown = True
+          params.put("LastManagerExitReason", f"{param} {datetime.datetime.now()}")
+          cloudlog.warning(f"Shutting down manager - {param} set")
 
-    if shutdown:
-      break
+      if shutdown:
+        break
+  finally:
+    xiaoge_startup.stop()
 
 def main() -> None:
   try:

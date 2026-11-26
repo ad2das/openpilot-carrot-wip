@@ -88,8 +88,8 @@ def _block_sigusr2_for_fork(*, check_fork_method: bool = True):
 
 
 def _daemon_preexec() -> None:
-  # subprocess.Popen with preexec_fn uses raw C fork() without Python's
-  # os.register_at_fork hooks, so unblock SIGUSR2 explicitly before exec.
+  # Explicitly unblock SIGUSR2 before exec even if an implementation bypasses
+  # Python's os.register_at_fork hooks in subprocess.Popen(..., preexec_fn=...).
   _unblock_sigusr2_in_child()
   os.setpgrp()
 

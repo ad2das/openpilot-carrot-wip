@@ -54,6 +54,7 @@ class Mic:
     self.sound_pressure_level_weighted = 0
 
     self.lock = threading.Lock()
+    self._last_stream_error: str | None = None
 
   def update(self):
     with self.lock:
@@ -97,9 +98,18 @@ class Mic:
   @retry(attempts=20, delay=3)
   def get_stream(self, sd):
     # reload sounddevice to reinitialize portaudio
-    sd._terminate()
-    sd._initialize()
-    return sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    try:
+      sd._terminate()
+      sd._initialize()
+      stream = sd.InputStream(channels=1, samplerate=SAMPLE_RATE, callback=self.callback, blocksize=SAMPLE_BUFFER)
+    except Exception as e:
+      err = f"{type(e).__name__}: {e}"
+      if err != getattr(self, "_last_stream_error", None):
+        self._last_stream_error = err
+        cloudlog.warning(f"micd get_stream failed: {err}")
+      raise
+    self._last_stream_error = None
+    return stream
 
   def micd_thread(self):
     # sounddevice must be imported after forking processes
