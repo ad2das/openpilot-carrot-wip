@@ -377,3 +377,59 @@ def test_disengaged_does_not_unconditionally_raise_v_cruise_kph():
   CS.vEgoCluster = 90 / 3.6
   out = helper._update_cruise_state(CS, CC, helper.v_cruise_kph)
   assert out == 60.0
+  assert helper.v_cruise_kph == 60.0
+
+
+def test_soft_hold_on_cancel_not_wiped_by_fcw_or_desired_speed():
+  helper, CS, CC, rec = make_helper()
+  CS.cruiseState.available = True
+  helper.soft_hold_on_cancel = True
+  helper._cruise_cancel_state = True
+  helper.cruiseOnDist = 20.0
+  helper.d_rel = 6.0
+  helper.v_rel = -0.5
+  helper.desiredSpeed = 0.0
+  CS.vEgo = 0.05  # below soft-hold arm threshold (< 0.1 m/s) but above fcw trigger (> 0.02 m/s)
+  CS.vEgoCluster = 0.05
+  press_helper(helper, CS, CC, rec, brake=True, frames=65, vset=1, steer=0.0)
+  assert helper._soft_hold_active == 1
+
+  # Release brake while still in cancel state: soft hold must engage and stay active
+  # (not be clobbered by the same-tick fcw/desiredSpeed _cruise_control rejection).
+  logs = frame(helper, CS, CC, rec, vset=1, steer=0.0)
+  assert helper._soft_hold_active == 2
+  assert helper._activate_cruise == 1
+  assert helper._cruise_cancel_state is True
+  assert "Cruise on (soft hold)" in logs
+
+  # Next tick before selfdrived reports CC.enabled=True: soft hold must still not be wiped.
+  frame(helper, CS, CC, rec, vset=1, steer=0.0)
+  assert helper._soft_hold_active == 2
+  assert helper._cruise_cancel_state is True
+
+
+def test_soft_hold_survives_steering_interlock():
+  """Soft hold is armed before the interlock check, as in 1456a8f00: at |steer| >= 70 the hold stays active
+  and the rejected engage must not fall through to a latched brake-resume."""
+  helper, CS, CC, rec = make_helper()
+  CS.vEgo = CS.vEgoCluster = 0.0
+  CS.cruiseState.available = True
+  press_helper(helper, CS, CC, rec, brake=True, frames=100, vset=0, steer=80.0)
+  assert helper._soft_hold_active == 1
+
+  for _ in range(5):
+    frame(helper, CS, CC, rec, vset=0, steer=80.0)
+  assert helper._soft_hold_active == 2
+  assert helper._activate_cruise == 0
+  assert not any("Resume pending" in line for f in rec.frames[-6:] for line in f)
+
+
+def test_safe_stop_fcw_engage_same_speed_lead():
+  """Coasting manually at 72 km/h 40 m behind a same-speed lead is an unsafe gap for the v^2 stopping model,
+  so the fcw engage fires as in 1456a8f00."""
+  helper, CS, CC, rec = make_helper()
+  CS.vEgo = CS.vEgoCluster = 20.0
+  helper.d_rel, helper.v_rel = 40.0, 0.0
+  logs = frame(helper, CS, CC, rec, vset=72)
+  assert helper._activate_cruise == 1
+  assert "Cruise on (fcw)" in logs

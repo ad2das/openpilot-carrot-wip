@@ -802,50 +802,39 @@ class VCruiseCarrot:
     # Explicit HID button requests bypass automatic-engage preferences only;
     # availability/interlocks below and selfdrived's normal no-entry checks remain.
     if enable > 0 and not self._cruise_available:
-      self._activate_cruise = 0
-      self._soft_hold_active = 0
       self._add_log(reason + " > Cruise unavailable")
-      return
+      return False
     if enable > 0 and self._steering_interlock_active:
-      self._activate_cruise = 0
-      self._soft_hold_active = 0
       self._add_log(reason + " > Steering angle interlock active")
-      return
+      return False
     if enable > 0 and self._hold_interlock_active:
-      self._activate_cruise = 0
-      self._soft_hold_active = 0
       self._add_log(reason + " > Brake hold interlock active")
-      return
+      return False
     if self._cruise_cancel_state and not allow_cancel_state:
-      if enable > 0:
-        self._activate_cruise = 0
-        self._soft_hold_active = 0
       self._add_log(reason + " > Cancel state")
-    elif enable > 0 and self._cancel_timer > 0 and cancel_timer >= 0:
-      enable = 0
-      self._activate_cruise = 0
-      self._soft_hold_active = 0
+      return False
+    if enable > 0 and self._cancel_timer > 0 and cancel_timer >= 0:
       self._add_log(reason + " > Canceled")
-    else:
-      if not manual and self.autoCruiseControl == 0 and enable != 0:
-        enable = 0
-        self._soft_hold_active = 0
-        return
-      if not manual and self.autoCruiseControl_cancel_timer > 0 and enable != 0:
-        self._add_log(reason + " > timer Canceled")
-        enable = 0
-        self._soft_hold_active = 0
-        return
-      self._activate_cruise = enable
-      self._cancel_timer = int(cancel_timer / 0.01)   # DT_CTRL: 0.01
-      self._add_log(reason)
+      return False
+    if not manual and self.autoCruiseControl == 0 and enable != 0:
+      self._soft_hold_active = 0
+      return False
+    if not manual and self.autoCruiseControl_cancel_timer > 0 and enable != 0:
+      self._add_log(reason + " > timer Canceled")
+      self._soft_hold_active = 0
+      return False
+    self._activate_cruise = enable
+    self._cancel_timer = int(cancel_timer / 0.01)   # DT_CTRL: 0.01
+    self._add_log(reason)
+    return True
 
   def _check_safe_stop(self, CS, safe_distance = 3):
+    v_ego = CS.vEgo
     decel_rate = 1.5
-    v_closing = max(0.0, -float(self.v_rel))
-    d_stop_closing = (v_closing ** 2) / (2 * decel_rate)
+    d_stop_ego = (v_ego ** 2) / (2 * decel_rate)
+    d_stop_rel = (self.v_rel ** 2) / (2 * decel_rate)
 
-    d_final = self.d_rel - d_stop_closing
+    d_final = self.d_rel - d_stop_ego - d_stop_rel
 
     if d_final >= safe_distance:
       return True, d_final
@@ -955,10 +944,12 @@ class VCruiseCarrot:
 
   def _update_cruise_state(self, CS, CC, v_cruise_kph):
     self._update_resume_pending(CS, CC)
+    soft_hold_release = False
     if not CC.enabled:
       #self._pause_auto_speed_up = False
       if self._brake_pressed_count == -1 and self._soft_hold_active > 0:
         #self.autoCruiseControl_cancel_timer = 0
+        soft_hold_release = True
         self._engage_soft_hold()
       # GM: autoResume
       elif self.CP.brand == "gm" and self.params.get_bool("ActivateCruiseAfterBrake"):
@@ -980,7 +971,7 @@ class VCruiseCarrot:
         v_cruise_kph = self._v_cruise_desired(CS, v_cruise_kph)
     elif self._gas_pressed_count == -1:
       v_cruise_kph = self._gas_release(CS, CC, v_cruise_kph, latch=True)
-    elif self._brake_pressed_count == -1 and self._soft_hold_active == 0:
+    elif self._brake_pressed_count == -1 and not soft_hold_release and self._soft_hold_active == 0:
       v_cruise_kph = self._brake_release(CS, CC, v_cruise_kph, latch=True)
     elif self._brake_pressed_count < 0 and self._gas_pressed_count < 0:
       if self._resume_pending is not None and not CC.enabled and self._resume_gate_clear(CS):
@@ -988,7 +979,7 @@ class VCruiseCarrot:
         self._clear_resume_pending()
         release = self._gas_release if kind == 'gas' else self._brake_release
         v_cruise_kph = release(CS, CC, v_cruise_kph, latch=False)
-      elif not CC.enabled:
+      elif not CC.enabled and not soft_hold_release and self._soft_hold_active == 0 and self._activate_cruise == 0:
         if self.d_rel > 0 and CS.vEgo > 0.02:
           safe_state, safe_dist = self._check_safe_stop(CS, 4)
           if abs(CS.steeringAngleDeg) > 70:
