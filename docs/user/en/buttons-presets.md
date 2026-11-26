@@ -35,10 +35,9 @@ Carrot Web restores an individual item using the `default` in `carrot_settings.j
 |---|---:|---:|
 | `PaddleMode` | 1 | 0 |
 | `CruiseSpeedUnitBasic` | 10 | 1 |
-| `CruiseButtonTest1` / `2` / `3` | 0 / 0 / 0 | 8 / 30 / 1 |
 | `CruiseSpeed1` through `5` | 10 / 10 / 10 / 10 / 10 | 30 / 50 / 80 / 110 / 130 |
 
-The button-test catalog default of `0` is even below the displayed minimum. Do not force values to match a table; back up and use the current value on your own device as the baseline.
+The button-message tests `CruiseButtonTest1` through `3` now use 8 / 30 / 1 for both defaults. Do not force values to match a table; back up and use the current value on your own device as the baseline.
 
 <a id="button-modes"></a>
 ## 1. Button modes
