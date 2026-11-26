@@ -1,5 +1,6 @@
 """Exercise the production PythonProcess without importing device-only services."""
 import ast
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock  # noqa: TID251 - use pytest with stdlib call assertions
@@ -13,16 +14,26 @@ def factories():
   tree = ast.parse(path.read_text(encoding='utf-8'))
   definition = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'PythonProcess')
   default, spawned = Mock(), Mock()
+  fork_blocks = []
+
+  @contextmanager
+  def fake_block_sigusr2():
+    fork_blocks.append('enter')
+    try:
+      yield
+    finally:
+      fork_blocks.append('exit')
+
   namespace = {'ManagerProcess': type('Base', (), {'proc': None, 'shutting_down': False}),
                'Process': default, 'get_context': Mock(return_value=SimpleNamespace(Process=spawned)),
-               'launcher': Mock(), 'cloudlog': Mock()}
+               'launcher': Mock(), 'cloudlog': Mock(), '_block_sigusr2_for_fork': fake_block_sigusr2}
   exec(compile(ast.Module(body=[definition], type_ignores=[]), str(path), 'exec'), namespace)
-  return namespace, default, spawned
+  return namespace, default, spawned, fork_blocks
 
 
 @pytest.mark.parametrize('spawn', [False, True])
 def test_start_uses_selected_context_and_does_not_duplicate_child(factories, spawn):
-  ns, default, spawned = factories
+  ns, default, spawned, fork_blocks = factories
   process = ns['PythonProcess']('worker', 'worker.module', lambda *_: True, spawn=spawn)
   process.start()
   process.start()
@@ -32,8 +43,10 @@ def test_start_uses_selected_context_and_does_not_duplicate_child(factories, spa
   unused.assert_not_called()
   if spawn:
     ns['get_context'].assert_called_once_with('spawn')
+    assert fork_blocks == []
   else:
     ns['get_context'].assert_not_called()
+    assert fork_blocks == ['enter', 'exit']
 
 
 def test_spawned_processes_are_the_reviewed_set():

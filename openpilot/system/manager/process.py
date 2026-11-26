@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib
 import os
 import signal
@@ -5,7 +6,7 @@ import time
 import subprocess
 from collections.abc import Callable, ValuesView
 from abc import ABC, abstractmethod
-from multiprocessing import Process, get_context
+from multiprocessing import Process, get_context, get_start_method
 
 from setproctitle import setproctitle
 
@@ -49,6 +50,48 @@ def nativelauncher(pargs: list[str], cwd: str, name: str) -> None:
   # exec the process
   os.chdir(cwd)
   os.execvp(pargs[0], pargs)
+
+
+_SIGUSR2_AT_FORK_REGISTERED = False
+
+
+def _unblock_sigusr2_in_child() -> None:
+  # Signal masks are inherited across fork and exec; children must unblock
+  # SIGUSR2 so msgq_poll keeps its tkill(SIGUSR2) wakeups.
+  if hasattr(signal, "SIGUSR2") and hasattr(signal, "pthread_sigmask"):
+    try:
+      signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR2})
+    except OSError:
+      pass
+
+
+@contextmanager
+def _block_sigusr2_for_fork(*, check_fork_method: bool = True):
+  # On AGNOS kernel 4.9, copy_process() restarts fork() with -ERESTARTNOINTR
+  # whenever an unblocked signal is pending. msgq sends ~230 SIGUSR2/s to the
+  # manager main thread onroad, causing fork() to livelock indefinitely.
+  global _SIGUSR2_AT_FORK_REGISTERED
+  if not (hasattr(signal, "SIGUSR2") and hasattr(signal, "pthread_sigmask")):
+    yield
+    return
+  if check_fork_method and get_start_method() != "fork":
+    yield
+    return
+  if not _SIGUSR2_AT_FORK_REGISTERED and hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_unblock_sigusr2_in_child)
+    _SIGUSR2_AT_FORK_REGISTERED = True
+  prev_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR2})
+  try:
+    yield
+  finally:
+    signal.pthread_sigmask(signal.SIG_SETMASK, prev_mask)
+
+
+def _daemon_preexec() -> None:
+  # subprocess.Popen with preexec_fn uses raw C fork() without Python's
+  # os.register_at_fork hooks, so unblock SIGUSR2 explicitly before exec.
+  _unblock_sigusr2_in_child()
+  os.setpgrp()
 
 
 def join_process(process: Process, timeout: float) -> None:
@@ -102,7 +145,10 @@ class ManagerProcess(ABC):
       if self.proc.exitcode is None and retry:
         cloudlog.info(f"killing {self.name} with SIGKILL")
         self.signal(signal.SIGKILL)
-        self.proc.join()
+        join_process(self.proc, 5)
+        if self.proc.exitcode is None:
+          cloudlog.error(f"{self.name} did not exit after SIGKILL")
+          return None
 
     ret = self.proc.exitcode
     cloudlog.info(f"{self.name} is dead with {ret}")
@@ -163,7 +209,8 @@ class NativeProcess(ManagerProcess):
     cwd = os.path.join(BASEDIR, self.cwd)
     cloudlog.info(f"starting process {self.name}")
     self.proc = Process(name=self.name, target=self.launcher, args=(self.cmdline, cwd, self.name))
-    self.proc.start()
+    with _block_sigusr2_for_fork():
+      self.proc.start()
     self.shutting_down = False
 
 
@@ -203,7 +250,11 @@ class PythonProcess(ManagerProcess):
 
     cloudlog.info(f"starting python {self.module}")
     self.proc = self.process_factory(name=name, target=self.launcher, args=(self.module, self.name))
-    self.proc.start()
+    if self.spawn:
+      self.proc.start()
+    else:
+      with _block_sigusr2_for_fork():
+        self.proc.start()
     self.shutting_down = False
 
 
@@ -241,11 +292,12 @@ class DaemonProcess(ManagerProcess):
         pass
 
     cloudlog.info(f"starting daemon {self.name}")
-    proc = subprocess.Popen(['python', '-m', self.module],
-                               stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL,
-                               stderr=subprocess.DEVNULL,
-                               preexec_fn=os.setpgrp)
+    with _block_sigusr2_for_fork(check_fork_method=False):
+      proc = subprocess.Popen(['python', '-m', self.module],
+                                stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                preexec_fn=_daemon_preexec)
 
     self.params.put(self.param_name, proc.pid)
 
