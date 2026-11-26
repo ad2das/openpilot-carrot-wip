@@ -264,6 +264,7 @@ def manager_thread(update_status: UpdateStatus) -> None:
   # Writing the supported-cars files can import every car brand; do it after
   # the first processes (including the early UI) are already running.
   supported_cars_thread = start_supported_cars_writer()
+  supported_cars_waited = False
 
   print_timer = 0
 
@@ -294,9 +295,11 @@ def manager_thread(update_status: UpdateStatus) -> None:
     ignition_prev = ignition
 
     if supported_cars_thread is not None:
-      if started:
+      if started and not supported_cars_waited:
         # Drain the brand-import thread before forking onroad processes, kicking
         # the stall watchdog in short slices so startup never trips a false stall.
+        # Wait once: a still-running writer must not block every later loop.
+        supported_cars_waited = True
         deadline = time.monotonic() + 5.0
         while supported_cars_thread.is_alive() and time.monotonic() < deadline:
           stall_watchdog.kick()
