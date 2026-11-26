@@ -509,54 +509,18 @@ def test_oem_autohold_without_prior_openpilot_hold_is_untouched(camera):
 
 
 @pytest.mark.parametrize("camera", [True, False])
-def test_direct_gas_from_hold_releases_immediately_with_restart_request(camera):
-  """Pressing gas directly from an openpilot ISG hold must drop StopReq immediately AND send CIS2=2."""
-  live, reference = isg_cs(), isg_cs()
-  a, b = CanfdStopping(), isg_off(CanfdStopping())
-  for cs in (live, reference):
-    cs.canfdSccHoldActive = True
-  for _ in range(3):
-    assert payload(camera, a, live, stopping=True, accel=-0.5) == \
-           payload(camera, b, reference, stopping=True, accel=-0.5)
-  assert a.isg_mode == ""
-
-  for cs in (live, reference):
-    cs.out.gasPressed = True
-  live_values = decode(payload(camera, a, live, stopping=True, accel=-0.5, override=True))
-  base_values = decode(payload(camera, b, reference, stopping=True, accel=-0.5, override=True))
-  assert live_values["StopReq"] == 0
-  assert live_values["CRUSE_INFO_SET_2"] == CIS2_RESTART
-  assert a.isg_mode == "post"
-  for key in ("CRUSE_INFO_SET_2", "CHECKSUM"):
-    live_values.pop(key)
-    base_values.pop(key)
-  assert live_values == base_values
-
-  at_rest(live, 0.2)
-  at_rest(reference, 0.2)
-  assert decode(payload(camera, a, live, stopping=False, accel=0.5, override=True))["CRUSE_INFO_SET_2"] == base_cis2(camera)
-  assert a.isg_mode == ""
-
-
-@pytest.mark.parametrize("camera", [True, False])
-def test_direct_neutral_from_hold_releases_immediately_with_restart_request(camera):
-  """Shifting directly out of drive during an openpilot ISG hold must drop StopReq immediately AND send CIS2=2."""
+def test_gear_out_of_drive_from_hold_matches_stock(camera):
+  """Shifting out of drive during an openpilot ISG hold is a plain driver release, as on the stock SCC:
+  no post window, and CRUSE_INFO_SET_2 stays at the packet's own value instead of being forced to 2."""
   cs = isg_cs()
   controller, _ = held(camera, cs)
-  assert controller.isg_mode == ""
 
   cs.out.gearShifter = "neutral"
-  values = send(camera, controller, cs, enabled=False)
-  assert values["ACCMode"] == 0
-  assert values["StopReq"] == 0
-  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
-  assert controller.isg_mode == "post"
-
-  cs.isgAutoStop = False
-  for frame in range(ISG_POST_FRAMES):
-    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"post frame {frame}"
-  assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == base_cis2(camera)
-  assert controller.isg_mode == ""
+  for frame in range(6):
+    values = send(camera, controller, cs, enabled=False)
+    assert values["StopReq"] == 0, f"frame {frame} still requested the hold"
+    assert values["CRUSE_INFO_SET_2"] == base_cis2(camera), f"frame {frame} forced CIS2"
+    assert controller.isg_mode == "", f"frame {frame} entered post"
 
 
 def test_late_isg_status_registration_recovers_after_startup_window():
@@ -673,40 +637,6 @@ def test_read_isg_before_first_frame_is_unknown_even_at_low_timestamp():
   parser._add_message("ISG_STATUS", float("nan"), ignore_counter=True)
   parser.update([100_000_000, [(96, bytes(24), 0)]])
   assert read_isg(parser, parser.vl["ISG_STATUS"]) == (-1, False)
-
-
-@pytest.mark.parametrize("camera", [True, False])
-def test_direct_gas_from_post_mode_resets_post_window(camera):
-  """A direct gas release from an active post window with a re-stopped engine must get a full 2 s post window."""
-  cs = isg_cs()
-  controller, _ = held(camera, cs)
-  send(camera, controller, cs, stopping=False, accel=0.5)
-  assert controller.isg_mode == "depart"
-
-  # Engine restarts -> post runs for ISG_POST_FRAMES - 1 ticks at standstill while still holding StopReq=1.
-  cs.isgAutoStop = False
-  for _ in range(ISG_POST_FRAMES - 1):
-    send(camera, controller, cs, stopping=True, accel=-0.5)
-  assert controller.isg_mode == "post"
-  assert controller.isg_frames == ISG_POST_FRAMES - 1
-
-  # Engine re-enters auto-stop while StopReq=1, then driver presses gas directly.
-  cs.isgAutoStop = True
-  send(camera, controller, cs, stopping=True, accel=-0.5)
-  cs.out.gasPressed = True
-  values = send(camera, controller, cs, stopping=True, accel=-0.5, override=True)
-  assert values["StopReq"] == 0
-  assert values["CRUSE_INFO_SET_2"] == CIS2_RESTART
-  assert controller.isg_mode == "post"
-  assert controller.isg_frames == 0
-
-  # After the second restart, CIS2 must remain 2 for the full ISG_POST_FRAMES window (not 1 frame).
-  cs.out.gasPressed = False
-  cs.isgAutoStop = False
-  for frame in range(ISG_POST_FRAMES):
-    assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == CIS2_RESTART, f"post frame {frame}"
-  assert send(camera, controller, cs, enabled=False)["CRUSE_INFO_SET_2"] == base_cis2(camera)
-  assert controller.isg_mode == ""
 
 
 if __name__ == "__main__":
