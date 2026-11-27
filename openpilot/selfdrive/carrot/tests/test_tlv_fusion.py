@@ -527,6 +527,9 @@ def carrot_man_message(state: int = 2, src: int = 1, speed: int = 60,
 
 def planner_for_gate(stop_sign: bool) -> CarrotPlanner:
   planner = CarrotPlanner.__new__(CarrotPlanner)
+  # The skeleton skips __init__: give the start rule the mode it reads (2 is the
+  # __init__ default, so these gate tests keep their stop&go behaviour).
+  planner.trafficLightDetectMode = 2
   planner.trafficState_carrot = 1
   planner.trafficState_carrot_src = 1
   planner.soft_hold_active = 0

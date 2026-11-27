@@ -161,6 +161,12 @@ def e2e_stop_rearm(actual_stop_distance: float, stop_dist: float, near: bool) ->
 # existing e2eStop at the model's stop distance. Never derives a distance from the lamp.
 # W-TLT1 moved its constants into openpilot/selfdrive/carrot/tlv_stop_tiers.py.
 
+def tlv_start_xstate_ok(x_state, detect_mode) -> bool:
+  """A traffic start may leave e2eStop in every mode, but may launch a stopped car
+  (e2eStopped) only outside mode 1 (stop only), the rule the model-green start uses."""
+  return x_state == XState.e2eStop or (x_state == XState.e2eStopped and detect_mode != 1)
+
+
 class CarrotPlanner:
   def __init__(self, signal_assist=None, start_guard=None, stop_prepare=None):
     # Per-device opt-in only; no flag means the original controller path.
@@ -959,7 +965,7 @@ class CarrotPlanner:
       if trigger_start:
         if self.soft_hold_active > 0:
           self.add_event(EventName.trafficSignChanged)
-        elif self.xState in [XState.e2eStop, XState.e2eStopped]:
+        elif tlv_start_xstate_ok(self.xState, self.trafficLightDetectMode):
           self.xState = XState.e2eCruise
           self.traffic_starting_count = 10.0 / DT_MDL
 
