@@ -98,6 +98,32 @@ VOTE_TRACK_KEEP_S = 0.75
 # Same-track green (W74D): a TLV green/left start edge is only valid from the
 # tracked light that was confirmed red/redLeft within this window.
 GO_AFTER_RED_WINDOW_S = 120.0
+# GAR1 (11-27 13:23 Palisade): the red light was re-identified 27 -> 28 -> 31 -> 33
+# while red, so the same-track goAfterRed credit was lost and the car braked to the
+# line on a green. A NEW track inherits ONLY red_confirmed_s (never votes) from one
+# parent proven to be the same light: an unmatched alive track, or one dropped by
+# miss expiry <= INHERIT_GRAVE_S ago (never a frame-exit drop), whose ego-predicted
+# box passes the anisotropic position gate and both size-ratio gates, whose red is
+# <= INHERIT_RED_MAX_AGE_S old and not green-confirmed since, and which is fewer than
+# MAX_INHERIT_HOPS links from a self-confirmed red. A detector re-match of a live
+# parent revokes the credit (two co-existing lights, not a re-ID).
+INHERIT_GRAVE_S = 1.0
+INHERIT_GRAVE_MAX = 16
+INHERIT_RED_MAX_AGE_S = 5.0
+MAX_INHERIT_HOPS = 3
+INHERIT_DX_W = 1.2
+INHERIT_DY_H = 3.0
+INHERIT_W_RATIO = (0.70, 1.43)
+INHERIT_H_RATIO = (0.67, 1.50)
+INHERIT_MIN_RANGE_M = 5.0
+GO_CLASSES = (LampClass.GREEN, LampClass.GREEN_LEFT, LampClass.LEFT)
+# GAR1 R7 (11-27 Neon GAR3 5a): an inherited red counts only after the new track's own first
+# deciding vote is red/redLeft at p >= 0.6. A green/left/yellow first vote drops it (a light born
+# green is a misread or a neighbouring head, 000004c0 08:02:39 / 000004e3 07:51:30).
+INHERIT_CONFIRM_MIN_PROB = RED_LIKELY_MIN_PROB
+INHERIT_DROP_CLASSES = GO_CLASSES + (LampClass.YELLOW,)
+INHERIT_PENDING_MAX_VOTES = 2   # undecided votes (OFF, RED_YELLOW, red/redLeft p < 0.6) a pending credit survives
+INHERIT_PENDING_MAX_S = 0.5     # no deciding red vote within this after the re-ID -> the credit is dropped
 # W139c fast-road phantom gate support: count the detector matches (and creation)
 # of a track in this window. W139b showed >= 2 distinct detect cycles within
 # 2.5 s separates most high-speed phantom lamps (roof markers, LED boards,
@@ -219,6 +245,45 @@ def match_score(a: tuple[float, float, float, float], b: tuple[float, float, flo
   return 0.0
 
 
+def inherit_cost(pred: tuple[float, float, float, float], box: tuple[float, float, float, float]) -> float | None:
+  """GAR1 same-light gate: normalized cost (<= 1.0) or None when box is not the predicted light."""
+  pw, ph = pred[2] - pred[0], pred[3] - pred[1]
+  dw, dh = box[2] - box[0], box[3] - box[1]
+  if min(pw, ph, dw, dh) <= 0.0:
+    return None
+  mw, mh = min(pw, dw), min(ph, dh)
+  dx = abs(0.5 * (box[0] + box[2]) - 0.5 * (pred[0] + pred[2]))
+  dy = abs(0.5 * (box[1] + box[3]) - 0.5 * (pred[1] + pred[3]))
+  if dx > INHERIT_DX_W * mw or dy > INHERIT_DY_H * mh:
+    return None
+  if not (INHERIT_W_RATIO[0] <= dw / pw <= INHERIT_W_RATIO[1] and INHERIT_H_RATIO[0] <= dh / ph <= INHERIT_H_RATIO[1]):
+    return None
+  return max(dx / (INHERIT_DX_W * mw), dy / (INHERIT_DY_H * mh))
+
+
+def _drop_inherited_red(track: Track) -> None:
+  track.red_confirmed_s = None
+  track.red_hops = 0
+  track.inherited_from = ()
+  track.inherit_pending_since = None
+  track.inherit_pending_votes = 0
+
+
+def _settle_inherited_red(track: Track, now: float, cls: int, prob: float) -> None:
+  """GAR1 R7: this track's own first deciding vote keeps or drops an inherited red."""
+  if now - track.inherit_pending_since > INHERIT_PENDING_MAX_S:
+    _drop_inherited_red(track)
+  elif cls in ONSET_RED_CLASSES and prob >= INHERIT_CONFIRM_MIN_PROB:
+    track.inherit_pending_since = None
+    track.inherit_pending_votes = 0
+  elif cls in INHERIT_DROP_CLASSES:
+    _drop_inherited_red(track)
+  else:
+    track.inherit_pending_votes += 1
+    if track.inherit_pending_votes > INHERIT_PENDING_MAX_VOTES:
+      _drop_inherited_red(track)
+
+
 @dataclass
 class Track:
   track_id: int
@@ -237,6 +302,10 @@ class Track:
   # Last red-family confirmation time (monotonic); the W74D same-track green
   # window. None until this track was ever confirmed red/redLeft.
   red_confirmed_s: float | None = None
+  # GAR1: last green/greenLeft confirmation time (monotonic). A parent that
+  # turned green since its red is not a light still showing red; a bare LEFT is
+  # red for straight traffic (carrot_serv.py) and never counts here.
+  green_confirmed_s: float | None = None
   # Ego-motion anchor: the detection box and odometry state it came from. All
   # four are rewritten whenever the detector matches/creates the track, so
   # predict_box() can propagate the light forward between detector frames.
@@ -254,6 +323,16 @@ class Track:
   # accepted NCC refine). None until the first verification; the standstill
   # stale-box vote needs this to bound how old the box it votes on can be.
   last_verified_s: float | None = None
+  # GAR1: links since the last self-confirmed red (0 = own red) and the live parent
+  # whose detector re-match revokes an inherited red_confirmed_s.
+  red_hops: int = 0
+  inherited_from: tuple[int, ...] = ()
+  # GAR1: a track donates its red credit at most once (never reset).
+  red_donated: bool = False
+  # GAR1 R7: creation time of an inherited red not yet confirmed by this track's own red vote
+  # (None = no pending credit), and the undecided votes it has taken.
+  inherit_pending_since: float | None = None
+  inherit_pending_votes: int = 0
 
   @property
   def cx(self) -> float:
@@ -469,6 +548,7 @@ class TrafficLightTracker:
     self.tracks: list[Track] = []
     self.last_matches: list[tuple[Detection, int]] = []
     self._next_id = 1
+    self.graveyard: list[tuple[float, Track]] = []
 
   def update(self, frame_idx: int, detections: list[Detection], view: str, focal_px: float,
              now: float | None = None, *, predict=None, anchor: tuple[float, float, float] | None = None,
@@ -485,6 +565,8 @@ class TrafficLightTracker:
     frame is dropped, and one unmatched while its predicted centre is inside
     the crop accrues view_misses (VIEW_MISS_LIMIT drops it).
     """
+    if now is not None and self.graveyard:
+      self.graveyard = [(t, tr) for (t, tr) in self.graveyard if 0.0 <= now - t <= INHERIT_GRAVE_S]
     pred_boxes = [predict(t) if predict is not None else t.box for t in self.tracks]
 
     pairs: list[tuple[float, int, int]] = []
@@ -502,6 +584,13 @@ class TrafficLightTracker:
         continue
       det_to_track[di] = ti
       used_tracks.add(ti)
+
+    rematched = {self.tracks[ti].track_id for ti in used_tracks}
+    for track in self.tracks:
+      if track.inherited_from and any(i in rematched for i in track.inherited_from):
+        _drop_inherited_red(track)
+    inherit = self._inherit_links(detections, det_to_track, used_tracks, pred_boxes, now, predict,
+                                  anchor, focal_px, frame_box)
 
     def apply_anchor(track: Track) -> None:
       if anchor is not None:
@@ -542,6 +631,14 @@ class TrafficLightTracker:
         if now is not None:
           track.det_times.append(float(now))
           track.last_verified_s = float(now)
+        link = inherit.get(di)
+        if link is not None:
+          parent, from_grave = link
+          track.red_confirmed_s = parent.red_confirmed_s
+          track.red_hops = parent.red_hops + 1
+          track.inherited_from = parent.inherited_from if from_grave else parent.inherited_from + (parent.track_id,)
+          track.inherit_pending_since = float(now)
+          track.inherit_pending_votes = 0
         self._next_id += 1
         self.tracks.append(track)
         matched_track_ids.add(track.track_id)
@@ -558,7 +655,11 @@ class TrafficLightTracker:
       pred = pred_boxes[ti] if ti < len(pred_boxes) else track.box
       if self._alive(track, frame_idx, now, pred=pred, frame_box=frame_box):
         keep.append(track)
+      elif now is not None and (frame_box is None or _centre_inside(pred, frame_box)) and self._grave_ok(track, now):
+        self.graveyard.append((float(now), track))  # miss expiry only, never a frame exit
     self.tracks = keep
+    if len(self.graveyard) > INHERIT_GRAVE_MAX:
+      del self.graveyard[:len(self.graveyard) - INHERIT_GRAVE_MAX]
     return self.last_matches
 
   def _alive(self, track: Track, frame_idx: int, now: float | None, *,
@@ -571,6 +672,74 @@ class TrafficLightTracker:
     if frame_idx - track.last_frame <= self.max_misses:
       return True
     return now is not None and bool(track.votes) and now - track.votes[-1][0] <= VOTE_TRACK_KEEP_S
+
+  @staticmethod
+  def _grave_ok(track: Track, now: float) -> bool:
+    """GAR1: only a fresh, unspent red credit is worth keeping for a re-ID."""
+    red_s = track.red_confirmed_s
+    return (red_s is not None and 0.0 <= now - red_s <= INHERIT_RED_MAX_AGE_S
+            and track.red_hops < MAX_INHERIT_HOPS and not track.red_donated
+            and track.inherit_pending_since is None
+            and (track.green_confirmed_s is None or track.green_confirmed_s < red_s))
+
+  @staticmethod
+  def _parent_ok(track: Track, pbox: tuple[float, float, float, float], now: float,
+                 anchor: tuple[float, float, float],
+                 frame_box: tuple[float, float, float, float] | None) -> bool:
+    if track.inherit_pending_since is not None:
+      return False  # GAR1 R7: an unconfirmed credit is no credit
+    red_s = track.red_confirmed_s
+    if red_s is None or not (0.0 <= now - red_s <= INHERIT_RED_MAX_AGE_S):
+      return False
+    if track.red_hops >= MAX_INHERIT_HOPS or track.anchor_box is None:
+      return False
+    if track.red_donated:
+      return False
+    if track.green_confirmed_s is not None and track.green_confirmed_s >= red_s:
+      return False
+    d0 = estimate_distance_m(max(0.0, track.anchor_box[3] - track.anchor_box[1]), track.focal_px)
+    ds = float(anchor[0]) - track.anchor_s
+    if not math.isfinite(d0) or ds < 0.0 or (ds > 0.0 and d0 - ds < INHERIT_MIN_RANGE_M):
+      return False  # predict_box would snap back to k = 1 (tracker.py predict_box)
+    return frame_box is None or _centre_inside(pbox, frame_box)
+
+  def _inherit_links(self, detections: list[Detection], det_to_track: dict[int, int], used_tracks: set[int],
+                     pred_boxes: list[tuple[float, float, float, float]], now: float | None, predict,
+                     anchor: tuple[float, float, float] | None, focal_px: float,
+                     frame_box: tuple[float, float, float, float] | None) -> dict[int, tuple[Track, bool]]:
+    """GAR1: {det index: (parent, from_graveyard)} for the new tracks that inherit red_confirmed_s."""
+    if now is None or predict is None or anchor is None or len(det_to_track) == len(detections):
+      return {}
+    pool: list[tuple[Track, tuple[float, float, float, float], bool]] = []
+    for ti, track in enumerate(self.tracks):
+      if ti not in used_tracks:
+        pool.append((track, pred_boxes[ti], False))
+    for _t_drop, track in self.graveyard:
+      pool.append((track, predict(track), True))
+    parents = [p for p in pool if self._parent_ok(p[0], p[1], now, anchor, frame_box)]
+    if not parents:
+      return {}
+    cands: list[tuple[float, int, int]] = []
+    for di, det in enumerate(detections):
+      if di in det_to_track:
+        continue
+      for pi, (_track, pbox, _g) in enumerate(parents):
+        cost = inherit_cost(pbox, det.box)
+        if cost is not None:
+          cands.append((cost, di, pi))
+    cands.sort()
+    out: dict[int, tuple[Track, bool]] = {}
+    used_p: set[int] = set()
+    for _cost, di, pi in cands:
+      if di in out or pi in used_p:
+        continue
+      out[di] = (parents[pi][0], parents[pi][2])
+      parents[pi][0].red_donated = True
+      used_p.add(pi)
+    consumed = {id(track) for track, from_grave in out.values() if from_grave}
+    if consumed:
+      self.graveyard = [(t, tr) for (t, tr) in self.graveyard if id(tr) not in consumed]
+    return out
 
   def confirmed(self, frame_idx: int) -> list[tuple[Track, int, float]]:
     out: list[tuple[Track, int, float]] = []
@@ -588,6 +757,8 @@ class TrafficLightTracker:
       track = by_id.get(int(track_id))
       if track is not None:
         track.votes.append((float(now), int(cls), float(prob)))
+        if track.inherit_pending_since is not None:
+          _settle_inherited_red(track, float(now), int(cls), float(prob))
 
   def confirm_track(self, track: Track, frame_idx: int, now: float,
                     use_classifier: bool, onset_strict: bool = False) -> tuple[int, float] | None:
@@ -617,11 +788,18 @@ class TrafficLightTracker:
     for track, cls, _conf in confirmed:
       if int(cls) in RED_FAMILY:
         track.red_confirmed_s = float(now)
+        track.red_hops = 0
+        track.inherited_from = ()
+        track.inherit_pending_since = None
+        track.inherit_pending_votes = 0
+      elif int(cls) in GREEN_FAMILY:
+        # A bare LEFT is red for straight traffic (carrot_serv.py), not a green.
+        track.green_confirmed_s = float(now)
 
   def go_after_red(self, track_id: int, now: float) -> bool:
     """True when this track was confirmed red/redLeft within 120 s."""
     track = self.track_by_id(track_id)
-    if track is None or track.red_confirmed_s is None:
+    if track is None or track.red_confirmed_s is None or track.inherit_pending_since is not None:
       return False
     return 0.0 <= now - track.red_confirmed_s <= GO_AFTER_RED_WINDOW_S
 
